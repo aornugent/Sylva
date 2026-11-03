@@ -19,6 +19,7 @@ pub mod geotiff;
 pub mod las;
 pub mod mesh;
 pub mod ply;
+pub mod ray_tiles;
 pub mod rdb;
 pub mod mta;
 pub mod mta_model;

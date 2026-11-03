@@ -412,6 +412,49 @@ def read_rxp_shots(path: str | Path, fill_missing: bool | tuple[float, float] | 
     return (shots, report) if return_report else shots
 
 
+def tile_ray_clouds(files, out, width: float = 25.0, buffer: float = 5.0, voxel: float = 0.01,
+                    terrain_voxel: float = 0.03, extent=None, min_rays: int = 100_000,
+                    threads: int = 4) -> tuple[list[dict], int]:
+    """Cut Shots files into raycloudtools ray-cloud tiles, streamed.
+
+    Each file must hold one scan position (e.g. one :meth:`Shots.from_scan`
+    per scan, transformed by its SOP). Echoes are binned by end point into
+    tiles centred on multiples of ``width`` (the grid ``rayextract trees
+    --grid_width`` assumes) plus ``buffer`` on every side, thinned to the
+    first echo per ``voxel`` in file order, and written with their rays from
+    the scanner. Misses are not written (``rayextract`` ignores them).
+
+    Writes ``out/tiles/<kx>_<ky>/cloud.ply`` (``time`` = row), ``scan.u16``
+    (each ray's index into ``files``) and ``out/terrain.ply`` (each tile's own
+    cell at ``terrain_voxel``). Memory is one row group per file and
+    ``threads`` tiles at a time.
+
+    Parameters
+    ----------
+    files
+        Shots Parquet files, one scan position each.
+    out
+        Output directory.
+    width, buffer
+        Tile width and the overlap added on every side (m); ``buffer < width / 2``.
+    voxel, terrain_voxel
+        Thinning voxels (m) for the tiles and for the terrain cloud; 0 keeps every echo.
+    extent
+        ``(xmin, ymin, xmax, ymax)``: drop echoes outside it.
+    min_rays
+        Tiles with fewer rays after thinning are not written.
+    threads
+        Tiles thinned at once.
+
+    Returns
+    -------
+    (tiles, n_terrain)
+        One dict per tile binned (``tile``, ``raw``, ``rays``, ``written``) and the terrain ray count.
+    """
+    return _core.tile_ray_clouds([str(f) for f in files], str(out), width, buffer, voxel, terrain_voxel,
+                                 None if extent is None else tuple(extent), min_rays, threads)
+
+
 def find_rivlib_shim(hint: str | Path | None = None) -> Path:
     """Locate ``libsylva_rivlib``, Sylva's shim over RiVLib's C++ class.
 

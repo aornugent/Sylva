@@ -31,9 +31,10 @@ from .plot import (  # noqa: F401
     PlotQSMs,
     build_plot,
 )
+from .support import surface_distance, surface_support  # noqa: F401
 from .wood import (  # noqa: F401
     wood_points,
 )
 
-__all__ = ["QSM", "PlotQSMs", "build_plot", "fit_cylinder", "fit_cylinder_ransac", "skeletonize", "build_qsm", "wood_points",
+__all__ = ["surface_support", "surface_distance", "QSM", "PlotQSMs", "build_plot", "fit_cylinder", "fit_cylinder_ransac", "skeletonize", "build_qsm", "wood_points",
            "write_obj", "write_ply_mesh", "Buttress", "buttress_mesh", "TreeMesh"]

@@ -583,6 +583,53 @@ fn shots_from_pointcloud<'py>(py: Python<'py>, xyz: PyReadonlyArray2<f64>, attrs
 }
 
 #[pyfunction]
+#[pyo3(signature = (cloud, a, b, radius, tol=0.03, per_m2=400.0, min_samples=16, seed=0))]
+#[allow(clippy::too_many_arguments, clippy::type_complexity)]
+fn qsm_surface_support<'py>(py: Python<'py>, cloud: PyReadonlyArray2<f64>, a: PyReadonlyArray2<f64>, b: PyReadonlyArray2<f64>, radius: PyReadonlyArray1<f64>,
+                            tol: f64, per_m2: f64, min_samples: usize, seed: u64) -> PyResult<(Bound<'py, PyArray2<f64>>, Bound<'py, PyArray1<u32>>, Bound<'py, PyArray1<bool>>)> {
+    let (cloud, a, b, r) = (xyz_from_py(cloud)?, xyz_from_py(a)?, xyz_from_py(b)?, radius.as_slice()?.to_vec());
+    let s = py.detach(|| {
+        let kd = sylva_rs::util::spatial::KdTree::new(&cloud);
+        qsm::support::surface_support(&kd, &a, &b, &r, tol, per_m2, min_samples, seed)
+    });
+    Ok((xyz_to_py(py, &s.samples), s.cylinder.into_pyarray(py), s.supported.into_pyarray(py)))
+}
+
+#[pyfunction]
+#[pyo3(signature = (points, point_offsets, a, b, radius, cyl_offsets, k=8))]
+#[allow(clippy::too_many_arguments)]
+fn qsm_surface_distance<'py>(py: Python<'py>, points: PyReadonlyArray2<f64>, point_offsets: Vec<usize>, a: PyReadonlyArray2<f64>, b: PyReadonlyArray2<f64>,
+                             radius: PyReadonlyArray1<f64>, cyl_offsets: Vec<usize>, k: usize) -> PyResult<Bound<'py, PyArray1<f64>>> {
+    let (points, a, b, r) = (xyz_from_py(points)?, xyz_from_py(a)?, xyz_from_py(b)?, radius.as_slice()?.to_vec());
+    if point_offsets.len() != cyl_offsets.len() {
+        return Err(PyValueError::new_err("point_offsets and cyl_offsets need one entry per group, plus one"));
+    }
+    let d = py.detach(|| qsm::support::surface_distance(&points, &point_offsets, &a, &b, &r, &cyl_offsets, k));
+    Ok(d.into_pyarray(py))
+}
+
+#[pyfunction]
+#[pyo3(signature = (files, out, width, buffer, voxel, terrain_voxel, extent=None, min_rays=100_000, threads=4))]
+#[allow(clippy::too_many_arguments)]
+fn tile_ray_clouds<'py>(py: Python<'py>, files: Vec<PathBuf>, out: PathBuf, width: f64, buffer: f64, voxel: f64, terrain_voxel: f64,
+                        extent: Option<(f64, f64, f64, f64)>, min_rays: usize, threads: usize) -> PyResult<(Vec<Bound<'py, PyDict>>, usize)> {
+    let opts = io::ray_tiles::TileOptions { width, buffer, voxel, terrain_voxel, extent: extent.map(|e| [e.0, e.1, e.2, e.3]), min_rays };
+    let (tiles, n_terrain) = py.detach(|| io::ray_tiles::tile_ray_clouds(&files, &out, &opts, threads)).map_err(err)?;
+    let tiles = tiles
+        .into_iter()
+        .map(|t| {
+            let d = PyDict::new(py);
+            d.set_item("tile", format!("{}_{}", t.kx, t.ky))?;
+            d.set_item("raw", t.raw)?;
+            d.set_item("rays", t.rays)?;
+            d.set_item("written", t.rays >= min_rays.max(1))?;
+            Ok(d)
+        })
+        .collect::<PyResult<_>>()?;
+    Ok((tiles, n_terrain))
+}
+
+#[pyfunction]
 #[pyo3(signature = (xyz, attrs=None, fill_missing=None))]
 fn shots_from_scan_points<'py>(py: Python<'py>, xyz: PyReadonlyArray2<f64>, attrs: Option<&Bound<'_, PyDict>>, fill_missing: Option<&Bound<'py, PyAny>>) -> PyResult<(Bound<'py, PyDict>, Option<Bound<'py, PyDict>>)> {
     let c = cloud_from_py(xyz, attrs)?;
@@ -1860,6 +1907,9 @@ fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
         wrap_pyfunction!(read_matrix_file, m)?,
         wrap_pyfunction!(shots_from_pointcloud, m)?,
         wrap_pyfunction!(shots_from_scan_points, m)?,
+        wrap_pyfunction!(tile_ray_clouds, m)?,
+        wrap_pyfunction!(qsm_surface_support, m)?,
+        wrap_pyfunction!(qsm_surface_distance, m)?,
         wrap_pyfunction!(shots_from_ray_cloud, m)?,
         wrap_pyfunction!(shots_to_pointcloud, m)?,
         wrap_pyfunction!(shots_transform, m)?,
