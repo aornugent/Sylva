@@ -166,6 +166,58 @@ impl Shots {
         shots
     }
 
+    /// Pulses from one scan's echoes in the scanner's frame (SOCS), in any
+    /// order: a LAS/LAZ/COPC export, which stores points spatially rather
+    /// than as fired. Echoes are sorted by `gps_time` (required) and grouped
+    /// into pulses as in [`Shots::from_pointcloud`]. The LAS
+    /// `return_number` and `number_of_returns` are kept as echo attributes
+    /// `las_return_number` and `las_number_of_returns`, so a pulse that lost
+    /// echoes in export can still be recognised.
+    ///
+    /// With `fill_missing`, the pulses that returned nothing are recovered
+    /// from the pulse timing ([`reconstruct::reconstruct_misses`], as for an
+    /// `.rxp`) and appended as echo-less shots. A pulse whose every echo was
+    /// dropped by the export is indistinguishable from a miss and is
+    /// recovered as one.
+    pub fn from_scan_points(cloud: &PointCloud, fill_missing: bool, zenith_range: Option<(f64, f64)>) -> Result<(Shots, Option<reconstruct::MissReport>)> {
+        let t = cloud.attr_f64("gps_time").ok_or_else(|| Error::invalid("from_scan_points: the points need a gps_time attribute"))?;
+        let mut order: Vec<usize> = (0..cloud.len()).collect();
+        order.sort_by(|&a, &b| t[a].total_cmp(&t[b]));
+        let mut sorted = cloud.take(&order);
+        for (from, to) in [("return_number", "las_return_number"), ("number_of_returns", "las_number_of_returns")] {
+            if let Some(v) = sorted.attrs.remove(from) {
+                sorted.attrs.insert(to.into(), v);
+            }
+        }
+        let shots = Shots::from_pointcloud(&sorted, [0.0, 0.0, 0.0]);
+        if !fill_missing || shots.n_shots() < 2 {
+            return Ok((shots, None));
+        }
+        // One time per pulse: the groups from_pointcloud formed, in order.
+        let ts: Vec<f64> = order.iter().map(|&i| t[i]).collect();
+        let t0 = ts[0];
+        let mut pulse_time = Vec::with_capacity(shots.n_shots());
+        for (i, &x) in ts.iter().enumerate() {
+            if i == 0 || x != ts[i - 1] {
+                pulse_time.push(((x - t0) * 1e9).round() as u64);
+            }
+        }
+        let rec = reconstruct::reconstruct_misses(&pulse_time, &shots.direction, zenith_range, 1);
+        let n = rec.misses.len();
+        if n == 0 {
+            return Ok((shots, Some(rec.report)));
+        }
+        let empty = Shots {
+            origin: vec![[0.0, 0.0, 0.0]; n],
+            direction: rec.misses,
+            echo_start: vec![shots.echo_range.len(); n],
+            echo_count: vec![0; n],
+            echo_range: Vec::new(),
+            echo_attrs: shots.echo_attrs.iter().map(|(k, v)| (k.clone(), v.take(&[]))).collect(),
+        };
+        Ok((Shots::concatenate(&[&shots, &empty])?, Some(rec.report)))
+    }
+
     /// Build from a raycloudtools-style ray cloud: per point `xyz` and the
     /// vector from the end point back to the sensor (`nx, ny, nz` or
     /// `rayx, rayy, rayz` in PLY ray clouds, `sx, sy, sz` in LAS/LAZ ones,
