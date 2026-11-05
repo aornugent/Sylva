@@ -36,31 +36,30 @@ class ScanIndex:
     ----------
     path
         A Shots Parquet file holding one scan position.
-    misses
-        Whether the store kept pulses without echoes. An echoes-only export
-        (e.g. a filtered COPC) has none, and has lost echoes too; the calliper's
-        upper bound is then incomplete and thin wood rests on the prior. A file
-        in which every pulse has an echo can't have kept misses: True is an error.
     threads
         Row groups read at once (0: one thread per core).
     """
 
-    def __init__(self, path: str | PathLike, misses: bool, threads: int = 0) -> None:
-        self._core = _core.ScanIndex(path, bool(misses), int(threads))
-
-    @property
-    def origin(self) -> tuple[float, float, float]:
-        """The scanner position."""
-        return self._core.origin
+    def __init__(self, path: str | PathLike, threads: int = 0) -> None:
+        self._core = _core.ScanIndex(path, int(threads))
 
     @property
     def misses(self) -> bool:
-        """Whether the store kept pulses without echoes."""
+        """Whether the store kept pulses without echoes: whether any pulse has none.
+
+        An echoes-only export (e.g. a filtered COPC) has none, and has lost
+        echoes too; the calliper's upper bound is then incomplete and thin wood
+        rests on the prior."""
         return self._core.misses
 
     @property
     def n_pulses(self) -> int:
         return self._core.n_pulses
+
+    @property
+    def nbytes(self) -> int:
+        """The memory the index holds (bytes)."""
+        return self._core.nbytes
 
 
 def evidence(scans, a, b, r_claim=None, beam=VZ400I, threads: int = 0) -> dict[str, np.ndarray]:

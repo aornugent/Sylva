@@ -352,8 +352,7 @@ fn plot_write_cylinders(py: Python<'_>, directory: PathBuf, entries: Vec<EntryAr
 }
 
 /// One scan's pulses indexed by direction, read from a single-position Shots
-/// file and held on the Rust side; `misses`: whether the store kept pulses
-/// without echoes.
+/// file and held on the Rust side.
 #[pyclass(name = "ScanIndex", frozen)]
 pub(crate) struct PyScanIndex {
     inner: ScanIndex,
@@ -362,25 +361,24 @@ pub(crate) struct PyScanIndex {
 #[pymethods]
 impl PyScanIndex {
     #[new]
-    fn new(py: Python<'_>, path: PathBuf, misses: bool, threads: usize) -> PyResult<Self> {
-        let inner = py.detach(|| ScanIndex::from_file(&path, misses, threads)).map_err(err)?;
+    fn new(py: Python<'_>, path: PathBuf, threads: usize) -> PyResult<Self> {
+        let inner = py.detach(|| ScanIndex::from_file(&path, threads)).map_err(err)?;
         Ok(PyScanIndex { inner })
     }
 
     #[getter]
-    fn origin(&self) -> (f64, f64, f64) {
-        let o = self.inner.origin;
-        (o[0], o[1], o[2])
-    }
-
-    #[getter]
     fn misses(&self) -> bool {
-        self.inner.misses
+        self.inner.misses()
     }
 
     #[getter]
     fn n_pulses(&self) -> usize {
         self.inner.n_pulses()
+    }
+
+    #[getter]
+    fn nbytes(&self) -> usize {
+        self.inner.nbytes()
     }
 }
 

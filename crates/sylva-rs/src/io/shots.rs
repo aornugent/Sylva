@@ -95,7 +95,7 @@ fn list_field(name: &str, element: &str) -> String {
 }
 
 /// Beam direction to `(zenith, azimuth)`.
-pub(crate) fn angles(d: &Point) -> (f64, f64) {
+fn angles(d: &Point) -> (f64, f64) {
     (d[2].clamp(-1.0, 1.0).acos(), d[0].atan2(d[1]))
 }
 

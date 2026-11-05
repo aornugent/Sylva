@@ -48,17 +48,15 @@
 //! the calliper can't inflate it. Pass every cylinder near the ones of
 //! interest (a whole tile), so a neighbour's echoes go to the neighbour.
 //! Speed comes from looking only where wood is: each scan is indexed once by
-//! pulse direction ([`ScanIndex`]), each cylinder visits only the direction
-//! cells its axis covers seen from the scanner, and cylinders run in
-//! parallel.
+//! pulse direction ([`ScanIndex`]), each cylinder visits only the pulses near
+//! its axis, and cylinders run in parallel.
 
 use std::path::Path;
 
 use rayon::prelude::*;
 
 use crate::error::{Error, Result};
-use crate::io::shots::{angles, direction, Rays, ShotsFile};
-use crate::shots::Shots;
+use crate::io::shots::{direction, Rays, ShotsFile};
 use crate::transform::{add, dot, norm, scale, sub};
 use crate::util::numeric::median;
 use crate::Point;
@@ -78,6 +76,7 @@ impl Beam {
     /// RIEGL VZ-400i (and VZ-2000i).
     pub const VZ400I: Beam = Beam { divergence: 0.35e-3, exit: 0.007, range_noise: 0.003 };
 
+    /// The beam's diameter (m) at `range` (m).
     pub fn footprint(&self, range: f64) -> f64 {
         self.exit + self.divergence * range
     }
@@ -144,11 +143,14 @@ fn pool(threads: usize) -> Result<rayon::ThreadPool> {
 
 /// One scan's pulses, indexed by direction: what [`evidence`] reads. About
 /// 16 bytes per pulse and 4 per echo, plus a 6.5 MB cell table.
+///
+/// [`ScanIndex::pulses_near`], [`ScanIndex::origin`] and
+/// [`ScanIndex::misses`] are all that [`evidence`] asks of it, so the storage
+/// can change without touching the evidence.
 #[derive(Debug, Clone)]
 pub struct ScanIndex {
-    pub origin: Point,
-    /// Whether the store recorded pulses without echoes (free space).
-    pub misses: bool,
+    origin: Point,
+    misses: bool,
     /// Pulses in direction-cell order: cell `c` holds `cell_start[c]..cell_start[c + 1]`.
     dir: Vec<[f32; 3]>,
     /// Pulse `p`'s echoes are `range[echo_start[p]..echo_start[p + 1]]`, nearest first.
@@ -160,9 +162,7 @@ pub struct ScanIndex {
 impl ScanIndex {
     /// Index a single-position Shots file, reading only angles and ranges,
     /// row groups in parallel on `threads` threads (0: one per core).
-    /// `misses`: whether the store kept pulses without echoes (an echoes-only
-    /// export has none, but may have lost echoes too, which this can't see).
-    pub fn from_file(path: impl AsRef<Path>, misses: bool, threads: usize) -> Result<Self> {
+    pub fn from_file(path: impl AsRef<Path>, threads: usize) -> Result<Self> {
         let file = ShotsFile::open(path)?;
         let [origin] = *file.scans() else {
             return Err(Error::invalid("ScanIndex: the shots file must hold exactly one scan position"));
@@ -177,33 +177,17 @@ impl ScanIndex {
                 rays.echo_count.extend(g.echo_count);
                 rays.range.extend(g.range);
             }
-            Self::build(origin, misses, rays)
+            Self::build(origin, rays)
         })
     }
 
-    /// Index the shots of one scan position held in memory.
-    pub fn new(shots: &Shots, misses: bool) -> Result<Self> {
-        let origin = shots.origin.first().copied().unwrap_or([0.0; 3]);
-        if shots.origin.iter().any(|o| (0..3).any(|k| (o[k] - origin[k]).abs() > 1e-6)) {
-            return Err(Error::invalid("ScanIndex: the shots come from more than one scan position"));
-        }
-        let (zenith, azimuth) = shots.direction.iter().map(|d| {
-            let (z, a) = angles(d);
-            (z as f32, a as f32)
-        }).unzip();
-        let range = (0..shots.n_shots()).flat_map(|p| &shots.echo_range[shots.echo_start[p]..shots.echo_start[p] + shots.echo_count[p] as usize]).map(|&r| r as f32).collect();
-        Self::build(origin, misses, Rays { zenith, azimuth, echo_count: shots.echo_count.clone(), range })
-    }
-
     /// Put the pulses in direction-cell order (a stable counting sort).
-    fn build(origin: Point, misses: bool, rays: Rays) -> Result<Self> {
+    fn build(origin: Point, rays: Rays) -> Result<Self> {
         let n = rays.zenith.len();
         if n >= u32::MAX as usize || rays.range.len() >= u32::MAX as usize {
             return Err(Error::invalid("ScanIndex: too many pulses or echoes for one scan"));
         }
-        if misses && n > 0 && !rays.echo_count.contains(&0) {
-            return Err(Error::invalid("ScanIndex: misses=true, but every pulse has an echo, as in an echoes-only store"));
-        }
+        let misses = rays.echo_count.contains(&0);
         let cell: Vec<u32> = rays.zenith.par_iter().zip(&rays.azimuth).map(|(&z, &a)| cell_of(z as f64, a as f64) as u32).collect();
         let mut cell_start = vec![0u32; NZ * NA + 1];
         for &c in &cell {
@@ -234,25 +218,39 @@ impl ScanIndex {
         Ok(ScanIndex { origin, misses, dir, echo_start, range, cell_start })
     }
 
+    /// The scanner position.
+    pub fn origin(&self) -> Point {
+        self.origin
+    }
+
+    /// Whether the store kept pulses without echoes (free space): whether any
+    /// pulse has none. An echoes-only export has none, and may have lost
+    /// echoes too, which this can't see.
+    pub fn misses(&self) -> bool {
+        self.misses
+    }
+
     pub fn n_pulses(&self) -> usize {
         self.dir.len()
     }
 
-    fn dir(&self, p: usize) -> Point {
-        self.dir[p].map(|x| x as f64)
+    /// The bytes the index holds.
+    pub fn nbytes(&self) -> usize {
+        size_of_val(&self.dir[..]) + size_of_val(&self.echo_start[..]) + size_of_val(&self.range[..]) + size_of_val(&self.cell_start[..])
     }
 
-    fn echoes(&self, p: usize) -> &[f32] {
-        &self.range[self.echo_start[p] as usize..self.echo_start[p + 1] as usize]
-    }
-
-    /// Pulses whose direction falls in the cell rectangle a segment covers, padded by `window`.
-    fn for_pulses_near(&self, a: &Point, b: &Point, window: f64, mut f: impl FnMut(usize)) {
+    /// Calls `f(pulse, direction, echo ranges)` for every pulse whose line
+    /// passes within `window` of the segment `a -> b`, and for others near it
+    /// (the caller tests the geometry). `pulse` names the pulse in this
+    /// index; its echoes are nearest first.
+    pub fn pulses_near(&self, a: &Point, b: &Point, window: f64, mut f: impl FnMut(u32, Point, &[f32])) {
         let (z0, nz, a0, na) = rectangle(&sub(a, &self.origin), &sub(b, &self.origin), window);
         for iz in z0..z0 + nz {
             for j in 0..na {
                 let cell = iz * NA + (a0 + j as i64).rem_euclid(NA as i64) as usize;
-                (self.cell_start[cell] as usize..self.cell_start[cell + 1] as usize).for_each(&mut f);
+                for p in self.cell_start[cell] as usize..self.cell_start[cell + 1] as usize {
+                    f(p as u32, self.dir[p].map(|x| x as f64), &self.range[self.echo_start[p] as usize..self.echo_start[p + 1] as usize]);
+                }
             }
         }
     }
@@ -304,7 +302,7 @@ pub struct Evidence {
 /// scanner. Its echoes near the axis are the cylinder's candidates
 /// `cand..cand + n_cand`.
 struct Pair {
-    cand: u32,
+    cand: usize,
     n_cand: u32,
     d: f32,
     t: f32,
@@ -312,12 +310,12 @@ struct Pair {
     beyond: bool,
 }
 
-/// An echo `q` from a cylinder's axis, projecting onto the segment: a
-/// candidate hit. `echo` indexes the scan's ranges.
+/// An echo, the `k`-th of a scan's pulse, at `q` from a cylinder's axis and
+/// projecting onto the segment: a candidate hit.
 struct Cand {
     scan: u32,
     pulse: u32,
-    echo: u32,
+    k: u32,
     q: f32,
     range: f32,
 }
@@ -342,6 +340,9 @@ pub fn evidence(scans: &[&ScanIndex], a: &[Point], b: &[Point], r_claim: Option<
     if b.len() != n || r_claim.is_some_and(|r| r.len() != n) {
         return Err(Error::invalid("evidence: a, b and r_claim must have one row per cylinder"));
     }
+    if n >= u32::MAX as usize || scans.len() >= u32::MAX as usize {
+        return Err(Error::invalid("evidence: too many cylinders or scans"));
+    }
     pool(threads)?.install(|| Ok(evidence_on(scans, a, b, r_claim, p)))
 }
 
@@ -350,15 +351,15 @@ fn evidence_on(scans: &[&ScanIndex], a: &[Point], b: &[Point], r_claim: Option<&
     let cap = p.window_cap;
     let len: Vec<f64> = (0..n).map(|i| norm(&sub(&b[i], &a[i])).max(1e-9)).collect();
     let u: Vec<Point> = (0..n).map(|i| sub(&b[i], &a[i]).map(|x| x / len[i])).collect();
+    let misses: Vec<bool> = scans.iter().map(|s| s.misses()).collect();
 
     // 1. once: the (pulse, cylinder) pairs within the cap, and the echoes of their pulses near the axis
     let found: Vec<(Vec<Pair>, Vec<Cand>)> = (0..n).into_par_iter().map(|c| {
         let (mut pairs, mut cands) = (Vec::new(), Vec::new());
         for (si, s) in scans.iter().enumerate() {
-            let w0 = sub(&s.origin, &a[c]);
+            let w0 = sub(&s.origin(), &a[c]);
             let dd = dot(&w0, &u[c]);
-            s.for_pulses_near(&a[c], &b[c], cap, |pu| {
-                let d = s.dir(pu);
+            s.pulses_near(&a[c], &b[c], cap, |pulse, d, echoes| {
                 let (bb, ee) = (dot(&d, &u[c]), dot(&d, &w0));
                 let den = (1.0 - bb * bb).max(1e-12);
                 let (t_ray, s_ax) = ((bb * dd - ee) / den, (dd - bb * ee) / den);
@@ -367,18 +368,18 @@ fn evidence_on(scans: &[&ScanIndex], a: &[Point], b: &[Point], r_claim: Option<&
                     return;
                 }
                 let first = cands.len();
-                for e in s.echo_start[pu] as usize..s.echo_start[pu + 1] as usize {
-                    let w = add(&w0, &scale(&d, s.range[e] as f64)); // the echo, from a
+                for (k, &range) in echoes.iter().enumerate() {
+                    let w = add(&w0, &scale(&d, range as f64)); // the echo, from a
                     let t = dot(&w, &u[c]);
                     let q = norm(&sub(&w, &scale(&u[c], t)));
                     if t >= 0.0 && t <= len[c] && q < cap {
-                        cands.push(Cand { scan: si as u32, pulse: pu as u32, echo: e as u32, q: q as f32, range: s.range[e] });
+                        cands.push(Cand { scan: si as u32, pulse, k: k as u32, q: q as f32, range });
                     }
                 }
-                let last = s.echoes(pu).last().map_or(f64::INFINITY, |&r| r as f64); // infinite for a miss
+                let last = echoes.last().map_or(f64::INFINITY, |&r| r as f64); // infinite for a miss
                 // a pulse that stopped short without an echo near the axis is neither a hit nor a pass
                 if s_ax > 0.0 && s_ax < len[c] && (last > t_ray || cands.len() > first) {
-                    pairs.push(Pair { cand: first as u32, n_cand: (cands.len() - first) as u32, d: dist as f32, t: t_ray as f32, beyond: last > t_ray });
+                    pairs.push(Pair { cand: first, n_cand: (cands.len() - first) as u32, d: dist as f32, t: t_ray as f32, beyond: last > t_ray });
                 }
             });
         }
@@ -390,10 +391,10 @@ fn evidence_on(scans: &[&ScanIndex], a: &[Point], b: &[Point], r_claim: Option<&
     }
     let (pairs, cands): (Vec<Vec<Pair>>, Vec<Vec<Cand>>) = found.into_iter().unzip();
     let cands: Vec<Cand> = cands.into_iter().flatten().collect();
-    // each echo's candidates together, cylinders ascending: (scan, echo, cylinder, candidate)
-    let mut by_echo: Vec<(u32, u32, u32, u32)> = (0..n).into_par_iter().flat_map_iter(|c| {
+    // each echo's candidates together, cylinders ascending: (scan, pulse, echo, cylinder, candidate)
+    let mut by_echo: Vec<(u32, u32, u32, u32, usize)> = (0..n).into_par_iter().flat_map_iter(|c| {
         let cands = &cands;
-        (cand_at[c]..cand_at[c + 1]).map(move |i| (cands[i].scan, cands[i].echo, c as u32, i as u32))
+        (cand_at[c]..cand_at[c + 1]).map(move |i| (cands[i].scan, cands[i].pulse, cands[i].k, c as u32, i))
     }).collect();
     by_echo.par_sort_unstable();
 
@@ -403,10 +404,10 @@ fn evidence_on(scans: &[&ScanIndex], a: &[Point], b: &[Point], r_claim: Option<&
     for _ in 0..p.rounds.max(1) {
         // an echo goes to the cylinder whose surface it lies nearest (ties: the lower index), among those
         // whose window holds it
-        let winners: Vec<u32> = by_echo.par_chunk_by(|x, y| (x.0, x.1) == (y.0, y.1)).filter_map(|group| {
-            let mut best: Option<(f64, u32)> = None;
-            for &(_, _, c, i) in group {
-                let q = cands[i as usize].q as f64;
+        let winners: Vec<usize> = by_echo.par_chunk_by(|x, y| (x.0, x.1, x.2) == (y.0, y.1, y.2)).filter_map(|group| {
+            let mut best: Option<(f64, usize)> = None;
+            for &(_, _, _, c, i) in group {
+                let q = cands[i].q as f64;
                 let resid = (q - r_hat[c as usize]).abs();
                 if q < win[c as usize] && best.is_none_or(|(br, _)| resid < br) {
                     best = Some((resid, i));
@@ -416,11 +417,11 @@ fn evidence_on(scans: &[&ScanIndex], a: &[Point], b: &[Point], r_claim: Option<&
         }).collect();
         let mut won = vec![false; cands.len()];
         for i in winners {
-            won[i as usize] = true;
+            won[i] = true;
         }
         out = (0..n).into_par_iter().map(|c| {
             let at = cand_at[c]..cand_at[c + 1];
-            cylinder(&pairs[c], &cands[at.clone()], &won[at], r_hat[c], win[c], r_claim.map(|r| r[c]), scans, p)
+            cylinder(&pairs[c], &cands[at.clone()], &won[at], r_hat[c], win[c], r_claim.map(|r| r[c]), &misses, p)
         }).collect::<Vec<Round>>();
         for c in 0..n {
             let (r, hi) = (out[c].med, out[c].hi);
@@ -441,9 +442,9 @@ fn evidence_on(scans: &[&ScanIndex], a: &[Point], b: &[Point], r_claim: Option<&
 
 /// One cylinder in a round: its hits (per pulse, the echo it won nearest its
 /// surface `r_prev`), its pairs within the window `win` as hits, passes or
-/// neither, and what they say.
+/// neither, and what they say. `misses[s]`: whether scan `s` kept misses.
 #[allow(clippy::too_many_arguments)]
-fn cylinder(pairs: &[Pair], cands: &[Cand], won: &[bool], r_prev: f64, win: f64, r_claim: Option<f64>, scans: &[&ScanIndex], p: &EvidenceParams) -> Round {
+fn cylinder(pairs: &[Pair], cands: &[Cand], won: &[bool], r_prev: f64, win: f64, r_claim: Option<f64>, misses: &[bool], p: &EvidenceParams) -> Round {
     let resid = |k: usize| (cands[k].q as f64 - r_prev).abs();
     let mut hits: Vec<&Cand> = Vec::new();
     for run in (0..cands.len()).collect::<Vec<_>>().chunk_by(|&x, &y| (cands[x].scan, cands[x].pulse) == (cands[y].scan, cands[y].pulse)) {
@@ -453,7 +454,7 @@ fn cylinder(pairs: &[Pair], cands: &[Cand], won: &[bool], r_prev: f64, win: f64,
     }
     let (mut hit_d, mut pass_d, mut n_contra) = (Vec::new(), Vec::new(), 0u32);
     for pr in pairs.iter().filter(|pr| (pr.d as f64) < win) {
-        let mine = pr.cand as usize..(pr.cand + pr.n_cand) as usize;
+        let mine = pr.cand..pr.cand + pr.n_cand as usize;
         let (d, w) = (pr.d as f64, p.beam.footprint(pr.t as f64));
         if mine.clone().any(|k| won[k]) {
             hit_d.push(d - w / 2.0);
@@ -472,12 +473,12 @@ fn cylinder(pairs: &[Pair], cands: &[Cand], won: &[bool], r_prev: f64, win: f64,
     let m = median(&hits.iter().map(|e| e.q as f64).collect::<Vec<_>>());
     let w = median(&hits.iter().map(|e| p.beam.footprint(e.range as f64)).collect::<Vec<_>>());
     let spread = 1.4826 * median(&hits.iter().map(|e| (e.q as f64 - m).abs()).collect::<Vec<_>>());
-    let mut per_scan = vec![0.0; scans.len()];
+    let mut per_scan = vec![0.0; misses.len()];
     let mut seen_with_misses = false;
     for e in &hits {
         let sigma = (p.beam.footprint(e.range as f64) / 2.0).hypot(p.beam.range_noise);
         per_scan[e.scan as usize] += (m / sigma).powi(2);
-        seen_with_misses |= scans[e.scan as usize].misses;
+        seen_with_misses |= misses[e.scan as usize];
     }
     out.med = m;
     out.mu = m.max(1e-4).ln();
@@ -495,7 +496,7 @@ fn cylinder(pairs: &[Pair], cands: &[Cand], won: &[bool], r_prev: f64, win: f64,
 /// closer to the axis) from pulses that passed (`pass_d`, farther): the range
 /// `(lo, hi)` of thresholds within `slack` misclassified pulses of the best.
 /// A few clutter hits or leaks only widen the range.
-pub fn calliper(hit_d: &[f64], pass_d: &[f64], slack: usize) -> (f64, f64) {
+fn calliper(hit_d: &[f64], pass_d: &[f64], slack: usize) -> (f64, f64) {
     if hit_d.is_empty() {
         return (0.0, pass_d.iter().copied().fold(f64::INFINITY, f64::min));
     }
@@ -525,6 +526,7 @@ pub fn calliper(hit_d: &[f64], pass_d: &[f64], slack: usize) -> (f64, f64) {
 mod tests {
     use super::*;
     use crate::io::shots::{write_shots, ShotsWriteOptions};
+    use crate::shots::Shots;
 
     /// Pulses on a fine grid from the origin towards a vertical cylinder of
     /// radius `r` at distance 5 m, with a wall behind it. With `misses` the
@@ -563,11 +565,22 @@ mod tests {
             }
             az += step;
         }
-        shots
+        if misses { shots } else { shots.subset(&(0..shots.n_shots()).map(|p| shots.echo_count[p] > 0).collect::<Vec<_>>()) }
+    }
+
+    /// The index of `shots` written to a temporary file, in row groups of `row_group_size`.
+    fn index(shots: &Shots, row_group_size: usize) -> ScanIndex {
+        static FILES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let k = FILES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!("sylva_evidence_{}_{k}.parquet", std::process::id()));
+        write_shots(shots, &path, &ShotsWriteOptions { row_group_size, ..Default::default() }).unwrap();
+        let index = ScanIndex::from_file(&path, 3).unwrap();
+        std::fs::remove_file(&path).unwrap();
+        index
     }
 
     fn scene(r: f64, misses: bool) -> (ScanIndex, Point, Point) {
-        (ScanIndex::new(&shots(r, misses), misses).unwrap(), [0.0, 5.0, -1.0], [0.0, 5.0, 1.0])
+        (index(&shots(r, misses), ShotsWriteOptions::default().row_group_size), [0.0, 5.0, -1.0], [0.0, 5.0, 1.0])
     }
 
     #[test]
@@ -589,6 +602,7 @@ mod tests {
         let e = evidence(&[&s], &[a], &[b], Some(&[0.05]), &EvidenceParams::default(), 0).unwrap();
         assert_eq!(e.n_contra[0], 0);
         let (s, a, b) = scene(0.01, false);
+        assert!(!s.misses());
         let e = evidence(&[&s], &[a], &[b], None, &EvidenceParams::default(), 0).unwrap();
         assert!(e.n_hit[0] > 0 && e.tau[0] == 0.0, "1 cm in an echoes-only store rests on the prior");
     }
@@ -615,17 +629,12 @@ mod tests {
     }
 
     #[test]
-    fn a_file_indexes_as_its_shots_and_misses_need_a_pulse_without_echoes() {
-        let path = std::env::temp_dir().join(format!("sylva_evidence_{}.parquet", std::process::id()));
+    fn row_groups_read_in_parallel_index_as_one_and_misses_are_pulses_without_echoes() {
         let shots = shots(0.05, true);
-        write_shots(&shots, &path, &ShotsWriteOptions { row_group_size: 1000, ..Default::default() }).unwrap();
-        let (from_file, from_shots) = (ScanIndex::from_file(&path, true, 3).unwrap(), ScanIndex::new(&shots, true).unwrap());
-        assert_eq!((from_file.dir, from_file.echo_start, from_file.range), (from_shots.dir, from_shots.echo_start, from_shots.range));
-        let echoes_only = shots.subset(&(0..shots.n_shots()).map(|p| shots.echo_count[p] > 0).collect::<Vec<_>>());
-        write_shots(&echoes_only, &path, &ShotsWriteOptions::default()).unwrap();
-        assert!(ScanIndex::from_file(&path, true, 0).is_err());
-        assert!(ScanIndex::from_file(&path, false, 0).is_ok());
-        std::fs::remove_file(&path).unwrap();
+        let (one, many) = (index(&shots, shots.n_shots()), index(&shots, 1000));
+        assert_eq!((&one.dir, &one.echo_start, &one.range), (&many.dir, &many.echo_start, &many.range));
+        assert!(one.misses() && one.n_pulses() == shots.n_shots() && one.origin() == [0.0; 3]);
+        assert!(!index(&self::shots(0.05, false), 1000).misses());
     }
 
     #[test]

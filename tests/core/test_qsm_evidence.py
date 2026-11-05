@@ -25,12 +25,12 @@ def fan(tmp_path, r=0.05, misses=True):
         shots = shots.subset(has)
     path = tmp_path / f"scan_{r}_{misses}.parquet"
     shots.save(path)
-    return ScanIndex(path, misses, threads=2), np.array([[0.0, 5.0, -1.0]]), np.array([[0.0, 5.0, 1.0]])
+    return ScanIndex(path, threads=2), np.array([[0.0, 5.0, -1.0]]), np.array([[0.0, 5.0, 1.0]])
 
 
 def test_a_measured_cylinder_gets_its_radius_a_calliper_and_an_audit(tmp_path):
     scan, a, b = fan(tmp_path)
-    assert scan.misses and scan.n_pulses > 10_000 and scan.origin == (0.0, 0.0, 0.0)
+    assert scan.misses and scan.n_pulses > 10_000 and scan.nbytes > 16 * scan.n_pulses
     e = evidence([scan], a, b, r_claim=[0.075])
     assert np.exp(e["mu"][0]) == pytest.approx(0.05, rel=0.05)
     assert e["tau"][0] > 0 and e["lo"][0] < 0.055 and e["hi"][0] > 0.045
@@ -51,12 +51,6 @@ def test_inputs_are_checked(tmp_path):
         evidence([scan], a, np.r_[b, b])
     with pytest.raises(ValueError):
         evidence([scan], a, b, r_claim=[0.05, 0.05])
-
-
-def test_misses_need_a_pulse_without_echoes(tmp_path):
-    fan(tmp_path, misses=False)
-    with pytest.raises(ValueError, match="misses"):
-        ScanIndex(tmp_path / "scan_0.05_False.parquet", misses=True)
 
 
 def test_a_neighbours_echoes_are_not_counted(tmp_path):
