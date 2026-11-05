@@ -2,11 +2,14 @@ import numpy as np
 import pytest
 
 from sylva import Shots
-from sylva.qsm import ShotsIndex, evidence
+from sylva.qsm import ScanIndex, evidence
 
 
 def fan(tmp_path, r=0.05, misses=True):
-    """Pulses from the origin on a fine grid towards a vertical cylinder of radius r at (0, 5), wall at y = 8."""
+    """Pulses from the origin on a fine grid towards a vertical cylinder of radius r at (0, 5), wall at y = 8.
+
+    With misses, the pulses over and under the wall are kept without echoes; without, the wall's top and
+    bottom are lost too."""
     az, el = np.meshgrid(np.arange(-0.03, 0.03, 0.0005), np.arange(-0.05, 0.05, 0.0005))
     zen, az = np.pi / 2 - el.ravel(), az.ravel()
     d = np.c_[np.sin(zen) * np.sin(az), np.sin(zen) * np.cos(az), np.cos(zen)]
@@ -15,14 +18,14 @@ def fan(tmp_path, r=0.05, misses=True):
     d2 = 25.0 - tca ** 2
     hit = (d2 <= r * r) & (np.abs(d[:, 2] * tca / h) <= 1.0)
     rng = np.where(hit, (tca - np.sqrt(np.maximum(r * r - d2, 0))) / h, 8.0 / d[:, 1])
-    has = hit | misses | (np.abs(el.ravel()) < 0.04)  # without misses, the wall's top and bottom are lost
+    has = hit | (np.abs(el.ravel()) < (0.045 if misses else 0.04))
     shots = Shots(origin=np.zeros((len(d), 3)), direction=d, echo_start=np.cumsum(np.r_[0, has[:-1]]),
                   echo_count=has.astype(np.uint32), echo_range=rng[has])
     if not misses:
         shots = shots.subset(has)
     path = tmp_path / f"scan_{r}_{misses}.parquet"
     shots.save(path)
-    return ShotsIndex(path, misses), np.array([[0.0, 5.0, -1.0]]), np.array([[0.0, 5.0, 1.0]])
+    return ScanIndex(path, misses, threads=2), np.array([[0.0, 5.0, -1.0]]), np.array([[0.0, 5.0, 1.0]])
 
 
 def test_a_measured_cylinder_gets_its_radius_a_calliper_and_an_audit(tmp_path):
@@ -48,3 +51,9 @@ def test_inputs_are_checked(tmp_path):
         evidence([scan], a, np.r_[b, b])
     with pytest.raises(ValueError):
         evidence([scan], a, b, r_claim=[0.05, 0.05])
+
+
+def test_misses_need_a_pulse_without_echoes(tmp_path):
+    fan(tmp_path, misses=False)
+    with pytest.raises(ValueError, match="misses"):
+        ScanIndex(tmp_path / "scan_0.05_False.parquet", misses=True)

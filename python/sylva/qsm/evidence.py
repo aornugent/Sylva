@@ -24,11 +24,12 @@ from .. import _core
 VZ400I = (0.35e-3, 0.007, 0.003)
 
 
-def ShotsIndex(path: str | PathLike, misses: bool) -> _core.ShotsIndex:  # noqa: N802 (a constructor)
+class ScanIndex:
     """One scan's pulses, read from a single-position Shots file and indexed by direction.
 
-    Built once per scan and reused by every :func:`evidence` call (about 24
-    bytes per pulse and 4 per echo, held on the Rust side).
+    Built once per scan and reused by every :func:`evidence` call (about 16
+    bytes per pulse and 4 per echo, held on the Rust side). Only the angles
+    and echo ranges are read.
 
     Parameters
     ----------
@@ -37,13 +38,31 @@ def ShotsIndex(path: str | PathLike, misses: bool) -> _core.ShotsIndex:  # noqa:
     misses
         Whether the store kept pulses without echoes. An echoes-only export
         (e.g. a filtered COPC) has none, and has lost echoes too; the calliper's
-        upper bound is then incomplete and thin wood rests on the prior.
+        upper bound is then incomplete and thin wood rests on the prior. A file
+        in which every pulse has an echo can't have kept misses: True is an error.
+    threads
+        Row groups read at once (0: one thread per core).
     """
-    return _core.ShotsIndex(str(path), bool(misses))
+
+    def __init__(self, path: str | PathLike, misses: bool, threads: int = 0) -> None:
+        self._core = _core.ScanIndex(path, bool(misses), int(threads))
+
+    @property
+    def origin(self) -> tuple[float, float, float]:
+        """The scanner position."""
+        return self._core.origin
+
+    @property
+    def misses(self) -> bool:
+        """Whether the store kept pulses without echoes."""
+        return self._core.misses
+
+    @property
+    def n_pulses(self) -> int:
+        return self._core.n_pulses
 
 
-def evidence(scans, a, b, r_claim=None, beam=VZ400I, floor_log: float = 0.05, footprint_sd: float = 0.9,
-             spread_sd: float = 1.0, echoes_only_min_radius: float = 0.02, q_max: float = 0.5) -> dict[str, np.ndarray]:
+def evidence(scans, a, b, r_claim=None, beam=VZ400I, q_max: float = 0.5, threads: int = 0) -> dict[str, np.ndarray]:
     """The evidence the rays of ``scans`` give about cylinders ``a[i] -> b[i]``.
 
     Each echo goes to its nearest axis within ``q_max``. Per cylinder:
@@ -51,11 +70,12 @@ def evidence(scans, a, b, r_claim=None, beam=VZ400I, floor_log: float = 0.05, fo
     - ``mu``: log of the median distance of its echoes from the axis (NaN without echoes);
     - ``tau``: precision of ``mu``. Each echo is worth ``(r / sigma)^2``, ``sigma``
       half the beam footprint at its range combined with the ranging noise; each
-      scan's sum is capped by ``floor_log``, scans add, and the footprint
-      (``footprint_sd``) and clutter spread (``spread_sd``) add systematic
-      variance. 0 without echoes, or where the rays don't determine the radius:
-      pulses passed closer to the axis than its echoes sit, or no scan that saw
-      it recorded misses and it is thinner than ``echoes_only_min_radius``;
+      scan's sum is capped by a floor (registration, wind), scans add, and the
+      footprint and clutter spread add systematic variance (calibrated constants,
+      set in the Rust core). 0 without echoes, or where the rays don't determine
+      the radius: pulses passed closer to the axis than its echoes sit, or no
+      scan that saw it recorded misses and it is thinner than 2 cm. So
+      ``(tau == 0) & (n_hit > 0)`` is "prior only";
     - ``lo``, ``hi``: the beam calliper, from pulses that hit (``d - w/2``) or
       passed (``d + w/2``) within a window of three times its echo distance;
     - ``n_hit`` (echoes), ``n_cross`` (pulses that hit or passed) and
@@ -64,13 +84,17 @@ def evidence(scans, a, b, r_claim=None, beam=VZ400I, floor_log: float = 0.05, fo
     Parameters
     ----------
     scans
-        :func:`ShotsIndex` of each scan to use.
+        :class:`ScanIndex` of each scan to use.
     a, b
         ``(n, 3)`` cylinder axes.
     r_claim
         ``(n,)`` claimed radii to audit, or None.
     beam
         ``(divergence, exit diameter, range noise)`` of the scanner.
+    q_max
+        An echo farther than this from every axis belongs to no cylinder (m).
+    threads
+        Threads to use (0: one per core).
 
     Returns
     -------
@@ -83,5 +107,5 @@ def evidence(scans, a, b, r_claim=None, beam=VZ400I, floor_log: float = 0.05, fo
         r_claim = np.ascontiguousarray(r_claim, np.float64).reshape(-1)
         if len(r_claim) != len(a):
             raise ValueError("r_claim needs one value per cylinder")
-    return _core.qsm_evidence(list(scans), a, b, r_claim, tuple(float(v) for v in beam), float(floor_log),
-                              float(footprint_sd), float(spread_sd), float(echoes_only_min_radius), float(q_max))
+    return _core.qsm_evidence([s._core for s in scans], a, b, r_claim, tuple(float(v) for v in beam), float(q_max),
+                              int(threads))
