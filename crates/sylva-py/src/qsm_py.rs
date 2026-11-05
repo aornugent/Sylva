@@ -15,6 +15,8 @@ use pyo3::exceptions::{PyFileNotFoundError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList};
 use sylva_rs::qsm::buttress::{Buttress, ButtressParams};
+use sylva_rs::io::shots::ShotsFile;
+use sylva_rs::qsm::evidence::{self, Beam, EvidenceParams, ScanIndex};
 use sylva_rs::qsm::QsmParams;
 use sylva_rs::qsm::ops::{self as ops, Row, Segment};
 use sylva_rs::qsm::plot::{self as plot, ButtressView, PlotEntry, PlotParams};
@@ -350,7 +352,61 @@ fn plot_write_cylinders(py: Python<'_>, directory: PathBuf, entries: Vec<EntryAr
     py.detach(|| plot::write_cylinders(&directory, &views(&owned), prefix)).map_err(err)
 }
 
+/// One scan's pulses indexed by direction, read from a single-position Shots
+/// file and held on the Rust side; `misses`: whether the store kept pulses
+/// without echoes.
+#[pyclass(name = "ShotsIndex", frozen)]
+pub(crate) struct PyShotsIndex {
+    inner: ScanIndex,
+}
+
+#[pymethods]
+impl PyShotsIndex {
+    #[new]
+    fn new(py: Python<'_>, path: PathBuf, misses: bool) -> PyResult<Self> {
+        let inner = py.detach(|| ShotsFile::open(&path).and_then(|f| f.read_all()).and_then(|s| ScanIndex::new(&s, misses))).map_err(err)?;
+        Ok(PyShotsIndex { inner })
+    }
+
+    #[getter]
+    fn origin(&self) -> (f64, f64, f64) {
+        let o = self.inner.origin;
+        (o[0], o[1], o[2])
+    }
+
+    #[getter]
+    fn misses(&self) -> bool {
+        self.inner.misses
+    }
+
+    #[getter]
+    fn n_pulses(&self) -> usize {
+        self.inner.n_pulses()
+    }
+}
+
+#[pyfunction]
+#[allow(clippy::too_many_arguments)]
+fn qsm_evidence<'py>(py: Python<'py>, scans: Vec<Bound<'py, PyShotsIndex>>, a: PyReadonlyArray2<f64>, b: PyReadonlyArray2<f64>, r_claim: Option<PyReadonlyArray1<f64>>, beam: (f64, f64, f64), floor_log: f64, footprint_sd: f64, spread_sd: f64, echoes_only_min_radius: f64, q_max: f64) -> PyResult<Bound<'py, PyDict>> {
+    let (a, b) = (xyz_from_py(a)?, xyz_from_py(b)?);
+    let r_claim: Option<Vec<f64>> = r_claim.map(|r| r.as_array().to_vec());
+    let p = EvidenceParams { beam: Beam { divergence: beam.0, exit: beam.1, range_noise: beam.2 }, floor_log, footprint_sd, spread_sd, echoes_only_min_radius, q_max };
+    let refs: Vec<&ScanIndex> = scans.iter().map(|s| &s.get().inner).collect();
+    let e = py.detach(|| evidence::evidence(&refs, &a, &b, r_claim.as_deref(), &p)).map_err(err)?;
+    let d = PyDict::new(py);
+    d.set_item("mu", e.mu.into_pyarray(py))?;
+    d.set_item("tau", e.tau.into_pyarray(py))?;
+    d.set_item("lo", e.lo.into_pyarray(py))?;
+    d.set_item("hi", e.hi.into_pyarray(py))?;
+    d.set_item("n_hit", e.n_hit.into_pyarray(py))?;
+    d.set_item("n_cross", e.n_cross.into_pyarray(py))?;
+    d.set_item("n_contra", e.n_contra.into_pyarray(py))?;
+    Ok(d)
+}
+
 pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
+    m.add_class::<PyShotsIndex>()?;
+    m.add_function(wrap_pyfunction!(qsm_evidence, m)?)?;
     for f in [
         wrap_pyfunction!(qsm_totals, m)?,
         wrap_pyfunction!(qsm_ends, m)?,
