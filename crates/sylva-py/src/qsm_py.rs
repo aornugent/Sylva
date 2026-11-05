@@ -384,13 +384,13 @@ impl PyScanIndex {
     }
 }
 
-/// The calibration settings stay at their Rust defaults; a scanner's beam and
-/// `q_max` are the choices.
+/// The calibration settings stay at their Rust defaults; a scanner's beam is
+/// the choice.
 #[pyfunction]
-fn qsm_evidence<'py>(py: Python<'py>, scans: Vec<Bound<'py, PyScanIndex>>, a: PyReadonlyArray2<f64>, b: PyReadonlyArray2<f64>, r_claim: Option<PyReadonlyArray1<f64>>, beam: (f64, f64, f64), q_max: f64, threads: usize) -> PyResult<Bound<'py, PyDict>> {
+fn qsm_evidence<'py>(py: Python<'py>, scans: Vec<Bound<'py, PyScanIndex>>, a: PyReadonlyArray2<f64>, b: PyReadonlyArray2<f64>, r_claim: Option<PyReadonlyArray1<f64>>, beam: (f64, f64, f64), threads: usize) -> PyResult<Bound<'py, PyDict>> {
     let (a, b) = (xyz_from_py(a)?, xyz_from_py(b)?);
     let r_claim: Option<Vec<f64>> = r_claim.map(|r| r.as_array().to_vec());
-    let p = EvidenceParams { beam: Beam { divergence: beam.0, exit: beam.1, range_noise: beam.2 }, q_max, ..EvidenceParams::default() };
+    let p = EvidenceParams { beam: Beam { divergence: beam.0, exit: beam.1, range_noise: beam.2 }, ..EvidenceParams::default() };
     let refs: Vec<&ScanIndex> = scans.iter().map(|s| &s.get().inner).collect();
     let e = py.detach(|| evidence::evidence(&refs, &a, &b, r_claim.as_deref(), &p, threads)).map_err(err)?;
     let d = PyDict::new(py);

@@ -9,7 +9,8 @@ taper prior rather than a measurement), the rays of the scans give per
 cylinder the log radius of its echoes with a calibrated precision, the beam
 calliper bounding the radius from pulses that hit or passed close by, and an
 audit count of passes inside a claimed radius. Pass every cylinder near the
-ones of interest (a whole tile): each echo goes to its nearest axis.
+ones of interest (a whole tile): each echo goes to the one cylinder whose
+surface it lies nearest.
 """
 
 from __future__ import annotations
@@ -62,24 +63,34 @@ class ScanIndex:
         return self._core.n_pulses
 
 
-def evidence(scans, a, b, r_claim=None, beam=VZ400I, q_max: float = 0.5, threads: int = 0) -> dict[str, np.ndarray]:
+def evidence(scans, a, b, r_claim=None, beam=VZ400I, threads: int = 0) -> dict[str, np.ndarray]:
     """The evidence the rays of ``scans`` give about cylinders ``a[i] -> b[i]``.
 
-    Each echo goes to its nearest axis within ``q_max``. Per cylinder:
+    Ray first: the pulses passing within 25 cm of each axis are enumerated
+    once; then, over a few rounds, each echo goes to the one cylinder whose
+    surface it lies nearest among those whose window holds it (a pulse hits a
+    cylinder at most once), and each window is set from the cylinder's own
+    calliper (``max(1.5 hi, hi + 2 cm)``, else ``2 r + 2 cm``, within 2-25 cm),
+    so a claim can't move it. A pulse in the window whose echo near this axis
+    went to a neighbour or a fork is neither a hit nor a pass. Radii above
+    25 cm are not measured. Per cylinder:
 
-    - ``mu``: log of the median distance of its echoes from the axis (NaN without echoes);
-    - ``tau``: precision of ``mu``. Each echo is worth ``(r / sigma)^2``, ``sigma``
+    - ``mu``: log of the median distance of its hits from the axis (NaN without hits);
+    - ``tau``: precision of ``mu``. Each hit is worth ``(r / sigma)^2``, ``sigma``
       half the beam footprint at its range combined with the ranging noise; each
       scan's sum is capped by a floor (registration, wind), scans add, and the
       footprint and clutter spread add systematic variance (calibrated constants,
-      set in the Rust core). 0 without echoes, or where the rays don't determine
-      the radius: pulses passed closer to the axis than its echoes sit, or no
-      scan that saw it recorded misses and it is thinner than 2 cm. So
-      ``(tau == 0) & (n_hit > 0)`` is "prior only";
-    - ``lo``, ``hi``: the beam calliper, from pulses that hit (``d - w/2``) or
-      passed (``d + w/2``) within a window of three times its echo distance;
-    - ``n_hit`` (echoes), ``n_cross`` (pulses that hit or passed) and
-      ``n_contra`` (passes inside ``r_claim``, if given).
+      set in the Rust core). 0 without hits, or where the rays don't determine
+      the radius: pulses passed closer to the axis than its echoes sit; no scan
+      that saw it recorded misses and it is thinner than 2 cm; or its echoes sit
+      within half a beam footprint of the axis. So ``(tau == 0) & (n_hit > 0)``
+      is "prior only";
+    - ``lo``, ``hi``: the beam calliper, from pulses in the window that hit
+      (``d - w/2``) or passed (``d + w/2``);
+    - ``n_hit`` (hits), ``n_cross`` (pulses in the window that hit or passed)
+      and ``n_contra`` (passes inside ``r_claim``, if given). Off-centre fitted
+      axes leave honest claims a few passes inside: a tolerant audit flags a
+      fat claim at ``n_contra >= max(2, 0.05 * n_cross)``.
 
     Parameters
     ----------
@@ -91,8 +102,6 @@ def evidence(scans, a, b, r_claim=None, beam=VZ400I, q_max: float = 0.5, threads
         ``(n,)`` claimed radii to audit, or None.
     beam
         ``(divergence, exit diameter, range noise)`` of the scanner.
-    q_max
-        An echo farther than this from every axis belongs to no cylinder (m).
     threads
         Threads to use (0: one per core).
 
@@ -107,5 +116,4 @@ def evidence(scans, a, b, r_claim=None, beam=VZ400I, q_max: float = 0.5, threads
         r_claim = np.ascontiguousarray(r_claim, np.float64).reshape(-1)
         if len(r_claim) != len(a):
             raise ValueError("r_claim needs one value per cylinder")
-    return _core.qsm_evidence([s._core for s in scans], a, b, r_claim, tuple(float(v) for v in beam), float(q_max),
-                              int(threads))
+    return _core.qsm_evidence([s._core for s in scans], a, b, r_claim, tuple(float(v) for v in beam), int(threads))

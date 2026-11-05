@@ -9,8 +9,8 @@
 //! whose radii are a taper prior, not a measurement), the rays of the scans
 //! give, per cylinder:
 //!
-//! - `mu`, `tau`: the log of the median distance of its echoes from the axis,
-//!   and its precision. Each echo is worth `(r / sigma)^2`, `sigma` half the
+//! - `mu`, `tau`: the log of the median distance of its hits from the axis,
+//!   and its precision. Each hit is worth `(r / sigma)^2`, `sigma` half the
 //!   beam footprint at its range combined with the ranging noise; each scan's
 //!   sum is capped by a floor that more echoes don't remove (registration,
 //!   wind), and scans add. The footprint (echoes sit outside the surface by a
@@ -18,21 +18,39 @@
 //!   systematic variance. `tau = 0` where the rays don't determine the
 //!   radius, which then rests on the prior: pulses went past closer to the
 //!   axis than its echoes sit (the echoes are leaves around a twig, not its
-//!   surface), or none of the scans that saw it recorded misses and it is
-//!   thinner than echoes alone can tell from clutter. So `tau == 0 && n_hit > 0`
-//!   is "prior only".
+//!   surface); none of the scans that saw it recorded misses and it is
+//!   thinner than echoes alone can tell from clutter; or its echoes sit
+//!   closer to the axis than a fraction of the beam footprint (wood the beam
+//!   is too wide to measure). So `tau == 0 && n_hit > 0` is "prior only".
 //! - `lo`, `hi`: the beam calliper. A pulse that hit the cylinder came within
-//!   `d` of the axis, so `r > d - w/2`; one that went past and echoed beyond
-//!   came within `d` without hitting, so `r < d + w/2` (`w`: the footprint).
-//! - counts: echoes, pulses that reached it, and passes inside a claimed
-//!   radius (the audit of a fat claim).
+//!   `d` of the axis, so `r > d - w/2`; one that passed came within `d`
+//!   without hitting, so `r < d + w/2` (`w`: the footprint).
+//! - counts: `n_hit` (hits), `n_cross` (hits and passes in the window) and
+//!   `n_contra` (passes inside a claimed radius). A tolerant audit of a fat
+//!   claim is `n_contra >= max(2, 0.05 * n_cross)`: off-centre fitted axes
+//!   leave honest claims a few passes inside; the verdict is the caller's.
 //!
-//! Every echo goes to its nearest axis within `q_max`, so pass every cylinder
-//! near the ones of interest (a whole tile) and a neighbour's echoes go to the
-//! neighbour. Speed comes from looking only where wood is: each scan is
-//! indexed once by pulse direction ([`ScanIndex`]), each cylinder visits only
-//! the direction cells its axis covers seen from the scanner, and cylinders
-//! run in parallel.
+//! Ray first: one enumeration of the (pulse, cylinder) pairs whose line
+//! passes within `window_cap` of the axis, with the echoes of those pulses
+//! near the axis, then a few rounds over these tables:
+//!
+//! 1. each echo goes to the one cylinder whose surface it lies nearest,
+//!    `|q - r|`, among those whose window holds it (the first round: the
+//!    nearest axis); a pulse hits a cylinder at most once;
+//! 2. `r` is the median distance of a cylinder's hits;
+//! 3. a pair in the window is a hit, a pass (no echo of the pulse near the
+//!    axis, and the pulse went on), or neither (its echo near this axis went
+//!    to a neighbour or a fork: no evidence about this cylinder);
+//! 4. the next window is `max(1.5 hi, hi + 2 cm)` where passes bound the
+//!    calliper, else `2 r + 2 cm`, within `[window_min, window_cap]`.
+//!
+//! The window comes from the rays, so a claim can't move it and leaves beyond
+//! the calliper can't inflate it. Pass every cylinder near the ones of
+//! interest (a whole tile), so a neighbour's echoes go to the neighbour.
+//! Speed comes from looking only where wood is: each scan is indexed once by
+//! pulse direction ([`ScanIndex`]), each cylinder visits only the direction
+//! cells its axis covers seen from the scanner, and cylinders run in
+//! parallel.
 
 use std::path::Path;
 
@@ -43,7 +61,6 @@ use crate::io::shots::{angles, direction, Rays, ShotsFile};
 use crate::shots::Shots;
 use crate::transform::{add, dot, norm, scale, sub};
 use crate::util::numeric::median;
-use crate::util::spatial::KdTree;
 use crate::Point;
 
 /// A scanner's beam: footprint `exit + divergence * range` and ranging noise.
@@ -79,20 +96,40 @@ pub struct EvidenceParams {
     /// Below this radius an echoes-only store can't tell a twig from the
     /// leaves around it: prior only.
     pub echoes_only_min_radius: f64,
-    /// An echo farther than this from every axis belongs to no cylinder (m).
-    pub q_max: f64,
+    /// Where the hits' median distance from the axis is below this many beam
+    /// footprints, the beam is too wide to measure the wood: prior only. At
+    /// 0.5 the radius the echoes imply (they sit about `w/2` outside the
+    /// surface) is not positive. 1 (wood thinner than the beam) also drops
+    /// well-measured 1-2 cm wood and leaves the clutter-fattened twigs.
+    pub min_footprints: f64,
+    /// The widest window (m): no echo farther from an axis is a candidate
+    /// hit, so it must exceed the largest radius to be measured.
+    pub window_cap: f64,
+    /// The narrowest window (m).
+    pub window_min: f64,
+    /// Rounds of assignment and windowing.
+    pub rounds: usize,
 }
 
 impl Default for EvidenceParams {
     fn default() -> Self {
-        EvidenceParams { beam: Beam::VZ400I, floor_log: 0.05, footprint_sd: 0.9, spread_sd: 1.0, echoes_only_min_radius: 0.02, q_max: 0.5 }
+        EvidenceParams {
+            beam: Beam::VZ400I,
+            floor_log: 0.05,
+            footprint_sd: 0.9,
+            spread_sd: 1.0,
+            echoes_only_min_radius: 0.02,
+            min_footprints: 0.5,
+            window_cap: 0.25,
+            window_min: 0.02,
+            rounds: 3,
+        }
     }
 }
 
 const CELL: f64 = 0.2 * std::f64::consts::PI / 180.0; // direction grid of the scan index
 const NZ: usize = 900; // ceil(pi / CELL)
 const NA: usize = 1800; // ceil(2 pi / CELL)
-const SAMPLE: f64 = 0.02; // axis sampling for echo assignment (m)
 
 fn cell_of(zen: f64, az: f64) -> usize {
     let iz = ((zen / CELL) as usize).min(NZ - 1);
@@ -209,23 +246,15 @@ impl ScanIndex {
         &self.range[self.echo_start[p] as usize..self.echo_start[p + 1] as usize]
     }
 
-    /// Direction cells of the rectangle a segment covers, padded by `window`.
-    fn for_cells_near(&self, a: &Point, b: &Point, window: f64, mut f: impl FnMut(usize)) {
+    /// Pulses whose direction falls in the cell rectangle a segment covers, padded by `window`.
+    fn for_pulses_near(&self, a: &Point, b: &Point, window: f64, mut f: impl FnMut(usize)) {
         let (z0, nz, a0, na) = rectangle(&sub(a, &self.origin), &sub(b, &self.origin), window);
         for iz in z0..z0 + nz {
             for j in 0..na {
-                f(iz * NA + (a0 + j as i64).rem_euclid(NA as i64) as usize);
+                let cell = iz * NA + (a0 + j as i64).rem_euclid(NA as i64) as usize;
+                (self.cell_start[cell] as usize..self.cell_start[cell + 1] as usize).for_each(&mut f);
             }
         }
-    }
-
-    fn pulses_in(&self, cell: usize) -> std::ops::Range<usize> {
-        self.cell_start[cell] as usize..self.cell_start[cell + 1] as usize
-    }
-
-    /// Pulses whose direction falls in the cell rectangle a segment covers, padded by `window`.
-    fn for_pulses_near(&self, a: &Point, b: &Point, window: f64, mut f: impl FnMut(usize)) {
-        self.for_cells_near(a, b, window, |c| self.pulses_in(c).for_each(&mut f));
     }
 }
 
@@ -270,12 +299,39 @@ pub struct Evidence {
     pub n_contra: Vec<u32>,
 }
 
-struct Echo {
-    cyl: u32,
+/// A pulse whose line passes within the window cap of a cylinder's axis,
+/// closest at `d` (`t` along the ray) inside the segment and ahead of the
+/// scanner. Its echoes near the axis are the cylinder's candidates
+/// `cand..cand + n_cand`.
+struct Pair {
+    cand: u32,
+    n_cand: u32,
+    d: f32,
+    t: f32,
+    /// The pulse went on past `t`: its last echo is beyond, or it missed.
+    beyond: bool,
+}
+
+/// An echo `q` from a cylinder's axis, projecting onto the segment: a
+/// candidate hit. `echo` indexes the scan's ranges.
+struct Cand {
     scan: u32,
     pulse: u32,
-    q: f64,
-    range: f64,
+    echo: u32,
+    q: f32,
+    range: f32,
+}
+
+/// One cylinder's result of a round.
+struct Round {
+    med: f64,
+    mu: f64,
+    tau: f64,
+    lo: f64,
+    hi: f64,
+    n_hit: u32,
+    n_cross: u32,
+    n_contra: u32,
 }
 
 /// The evidence the `scans` give about cylinders `a[i] -> b[i]`; `r_claim`,
@@ -291,137 +347,146 @@ pub fn evidence(scans: &[&ScanIndex], a: &[Point], b: &[Point], r_claim: Option<
 
 fn evidence_on(scans: &[&ScanIndex], a: &[Point], b: &[Point], r_claim: Option<&[f64]>, p: &EvidenceParams) -> Evidence {
     let n = a.len();
+    let cap = p.window_cap;
     let len: Vec<f64> = (0..n).map(|i| norm(&sub(&b[i], &a[i])).max(1e-9)).collect();
     let u: Vec<Point> = (0..n).map(|i| sub(&b[i], &a[i]).map(|x| x / len[i])).collect();
-    // segment distance and position along it
-    let seg = |c: usize, q: &Point| -> (f64, f64) {
-        let w = sub(q, &a[c]);
-        let t = dot(&w, &u[c]);
-        (norm(&sub(&w, &scale(&u[c], t.clamp(0.0, len[c])))), t)
-    };
 
-    // 1. echoes near any axis -> their nearest cylinder (axis samples every 2 cm, then the exact segment)
-    let mut owner = Vec::new();
-    let mut samples = Vec::new();
-    for c in 0..n {
-        let k = ((len[c] / SAMPLE) as usize).max(1) + 1;
-        for j in 0..k {
-            samples.push(add(&a[c], &scale(&u[c], j as f64 / (k - 1) as f64 * len[c])));
-            owner.push(c);
-        }
-    }
-    let kd = KdTree::new(&samples);
-    let (kd, owner, seg, len_ref) = (&kd, &owner, &seg, &len); // shared by the parallel closures
-    let mut echoes: Vec<Echo> = Vec::new();
-    for (si, s) in scans.iter().enumerate() {
-        let mut marked = vec![false; NZ * NA];
-        for c in 0..n {
-            s.for_cells_near(&a[c], &b[c], p.q_max, |cell| marked[cell] = true);
-        }
-        let cells: Vec<usize> = (0..NZ * NA).filter(|&c| marked[c]).collect();
-        let found: Vec<Echo> = cells.par_iter().flat_map_iter(|&cell| s.pulses_in(cell)).flat_map_iter(|pu| {
-            let d = s.dir(pu);
-            s.echoes(pu).iter().filter_map(move |&rng| {
-                let rng = rng as f64;
-                let q = add(&s.origin, &scale(&d, rng));
-                // every cylinder with a point within q_max has a sample within q_max + SAMPLE / 2: the
-                // nearest of those the echo projects onto (ties to the lower index)
-                let mut best: Option<(f64, usize)> = None;
-                for (i, _) in kd.within(&q, p.q_max + SAMPLE / 2.0) {
-                    let c = owner[i];
-                    let (dist, t) = seg(c, &q);
-                    if t >= 0.0 && t <= len_ref[c] && dist < p.q_max && best.is_none_or(|(bd, bc)| dist < bd || (dist == bd && c < bc)) {
-                        best = Some((dist, c));
-                    }
-                }
-                best.map(|(q, c)| Echo { cyl: c as u32, scan: si as u32, pulse: pu as u32, q, range: rng })
-            }).collect::<Vec<_>>()
-        }).collect();
-        echoes.extend(found);
-    }
-    echoes.sort_by_key(|e| (e.cyl, e.scan, e.pulse));
-    let mut at = vec![0usize; n + 1];
-    for e in &echoes {
-        at[e.cyl as usize + 1] += 1;
-    }
-    for i in 0..n {
-        at[i + 1] += at[i];
-    }
-
-    let ns = scans.len();
-    let mut out = Evidence {
-        mu: vec![f64::NAN; n], tau: vec![0.0; n], lo: vec![0.0; n], hi: vec![f64::INFINITY; n],
-        n_hit: (0..n).map(|c| (at[c + 1] - at[c]) as u32).collect(), n_cross: vec![0; n], n_contra: vec![0; n],
-    };
-    let mut med = vec![f64::NAN; n];
-    let mut seen_with_misses = vec![false; n];
-    for c in 0..n {
-        let mine = &echoes[at[c]..at[c + 1]];
-        if mine.is_empty() {
-            continue;
-        }
-        let m = median(&mine.iter().map(|e| e.q).collect::<Vec<_>>());
-        let w = median(&mine.iter().map(|e| p.beam.footprint(e.range)).collect::<Vec<_>>());
-        let spread = 1.4826 * median(&mine.iter().map(|e| (e.q - m).abs()).collect::<Vec<_>>());
-        let mut per_scan = vec![0.0; ns];
-        for e in mine {
-            let sigma = (p.beam.footprint(e.range) / 2.0).hypot(p.beam.range_noise);
-            per_scan[e.scan as usize] += (m / sigma).powi(2);
-            seen_with_misses[c] |= scans[e.scan as usize].misses;
-        }
-        let tau: f64 = per_scan.iter().filter(|&&t| t > 0.0).map(|t| 1.0 / (1.0 / t + p.floor_log * p.floor_log)).sum();
-        out.tau[c] = 1.0 / (1.0 / tau + (p.footprint_sd * w / 2.0 / m).powi(2) + (p.spread_sd * spread / m).powi(2));
-        out.mu[c] = m.max(1e-4).ln();
-        med[c] = m;
-    }
-
-    // 2. pulses passing near each axis, within a window set by its echoes: the calliper and the audit
-    let hit_keys: Vec<Vec<u64>> = (0..ns).map(|si| {
-        let mut k: Vec<u64> = echoes.iter().filter(|e| e.scan as usize == si).map(|e| ((e.pulse as u64) << 32) | e.cyl as u64).collect();
-        k.sort_unstable();
-        k.dedup();
-        k
-    }).collect();
-    let per_cyl: Vec<(u32, f64, f64, u32)> = (0..n).into_par_iter().map(|c| {
-        let window = if med[c].is_nan() { 0.05 } else { (3.0 * med[c]).max(0.05) };
-        let (mut hits, mut passes, mut contra) = (Vec::new(), Vec::new(), 0u32);
+    // 1. once: the (pulse, cylinder) pairs within the cap, and the echoes of their pulses near the axis
+    let found: Vec<(Vec<Pair>, Vec<Cand>)> = (0..n).into_par_iter().map(|c| {
+        let (mut pairs, mut cands) = (Vec::new(), Vec::new());
         for (si, s) in scans.iter().enumerate() {
-            s.for_pulses_near(&a[c], &b[c], window, |pu| {
+            let w0 = sub(&s.origin, &a[c]);
+            let dd = dot(&w0, &u[c]);
+            s.for_pulses_near(&a[c], &b[c], cap, |pu| {
                 let d = s.dir(pu);
-                let w0 = sub(&s.origin, &a[c]);
-                let (bb, dd, ee) = (dot(&d, &u[c]), dot(&w0, &u[c]), dot(&d, &w0));
+                let (bb, ee) = (dot(&d, &u[c]), dot(&d, &w0));
                 let den = (1.0 - bb * bb).max(1e-12);
                 let (t_ray, s_ax) = ((bb * dd - ee) / den, (dd - bb * ee) / den);
-                let dist = norm(&sub(&add(&s.origin, &scale(&d, t_ray)), &add(&a[c], &scale(&u[c], s_ax.clamp(0.0, len[c])))));
-                let last = s.echoes(pu).last().map_or(f64::INFINITY, |&r| r as f64); // infinite for a miss
-                if !(dist < window && s_ax > 0.0 && s_ax < len[c] && t_ray > 0.0 && last >= t_ray - window) {
+                let dist = norm(&sub(&add(&w0, &scale(&d, t_ray)), &scale(&u[c], s_ax.clamp(0.0, len[c]))));
+                if !(dist < cap && t_ray > 0.0) {
                     return;
                 }
-                let w = p.beam.footprint(t_ray);
-                if hit_keys[si].binary_search(&(((pu as u64) << 32) | c as u64)).is_ok() {
-                    hits.push(dist - w / 2.0);
-                } else if last > t_ray {
-                    passes.push(dist + w / 2.0);
-                    if r_claim.is_some_and(|r| dist < r[c] - w / 2.0) {
-                        contra += 1;
+                let first = cands.len();
+                for e in s.echo_start[pu] as usize..s.echo_start[pu + 1] as usize {
+                    let w = add(&w0, &scale(&d, s.range[e] as f64)); // the echo, from a
+                    let t = dot(&w, &u[c]);
+                    let q = norm(&sub(&w, &scale(&u[c], t)));
+                    if t >= 0.0 && t <= len[c] && q < cap {
+                        cands.push(Cand { scan: si as u32, pulse: pu as u32, echo: e as u32, q: q as f32, range: s.range[e] });
                     }
+                }
+                let last = s.echoes(pu).last().map_or(f64::INFINITY, |&r| r as f64); // infinite for a miss
+                // a pulse that stopped short without an echo near the axis is neither a hit nor a pass
+                if s_ax > 0.0 && s_ax < len[c] && (last > t_ray || cands.len() > first) {
+                    pairs.push(Pair { cand: first as u32, n_cand: (cands.len() - first) as u32, d: dist as f32, t: t_ray as f32, beyond: last > t_ray });
                 }
             });
         }
-        let n_cross = (hits.len() + passes.len()) as u32;
-        let (lo, hi) = if n_cross > 0 { calliper(&hits, &passes, 2) } else { (0.0, f64::INFINITY) };
-        (n_cross, lo, hi, contra)
+        (pairs, cands)
     }).collect();
-    for (c, (n_cross, lo, hi, contra)) in per_cyl.into_iter().enumerate() {
-        out.n_cross[c] = n_cross;
-        out.lo[c] = lo;
-        out.hi[c] = hi;
-        out.n_contra[c] = contra;
-        // prior only (module docs): passes inside the echoes, or thin wood seen only by echoes-only scans
-        let r = out.mu[c].exp();
-        if out.n_hit[c] > 0 && (hi < r || (!seen_with_misses[c] && r < p.echoes_only_min_radius)) {
-            out.tau[c] = 0.0;
+    let mut cand_at = vec![0usize; n + 1];
+    for (c, (_, cands)) in found.iter().enumerate() {
+        cand_at[c + 1] = cand_at[c] + cands.len();
+    }
+    let (pairs, cands): (Vec<Vec<Pair>>, Vec<Vec<Cand>>) = found.into_iter().unzip();
+    let cands: Vec<Cand> = cands.into_iter().flatten().collect();
+    // each echo's candidates together, cylinders ascending: (scan, echo, cylinder, candidate)
+    let mut by_echo: Vec<(u32, u32, u32, u32)> = (0..n).into_par_iter().flat_map_iter(|c| {
+        let cands = &cands;
+        (cand_at[c]..cand_at[c + 1]).map(move |i| (cands[i].scan, cands[i].echo, c as u32, i as u32))
+    }).collect();
+    by_echo.par_sort_unstable();
+
+    // 2. rounds over the tables: assign the echoes, classify the pairs, and set each window from its calliper
+    let (mut r_hat, mut win) = (vec![0.0; n], vec![cap; n]);
+    let mut out = Vec::new();
+    for _ in 0..p.rounds.max(1) {
+        // an echo goes to the cylinder whose surface it lies nearest (ties: the lower index), among those
+        // whose window holds it
+        let winners: Vec<u32> = by_echo.par_chunk_by(|x, y| (x.0, x.1) == (y.0, y.1)).filter_map(|group| {
+            let mut best: Option<(f64, u32)> = None;
+            for &(_, _, c, i) in group {
+                let q = cands[i as usize].q as f64;
+                let resid = (q - r_hat[c as usize]).abs();
+                if q < win[c as usize] && best.is_none_or(|(br, _)| resid < br) {
+                    best = Some((resid, i));
+                }
+            }
+            best.map(|(_, i)| i)
+        }).collect();
+        let mut won = vec![false; cands.len()];
+        for i in winners {
+            won[i as usize] = true;
         }
+        out = (0..n).into_par_iter().map(|c| {
+            let at = cand_at[c]..cand_at[c + 1];
+            cylinder(&pairs[c], &cands[at.clone()], &won[at], r_hat[c], win[c], r_claim.map(|r| r[c]), scans, p)
+        }).collect::<Vec<Round>>();
+        for c in 0..n {
+            let (r, hi) = (out[c].med, out[c].hi);
+            let w = if hi.is_finite() && hi > 0.0 { (1.5 * hi).max(hi + 0.02) } else { 2.0 * r + 0.02 };
+            (r_hat[c], win[c]) = (r, w.clamp(p.window_min, cap));
+        }
+    }
+    Evidence {
+        mu: out.iter().map(|o| o.mu).collect(),
+        tau: out.iter().map(|o| o.tau).collect(),
+        lo: out.iter().map(|o| o.lo).collect(),
+        hi: out.iter().map(|o| o.hi).collect(),
+        n_hit: out.iter().map(|o| o.n_hit).collect(),
+        n_cross: out.iter().map(|o| o.n_cross).collect(),
+        n_contra: out.iter().map(|o| o.n_contra).collect(),
+    }
+}
+
+/// One cylinder in a round: its hits (per pulse, the echo it won nearest its
+/// surface `r_prev`), its pairs within the window `win` as hits, passes or
+/// neither, and what they say.
+#[allow(clippy::too_many_arguments)]
+fn cylinder(pairs: &[Pair], cands: &[Cand], won: &[bool], r_prev: f64, win: f64, r_claim: Option<f64>, scans: &[&ScanIndex], p: &EvidenceParams) -> Round {
+    let resid = |k: usize| (cands[k].q as f64 - r_prev).abs();
+    let mut hits: Vec<&Cand> = Vec::new();
+    for run in (0..cands.len()).collect::<Vec<_>>().chunk_by(|&x, &y| (cands[x].scan, cands[x].pulse) == (cands[y].scan, cands[y].pulse)) {
+        // a pulse's candidates are consecutive; the first of equals wins
+        let best = run.iter().copied().filter(|&k| won[k]).fold(None, |b: Option<usize>, k| if b.is_none_or(|b| resid(k) < resid(b)) { Some(k) } else { b });
+        hits.extend(best.map(|k| &cands[k]));
+    }
+    let (mut hit_d, mut pass_d, mut n_contra) = (Vec::new(), Vec::new(), 0u32);
+    for pr in pairs.iter().filter(|pr| (pr.d as f64) < win) {
+        let mine = pr.cand as usize..(pr.cand + pr.n_cand) as usize;
+        let (d, w) = (pr.d as f64, p.beam.footprint(pr.t as f64));
+        if mine.clone().any(|k| won[k]) {
+            hit_d.push(d - w / 2.0);
+        } else if pr.beyond && !mine.into_iter().any(|k| (cands[k].q as f64) < win) {
+            // (a pulse with an echo near the axis that went to a neighbour or a fork is neither)
+            pass_d.push(d + w / 2.0);
+            n_contra += r_claim.is_some_and(|r| d < r - w / 2.0) as u32;
+        }
+    }
+    let n_cross = (hit_d.len() + pass_d.len()) as u32;
+    let (lo, hi) = if n_cross > 0 { calliper(&hit_d, &pass_d, 2) } else { (0.0, f64::INFINITY) };
+    let mut out = Round { med: 0.0, mu: f64::NAN, tau: 0.0, lo, hi, n_hit: hits.len() as u32, n_cross, n_contra };
+    if hits.is_empty() {
+        return out;
+    }
+    let m = median(&hits.iter().map(|e| e.q as f64).collect::<Vec<_>>());
+    let w = median(&hits.iter().map(|e| p.beam.footprint(e.range as f64)).collect::<Vec<_>>());
+    let spread = 1.4826 * median(&hits.iter().map(|e| (e.q as f64 - m).abs()).collect::<Vec<_>>());
+    let mut per_scan = vec![0.0; scans.len()];
+    let mut seen_with_misses = false;
+    for e in &hits {
+        let sigma = (p.beam.footprint(e.range as f64) / 2.0).hypot(p.beam.range_noise);
+        per_scan[e.scan as usize] += (m / sigma).powi(2);
+        seen_with_misses |= scans[e.scan as usize].misses;
+    }
+    out.med = m;
+    out.mu = m.max(1e-4).ln();
+    let r = out.mu.exp();
+    // prior only (module docs): passes inside the echoes, thin wood seen only by echoes-only scans, or wood
+    // the beam is too wide to measure
+    if !(hi < r || (!seen_with_misses && r < p.echoes_only_min_radius) || m < p.min_footprints * w) {
+        let tau: f64 = per_scan.iter().filter(|&&t| t > 0.0).map(|t| 1.0 / (1.0 / t + p.floor_log * p.floor_log)).sum();
+        out.tau = 1.0 / (1.0 / tau + (p.footprint_sd * w / 2.0 / m).powi(2) + (p.spread_sd * spread / m).powi(2));
     }
     out
 }
@@ -526,6 +591,27 @@ mod tests {
         let (s, a, b) = scene(0.01, false);
         let e = evidence(&[&s], &[a], &[b], None, &EvidenceParams::default(), 0).unwrap();
         assert!(e.n_hit[0] > 0 && e.tau[0] == 0.0, "1 cm in an echoes-only store rests on the prior");
+    }
+
+    #[test]
+    fn wood_thinner_than_the_beam_is_prior_only_even_with_misses() {
+        let (s, a, b) = scene(0.002, true);
+        let e = evidence(&[&s], &[a], &[b], None, &EvidenceParams::default(), 0).unwrap();
+        assert!(e.n_hit[0] > 0 && e.tau[0] == 0.0, "2 mm under a 9 mm footprint rests on the prior");
+        let e = evidence(&[&s], &[a], &[b], None, &EvidenceParams { min_footprints: 0.0, ..Default::default() }, 0).unwrap();
+        assert!(e.tau[0] > 0.0, "only the footprint rule makes it so");
+    }
+
+    #[test]
+    fn a_neighbours_echoes_are_not_counted() {
+        let (s, a, b) = scene(0.05, true);
+        let alone = evidence(&[&s], &[a], &[b], None, &EvidenceParams::default(), 0).unwrap();
+        // an empty axis 12 cm beside it, nearer the scanner's line of sight to some of its echoes
+        let (a2, b2) = ([0.12, 5.0, -1.0], [0.12, 5.0, 1.0]);
+        let e = evidence(&[&s], &[a, a2], &[b, b2], None, &EvidenceParams::default(), 0).unwrap();
+        assert_eq!(e.n_hit[1], 0, "the empty axis takes none of its neighbour's echoes");
+        assert_eq!((e.n_hit[0], e.mu[0]), (alone.n_hit[0], alone.mu[0]));
+        assert!(e.hi[1] < 0.02, "pulses pass through the empty axis's place: {}", e.hi[1]);
     }
 
     #[test]

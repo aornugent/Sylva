@@ -57,3 +57,17 @@ def test_misses_need_a_pulse_without_echoes(tmp_path):
     fan(tmp_path, misses=False)
     with pytest.raises(ValueError, match="misses"):
         ScanIndex(tmp_path / "scan_0.05_False.parquet", misses=True)
+
+
+def test_a_neighbours_echoes_are_not_counted(tmp_path):
+    scan, a, b = fan(tmp_path)
+    alone = evidence([scan], a, b)
+    e = evidence([scan], np.r_[a, a + [0.12, 0, 0]], np.r_[b, b + [0.12, 0, 0]])  # an empty axis beside it
+    assert e["n_hit"][1] == 0 and e["hi"][1] < 0.02
+    assert e["n_hit"][0] == alone["n_hit"][0] and e["mu"][0] == alone["mu"][0]
+
+
+def test_wood_thinner_than_the_beam_rests_on_the_prior(tmp_path):
+    scan, a, b = fan(tmp_path, r=0.002)
+    e = evidence([scan], a, b)
+    assert scan.misses and e["n_hit"][0] > 0 and e["tau"][0] == 0
