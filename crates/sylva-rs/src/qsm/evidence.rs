@@ -784,6 +784,52 @@ mod tests {
     }
 
     #[test]
+    fn pulses_near_finds_every_pulse_within_the_window() {
+        // pulses in random directions, and segments anywhere around the scanner: overhead, below, across it
+        let mut seed = 12345u64;
+        let mut uniform = move || {
+            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            (seed >> 11) as f64 / (1u64 << 53) as f64
+        };
+        let mut shots = Shots::default();
+        for p in 0..200_000 {
+            let (z, a) = ((1.0 - 2.0 * uniform()).acos(), 2.0 * std::f64::consts::PI * uniform());
+            shots.direction.push(direction(z, a));
+            shots.origin.push([0.0; 3]);
+            shots.echo_start.push(p);
+            shots.echo_count.push(1);
+            shots.echo_range.push(30.0);
+        }
+        let s = index(&shots, 100_000);
+        let dirs: Vec<Point> = (0..s.n_pulses()).map(|p| s.dir[p].map(|x| x as f64)).collect();
+        for _ in 0..300 {
+            let a = [(uniform() - 0.5) * 12.0, (uniform() - 0.5) * 12.0, (uniform() - 0.3) * 10.0];
+            let l = uniform() * 2.0;
+            let u = direction((1.0 - 2.0 * uniform()).acos(), 2.0 * std::f64::consts::PI * uniform());
+            let b = add(&a, &scale(&u, l));
+            let window = 0.02 + uniform() * 0.3;
+            let mut seen = vec![false; dirs.len()];
+            s.pulses_near(&a, &b, window, |p, _, _| seen[p as usize] = true);
+            for (p, d) in dirs.iter().enumerate() {
+                // the ray's distance from a point along the segment, convex in it
+                let gap = |s: f64| {
+                    let q = add(&a, &scale(&u, s));
+                    norm(&sub(&q, &scale(d, dot(&q, d).max(0.0))))
+                };
+                if gap(l / 2.0) > window + l / 2.0 {
+                    continue;
+                }
+                let (mut lo, mut hi) = (0.0, l);
+                for _ in 0..60 {
+                    let (m1, m2) = (lo + (hi - lo) / 3.0, hi - (hi - lo) / 3.0);
+                    if gap(m1) < gap(m2) { hi = m2 } else { lo = m1 }
+                }
+                assert!(gap(lo) >= window || seen[p], "missed pulse {p} for segment {a:?} -> {b:?}, window {window}");
+            }
+        }
+    }
+
+    #[test]
     fn a_cylinder_without_length_takes_no_echoes() {
         let (s, a, b) = scene(0.05, true);
         let alone = evidence(&[&s], &[a], &[b], None, &EvidenceParams::default(), 0).unwrap();
