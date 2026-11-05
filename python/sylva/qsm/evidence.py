@@ -15,14 +15,62 @@ surface it lies nearest.
 
 from __future__ import annotations
 
+import dataclasses
+from enum import IntEnum
 from os import PathLike
 
 import numpy as np
 
 from .. import _core
 
-#: RIEGL VZ-400i (and VZ-2000i) beam: full divergence (rad), diameter at the aperture (m), ranging precision (m).
-VZ400I = (0.35e-3, 0.007, 0.003)
+_DEFAULTS = _core.qsm_evidence_defaults()
+
+
+@dataclasses.dataclass(frozen=True)
+class EvidenceParams:
+    """The settings of :func:`evidence`; the defaults are the calibrated ones, for a RIEGL VZ-400i.
+
+    A plain record: ``dataclasses.asdict(params)`` is JSON-serialisable and,
+    with ``version``, is what a cache of evidence should key on.
+    """
+
+    #: Bumped by Sylva whenever the evidence changes for the same settings; a record of another version is an error.
+    version: int = _DEFAULTS["version"]
+    #: Full beam divergence (rad).
+    beam_divergence: float = _DEFAULTS["beam_divergence"]
+    #: Beam diameter at the aperture (m).
+    beam_exit: float = _DEFAULTS["beam_exit"]
+    #: Ranging precision (m).
+    range_noise: float = _DEFAULTS["range_noise"]
+    #: Log-radius error per scan that more echoes don't remove (registration, wind).
+    floor_log: float = _DEFAULTS["floor_log"]
+    #: Systematic log sd per unit of ``(w / 2) / r`` (echoes sit outside the surface).
+    footprint_sd: float = _DEFAULTS["footprint_sd"]
+    #: Systematic log sd per unit of ``spread / r`` (clutter around the axis).
+    spread_sd: float = _DEFAULTS["spread_sd"]
+    #: Below this radius (m), wood seen only by echoes-only scans rests on the prior.
+    echoes_only_min_radius: float = _DEFAULTS["echoes_only_min_radius"]
+    #: Wood whose echoes sit within this many beam footprints of the axis rests on the prior.
+    min_footprints: float = _DEFAULTS["min_footprints"]
+    #: The widest window (m): no echo farther from an axis is a candidate hit, and no
+    #: cylinder farther than this from an echo competes for it.
+    window_cap: float = _DEFAULTS["window_cap"]
+    #: The narrowest window (m).
+    window_min: float = _DEFAULTS["window_min"]
+    #: Where passes bound the calliper, the next window is ``max(window_hi_factor * hi, hi + window_hi_margin)``.
+    window_hi_factor: float = _DEFAULTS["window_hi_factor"]
+    window_hi_margin: float = _DEFAULTS["window_hi_margin"]
+    #: Otherwise it is ``window_r_factor * r + window_r_margin``.
+    window_r_factor: float = _DEFAULTS["window_r_factor"]
+    window_r_margin: float = _DEFAULTS["window_r_margin"]
+    #: Rounds of assignment and windowing.
+    rounds: int = _DEFAULTS["rounds"]
+    #: Cylinders shorter than this (m) take no echoes and get no evidence.
+    min_length: float = _DEFAULTS["min_length"]
+
+
+#: Why a cylinder's ``tau`` is what it is: :func:`evidence`'s ``reason``.
+Reason = IntEnum("Reason", _core.qsm_evidence_reasons())
 
 
 class ScanIndex:
@@ -62,34 +110,45 @@ class ScanIndex:
         return self._core.nbytes
 
 
-def evidence(scans, a, b, r_claim=None, beam=VZ400I, threads: int = 0) -> dict[str, np.ndarray]:
+def evidence(scans, a, b, r_claim=None, params: EvidenceParams = EvidenceParams(), threads: int = 0) -> dict[str, np.ndarray]:
     """The evidence the rays of ``scans`` give about cylinders ``a[i] -> b[i]``.
 
-    Ray first: the pulses passing within 25 cm of each axis are enumerated
-    once; then, over a few rounds, each echo goes to the one cylinder whose
-    surface it lies nearest among those whose window holds it (a pulse hits a
-    cylinder at most once), and each window is set from the cylinder's own
-    calliper (``max(1.5 hi, hi + 2 cm)``, else ``2 r + 2 cm``, within 2-25 cm),
-    so a claim can't move it. A pulse in the window whose echo near this axis
-    went to a neighbour or a fork is neither a hit nor a pass. Radii above
-    25 cm are not measured. Per cylinder:
+    Ray first: the pulses passing within ``params.window_cap`` (25 cm) of each
+    axis are enumerated once; then, over a few rounds, each echo goes to the
+    one cylinder whose surface it lies nearest among those whose window holds
+    it (a pulse hits a cylinder at most once), and each window is set from
+    the cylinder's own calliper (``max(1.5 hi, hi + 2 cm)``, else
+    ``2 r + 2 cm``, within 2-25 cm), so a claim can't move it. A pulse in the
+    window whose echo near this axis went to a neighbour or a fork is neither
+    a hit nor a pass. Radii above the cap are not measured. Per cylinder:
 
     - ``mu``: log of the median distance of its hits from the axis (NaN without hits);
     - ``tau``: precision of ``mu``. Each hit is worth ``(r / sigma)^2``, ``sigma``
       half the beam footprint at its range combined with the ranging noise; each
       scan's sum is capped by a floor (registration, wind), scans add, and the
-      footprint and clutter spread add systematic variance (calibrated constants,
-      set in the Rust core). 0 without hits, or where the rays don't determine
-      the radius: pulses passed closer to the axis than its echoes sit; no scan
-      that saw it recorded misses and it is thinner than 2 cm; or its echoes sit
-      within half a beam footprint of the axis. So ``(tau == 0) & (n_hit > 0)``
-      is "prior only";
+      footprint and clutter spread add systematic variance. 0 without hits, or
+      where the rays don't determine the radius (``reason``);
+    - ``reason`` (:class:`Reason`): ``MEASURED`` (``tau > 0``); ``NO_HITS``
+      (also cylinders shorter than ``min_length``); and three prior-only
+      cases, with hits but ``tau == 0``: ``CLUTTER`` (pulses passed closer to
+      the axis than its echoes sit), ``FOOTPRINT`` (its echoes sit within
+      ``min_footprints`` beam footprints of the axis), ``ECHOES_ONLY``
+      (thinner than ``echoes_only_min_radius`` and seen by no scan that kept
+      misses). So ``(tau == 0) & (n_hit > 0)`` is "prior only";
     - ``lo``, ``hi``: the beam calliper, from pulses in the window that hit
       (``d - w/2``) or passed (``d + w/2``);
-    - ``n_hit`` (hits), ``n_cross`` (pulses in the window that hit or passed)
-      and ``n_contra`` (passes inside ``r_claim``, if given). Off-centre fitted
-      axes leave honest claims a few passes inside: a tolerant audit flags a
-      fat claim at ``n_contra >= max(2, 0.05 * n_cross)``.
+    - ``n_hit``: the hits ``mu`` is the median of; ``n_cross``: pulses whose
+      line comes closest to the axis within the segment and the window, and
+      hit or passed (a hit near the ends can count in ``n_hit`` alone, so it
+      may exceed ``n_cross``); ``n_contra``: passes inside ``r_claim``, if
+      given (see :func:`contradicted`).
+
+    The evidence for a cylinder depends on every cylinder that competes for
+    its echoes: those within ``params.window_cap`` of an echo it could take,
+    so within ``2 * params.window_cap`` of its axis. Pass a whole tile; or,
+    for one tree, the tree and every cylinder within ``2 * window_cap`` of
+    it, which gives the tree's cylinders' evidence up to how the neighbours'
+    own windows settle (their neighbours are missing).
 
     Parameters
     ----------
@@ -99,20 +158,35 @@ def evidence(scans, a, b, r_claim=None, beam=VZ400I, threads: int = 0) -> dict[s
         ``(n, 3)`` cylinder axes.
     r_claim
         ``(n,)`` claimed radii to audit, or None.
-    beam
-        ``(divergence, exit diameter, range noise)`` of the scanner.
+    params
+        :class:`EvidenceParams`.
     threads
         Threads to use (0: one per core).
 
     Returns
     -------
-    dict of ``(n,)`` arrays: mu, tau, lo, hi, n_hit, n_cross, n_contra.
+    dict of ``(n,)`` arrays: mu, tau, lo, hi, n_hit, n_cross, n_contra, reason.
     """
-    a, b = np.ascontiguousarray(a, np.float64).reshape(-1, 3), np.ascontiguousarray(b, np.float64).reshape(-1, 3)
-    if len(a) != len(b):
-        raise ValueError("a and b need one row per cylinder")
+    scans = list(scans)
+    if not all(isinstance(s, ScanIndex) for s in scans):
+        raise TypeError("scans must be ScanIndex objects")
+    if not isinstance(params, EvidenceParams):
+        raise TypeError("params must be an EvidenceParams")
+    a, b = np.ascontiguousarray(a, np.float64), np.ascontiguousarray(b, np.float64)
+    if a.ndim != 2 or a.shape[1] != 3 or a.shape != b.shape:
+        raise ValueError(f"a and b must both have shape (n, 3), got {a.shape} and {b.shape}")
     if r_claim is not None:
-        r_claim = np.ascontiguousarray(r_claim, np.float64).reshape(-1)
-        if len(r_claim) != len(a):
-            raise ValueError("r_claim needs one value per cylinder")
-    return _core.qsm_evidence([s._core for s in scans], a, b, r_claim, tuple(float(v) for v in beam), int(threads))
+        r_claim = np.ascontiguousarray(r_claim, np.float64)
+        if r_claim.shape != (len(a),):
+            raise ValueError(f"r_claim must have shape ({len(a)},), got {r_claim.shape}")
+    return _core.qsm_evidence([s._core for s in scans], a, b, r_claim, dataclasses.asdict(params), int(threads))
+
+
+def contradicted(ev: dict[str, np.ndarray], min_count: int = 2, fraction: float = 0.05) -> np.ndarray:
+    """Whether the passes contradict each claimed radius: ``n_contra >= max(min_count, fraction * n_cross)``.
+
+    A tolerant audit of a fat claim on :func:`evidence` run with ``r_claim``:
+    off-centre fitted axes leave honest claims a few passes inside. The
+    verdict is the caller's.
+    """
+    return ev["n_contra"] >= np.maximum(min_count, fraction * ev["n_cross"])

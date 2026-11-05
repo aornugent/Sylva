@@ -382,13 +382,79 @@ impl PyScanIndex {
     }
 }
 
-/// The calibration settings stay at their Rust defaults; a scanner's beam is
-/// the choice.
+/// The fields of `EvidenceParams`, flat, with the beam's prefixed `beam_`
+/// (except `range_noise`), and the semantics `version`.
+fn evidence_params_to_py<'py>(py: Python<'py>, p: &EvidenceParams) -> PyResult<Bound<'py, PyDict>> {
+    let d = PyDict::new(py);
+    d.set_item("version", EvidenceParams::VERSION)?;
+    for (k, v) in [
+        ("beam_divergence", p.beam.divergence),
+        ("beam_exit", p.beam.exit),
+        ("range_noise", p.beam.range_noise),
+        ("floor_log", p.floor_log),
+        ("footprint_sd", p.footprint_sd),
+        ("spread_sd", p.spread_sd),
+        ("echoes_only_min_radius", p.echoes_only_min_radius),
+        ("min_footprints", p.min_footprints),
+        ("window_cap", p.window_cap),
+        ("window_min", p.window_min),
+        ("window_hi_factor", p.window_hi_factor),
+        ("window_hi_margin", p.window_hi_margin),
+        ("window_r_factor", p.window_r_factor),
+        ("window_r_margin", p.window_r_margin),
+        ("min_length", p.min_length),
+    ] {
+        d.set_item(k, v)?;
+    }
+    d.set_item("rounds", p.rounds)?;
+    Ok(d)
+}
+
+fn evidence_params_from_py(d: &Bound<'_, PyDict>) -> PyResult<EvidenceParams> {
+    let get = |k: &str| d.get_item(k)?.ok_or_else(|| PyValueError::new_err(format!("evidence params: no {k:?}")));
+    let f = |k: &str| get(k)?.extract::<f64>();
+    if get("version")?.extract::<u32>()? != EvidenceParams::VERSION {
+        return Err(PyValueError::new_err(format!("evidence params: version {} is not this Sylva's ({})", get("version")?, EvidenceParams::VERSION)));
+    }
+    if d.len() != 17 {
+        return Err(PyValueError::new_err("evidence params: unexpected fields"));
+    }
+    Ok(EvidenceParams {
+        beam: Beam { divergence: f("beam_divergence")?, exit: f("beam_exit")?, range_noise: f("range_noise")? },
+        floor_log: f("floor_log")?,
+        footprint_sd: f("footprint_sd")?,
+        spread_sd: f("spread_sd")?,
+        echoes_only_min_radius: f("echoes_only_min_radius")?,
+        min_footprints: f("min_footprints")?,
+        window_cap: f("window_cap")?,
+        window_min: f("window_min")?,
+        window_hi_factor: f("window_hi_factor")?,
+        window_hi_margin: f("window_hi_margin")?,
+        window_r_factor: f("window_r_factor")?,
+        window_r_margin: f("window_r_margin")?,
+        rounds: get("rounds")?.extract()?,
+        min_length: f("min_length")?,
+    })
+}
+
+/// The default evidence settings, as `evidence_params_to_py` lays them out.
 #[pyfunction]
-fn qsm_evidence<'py>(py: Python<'py>, scans: Vec<Bound<'py, PyScanIndex>>, a: PyReadonlyArray2<f64>, b: PyReadonlyArray2<f64>, r_claim: Option<PyReadonlyArray1<f64>>, beam: (f64, f64, f64), threads: usize) -> PyResult<Bound<'py, PyDict>> {
+fn qsm_evidence_defaults(py: Python<'_>) -> PyResult<Bound<'_, PyDict>> {
+    evidence_params_to_py(py, &EvidenceParams::default())
+}
+
+/// The names of the `reason` codes.
+#[pyfunction]
+fn qsm_evidence_reasons() -> Vec<(&'static str, u8)> {
+    use evidence::reason::*;
+    vec![("MEASURED", MEASURED), ("NO_HITS", NO_HITS), ("CLUTTER", CLUTTER), ("FOOTPRINT", FOOTPRINT), ("ECHOES_ONLY", ECHOES_ONLY)]
+}
+
+#[pyfunction]
+fn qsm_evidence<'py>(py: Python<'py>, scans: Vec<Bound<'py, PyScanIndex>>, a: PyReadonlyArray2<f64>, b: PyReadonlyArray2<f64>, r_claim: Option<PyReadonlyArray1<f64>>, params: Bound<'py, PyDict>, threads: usize) -> PyResult<Bound<'py, PyDict>> {
     let (a, b) = (xyz_from_py(a)?, xyz_from_py(b)?);
     let r_claim: Option<Vec<f64>> = r_claim.map(|r| r.as_array().to_vec());
-    let p = EvidenceParams { beam: Beam { divergence: beam.0, exit: beam.1, range_noise: beam.2 }, ..EvidenceParams::default() };
+    let p = evidence_params_from_py(&params)?;
     let refs: Vec<&ScanIndex> = scans.iter().map(|s| &s.get().inner).collect();
     let e = py.detach(|| evidence::evidence(&refs, &a, &b, r_claim.as_deref(), &p, threads)).map_err(err)?;
     let d = PyDict::new(py);
@@ -399,12 +465,15 @@ fn qsm_evidence<'py>(py: Python<'py>, scans: Vec<Bound<'py, PyScanIndex>>, a: Py
     d.set_item("n_hit", e.n_hit.into_pyarray(py))?;
     d.set_item("n_cross", e.n_cross.into_pyarray(py))?;
     d.set_item("n_contra", e.n_contra.into_pyarray(py))?;
+    d.set_item("reason", e.reason.into_pyarray(py))?;
     Ok(d)
 }
 
 pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyScanIndex>()?;
     m.add_function(wrap_pyfunction!(qsm_evidence, m)?)?;
+    m.add_function(wrap_pyfunction!(qsm_evidence_defaults, m)?)?;
+    m.add_function(wrap_pyfunction!(qsm_evidence_reasons, m)?)?;
     for f in [
         wrap_pyfunction!(qsm_totals, m)?,
         wrap_pyfunction!(qsm_ends, m)?,

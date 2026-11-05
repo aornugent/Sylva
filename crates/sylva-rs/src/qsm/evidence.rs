@@ -21,7 +21,8 @@
 //!   surface); none of the scans that saw it recorded misses and it is
 //!   thinner than echoes alone can tell from clutter; or its echoes sit
 //!   closer to the axis than a fraction of the beam footprint (wood the beam
-//!   is too wide to measure). So `tau == 0 && n_hit > 0` is "prior only".
+//!   is too wide to measure). So `tau == 0 && n_hit > 0` is "prior only",
+//!   and `reason` (see [`reason`]) says which.
 //! - `lo`, `hi`: the beam calliper. A pulse that hit the cylinder came within
 //!   `d` of the axis, so `r > d - w/2`; one that passed came within `d`
 //!   without hitting, so `r < d + w/2` (`w`: the footprint).
@@ -46,7 +47,8 @@
 //!    axis, and the pulse went on), or neither (its echo near this axis went
 //!    to a neighbour or a fork: no evidence about this cylinder);
 //! 4. the next window is `max(1.5 hi, hi + 2 cm)` where passes bound the
-//!    calliper, else `2 r + 2 cm`, within `[window_min, window_cap]`.
+//!    calliper, else `2 r + 2 cm`, within `[window_min, window_cap]` (the
+//!    constants are [`EvidenceParams`]').
 //!
 //! The window comes from the rays, so a claim can't move it and leaves beyond
 //! the calliper can't inflate it. Pass every cylinder near the ones of
@@ -106,10 +108,18 @@ pub struct EvidenceParams {
     /// well-measured 1-2 cm wood and leaves the clutter-fattened twigs.
     pub min_footprints: f64,
     /// The widest window (m): no echo farther from an axis is a candidate
-    /// hit, so it must exceed the largest radius to be measured.
+    /// hit, so it must exceed the largest radius to be measured. It is also
+    /// how far a cylinder's neighbours reach into its evidence.
     pub window_cap: f64,
     /// The narrowest window (m).
     pub window_min: f64,
+    /// Where passes bound the calliper, the next window is
+    /// `max(window_hi_factor * hi, hi + window_hi_margin)`...
+    pub window_hi_factor: f64,
+    pub window_hi_margin: f64,
+    /// ...else `window_r_factor * r + window_r_margin`.
+    pub window_r_factor: f64,
+    pub window_r_margin: f64,
     /// Rounds of assignment and windowing.
     pub rounds: usize,
     /// Cylinders shorter than this (m) have no axis to measure from: they
@@ -128,6 +138,10 @@ impl Default for EvidenceParams {
             min_footprints: 0.5,
             window_cap: 0.25,
             window_min: 0.02,
+            window_hi_factor: 1.5,
+            window_hi_margin: 0.02,
+            window_r_factor: 2.0,
+            window_r_margin: 0.02,
             rounds: 3,
             min_length: 0.001,
         }
@@ -135,12 +149,19 @@ impl Default for EvidenceParams {
 }
 
 impl EvidenceParams {
+    /// Bumped whenever the evidence changes for the same settings, so a
+    /// cache keyed on the settings and this can trust what it holds.
+    pub const VERSION: u32 = 1;
+
     /// An error unless the settings make sense together.
     pub fn check(&self) -> Result<()> {
         let b = &self.beam;
-        let non_negative = [b.divergence, b.exit, b.range_noise, self.floor_log, self.footprint_sd, self.spread_sd, self.echoes_only_min_radius, self.min_footprints, self.min_length];
+        let non_negative = [
+            b.divergence, b.exit, b.range_noise, self.floor_log, self.footprint_sd, self.spread_sd, self.echoes_only_min_radius, self.min_footprints,
+            self.window_hi_factor, self.window_hi_margin, self.window_r_factor, self.window_r_margin, self.min_length,
+        ];
         if !non_negative.iter().all(|&x| x.is_finite() && x >= 0.0) {
-            return Err(Error::invalid("evidence params: the beam, floor, sds, radii and lengths must be finite and not negative"));
+            return Err(Error::invalid("evidence params: the beam, floor, sds, radii, window rule and lengths must be finite and not negative"));
         }
         if !(self.window_min > 0.0 && self.window_min <= self.window_cap && self.window_cap.is_finite()) {
             return Err(Error::invalid("evidence params: need 0 < window_min <= window_cap"));
@@ -150,6 +171,30 @@ impl EvidenceParams {
         }
         Ok(())
     }
+
+    /// The next window of a cylinder whose hits sit at `r` and whose calliper
+    /// tops out at `hi`.
+    fn window(&self, r: f64, hi: f64) -> f64 {
+        let w = if hi.is_finite() && hi > 0.0 { (self.window_hi_factor * hi).max(hi + self.window_hi_margin) } else { self.window_r_factor * r + self.window_r_margin };
+        w.clamp(self.window_min, self.window_cap)
+    }
+}
+
+/// Why a cylinder's `tau` is what it is: [`evidence`]'s `reason`.
+pub mod reason {
+    /// The rays measure the radius: `tau > 0`.
+    pub const MEASURED: u8 = 0;
+    /// No hits (or no length): no evidence.
+    pub const NO_HITS: u8 = 1;
+    /// Prior only: pulses passed closer to the axis than its echoes sit
+    /// (`hi < r`: the echoes are clutter around something thinner).
+    pub const CLUTTER: u8 = 2;
+    /// Prior only: its echoes sit within `min_footprints` beam footprints of
+    /// the axis (the beam is too wide to measure it).
+    pub const FOOTPRINT: u8 = 3;
+    /// Prior only: thinner than `echoes_only_min_radius` and seen only by
+    /// scans that kept no misses.
+    pub const ECHOES_ONLY: u8 = 4;
 }
 
 const CELL: f64 = 0.2 * std::f64::consts::PI / 180.0; // direction grid of the scan index
@@ -330,6 +375,8 @@ pub struct Evidence {
     pub n_hit: Vec<u32>,
     pub n_cross: Vec<u32>,
     pub n_contra: Vec<u32>,
+    /// Why `tau` is what it is: one of [`reason`].
+    pub reason: Vec<u8>,
 }
 
 /// A pulse whose line passes within the window cap of a cylinder's axis,
@@ -365,6 +412,7 @@ struct Round {
     n_hit: u32,
     n_cross: u32,
     n_contra: u32,
+    reason: u8,
 }
 
 /// The evidence the `scans` give about cylinders `a[i] -> b[i]`; `r_claim`,
@@ -466,9 +514,7 @@ fn evidence_on(scans: &[&ScanIndex], a: &[Point], b: &[Point], r_claim: Option<&
             break;
         }
         for c in 0..n {
-            let (r, hi) = (out[c].med, out[c].hi);
-            let w = if hi.is_finite() && hi > 0.0 { (1.5 * hi).max(hi + 0.02) } else { 2.0 * r + 0.02 };
-            (r_hat[c], win[c]) = (r, w.clamp(p.window_min, cap));
+            (r_hat[c], win[c]) = (out[c].med, p.window(out[c].med, out[c].hi));
         }
     }
     Evidence {
@@ -479,6 +525,7 @@ fn evidence_on(scans: &[&ScanIndex], a: &[Point], b: &[Point], r_claim: Option<&
         n_hit: out.iter().map(|o| o.n_hit).collect(),
         n_cross: out.iter().map(|o| o.n_cross).collect(),
         n_contra: out.iter().map(|o| o.n_contra).collect(),
+        reason: out.iter().map(|o| o.reason).collect(),
     }
 }
 
@@ -508,7 +555,7 @@ fn cylinder(pairs: &[Pair], cands: &[Cand], won: &[bool], r_prev: f64, win: f64,
     }
     let n_cross = (hit_d.len() + pass_d.len()) as u32;
     let (lo, hi) = if n_cross > 0 { calliper(&hit_d, &pass_d, 2) } else { (0.0, f64::INFINITY) };
-    let mut out = Round { med: 0.0, mu: f64::NAN, tau: 0.0, lo, hi, n_hit: hits.len() as u32, n_cross, n_contra };
+    let mut out = Round { med: 0.0, mu: f64::NAN, tau: 0.0, lo, hi, n_hit: hits.len() as u32, n_cross, n_contra, reason: reason::NO_HITS };
     if hits.is_empty() {
         return out;
     }
@@ -525,12 +572,19 @@ fn cylinder(pairs: &[Pair], cands: &[Cand], won: &[bool], r_prev: f64, win: f64,
     out.med = m;
     out.mu = m.max(1e-4).ln();
     let r = out.mu.exp();
-    // prior only (module docs): passes inside the echoes, thin wood seen only by echoes-only scans, or wood
-    // the beam is too wide to measure
-    if !(hi < r || (!seen_with_misses && r < p.echoes_only_min_radius) || m < p.min_footprints * w) {
+    // prior only (module docs): passes inside the echoes, wood the beam is too wide to measure, or thin wood
+    // seen only by echoes-only scans
+    out.reason = if hi < r {
+        reason::CLUTTER
+    } else if m < p.min_footprints * w || m <= 0.0 {
+        reason::FOOTPRINT
+    } else if !seen_with_misses && r < p.echoes_only_min_radius {
+        reason::ECHOES_ONLY
+    } else {
         let tau: f64 = per_scan.iter().filter(|&&t| t > 0.0).map(|t| 1.0 / (1.0 / t + p.floor_log * p.floor_log)).sum();
         out.tau = 1.0 / (1.0 / tau + (p.footprint_sd * w / 2.0 / m).powi(2) + (p.spread_sd * spread / m).powi(2));
-    }
+        reason::MEASURED
+    };
     out
 }
 
@@ -632,7 +686,7 @@ mod tests {
         let e = evidence(&[&s], &[a], &[b], Some(&[1.5 * r]), &EvidenceParams::default(), 2).unwrap();
         // echoes lie on the near surface, so their median axis distance is about r
         assert!((e.mu[0].exp() / r - 1.0).abs() < 0.05, "mu {}", e.mu[0].exp());
-        assert!(e.tau[0] > 0.0);
+        assert!(e.tau[0] > 0.0 && e.reason[0] == reason::MEASURED);
         assert!(e.lo[0] < r + 0.005 && e.hi[0] > r - 0.005, "calliper [{}, {}]", e.lo[0], e.hi[0]);
         assert!(e.n_hit[0] > 100 && e.n_cross[0] > e.n_hit[0]);
         assert!(e.n_contra[0] > 0, "a 50 % fat claim is contradicted by passes");
@@ -647,6 +701,7 @@ mod tests {
         assert!(!s.misses());
         let e = evidence(&[&s], &[a], &[b], None, &EvidenceParams::default(), 0).unwrap();
         assert!(e.n_hit[0] > 0 && e.tau[0] == 0.0, "1 cm in an echoes-only store rests on the prior");
+        assert_eq!(e.reason[0], reason::ECHOES_ONLY);
     }
 
     #[test]
@@ -654,6 +709,7 @@ mod tests {
         let (s, a, b) = scene(0.002, true);
         let e = evidence(&[&s], &[a], &[b], None, &EvidenceParams::default(), 0).unwrap();
         assert!(e.n_hit[0] > 0 && e.tau[0] == 0.0, "2 mm under a 9 mm footprint rests on the prior");
+        assert_eq!(e.reason[0], reason::FOOTPRINT);
         let e = evidence(&[&s], &[a], &[b], None, &EvidenceParams { min_footprints: 0.0, ..Default::default() }, 0).unwrap();
         assert!(e.tau[0] > 0.0, "only the footprint rule makes it so");
     }
@@ -668,6 +724,33 @@ mod tests {
         assert_eq!(e.n_hit[1], 0, "the empty axis takes none of its neighbour's echoes");
         assert_eq!((e.n_hit[0], e.mu[0]), (alone.n_hit[0], alone.mu[0]));
         assert!(e.hi[1] < 0.02, "pulses pass through the empty axis's place: {}", e.hi[1]);
+        assert_eq!(e.reason[1], reason::NO_HITS);
+    }
+
+    #[test]
+    fn echoes_around_an_axis_that_pulses_pass_through_are_clutter() {
+        // a few leaves 4.5-5 cm from a vertical axis 5 m away; the pulses between them go through to a wall
+        let mut shots = Shots::default();
+        for i in 0..80 {
+            for j in 0..200 {
+                let (az, zen) = (-0.02 + i as f64 * 0.0005, std::f64::consts::FRAC_PI_2 - 0.05 + j as f64 * 0.0005);
+                let d = [zen.sin() * az.sin(), zen.sin() * az.cos(), zen.cos()];
+                let off = 5.0 * az.sin(); // the closest approach to the axis, in plan
+                shots.echo_start.push(shots.echo_range.len());
+                shots.echo_range.push(if (0.045..0.05).contains(&off.abs()) { 5.0 * az.cos() / zen.sin() } else { 8.0 / d[1] });
+                shots.echo_count.push(1);
+                shots.origin.push([0.0; 3]);
+                shots.direction.push(d);
+            }
+        }
+        let s = index(&shots, 10_000);
+        let (a, b) = ([0.0, 5.0, -0.2], [0.0, 5.0, 0.2]);
+        // in the first round's window the leaves are its hits, but the calliper is below them
+        let e = evidence(&[&s], &[a], &[b], None, &EvidenceParams { rounds: 1, ..Default::default() }, 0).unwrap();
+        assert!(e.n_hit[0] > 0 && e.tau[0] == 0.0 && e.reason[0] == reason::CLUTTER, "{e:?}");
+        // and the window then closes on the calliper, leaving them out
+        let e = evidence(&[&s], &[a], &[b], None, &EvidenceParams::default(), 0).unwrap();
+        assert!(e.n_hit[0] == 0 && e.reason[0] == reason::NO_HITS, "{e:?}");
     }
 
     #[test]
@@ -707,7 +790,7 @@ mod tests {
         // a point on the near surface, where the echoes are
         let dot = [0.0, 4.95, 0.0];
         let e = evidence(&[&s], &[dot, a], &[dot, b], Some(&[0.05, 0.05]), &EvidenceParams::default(), 0).unwrap();
-        assert!(e.mu[0].is_nan() && e.tau[0] == 0.0 && (e.n_hit[0], e.n_cross[0], e.n_contra[0]) == (0, 0, 0));
+        assert!(e.mu[0].is_nan() && e.tau[0] == 0.0 && (e.n_hit[0], e.n_cross[0], e.n_contra[0]) == (0, 0, 0) && e.reason[0] == reason::NO_HITS);
         assert_eq!((e.n_hit[1], e.mu[1], e.hi[1]), (alone.n_hit[0], alone.mu[0], alone.hi[0]));
     }
 
