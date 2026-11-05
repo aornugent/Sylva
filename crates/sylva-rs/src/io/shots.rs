@@ -95,11 +95,11 @@ fn list_field(name: &str, element: &str) -> String {
 }
 
 /// Beam direction to `(zenith, azimuth)`.
-fn angles(d: &Point) -> (f64, f64) {
+pub(crate) fn angles(d: &Point) -> (f64, f64) {
     (d[2].clamp(-1.0, 1.0).acos(), d[0].atan2(d[1]))
 }
 
-fn direction(zenith: f64, azimuth: f64) -> Point {
+pub(crate) fn direction(zenith: f64, azimuth: f64) -> Point {
     let (sz, cz) = zenith.sin_cos();
     let (sa, ca) = azimuth.sin_cos();
     [sz * sa, sz * ca, cz]
@@ -297,6 +297,16 @@ pub fn write_shots(shots: &Shots, path: impl AsRef<Path>, opts: &ShotsWriteOptio
     Ok(())
 }
 
+/// Pulses as [`ShotsFile::read_rays`] reads them: directions as stored, echo
+/// ranges in pulse order (`echo_count` per pulse), no origins or attributes.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Rays {
+    pub zenith: Vec<f32>,
+    pub azimuth: Vec<f32>,
+    pub echo_count: Vec<u32>,
+    pub range: Vec<f32>,
+}
+
 /// An open shots file; row groups are read on demand.
 pub struct ShotsFile {
     path: std::path::PathBuf,
@@ -466,6 +476,34 @@ impl ShotsFile {
             shots.echo_attrs.insert(name.clone(), attr);
         }
         Ok(shots)
+    }
+
+    /// The beams of one row group as stored, in single precision: angles and
+    /// echo ranges only, without origins or echo attributes (several times
+    /// faster than [`ShotsFile::read_group`] where those aren't needed).
+    pub fn read_rays(&self, group: usize) -> Result<Rays> {
+        let rg = self.reader.get_row_group(group)?;
+        let rows = rg.metadata().num_rows() as usize;
+        let first = if self.per_pulse { 3 } else { 1 }; // the origin columns come first
+        let reals = |col: usize, lists: bool| -> Result<(Vec<f32>, Vec<i16>)> {
+            let c = rg.get_column_reader(col)?;
+            if self.double {
+                let (v, l) = read_values::<DoubleType>(c, rows, lists, reader_of!(DoubleColumnReader))?;
+                Ok((v.into_iter().map(|x| x as f32).collect(), l))
+            } else {
+                read_values::<FloatType>(c, rows, lists, reader_of!(FloatColumnReader))
+            }
+        };
+        let (zenith, azimuth) = (reals(first, false)?.0, reals(first + 1, false)?.0);
+        let (range, levels) = reals(first + 2, true)?;
+        let mut echo_count: Vec<u32> = Vec::with_capacity(rows);
+        for &l in &levels {
+            match l {
+                2 => *echo_count.last_mut().ok_or_else(|| Error::invalid("shots file: bad list levels"))? += 1,
+                _ => echo_count.push(l as u32),
+            }
+        }
+        Ok(Rays { zenith, azimuth, echo_count, range })
     }
 
     /// Read every row group into one [`Shots`].
