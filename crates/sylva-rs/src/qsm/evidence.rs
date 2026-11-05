@@ -25,8 +25,12 @@
 //! - `lo`, `hi`: the beam calliper. A pulse that hit the cylinder came within
 //!   `d` of the axis, so `r > d - w/2`; one that passed came within `d`
 //!   without hitting, so `r < d + w/2` (`w`: the footprint).
-//! - counts: `n_hit` (hits), `n_cross` (hits and passes in the window) and
-//!   `n_contra` (passes inside a claimed radius). A tolerant audit of a fat
+//! - counts: `n_hit` (the hits `mu` is the median of), `n_cross` (pulses in
+//!   the window that hit or passed) and `n_contra` (passes inside a claimed
+//!   radius). A hit is an echo the cylinder won beside the segment, whether
+//!   or not its pulse's line comes closest to the axis within the segment;
+//!   `n_cross` counts only pulses that do, so `n_hit` can exceed `n_cross`
+//!   (pulses near the ends, or along the axis). A tolerant audit of a fat
 //!   claim is `n_contra >= max(2, 0.05 * n_cross)`: off-centre fitted axes
 //!   leave honest claims a few passes inside; the verdict is the caller's.
 //!
@@ -108,6 +112,9 @@ pub struct EvidenceParams {
     pub window_min: f64,
     /// Rounds of assignment and windowing.
     pub rounds: usize,
+    /// Cylinders shorter than this (m) have no axis to measure from: they
+    /// take no echoes and get no evidence.
+    pub min_length: f64,
 }
 
 impl Default for EvidenceParams {
@@ -122,7 +129,26 @@ impl Default for EvidenceParams {
             window_cap: 0.25,
             window_min: 0.02,
             rounds: 3,
+            min_length: 0.001,
         }
+    }
+}
+
+impl EvidenceParams {
+    /// An error unless the settings make sense together.
+    pub fn check(&self) -> Result<()> {
+        let b = &self.beam;
+        let non_negative = [b.divergence, b.exit, b.range_noise, self.floor_log, self.footprint_sd, self.spread_sd, self.echoes_only_min_radius, self.min_footprints, self.min_length];
+        if !non_negative.iter().all(|&x| x.is_finite() && x >= 0.0) {
+            return Err(Error::invalid("evidence params: the beam, floor, sds, radii and lengths must be finite and not negative"));
+        }
+        if !(self.window_min > 0.0 && self.window_min <= self.window_cap && self.window_cap.is_finite()) {
+            return Err(Error::invalid("evidence params: need 0 < window_min <= window_cap"));
+        }
+        if self.rounds == 0 {
+            return Err(Error::invalid("evidence params: need at least one round"));
+        }
+        Ok(())
     }
 }
 
@@ -268,7 +294,16 @@ fn rectangle(pa: &Point, pb: &Point, window: f64) -> (usize, usize, i64, usize) 
     let alpha = (window / r_min.max(1e-9)).min(1.0).asin() + CELL;
     let zen_az = |p: &Point| ((p[2] / norm(p).max(1e-9)).clamp(-1.0, 1.0).acos(), p[0].atan2(p[1]));
     let ((za, aa), (zb, ab_)) = (zen_az(pa), zen_az(pb));
-    let (z_lo, z_hi) = (za.min(zb) - alpha, za.max(zb) + alpha);
+    let (mut z_lo, mut z_hi) = (za.min(zb), za.max(zb));
+    // the zenith along a segment turns at most once (a segment overhead dips towards the zenith), where
+    // d/dt (z / |p|) = 0, which is linear in t
+    let den = ab[2] * dot(pa, &ab) - pa[2] * dot(&ab, &ab);
+    let t_turn = (pa[2] * dot(pa, &ab) - ab[2] * dot(pa, pa)) / den;
+    if t_turn > 0.0 && t_turn < 1.0 {
+        let z = zen_az(&add(pa, &scale(&ab, t_turn))).0;
+        (z_lo, z_hi) = (z_lo.min(z), z_hi.max(z));
+    }
+    let (z_lo, z_hi) = (z_lo - alpha, z_hi + alpha);
     let turn = (ab_ - aa + PI).rem_euclid(2.0 * PI) - PI; // the short way round from a to b
     let half = alpha / z_lo.max(0.0).sin().min(z_hi.min(PI).sin()).max(1e-9);
     // a segment passing over or under the scanner (within its window in plan) sweeps every azimuth
@@ -343,19 +378,23 @@ pub fn evidence(scans: &[&ScanIndex], a: &[Point], b: &[Point], r_claim: Option<
     if n >= u32::MAX as usize || scans.len() >= u32::MAX as usize {
         return Err(Error::invalid("evidence: too many cylinders or scans"));
     }
+    p.check()?;
     pool(threads)?.install(|| Ok(evidence_on(scans, a, b, r_claim, p)))
 }
 
 fn evidence_on(scans: &[&ScanIndex], a: &[Point], b: &[Point], r_claim: Option<&[f64]>, p: &EvidenceParams) -> Evidence {
     let n = a.len();
     let cap = p.window_cap;
-    let len: Vec<f64> = (0..n).map(|i| norm(&sub(&b[i], &a[i])).max(1e-9)).collect();
-    let u: Vec<Point> = (0..n).map(|i| sub(&b[i], &a[i]).map(|x| x / len[i])).collect();
+    let len: Vec<f64> = (0..n).map(|i| norm(&sub(&b[i], &a[i]))).collect();
+    let u: Vec<Point> = (0..n).map(|i| sub(&b[i], &a[i]).map(|x| x / len[i].max(1e-9))).collect();
     let misses: Vec<bool> = scans.iter().map(|s| s.misses()).collect();
 
     // 1. once: the (pulse, cylinder) pairs within the cap, and the echoes of their pulses near the axis
     let found: Vec<(Vec<Pair>, Vec<Cand>)> = (0..n).into_par_iter().map(|c| {
         let (mut pairs, mut cands) = (Vec::new(), Vec::new());
+        if !(len[c] >= p.min_length) {
+            return (pairs, cands); // no axis: every echo near its ends would be a candidate
+        }
         for (si, s) in scans.iter().enumerate() {
             let w0 = sub(&s.origin(), &a[c]);
             let dd = dot(&w0, &u[c]);
@@ -401,7 +440,7 @@ fn evidence_on(scans: &[&ScanIndex], a: &[Point], b: &[Point], r_claim: Option<&
     // 2. rounds over the tables: assign the echoes, classify the pairs, and set each window from its calliper
     let (mut r_hat, mut win) = (vec![0.0; n], vec![cap; n]);
     let mut out = Vec::new();
-    for _ in 0..p.rounds.max(1) {
+    for round in 0..p.rounds {
         // an echo goes to the cylinder whose surface it lies nearest (ties: the lower index), among those
         // whose window holds it
         let winners: Vec<usize> = by_echo.par_chunk_by(|x, y| (x.0, x.1, x.2) == (y.0, y.1, y.2)).filter_map(|group| {
@@ -423,6 +462,9 @@ fn evidence_on(scans: &[&ScanIndex], a: &[Point], b: &[Point], r_claim: Option<&
             let at = cand_at[c]..cand_at[c + 1];
             cylinder(&pairs[c], &cands[at.clone()], &won[at], r_hat[c], win[c], r_claim.map(|r| r[c]), &misses, p)
         }).collect::<Vec<Round>>();
+        if round + 1 == p.rounds {
+            break;
+        }
         for c in 0..n {
             let (r, hi) = (out[c].med, out[c].hi);
             let w = if hi.is_finite() && hi > 0.0 { (1.5 * hi).max(hi + 0.02) } else { 2.0 * r + 0.02 };
@@ -635,6 +677,47 @@ mod tests {
         assert_eq!((&one.dir, &one.echo_start, &one.range), (&many.dir, &many.echo_start, &many.range));
         assert!(one.misses() && one.n_pulses() == shots.n_shots() && one.origin() == [0.0; 3]);
         assert!(!index(&self::shots(0.05, false), 1000).misses());
+    }
+
+    #[test]
+    fn a_segment_overhead_finds_the_pulses_towards_its_middle() {
+        // seen from the scanner, a horizontal segment overhead is nearest the zenith in its middle (11 degrees
+        // from it), not at its ends (46 degrees)
+        let mut shots = Shots::default();
+        for k in 0..21 {
+            let target = [(k as f64 - 10.0) * 0.01, 1.0, 5.0];
+            shots.direction.push(target.map(|x| x / norm(&target)));
+            shots.origin.push([0.0; 3]);
+            shots.echo_start.push(k);
+            shots.echo_count.push(1);
+            shots.echo_range.push(norm(&target) - 0.05);
+        }
+        let s = index(&shots, 100);
+        let mut seen = 0;
+        s.pulses_near(&[-5.0, 1.0, 5.0], &[5.0, 1.0, 5.0], 0.1, |_, _, _| seen += 1);
+        assert_eq!(seen, 21);
+        let e = evidence(&[&s], &[[-5.0, 1.0, 5.0]], &[[5.0, 1.0, 5.0]], None, &EvidenceParams::default(), 1).unwrap();
+        assert_eq!(e.n_hit[0], 21);
+    }
+
+    #[test]
+    fn a_cylinder_without_length_takes_no_echoes() {
+        let (s, a, b) = scene(0.05, true);
+        let alone = evidence(&[&s], &[a], &[b], None, &EvidenceParams::default(), 0).unwrap();
+        // a point on the near surface, where the echoes are
+        let dot = [0.0, 4.95, 0.0];
+        let e = evidence(&[&s], &[dot, a], &[dot, b], Some(&[0.05, 0.05]), &EvidenceParams::default(), 0).unwrap();
+        assert!(e.mu[0].is_nan() && e.tau[0] == 0.0 && (e.n_hit[0], e.n_cross[0], e.n_contra[0]) == (0, 0, 0));
+        assert_eq!((e.n_hit[1], e.mu[1], e.hi[1]), (alone.n_hit[0], alone.mu[0], alone.hi[0]));
+    }
+
+    #[test]
+    fn settings_that_dont_make_sense_are_an_error() {
+        let (s, a, b) = scene(0.05, true);
+        let defaults = EvidenceParams::default();
+        for p in [EvidenceParams { window_min: 0.3, ..defaults }, EvidenceParams { rounds: 0, ..defaults }, EvidenceParams { floor_log: -1.0, ..defaults }] {
+            assert!(evidence(&[&s], &[a], &[b], None, &p, 0).is_err());
+        }
     }
 
     #[test]
