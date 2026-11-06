@@ -103,6 +103,7 @@ class ScanIndex:
 
     @property
     def n_pulses(self) -> int:
+        """The pulses the index holds, with or without echoes."""
         return self._core.n_pulses
 
     @property
@@ -199,5 +200,19 @@ def contradicted(ev: dict[str, np.ndarray], min_count: int = 2, fraction: float 
     A tolerant audit of a fat claim on :func:`evidence` run with ``r_claim``:
     off-centre fitted axes leave honest claims a few passes inside. The
     verdict is the caller's.
+
+    Parameters
+    ----------
+    ev
+        The output of :func:`evidence` run with ``r_claim``.
+    min_count
+        Contradicting passes always needed.
+    fraction
+        Contradicting passes needed as a share of the crossings.
+
+    Returns
+    -------
+    numpy.ndarray
+        ``(n,)`` bool, one per cylinder.
     """
     return ev["n_contra"] >= np.maximum(min_count, fraction * ev["n_cross"])

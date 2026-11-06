@@ -49,6 +49,24 @@ def surface_distance(points, point_offsets, a, b, radius, cyl_offsets, k: int = 
     ``cyl_offsets[g]:cyl_offsets[g + 1]``. Each point is measured against the
     ``k`` cylinders of its group whose midpoints are nearest; a group without
     cylinders gives ``inf``.
+
+    Parameters
+    ----------
+    points
+        ``(n, 3)`` points, grouped.
+    point_offsets
+        ``n_groups + 1`` offsets into ``points``.
+    a, b, radius
+        Cylinders ``a[i] -> b[i]`` of radius ``radius[i]``, grouped.
+    cyl_offsets
+        ``n_groups + 1`` offsets into the cylinders.
+    k
+        Cylinders tried per point.
+
+    Returns
+    -------
+    numpy.ndarray
+        ``(n,)`` signed distances (m).
     """
     return _core.qsm_surface_distance(np.ascontiguousarray(points, np.float64), [int(o) for o in point_offsets],
                                       np.ascontiguousarray(a, np.float64), np.ascontiguousarray(b, np.float64),
