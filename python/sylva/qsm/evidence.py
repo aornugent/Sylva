@@ -77,8 +77,9 @@ class ScanIndex:
     """One scan's pulses, read from a single-position Shots file and indexed by direction.
 
     Built once per scan and reused by every :func:`evidence` call (about 16
-    bytes per pulse and 4 per echo, held on the Rust side). Only the angles
-    and echo ranges are read.
+    bytes per pulse and 4 per echo, 8 where the store has reflectance and
+    deviation, held on the Rust side). Only the angles, the echo ranges and
+    those two attributes are read.
 
     Parameters
     ----------
@@ -141,7 +142,16 @@ def evidence(scans, a, b, r_claim=None, params: EvidenceParams = EvidenceParams(
       line comes closest to the axis within the segment and the window, and
       hit or passed (a hit near the ends can count in ``n_hit`` alone, so it
       may exceed ``n_cross``); ``n_contra``: passes inside ``r_claim``, if
-      given (see :func:`contradicted`).
+      given (see :func:`contradicted`);
+    - ``n_core``, ``n_pen``: penetration at the measured radius ``r``. Of the
+      pulses aimed at its core (closer to the axis than ``r - band``,
+      ``band = w/2 + max(1 cm, 0.3 r)`` for axis offsets) that reached ``r``,
+      ``n_pen`` went through or stopped deep inside it. A solid forbids that
+      and foliage allows it, so ``n_pen / n_core`` is high where the hits are
+      leaves around a thinner axis;
+    - ``reflectance``, ``deviation``: the median of its hits' (dB; RIEGL
+      deviation), NaN without hits or where the scans' stores lack them.
+      Leaves return weaker, wider pulses than wood.
 
     The evidence for a cylinder depends on every cylinder that competes for
     its echoes: those within ``params.window_cap`` of an echo it could take,
@@ -165,7 +175,8 @@ def evidence(scans, a, b, r_claim=None, params: EvidenceParams = EvidenceParams(
 
     Returns
     -------
-    dict of ``(n,)`` arrays: mu, tau, lo, hi, n_hit, n_cross, n_contra, reason.
+    dict of ``(n,)`` arrays: mu, tau, lo, hi, n_hit, n_cross, n_contra, reason,
+    n_core, n_pen, reflectance, deviation.
     """
     scans = list(scans)
     if not all(isinstance(s, ScanIndex) for s in scans):

@@ -298,13 +298,15 @@ pub fn write_shots(shots: &Shots, path: impl AsRef<Path>, opts: &ShotsWriteOptio
 }
 
 /// Pulses as [`ShotsFile::read_rays`] reads them: directions as stored, echo
-/// ranges in pulse order (`echo_count` per pulse), no origins or attributes.
+/// ranges in pulse order (`echo_count` per pulse), and the echo attributes
+/// asked for as `f32`, one per name, in the echo order of `range`; no origins.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Rays {
     pub zenith: Vec<f32>,
     pub azimuth: Vec<f32>,
     pub echo_count: Vec<u32>,
     pub range: Vec<f32>,
+    pub attrs: Vec<Vec<f32>>,
 }
 
 /// An open shots file; row groups are read on demand.
@@ -478,10 +480,11 @@ impl ShotsFile {
         Ok(shots)
     }
 
-    /// The beams of one row group as stored, in single precision: angles and
-    /// echo ranges only, without origins or echo attributes (several times
-    /// faster than [`ShotsFile::read_group`] where those aren't needed).
-    pub fn read_rays(&self, group: usize) -> Result<Rays> {
+    /// The beams of one row group as stored, in single precision: angles,
+    /// echo ranges and the numeric echo attributes named in `attrs` (see
+    /// [`ShotsFile::attr_names`]), without origins (several times faster than
+    /// [`ShotsFile::read_group`] where those aren't needed).
+    pub fn read_rays(&self, group: usize, attrs: &[&str]) -> Result<Rays> {
         let rg = self.reader.get_row_group(group)?;
         let rows = rg.metadata().num_rows() as usize;
         let first = if self.per_pulse { 3 } else { 1 }; // the origin columns come first
@@ -503,7 +506,24 @@ impl ShotsFile {
                 _ => echo_count.push(l as u32),
             }
         }
-        Ok(Rays { zenith, azimuth, echo_count, range })
+        let attrs = attrs.iter().map(|&name| {
+            let i = self.attrs.iter().position(|a| a.0 == name).ok_or_else(|| Error::invalid(format!("shots file: no echo attribute {name:?}")))?;
+            let c = rg.get_column_reader(first + 3 + i)?; // the attributes follow the ranges, in order
+            let ints = |c| read_values::<Int32Type>(c, rows, true, reader_of!(Int32ColumnReader)).map(|v| v.0);
+            let v: Vec<f32> = match self.attrs[i].1.as_str() {
+                "float32" => read_values::<FloatType>(c, rows, true, reader_of!(FloatColumnReader))?.0,
+                "float64" => read_values::<DoubleType>(c, rows, true, reader_of!(DoubleColumnReader))?.0.into_iter().map(|x| x as f32).collect(),
+                "int64" => read_values::<Int64Type>(c, rows, true, reader_of!(Int64ColumnReader))?.0.into_iter().map(|x| x as f32).collect(),
+                "uint32" => ints(c)?.into_iter().map(|x| x as u32 as f32).collect(),
+                "int32" | "uint16" | "uint8" | "int8" => ints(c)?.into_iter().map(|x| x as f32).collect(),
+                other => return Err(Error::invalid(format!("shots file: echo attribute {name:?} is {other}, not numeric"))),
+            };
+            if v.len() != range.len() {
+                return Err(Error::invalid(format!("shots file: attribute {name:?} does not match the echoes")));
+            }
+            Ok(v)
+        }).collect::<Result<_>>()?;
+        Ok(Rays { zenith, azimuth, echo_count, range, attrs })
     }
 
     /// Read every row group into one [`Shots`].

@@ -151,7 +151,7 @@ impl Default for EvidenceParams {
 impl EvidenceParams {
     /// Bumped whenever the evidence changes for the same settings, so a
     /// cache keyed on the settings and this can trust what it holds.
-    pub const VERSION: u32 = 1;
+    pub const VERSION: u32 = 2;
 
     /// An error unless the settings make sense together.
     pub fn check(&self) -> Result<()> {
@@ -227,8 +227,14 @@ pub struct ScanIndex {
     /// Pulse `p`'s echoes are `range[echo_start[p]..echo_start[p + 1]]`, nearest first.
     echo_start: Vec<u32>,
     range: Vec<f32>,
+    /// Each echo's reflectance (0.01 dB) and deviation, in `range` order; empty where the store has none.
+    reflectance: Vec<i16>,
+    deviation: Vec<u16>,
     cell_start: Vec<u32>,
 }
+
+/// The echo attributes a [`ScanIndex`] keeps, where the store has them.
+const CHARACTER: [&str; 2] = ["reflectance", "deviation"];
 
 impl ScanIndex {
     /// Index a single-position Shots file, reading only angles and ranges,
@@ -238,22 +244,29 @@ impl ScanIndex {
         let [origin] = *file.scans() else {
             return Err(Error::invalid("ScanIndex: the shots file must hold exactly one scan position"));
         };
+        let names: Vec<&str> = file.attr_names().filter(|a| CHARACTER.contains(a)).collect();
         pool(threads)?.install(|| {
             // a handle per row group: handles share no file position
-            let groups: Vec<Rays> = (0..file.n_groups()).into_par_iter().map(|g| file.reopen()?.read_rays(g)).collect::<Result<_>>()?;
-            let mut rays = Rays::default();
+            let groups: Vec<Rays> = (0..file.n_groups()).into_par_iter().map(|g| file.reopen()?.read_rays(g, &names)).collect::<Result<_>>()?;
+            let mut rays = Rays { attrs: vec![Vec::new(); names.len()], ..Default::default() };
             for g in groups {
                 rays.zenith.extend(g.zenith);
                 rays.azimuth.extend(g.azimuth);
                 rays.echo_count.extend(g.echo_count);
                 rays.range.extend(g.range);
+                for (all, a) in rays.attrs.iter_mut().zip(g.attrs) {
+                    all.extend(a);
+                }
             }
-            Self::build(origin, rays)
+            let mut attr = |name| names.iter().position(|&a| a == name).map(|i| std::mem::take(&mut rays.attrs[i])).unwrap_or_default();
+            let (refl, dev) = (attr("reflectance"), attr("deviation"));
+            Self::build(origin, rays, &refl, &dev)
         })
     }
 
-    /// Put the pulses in direction-cell order (a stable counting sort).
-    fn build(origin: Point, rays: Rays) -> Result<Self> {
+    /// Put the pulses in direction-cell order (a stable counting sort), with
+    /// the echoes' reflectance (dB) and deviation, if any (else empty).
+    fn build(origin: Point, rays: Rays, refl: &[f32], dev: &[f32]) -> Result<Self> {
         let n = rays.zenith.len();
         if n >= u32::MAX as usize || rays.range.len() >= u32::MAX as usize {
             return Err(Error::invalid("ScanIndex: too many pulses or echoes for one scan"));
@@ -285,8 +298,19 @@ impl ScanIndex {
             echo_start.push(echo_start[echo_start.len() - 1] + rays.echo_count[p as usize]);
         }
         let dir = src.par_iter().map(|&p| direction(rays.zenith[p as usize] as f64, rays.azimuth[p as usize] as f64).map(|x| x as f32)).collect();
-        let range = src.par_iter().flat_map_iter(|&p| &rays.range[from[p as usize] as usize..from[p as usize + 1] as usize]).copied().collect();
-        Ok(ScanIndex { origin, misses, dir, echo_start, range, cell_start })
+        let echoes = |v: &[f32]| -> Vec<f32> { if v.is_empty() { return Vec::new() } src.par_iter().flat_map_iter(|&p| &v[from[p as usize] as usize..from[p as usize + 1] as usize]).copied().collect() };
+        let range = echoes(&rays.range);
+        // `as` saturates: +-327 dB and deviations above 65535 are out of any scanner's range anyway
+        let reflectance = echoes(refl).into_iter().map(|x| (x * 100.0).round() as i16).collect();
+        let deviation = echoes(dev).into_iter().map(|x| x.round() as u16).collect();
+        Ok(ScanIndex { origin, misses, dir, echo_start, range, reflectance, deviation, cell_start })
+    }
+
+    /// The reflectance (dB) and deviation of echo `k` of `pulse`, NaN where
+    /// the store has none.
+    pub fn character(&self, pulse: u32, k: u32) -> (f64, f64) {
+        let e = self.echo_start[pulse as usize] as usize + k as usize;
+        (self.reflectance.get(e).map_or(f64::NAN, |&x| x as f64 / 100.0), self.deviation.get(e).map_or(f64::NAN, |&x| x as f64))
     }
 
     /// The scanner position.
@@ -307,7 +331,7 @@ impl ScanIndex {
 
     /// The bytes the index holds.
     pub fn nbytes(&self) -> usize {
-        size_of_val(&self.dir[..]) + size_of_val(&self.echo_start[..]) + size_of_val(&self.range[..]) + size_of_val(&self.cell_start[..])
+        size_of_val(&self.dir[..]) + size_of_val(&self.echo_start[..]) + size_of_val(&self.range[..]) + size_of_val(&self.reflectance[..]) + size_of_val(&self.deviation[..]) + size_of_val(&self.cell_start[..])
     }
 
     /// Calls `f(pulse, direction, echo ranges)` for every pulse whose line
@@ -377,6 +401,15 @@ pub struct Evidence {
     pub n_contra: Vec<u32>,
     /// Why `tau` is what it is: one of [`reason`].
     pub reason: Vec<u8>,
+    /// Penetration at the measured radius: pulses aimed at its core that
+    /// reached it (`n_core`), and those of them that went through or stopped
+    /// deep inside it (`n_pen`). Wood stops nearly all; foliage lets many by.
+    pub n_core: Vec<u32>,
+    pub n_pen: Vec<u32>,
+    /// The median reflectance (dB) and deviation of its hits, NaN without
+    /// hits or where the store has no such attribute.
+    pub reflectance: Vec<f64>,
+    pub deviation: Vec<f64>,
 }
 
 /// A pulse whose line passes within the window cap of a cylinder's axis,
@@ -390,6 +423,8 @@ struct Pair {
     t: f32,
     /// The pulse went on past `t`: its last echo is beyond, or it missed.
     beyond: bool,
+    /// Its last echo is the last of its candidates: where it stopped, beside the segment.
+    last_cand: bool,
 }
 
 /// An echo, the `k`-th of a scan's pulse, at `q` from a cylinder's axis and
@@ -413,6 +448,10 @@ struct Round {
     n_cross: u32,
     n_contra: u32,
     reason: u8,
+    n_core: u32,
+    n_pen: u32,
+    reflectance: f64,
+    deviation: f64,
 }
 
 /// The evidence the `scans` give about cylinders `a[i] -> b[i]`; `r_claim`,
@@ -466,7 +505,8 @@ fn evidence_on(scans: &[&ScanIndex], a: &[Point], b: &[Point], r_claim: Option<&
                 let last = echoes.last().map_or(f64::INFINITY, |&r| r as f64); // infinite for a miss
                 // a pulse that stopped short without an echo near the axis is neither a hit nor a pass
                 if s_ax > 0.0 && s_ax < len[c] && (last > t_ray || cands.len() > first) {
-                    pairs.push(Pair { cand: first, n_cand: (cands.len() - first) as u32, d: dist as f32, t: t_ray as f32, beyond: last > t_ray });
+                    let last_cand = cands.len() > first && cands[cands.len() - 1].k as usize + 1 == echoes.len();
+                    pairs.push(Pair { cand: first, n_cand: (cands.len() - first) as u32, d: dist as f32, t: t_ray as f32, beyond: last > t_ray, last_cand });
                 }
             });
         }
@@ -508,7 +548,7 @@ fn evidence_on(scans: &[&ScanIndex], a: &[Point], b: &[Point], r_claim: Option<&
         }
         out = (0..n).into_par_iter().map(|c| {
             let at = cand_at[c]..cand_at[c + 1];
-            cylinder(&pairs[c], &cands[at.clone()], &won[at], r_hat[c], win[c], r_claim.map(|r| r[c]), &misses, p)
+            cylinder(&pairs[c], &cands[at.clone()], &won[at], r_hat[c], win[c], r_claim.map(|r| r[c]), scans, &misses, p)
         }).collect::<Vec<Round>>();
         if round + 1 == p.rounds {
             break;
@@ -526,6 +566,10 @@ fn evidence_on(scans: &[&ScanIndex], a: &[Point], b: &[Point], r_claim: Option<&
         n_cross: out.iter().map(|o| o.n_cross).collect(),
         n_contra: out.iter().map(|o| o.n_contra).collect(),
         reason: out.iter().map(|o| o.reason).collect(),
+        n_core: out.iter().map(|o| o.n_core).collect(),
+        n_pen: out.iter().map(|o| o.n_pen).collect(),
+        reflectance: out.iter().map(|o| o.reflectance).collect(),
+        deviation: out.iter().map(|o| o.deviation).collect(),
     }
 }
 
@@ -533,7 +577,7 @@ fn evidence_on(scans: &[&ScanIndex], a: &[Point], b: &[Point], r_claim: Option<&
 /// surface `r_prev`), its pairs within the window `win` as hits, passes or
 /// neither, and what they say. `misses[s]`: whether scan `s` kept misses.
 #[allow(clippy::too_many_arguments)]
-fn cylinder(pairs: &[Pair], cands: &[Cand], won: &[bool], r_prev: f64, win: f64, r_claim: Option<f64>, misses: &[bool], p: &EvidenceParams) -> Round {
+fn cylinder(pairs: &[Pair], cands: &[Cand], won: &[bool], r_prev: f64, win: f64, r_claim: Option<f64>, scans: &[&ScanIndex], misses: &[bool], p: &EvidenceParams) -> Round {
     let resid = |k: usize| (cands[k].q as f64 - r_prev).abs();
     let mut hits: Vec<&Cand> = Vec::new();
     for run in (0..cands.len()).collect::<Vec<_>>().chunk_by(|&x, &y| (cands[x].scan, cands[x].pulse) == (cands[y].scan, cands[y].pulse)) {
@@ -555,11 +599,19 @@ fn cylinder(pairs: &[Pair], cands: &[Cand], won: &[bool], r_prev: f64, win: f64,
     }
     let n_cross = (hit_d.len() + pass_d.len()) as u32;
     let (lo, hi) = if n_cross > 0 { calliper(&hit_d, &pass_d, 2) } else { (0.0, f64::INFINITY) };
-    let mut out = Round { med: 0.0, mu: f64::NAN, tau: 0.0, lo, hi, n_hit: hits.len() as u32, n_cross, n_contra, reason: reason::NO_HITS };
+    let mut out = Round {
+        med: 0.0, mu: f64::NAN, tau: 0.0, lo, hi, n_hit: hits.len() as u32, n_cross, n_contra, reason: reason::NO_HITS,
+        n_core: 0, n_pen: 0, reflectance: f64::NAN, deviation: f64::NAN,
+    };
     if hits.is_empty() {
         return out;
     }
     let m = median(&hits.iter().map(|e| e.q as f64).collect::<Vec<_>>());
+    (out.n_core, out.n_pen) = penetration(pairs, cands, won, m.max(1e-4), win, p);
+    let character: Vec<(f64, f64)> = hits.iter().map(|e| scans[e.scan as usize].character(e.pulse, e.k)).collect();
+    let finite_median = |v: Vec<f64>| if v.is_empty() { f64::NAN } else { median(&v) };
+    out.reflectance = finite_median(character.iter().map(|c| c.0).filter(|x| x.is_finite()).collect());
+    out.deviation = finite_median(character.iter().map(|c| c.1).filter(|x| x.is_finite()).collect());
     let w = median(&hits.iter().map(|e| p.beam.footprint(e.range as f64)).collect::<Vec<_>>());
     let spread = 1.4826 * median(&hits.iter().map(|e| (e.q as f64 - m).abs()).collect::<Vec<_>>());
     let mut per_scan = vec![0.0; misses.len()];
@@ -586,6 +638,33 @@ fn cylinder(pairs: &[Pair], cands: &[Cand], won: &[bool], r_prev: f64, win: f64,
         reason::MEASURED
     };
     out
+}
+
+/// Penetration at radius `r`: `(n_core, n_pen)`. A pulse aimed at the core
+/// (`d < r - band`, `band = w/2 + max(1 cm, 0.3 r)` for axis offsets) that
+/// reached `r` either went through (it went on past the axis and its last
+/// echo isn't within `r + band` of it) or stopped at its last echo `q` from
+/// the axis: by the surface (`q` within `band` of `r`), or deep inside
+/// (`q < r - band`). Through or deep is penetration, which a solid of radius
+/// `r` forbids and foliage allows. A pulse that stopped short of `r + band`
+/// (or before the segment), or whose last echo went to a neighbour or a fork
+/// (not won here, but within the window), says nothing.
+fn penetration(pairs: &[Pair], cands: &[Cand], won: &[bool], r: f64, win: f64, p: &EvidenceParams) -> (u32, u32) {
+    let (mut n_core, mut n_pen) = (0, 0);
+    for pr in pairs {
+        let band = p.beam.footprint(pr.t as f64) / 2.0 + (0.3 * r).max(0.01);
+        let last = pr.last_cand.then(|| pr.cand + pr.n_cand as usize - 1);
+        if pr.d as f64 >= r - band || last.is_some_and(|k| !won[k] && (cands[k].q as f64) < win) {
+            continue;
+        }
+        let q = last.map_or(f64::INFINITY, |k| cands[k].q as f64);
+        if (pr.beyond && q > r + band) || q < r - band {
+            (n_core, n_pen) = (n_core + 1, n_pen + 1);
+        } else if q <= r + band {
+            n_core += 1;
+        }
+    }
+    (n_core, n_pen)
 }
 
 /// The radius as a distance threshold separating pulses that hit (`hit_d`,
@@ -751,6 +830,62 @@ mod tests {
         // and the window then closes on the calliper, leaving them out
         let e = evidence(&[&s], &[a], &[b], None, &EvidenceParams::default(), 0).unwrap();
         assert!(e.n_hit[0] == 0 && e.reason[0] == reason::NO_HITS, "{e:?}");
+    }
+
+    /// A porous ball of leaves (radius 12 cm, reflectance -20 dB, deviation
+    /// 15) around a point 5 m from the scanner, before a wall (-10 dB,
+    /// deviation 3): a pulse into the ball stops on a leaf at a random depth
+    /// half the time, else goes on to the wall. Echoes only, as an export.
+    fn leaf_ball() -> Shots {
+        let (c, rad) = ([0.0, 5.0, 0.0], 0.12);
+        let mut seed = 7u64;
+        let mut uniform = move || {
+            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            (seed >> 11) as f64 / (1u64 << 53) as f64
+        };
+        let mut shots = Shots::default();
+        let (mut refl, mut dev) = (Vec::new(), Vec::new());
+        for i in 0..121 {
+            for j in 0..201 {
+                let (az, zen) = (-0.03 + i as f64 * 0.0005, std::f64::consts::FRAC_PI_2 - 0.05 + j as f64 * 0.0005);
+                let d = [zen.sin() * az.sin(), zen.sin() * az.cos(), zen.cos()];
+                let tc = dot(&d, &c);
+                let gap2 = dot(&c, &c) - tc * tc;
+                shots.echo_start.push(shots.echo_range.len());
+                if gap2 < rad * rad && uniform() < 0.5 {
+                    let half = (rad * rad - gap2).sqrt();
+                    shots.echo_range.push(tc - half + 2.0 * half * uniform());
+                    (refl.push(-20.0f32), dev.push(15u16));
+                } else {
+                    shots.echo_range.push(8.0 / d[1]);
+                    (refl.push(-10.0), dev.push(3));
+                }
+                shots.echo_count.push(1);
+                shots.origin.push([0.0; 3]);
+                shots.direction.push(d);
+            }
+        }
+        shots.echo_attrs.insert("reflectance".into(), crate::pointcloud::Attr::F32(refl));
+        shots.echo_attrs.insert("deviation".into(), crate::pointcloud::Attr::U16(dev));
+        shots
+    }
+
+    #[test]
+    fn foliage_lets_pulses_through_its_core_and_wood_does_not() {
+        let (s, a, b) = scene(0.05, true);
+        let e = evidence(&[&s], &[a], &[b], None, &EvidenceParams::default(), 0).unwrap();
+        assert!(e.n_core[0] > 100 && e.n_pen[0] * 50 <= e.n_core[0], "solid wood: {} of {} core pulses through", e.n_pen[0], e.n_core[0]);
+        assert!(e.reflectance[0].is_nan() && e.deviation[0].is_nan(), "a store without echo character");
+        let s = index(&leaf_ball(), 10_000);
+        let (a, b) = ([0.0, 5.0, -0.1], [0.0, 5.0, 0.1]);
+        for rounds in [1, 3] {
+            let e = evidence(&[&s], &[a], &[b], None, &EvidenceParams { rounds, ..Default::default() }, 0).unwrap();
+            assert!(rounds > 1 || e.n_hit[0] > 0, "the first round's window holds the leaves");
+            if e.n_hit[0] > 0 {
+                assert!(e.n_core[0] > 20 && e.n_pen[0] * 2 > e.n_core[0], "leaves: {} of {} core pulses through ({e:?})", e.n_pen[0], e.n_core[0]);
+                assert_eq!((e.reflectance[0], e.deviation[0]), (-20.0, 15.0));
+            }
+        }
     }
 
     #[test]

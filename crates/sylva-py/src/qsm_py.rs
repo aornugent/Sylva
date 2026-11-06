@@ -466,6 +466,10 @@ fn qsm_evidence<'py>(py: Python<'py>, scans: Vec<Bound<'py, PyScanIndex>>, a: Py
     d.set_item("n_cross", e.n_cross.into_pyarray(py))?;
     d.set_item("n_contra", e.n_contra.into_pyarray(py))?;
     d.set_item("reason", e.reason.into_pyarray(py))?;
+    d.set_item("n_core", e.n_core.into_pyarray(py))?;
+    d.set_item("n_pen", e.n_pen.into_pyarray(py))?;
+    d.set_item("reflectance", e.reflectance.into_pyarray(py))?;
+    d.set_item("deviation", e.deviation.into_pyarray(py))?;
     Ok(d)
 }
 
