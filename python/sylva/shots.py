@@ -404,40 +404,6 @@ class Shots:
         return cls._from_core(_core.shots_from_pointcloud(cloud.xyz, cloud.attrs, tuple(origin)))
 
     @classmethod
-    def from_scan(cls, cloud: PointCloud, fill_missing: bool | tuple[float, float] | None = None,
-                  return_report: bool = False) -> Shots | tuple[Shots, dict | None]:
-        """Pulses from one scan's points in the scanner frame, in any order.
-
-        Use for a single-scan LAS/LAZ/COPC export (e.g. RiSCAN's
-        ``SINGLESCANS``), which stores points spatially rather than in firing
-        order. Points are sorted by ``gps_time`` and grouped into pulses as in
-        :meth:`from_pointcloud`; ``return_number`` and ``number_of_returns``
-        are kept as ``las_return_number`` and ``las_number_of_returns``.
-        Apply the scan's SOP afterwards with :meth:`transform`.
-
-        Parameters
-        ----------
-        cloud
-            Points of one scan position in its own frame (origin at the
-            scanner), with ``gps_time``.
-        fill_missing
-            Recover the pulses that returned nothing from the pulse timing,
-            as :func:`sylva.io.read_rxp_shots` does: ``True``, or the sweep's
-            ``(first, last)`` zenith in degrees from the scan pattern. A pulse
-            whose every echo the export dropped is recovered as a miss.
-        return_report
-            Also return what the reconstruction measured (see
-            :func:`sylva.io.read_rxp_shots`).
-
-        Returns
-        -------
-        Shots, or (Shots, dict | None) with ``return_report``
-        """
-        core, report = _core.shots_from_scan_points(cloud.xyz, cloud.attrs, fill_missing)
-        shots = cls._from_core(core)
-        return (shots, report) if return_report else shots
-
-    @classmethod
     def from_ray_cloud(cls, cloud: PointCloud) -> Shots:
         """From a raycloudtools ray cloud. ``nx, ny, nz`` (PLY) or ``sx, sy, sz``
         (LAS/LAZ) point from each end point back to the sensor; ``bound == 0``

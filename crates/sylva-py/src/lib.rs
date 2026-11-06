@@ -496,20 +496,22 @@ fn read_rxp_shots<'py>(py: Python<'py>, path: PathBuf, library: Option<PathBuf>,
     let mut opts = rxp_opts(library, drop_pseudo_echoes, min_range, max_range, stride, max_points, echoes, shot_stride, mta, max_zone, keep_uncertain, shim, max_lines, mta_model)?;
     (opts.fill_missing, opts.zenith_range) = fill_option(fill_missing)?;
     let (s, report) = py.detach(|| io::riegl::read_rxp_shots_with_report(&path, &opts)).map_err(err)?;
-    Ok((shots_to_py(py, &s)?, report.map(|r| miss_report_to_py(py, &r)).transpose()?))
-}
-
-fn miss_report_to_py<'py>(py: Python<'py>, r: &sylva_rs::shots::reconstruct::MissReport) -> PyResult<Bound<'py, PyDict>> {
-    let d = PyDict::new(py);
-    d.set_item("n_lines", r.n_lines)?;
-    d.set_item("pulse_interval", r.pulse_interval)?;
-    d.set_item("zenith_step", r.zenith_step)?;
-    d.set_item("zenith_range", r.zenith_range)?;
-    d.set_item("n_gap", r.n_gap)?;
-    d.set_item("n_before", r.n_before)?;
-    d.set_item("n_after", r.n_after)?;
-    d.set_item("n_misses", r.n_misses())?;
-    Ok(d)
+    let report = match report {
+        Some(r) => {
+            let d = PyDict::new(py);
+            d.set_item("n_lines", r.n_lines)?;
+            d.set_item("pulse_interval", r.pulse_interval)?;
+            d.set_item("zenith_step", r.zenith_step)?;
+            d.set_item("zenith_range", r.zenith_range)?;
+            d.set_item("n_gap", r.n_gap)?;
+            d.set_item("n_before", r.n_before)?;
+            d.set_item("n_after", r.n_after)?;
+            d.set_item("n_misses", r.n_misses())?;
+            Some(d)
+        }
+        None => None,
+    };
+    Ok((shots_to_py(py, &s)?, report))
 }
 
 #[pyfunction]
@@ -627,15 +629,6 @@ fn tile_ray_clouds<'py>(py: Python<'py>, files: Vec<PathBuf>, out: PathBuf, widt
         })
         .collect::<PyResult<_>>()?;
     Ok((tiles, n_terrain))
-}
-
-#[pyfunction]
-#[pyo3(signature = (xyz, attrs=None, fill_missing=None))]
-fn shots_from_scan_points<'py>(py: Python<'py>, xyz: PyReadonlyArray2<f64>, attrs: Option<&Bound<'_, PyDict>>, fill_missing: Option<&Bound<'py, PyAny>>) -> PyResult<(Bound<'py, PyDict>, Option<Bound<'py, PyDict>>)> {
-    let c = cloud_from_py(xyz, attrs)?;
-    let (fill, zenith_range) = fill_option(fill_missing)?;
-    let (s, report) = py.detach(|| Shots::from_scan_points(&c, fill, zenith_range)).map_err(err)?;
-    Ok((shots_to_py(py, &s)?, report.map(|r| miss_report_to_py(py, &r)).transpose()?))
 }
 
 #[pyfunction]
@@ -1906,7 +1899,6 @@ fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
         wrap_pyfunction!(find_rdblib, m)?,
         wrap_pyfunction!(read_matrix_file, m)?,
         wrap_pyfunction!(shots_from_pointcloud, m)?,
-        wrap_pyfunction!(shots_from_scan_points, m)?,
         wrap_pyfunction!(tile_ray_clouds, m)?,
         wrap_pyfunction!(qsm_surface_support, m)?,
         wrap_pyfunction!(qsm_surface_distance, m)?,
