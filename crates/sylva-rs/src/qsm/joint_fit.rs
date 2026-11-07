@@ -68,8 +68,16 @@ pub struct PriorParams {
     pub scan_rel: f64,
 }
 
+impl Default for PriorParams {
+    /// The calibration for TERN's Alice Mulga exports (3dtrees research 74 §14): real axes and scans are freer
+    /// than a synthetic bench's.
+    fn default() -> Self {
+        PriorParams { lam_prior: 1.0, lam_sd: 2.0, sig_ell: 1.0, sig_eta: 0.05, mu_fork: 0.10, sig_fork: 0.17, sig_root: 0.5, r_tip: 0.0, sig_tip: 0.3, sig_delta: 0.02, centre_rel: 1.0, centre_abs: 0.003, scan_abs: 0.002, scan_rel: 0.3 }
+    }
+}
+
 impl PriorParams {
-    fn check(&self) -> Result<()> {
+    pub(crate) fn check(&self) -> Result<()> {
         let sds = [("lam_prior", self.lam_prior), ("lam_sd", self.lam_sd), ("sig_ell", self.sig_ell), ("sig_eta", self.sig_eta), ("sig_fork", self.sig_fork), ("sig_root", self.sig_root), ("sig_delta", self.sig_delta)];
         if let Some((k, _)) = sds.iter().find(|(_, v)| !(v.is_finite() && *v > 0.0)) {
             return Err(Error::invalid(format!("joint fit: {k} must be positive")));

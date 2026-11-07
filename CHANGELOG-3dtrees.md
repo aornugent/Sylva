@@ -2,6 +2,14 @@
 
 `main` mirrors upstream; `develop` is ours (`git log main..develop`). Newest first.
 
+- `qsm.joint_tree` (Python `sylva.qsm.joint_tree`, with `JointParams` and `JointReason`) fits the joint model to one tree in one call: its rows and its neighbours' cylinders in, a fitted row per stem out. 3dtrees' screen and candidates call it per tree, as they call `evidence`; its table, ownership, split and existence were Python orchestration. Inside:
+  - each row's tube is decided once (`qsm.joint::window`);
+  - clump rows are split into their solid stems as child rows (`src`);
+  - each stop goes to the row whose surface explains it, the neighbours held at their claims;
+  - a row whose own profile beats its fit restarts from the profile;
+  - existence per row (`log_odds`, `p_wood`, `reason`), with outputs in world coordinates.
+
+  The likelihood's detection now also needs wood wide enough to give the share τ of the footprint: a radius near 0 still detected pulses near its axis, so "no wood" wasn't. That changes nothing for wood wider than about 1.2 mm at 20 m. Additive, apart from that change to the joint likelihood for thin wood.
 - `ScanIndex` keeps each echo's return number (`las_return_number`, 1 B per echo), and `qsm.pairs` reports it with each pulse's number of returns (`return_number`, `returns`). `qsm.joint::deleted` places each echo the export deleted between its recorded neighbours. `joint_table` keeps the passes it used to drop, flagging (`deleted`) those where a deleted echo could lie in the chord, and the likelihood's new `hide` makes such a pass a mixture with a deleted stop. Dropping every pass by a pulse with a deleted echo threw away pulses whose deleted echo lay elsewhere (on 3dtrees' clean stems, 89 % of them). Changes the joint table on stores with return counts; `pairs` gains columns.
 - `qsm.joint_fit` converges honestly and says more. Changes:
   - **Optimiser:** saddle-free Newton with a projected line search. A stage converges on its Newton decrement or on a stalled objective, and reports not converged when no step improves it. The old damping called a stalled step converged and stopped 23,000 short on a real tree.
