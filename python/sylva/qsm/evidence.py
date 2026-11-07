@@ -77,10 +77,11 @@ Reason = IntEnum("Reason", _core.qsm_evidence_reasons())
 class ScanIndex:
     """One scan's pulses, read from a single-position Shots file and indexed by direction.
 
-    Built once per scan and reused by every :func:`evidence` and :func:`pairs` call (about 16
-    bytes per pulse and 4 per echo, 8 where the store has reflectance and
-    deviation, held on the Rust side). Only the angles, the echo ranges and
-    those two attributes are read.
+    Built once per scan and reused by every :func:`evidence`, :func:`pairs` and
+    :func:`~sylva.qsm.joint_table` call (about 16 bytes per pulse, 17 where the
+    store has ``las_number_of_returns``, and 4 per echo, 8 where it has
+    reflectance and deviation, held on the Rust side). Only the angles, the
+    echo ranges and those three attributes are read.
 
     Parameters
     ----------

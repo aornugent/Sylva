@@ -3,17 +3,19 @@
 // Free software under the GNU General Public License v3.0 or later;
 // see the LICENSE file. There is no warranty, to the extent permitted by law.
 //! The fit of the joint wood, foliage and ray model ([`crate::qsm::joint`]):
-//! MAP by continuation and damped saddle-free Newton, then its Laplace
-//! summary.
+//! MAP by continuation and saddle-free Newton with a line search, then its
+//! Laplace summary.
 //!
 //! The unknowns are, per row (a cylinder), its axis offset across the axis
 //! (two, in the row's frame), `eta = log R` and `ell = log lambda`; and per
 //! (scan, branch) a nuisance offset `nu` that the scan's view of the branch
 //! is shifted by (sway, registration). The prior is a Gaussian Markov field
 //! over the tree: anchors of the centre on the starting axis, of foliage on
-//! its prior, of the level at a base; along a branch, the taper's steps (the
-//! prior radii's own) and a random walk of the centre; at a fork, soft
-//! Leonardo with the prior radii's area shares; foliage a random walk.
+//! its prior, of the level at a base and (optionally) of the radius at a tip;
+//! along a branch, the taper's steps (the prior radii's own) and a random walk
+//! of the centre; at a fork, soft Leonardo with the prior radii's area shares;
+//! foliage a random walk. A radius is capped at its row's `r_max` (the tube
+//! the pairs were taken in: wood wider than it is unobserved).
 //!
 //! A branch is a chain of rows between forks. Every likelihood term lies
 //! within one branch (a (row, scan) group touches its row and its scan's nu
@@ -26,12 +28,14 @@
 //!
 //! Newton is saddle-free: each group's 4x4 Hessian is replaced by the
 //! absolute value of its eigenvalues, so a block that isn't concave (a fat
-//! claim off-centre) still gives curvature in every direction. The
-//! likelihood's surface kernel is widened for the first stages and narrowed
-//! to its physical width (continuation): at that width the likelihood is a
-//! needle around the true surface, which local steps from a poor start miss.
+//! claim off-centre) still gives curvature in every direction; a backtracking
+//! line search takes the step (see [`FitOptions::tol`] for when a stage has
+//! converged). The likelihood's surface
+//! kernel is widened for the first stages and narrowed to its physical width
+//! (continuation): at that width the likelihood is a needle around the true
+//! surface, which local steps from a poor start miss.
 
-use nalgebra::{DMatrix, DVector, Matrix3, Matrix4, SymmetricEigen};
+use nalgebra::{DMatrix, DVector, Matrix2, Matrix3, Matrix4, SymmetricEigen};
 
 use crate::error::{Error, Result};
 use crate::qsm::joint::{frames, joint_blocks, joint_loglik, JointParams, Owner, Pulse};
@@ -50,6 +54,10 @@ pub struct PriorParams {
     pub mu_fork: f64,
     pub sig_fork: f64,
     pub sig_root: f64,
+    /// A tip's radius (m; 0: no anchor) and its log sd, at rows without
+    /// children.
+    pub r_tip: f64,
+    pub sig_tip: f64,
     /// The centre: its random walk (m per sqrt(m)) and its anchor on the
     /// starting axis, `centre_rel r_prior + centre_abs`.
     pub sig_delta: f64,
@@ -60,6 +68,26 @@ pub struct PriorParams {
     pub scan_rel: f64,
 }
 
+impl PriorParams {
+    fn check(&self) -> Result<()> {
+        let sds = [("lam_prior", self.lam_prior), ("lam_sd", self.lam_sd), ("sig_ell", self.sig_ell), ("sig_eta", self.sig_eta), ("sig_fork", self.sig_fork), ("sig_root", self.sig_root), ("sig_delta", self.sig_delta)];
+        if let Some((k, _)) = sds.iter().find(|(_, v)| !(v.is_finite() && *v > 0.0)) {
+            return Err(Error::invalid(format!("joint fit: {k} must be positive")));
+        }
+        let shares = [("mu_fork", self.mu_fork), ("centre_rel", self.centre_rel), ("centre_abs", self.centre_abs), ("scan_abs", self.scan_abs), ("scan_rel", self.scan_rel), ("r_tip", self.r_tip)];
+        if let Some((k, _)) = shares.iter().find(|(k, v)| !v.is_finite() || (*k != "mu_fork" && *v < 0.0)) {
+            return Err(Error::invalid(format!("joint fit: {k} must be finite (and not negative)")));
+        }
+        if self.centre_rel == 0.0 && self.centre_abs == 0.0 {
+            return Err(Error::invalid("joint fit: the centre anchor needs centre_rel or centre_abs"));
+        }
+        if self.r_tip > 0.0 && !(self.sig_tip.is_finite() && self.sig_tip > 0.0) {
+            return Err(Error::invalid("joint fit: a tip anchor needs a positive sig_tip"));
+        }
+        Ok(())
+    }
+}
+
 /// How the fit runs.
 #[derive(Debug, Clone, PartialEq)]
 pub struct FitOptions {
@@ -68,15 +96,23 @@ pub struct FitOptions {
     pub schedule: Vec<f64>,
     /// Newton iterations per stage at most.
     pub iters: usize,
-    /// Converged when an iteration improves the objective by less than
-    /// `tol (1 + |objective|)`.
+    /// A stage has converged when its Newton decrement, or the objective's
+    /// gain over its last ten iterations, is below `tol (1 + |objective|)`.
+    /// The likelihood is only piecewise smooth (clamps, the silhouette), so at
+    /// its maximum the decrement need not vanish.
     pub tol: f64,
     pub threads: usize,
 }
 
+/// The `eta - eta_hat` offsets of [`Fit::profile`].
+pub fn profile_grid() -> [f64; 21] {
+    std::array::from_fn(|i| -1.5 + 0.125 * i as f64)
+}
+
 /// The fit: the MAP state, Laplace sds of each row's unknowns, the share of
-/// eta's posterior precision from the row's own rays (`rho_local`) and the
-/// reduction of its variance from the prior's (`rho_pooled`).
+/// eta's posterior precision from the row's own rays (`rho_local`, each scan's
+/// nuisance integrated out) and the reduction of its variance from the
+/// prior's (`rho_pooled`).
 #[derive(Debug, Clone, PartialEq)]
 pub struct Fit {
     pub theta: Vec<[f64; 4]>,
@@ -84,19 +120,32 @@ pub struct Fit {
     pub sd: Vec<[f64; 4]>,
     pub rho_local: Vec<f64>,
     pub rho_pooled: Vec<f64>,
+    /// Each row's likelihood message at the MAP: the gradient and Hessian of
+    /// its own pairs' log likelihood in its state (the nuisances held), from
+    /// which a new prior re-solves the tree without the rays.
+    pub grad: Vec<[f64; 4]>,
+    pub hess: Vec<[[f64; 4]; 4]>,
+    /// Each row's own pairs' log likelihood with eta moved by each
+    /// [`profile_grid`] offset, the rest of the state held at the MAP.
+    pub profile: Vec<[f64; 21]>,
     pub objective: f64,
     /// Newton iterations per stage, and whether every stage converged.
     pub iterations: Vec<usize>,
     pub converged: bool,
+    /// The sds come from the true Hessian (else, where it isn't negative
+    /// definite at the MAP, from the saddle-free one).
+    pub exact: bool,
 }
 
-/// The rows: cylinders `a -> b` with their prior radii and parents (a
-/// parent's index is below its child's; -1 at a base).
+/// The rows: cylinders `a -> b` with their prior radii, the largest radius
+/// their pairs can show (the tube's; infinite for none), and parents (a parent's index is below
+/// its child's; -1 at a base).
 #[derive(Debug, Clone, Copy)]
 pub struct Rows<'a> {
     pub a: &'a [Point],
     pub b: &'a [Point],
     pub r_prior: &'a [f64],
+    pub r_max: &'a [f64],
     pub parent: &'a [i64],
 }
 
@@ -125,6 +174,7 @@ struct Problem<'a> {
     factors: Vec<Factor>,
     nu_w: Vec<f64>,
     cap: Vec<f64>,
+    eta_max: Vec<f64>,
     n_var: usize,
     threads: usize,
 }
@@ -138,20 +188,31 @@ struct System {
     g: Vec<DVector<f64>>,
 }
 
+/// The likelihood's per-group sums: gradient and Hessian.
+type Groups = (Vec<[f64; 4]>, Vec<[[f64; 4]; 4]>);
+
 impl<'a> Problem<'a> {
     fn new(pulses: &'a [Pulse], row: &[u32], scan: &[u32], rows: &Rows, n_scans: usize, p: &PriorParams, threads: usize) -> Result<Self> {
+        p.check()?;
         let n = rows.a.len();
-        if rows.b.len() != n || rows.r_prior.len() != n || rows.parent.len() != n {
-            return Err(Error::invalid("joint fit: a, b, r_prior and parent must have one entry per row"));
+        if [rows.b.len(), rows.r_prior.len(), rows.r_max.len(), rows.parent.len()].iter().any(|&l| l != n) {
+            return Err(Error::invalid("joint fit: a, b, r_prior, r_max and parent must have one entry per row"));
         }
         if rows.parent.iter().enumerate().any(|(k, &q)| q >= k as i64 || q < -1) {
             return Err(Error::invalid("joint fit: each parent must come before its child (-1 at a base)"));
         }
-        if !rows.r_prior.iter().all(|r| r.is_finite() && *r > 0.0) {
-            return Err(Error::invalid("joint fit: prior radii must be positive"));
+        if !rows.r_prior.iter().all(|r| r.is_finite() && *r > 0.0) || !rows.r_max.iter().all(|r| *r > 0.0) {
+            return Err(Error::invalid("joint fit: prior radii must be positive, and largest radii positive or infinite"));
         }
         if row.len() != pulses.len() || scan.len() != pulses.len() || row.iter().any(|&k| k as usize >= n) || scan.iter().any(|&s| s as usize >= n_scans) {
             return Err(Error::invalid("joint fit: each pair needs a row and a scan in range"));
+        }
+        if n.saturating_mul(n_scans) > u32::MAX as usize {
+            return Err(Error::invalid("joint fit: too many rows times scans"));
+        }
+        let fr = frames(rows.a, rows.b);
+        if !fr.iter().all(|f| f.3.is_finite() && f.3 > 0.0) {
+            return Err(Error::invalid("joint fit: every row needs a length"));
         }
         let parent: Vec<Option<usize>> = rows.parent.iter().map(|&q| (q >= 0).then_some(q as usize)).collect();
         let mut kids = vec![Vec::new(); n];
@@ -175,18 +236,23 @@ impl<'a> Problem<'a> {
         }
         let nb = blocks.len();
         let use_nu = p.scan_abs > 0.0 || p.scan_rel > 0.0;
+        if use_nu && n_scans.saturating_mul(nb) >= u32::MAX as usize {
+            return Err(Error::invalid("joint fit: too many scans times branches"));
+        }
         for bl in blocks.iter_mut() {
             bl.dim = 4 * bl.rows.len() + if use_nu { 2 * n_scans } else { 0 };
         }
-        let fr = frames(rows.a, rows.b);
         let eta0: Vec<f64> = rows.r_prior.iter().map(|r| r.ln()).collect();
         let mut factors = Vec::new();
         let mut add = |vars: Vec<(usize, f64)>, mean: f64, sd: f64| factors.push(Factor { vars, mean, w: 1.0 / (sd * sd) });
         for k in 0..n {
-            let sc = p.centre_rel * rows.r_prior[k] + p.centre_abs;
-            add(vec![(4 * k, 1.0)], 0.0, sc);
-            add(vec![(4 * k + 1, 1.0)], 0.0, sc);
+            let centre = p.centre_rel * rows.r_prior[k] + p.centre_abs;
+            add(vec![(4 * k, 1.0)], 0.0, centre);
+            add(vec![(4 * k + 1, 1.0)], 0.0, centre);
             add(vec![(4 * k + 3, 1.0)], p.lam_prior.ln(), p.lam_sd);
+            if kids[k].is_empty() && p.r_tip > 0.0 {
+                add(vec![(4 * k + 2, 1.0)], p.r_tip.ln(), p.sig_tip);
+            }
             let Some(q) = parent[k] else {
                 add(vec![(4 * k + 2, 1.0)], eta0[k], p.sig_root);
                 continue;
@@ -225,8 +291,9 @@ impl<'a> Problem<'a> {
             }
         }
         let owners = row.iter().zip(scan).map(|(&k, &s)| Owner { row: k, nu: if use_nu { (s as usize * nb + branch[k as usize]) as u32 } else { u32::MAX } }).collect();
-        let group = row.iter().zip(scan).map(|(&k, &s)| k * n_scans as u32 + s).collect();
-        Ok(Problem { pulses, owners, group, n, s: n_scans, use_nu, branch, rowpos, blocks, factors, nu_w, cap, n_var, threads })
+        let group = row.iter().zip(scan).map(|(&k, &s)| (k as usize * n_scans + s as usize) as u32).collect();
+        let eta_max = rows.r_max.iter().map(|r| r.ln()).collect();
+        Ok(Problem { pulses, owners, group, n, s: n_scans, use_nu, branch, rowpos, blocks, factors, nu_w, cap, eta_max, n_var, threads })
     }
 
     /// Block and position of a global unknown.
@@ -242,10 +309,35 @@ impl<'a> Problem<'a> {
         }
     }
 
+    /// A vector on the branch tree in global order.
+    fn gather(&self, v: &[DVector<f64>]) -> Vec<f64> {
+        (0..self.n_var).map(|i| {
+            let (b, p) = self.loc(i);
+            v[b][p]
+        }).collect()
+    }
+
     fn split(&self, x: &[f64]) -> (Vec<[f64; 4]>, Vec<[f64; 2]>) {
         let theta = (0..self.n).map(|k| [x[4 * k], x[4 * k + 1], x[4 * k + 2], x[4 * k + 3]]).collect();
         let nu = if self.use_nu { x[4 * self.n..].chunks(2).map(|c| [c[0], c[1]]).collect() } else { vec![[0.0, 0.0]] };
         (theta, nu)
+    }
+
+    /// Caps each radius at its row's largest.
+    fn project(&self, x: &mut [f64]) {
+        for k in 0..self.n {
+            x[4 * k + 2] = x[4 * k + 2].min(self.eta_max[k]);
+        }
+    }
+
+    /// Each row's own pairs' log likelihood at row states `theta`.
+    fn row_loglik(&self, theta: &[[f64; 4]], nu: &[[f64; 2]], like: &JointParams) -> Result<Vec<f64>> {
+        let ll = joint_loglik(self.pulses, &self.owners, theta, nu, like, self.threads)?;
+        let mut out = vec![0.0; self.n];
+        for (o, l) in self.owners.iter().zip(ll) {
+            out[o.row as usize] += l;
+        }
+        Ok(out)
     }
 
     fn objective(&self, x: &[f64], like: &JointParams) -> Result<f64> {
@@ -301,23 +393,30 @@ impl<'a> Problem<'a> {
         }
     }
 
-    /// The Newton system at x: the likelihood's per-(row, scan) blocks made
-    /// positive definite (absolute eigenvalues) and lifted onto their row and
-    /// nuisance, plus the prior. Also each row's summed likelihood block.
-    fn system(&self, x: &[f64], like: &JointParams) -> Result<(System, Vec<Matrix4<f64>>)> {
+    fn groups(&self, x: &[f64], like: &JointParams) -> Result<Groups> {
         let (theta, nu) = self.split(x);
-        let n_groups = self.n * self.s;
-        let (_, grad, hess) = joint_blocks(self.pulses, &self.owners, &self.group, n_groups, &theta, &nu, like, self.threads)?;
-        let mut sys = self.empty_system();
-        let mut row_h = vec![Matrix4::zeros(); self.n];
-        let mut used = vec![false; n_groups];
+        let (_, grad, hess) = joint_blocks(self.pulses, &self.owners, &self.group, self.n * self.s, &theta, &nu, like, self.threads)?;
+        Ok((grad, hess))
+    }
+
+    /// The groups that have pairs, with their row and scan.
+    fn used(&self) -> Vec<(usize, usize, usize)> {
+        let mut used = vec![false; self.n * self.s];
         for &q in &self.group {
             used[q as usize] = true;
         }
-        for q in (0..n_groups).filter(|&q| used[q]) {
-            let (k, s) = (q / self.s, q % self.s);
-            let h = abs_eig(&Matrix4::from(hess[q]));
-            row_h[k] += h;
+        (0..used.len()).filter(|&q| used[q]).map(|q| (q, q / self.s, q % self.s)).collect()
+    }
+
+    /// The Newton system at x from the likelihood's groups: their negated
+    /// Hessians (`exact`), or the absolute ones (saddle-free), lifted onto
+    /// their row and nuisance, plus the prior.
+    fn system(&self, x: &[f64], groups: &Groups, exact: bool) -> System {
+        let (grad, hess) = groups;
+        let mut sys = self.empty_system();
+        for (q, k, s) in self.used() {
+            let hq = Matrix4::from(hess[q]);
+            let h = if exact { -hq } else { abs_eig(&hq) };
             let (bi, rp) = (self.branch[k], 4 * self.rowpos[k]);
             let np = 4 * self.blocks[bi].rows.len() + 2 * s;
             let at = |a: usize| -> Vec<usize> { if a < 2 && self.use_nu { vec![rp + a, np + a] } else { vec![rp + a] } };
@@ -333,13 +432,13 @@ impl<'a> Problem<'a> {
             }
         }
         self.add_prior(&mut sys, x);
-        Ok((sys, row_h))
+        sys
     }
 
-    /// Solves `(H + mu I) x = g` on the branch tree: each block eliminated
-    /// into its parent row, leaves first, then substituted back. With `cov`,
-    /// also the diagonal of the inverse (top-down). None if a block isn't
-    /// positive definite.
+    /// Solves `(H + mu diag H) x = g` on the branch tree: each block
+    /// eliminated into its parent row, leaves first, then substituted back.
+    /// With `cov`, also the diagonal of the inverse (top-down). None if a
+    /// block isn't positive definite.
     #[allow(clippy::type_complexity)]
     fn solve(&self, sys: &System, mu: f64, cov: bool) -> Option<(Vec<f64>, Option<Vec<f64>>)> {
         let nb = self.blocks.len();
@@ -347,7 +446,7 @@ impl<'a> Problem<'a> {
         let mut g = sys.g.clone();
         for m in h.iter_mut() {
             for i in 0..m.nrows() {
-                m[(i, i)] += mu;
+                m[(i, i)] *= 1.0 + mu;
             }
         }
         let mut chol = Vec::with_capacity(nb);
@@ -392,58 +491,70 @@ impl<'a> Problem<'a> {
                 }
             }
         }
-        let mut x = vec![0.0; self.n_var];
-        let mut var = cov.then(|| vec![0.0; self.n_var]);
-        for v in 0..self.n_var {
+        let x = self.gather(&xb);
+        let var = cov.then(|| (0..self.n_var).map(|v| {
             let (b, p) = self.loc(v);
-            x[v] = xb[b][p];
-            if let Some(var) = var.as_mut() {
-                var[v] = sig[b][(p, p)];
-            }
-        }
+            sig[b][(p, p)]
+        }).collect());
         Some((x, var))
     }
 
-    /// Damped saddle-free Newton at one stage; returns the iterations taken
-    /// and whether it converged.
+    /// Saddle-free Newton with a backtracking line search at one stage;
+    /// returns the iterations taken and whether it converged (see
+    /// [`FitOptions::tol`]; else the iterations ran out, or no step along the
+    /// Newton direction improved the objective).
     fn newton(&self, x: &mut [f64], like: &JointParams, iters: usize, tol: f64) -> Result<(usize, bool)> {
+        const WINDOW: usize = 10;
         let mut obj = self.objective(x, like)?;
-        let mut mu = 1.0;
+        if !obj.is_finite() {
+            return Err(Error::invalid("joint fit: the objective isn't finite at the start"));
+        }
+        let mut history = vec![obj];
         for it in 0..iters {
-            let (sys, _) = self.system(x, like)?;
-            let mut accepted = None;
-            for _ in 0..12 {
-                let Some((mut step, _)) = self.solve(&sys, mu, false) else {
-                    mu *= 4.0;
-                    continue;
-                };
-                for (s, c) in step.iter_mut().zip(&self.cap) {
-                    *s = s.clamp(-c, *c);
-                }
-                let trial: Vec<f64> = x.iter().zip(&step).map(|(a, b)| a + b).collect();
+            if history.len() > WINDOW && obj - history[history.len() - 1 - WINDOW] <= tol * (1.0 + obj.abs()) {
+                return Ok((it, true));
+            }
+            let groups = self.groups(x, like)?;
+            let sys = self.system(x, &groups, false);
+            let g = self.gather(&sys.g);
+            // the blocks are positive definite; a little ridge only if rounding says otherwise
+            let step = [0.0, 1e-8, 1e-6, 1e-4, 1e-2, 1.0].iter().find_map(|&mu| self.solve(&sys, mu, false))
+                .ok_or_else(|| Error::invalid("joint fit: no Newton step (the system isn't positive definite)"))?.0;
+            // the step as the radius caps leave it, and its decrement
+            let mut to = x.iter().zip(&step).map(|(a, s)| a + s).collect::<Vec<f64>>();
+            self.project(&mut to);
+            let full: Vec<f64> = to.iter().zip(x.iter()).map(|(t, a)| t - a).collect();
+            let dec: f64 = g.iter().zip(&full).map(|(g, d)| g * d).sum();
+            if dec <= 2.0 * tol * (1.0 + obj.abs()) {
+                return Ok((it, true));
+            }
+            // no unknown moves further than its cap in one step
+            let scale = full.iter().zip(&self.cap).map(|(d, c)| d.abs() / c).fold(1.0, f64::max);
+            let (dir, slope) = (full.iter().map(|d| d / scale).collect::<Vec<f64>>(), dec / scale);
+            let mut alpha = 1.0;
+            let mut accepted = false;
+            for _ in 0..40 {
+                let trial: Vec<f64> = x.iter().zip(&dir).map(|(a, d)| a + alpha * d).collect();
                 let o = self.objective(&trial, like)?;
-                if o > obj {
-                    accepted = Some((trial, o - obj));
+                if o.is_finite() && o >= obj + 1e-4 * alpha * slope {
+                    x.copy_from_slice(&trial);
                     obj = o;
-                    mu = (mu / 3.0).max(1e-6);
+                    history.push(o);
+                    accepted = true;
                     break;
                 }
-                mu *= 4.0;
+                alpha *= 0.5;
             }
-            let Some((trial, gain)) = accepted else {
-                return Ok((it, true)); // no damped step improves: a maximum to the precision of the objective
-            };
-            x.copy_from_slice(&trial);
-            if gain < tol * (1.0 + obj.abs()) {
-                return Ok((it + 1, true));
+            if !accepted {
+                return Ok((it, false));
             }
         }
         Ok((iters, false))
     }
 }
 
-/// `V |Lambda| V^T` of a symmetric 4x4, negated: the curvature saddle-free
-/// Newton uses (eigenvalues floored at 1e-6).
+/// `V |Lambda| V^T` of a symmetric 4x4: the curvature saddle-free Newton uses
+/// for a log likelihood's Hessian (eigenvalues' magnitudes floored at 1e-6).
 fn abs_eig(h: &Matrix4<f64>) -> Matrix4<f64> {
     let e = SymmetricEigen::new(*h);
     let d = Matrix4::from_diagonal(&e.eigenvalues.map(|l| l.abs().max(1e-6)));
@@ -456,14 +567,18 @@ fn abs_eig(h: &Matrix4<f64>) -> Matrix4<f64> {
 #[allow(clippy::too_many_arguments)]
 pub fn joint_fit(pulses: &[Pulse], row: &[u32], scan: &[u32], rows: &Rows, n_scans: usize, like: &JointParams, prior: &PriorParams, opts: &FitOptions, theta0: Option<&[[f64; 4]]>) -> Result<Fit> {
     let pr = Problem::new(pulses, row, scan, rows, n_scans, prior, opts.threads)?;
+    if theta0.is_some_and(|t| t.len() != pr.n) {
+        return Err(Error::invalid("joint fit: theta0 must have one state per row"));
+    }
+    if opts.tol.is_nan() || opts.tol < 0.0 ||opts.schedule.iter().any(|s| !s.is_finite()) {
+        return Err(Error::invalid("joint fit: tol and the schedule must be finite (tol not negative)"));
+    }
     let mut x = vec![0.0; pr.n_var];
     for k in 0..pr.n {
         let t = theta0.map_or([0.0, 0.0, rows.r_prior[k].ln(), prior.lam_prior.ln()], |t| t[k]);
         x[4 * k..4 * k + 4].copy_from_slice(&t);
     }
-    if theta0.is_some_and(|t| t.len() != pr.n) {
-        return Err(Error::invalid("joint fit: theta0 must have one row per row"));
-    }
+    pr.project(&mut x);
     let mut stages: Vec<f64> = opts.schedule.iter().copied().filter(|&s| s > like.rough).collect();
     stages.push(like.rough);
     let (mut iterations, mut converged) = (Vec::new(), true);
@@ -472,19 +587,46 @@ pub fn joint_fit(pulses: &[Pulse], row: &[u32], scan: &[u32], rows: &Rows, n_sca
         iterations.push(it);
         converged &= ok;
     }
-    // Laplace: the posterior's and the prior's variances on the branch tree
-    let (sys, row_h) = pr.system(&x, like)?;
-    let (_, var) = pr.solve(&sys, 0.0, true).ok_or_else(|| Error::invalid("joint fit: the posterior isn't positive definite"))?;
-    let var = var.unwrap();
+    // Laplace: the posterior's variances on the branch tree, from the true Hessian where it is negative definite
+    let groups = pr.groups(&x, like)?;
+    let (var, exact) = match pr.solve(&pr.system(&x, &groups, true), 0.0, true) {
+        Some((_, var)) => (var.unwrap(), true),
+        None => {
+            let (_, var) = pr.solve(&pr.system(&x, &groups, false), 0.0, true).ok_or_else(|| Error::invalid("joint fit: the posterior isn't positive definite"))?;
+            (var.unwrap(), false)
+        }
+    };
     let mut prior_sys = pr.empty_system();
     pr.add_prior(&mut prior_sys, &x);
     let (_, pvar) = pr.solve(&prior_sys, 0.0, true).ok_or_else(|| Error::invalid("joint fit: the prior isn't positive definite"))?;
     let pvar = pvar.unwrap();
     let (theta, nu) = pr.split(&x);
     let sd = (0..pr.n).map(|k| std::array::from_fn(|j| var[4 * k + j].sqrt())).collect();
+    // each row's message, and its information on eta with each scan's nuisance integrated out
+    let (gq, hq) = &groups;
+    let (mut grad, mut hess) = (vec![[0.0; 4]; pr.n], vec![[[0.0; 4]; 4]; pr.n]);
+    let mut info = vec![Matrix4::zeros(); pr.n];
+    let nb = pr.blocks.len();
+    for (q, k, s) in pr.used() {
+        for a in 0..4 {
+            grad[k][a] += gq[q][a];
+            for b in 0..4 {
+                hess[k][a][b] += hq[q][a][b];
+            }
+        }
+        let h = abs_eig(&Matrix4::from(hq[q]));
+        info[k] += if pr.use_nu {
+            let w = pr.nu_w[2 * (s * nb + pr.branch[k])];
+            let bm = h.fixed_columns::<2>(0).into_owned();
+            let c = h.fixed_view::<2, 2>(0, 0).into_owned() + Matrix2::identity() * w;
+            c.try_inverse().map_or(h, |ci| h - bm * ci * bm.transpose())
+        } else {
+            h
+        };
+    }
     let rho_local = (0..pr.n).map(|k| {
         // eta's precision from the row's own rays, its other unknowns integrated out within the row
-        let h = &row_h[k];
+        let h = &info[k];
         let o = [0, 1, 3];
         let hoo = Matrix3::from_fn(|i, j| h[(o[i], o[j])]) + Matrix3::identity() * 1e-9;
         let ho = nalgebra::Vector3::from_fn(|i, _| h[(o[i], 2)]);
@@ -492,15 +634,32 @@ pub fn joint_fit(pulses: &[Pulse], row: &[u32], scan: &[u32], rows: &Rows, n_sca
         (tau * var[4 * k + 2]).clamp(0.0, 1.0)
     }).collect();
     let rho_pooled = (0..pr.n).map(|k| 1.0 - var[4 * k + 2] / pvar[4 * k + 2]).collect();
-    Ok(Fit { theta, nu: if pr.use_nu { nu } else { Vec::new() }, sd, rho_local, rho_pooled, objective: pr.objective(&x, like)?, iterations, converged })
+    let mut profile = vec![[0.0; 21]; pr.n];
+    for (j, d) in profile_grid().into_iter().enumerate() {
+        let moved: Vec<[f64; 4]> = theta.iter().map(|t| [t[0], t[1], t[2] + d, t[3]]).collect();
+        for (k, l) in pr.row_loglik(&moved, &nu, like)?.into_iter().enumerate() {
+            profile[k][j] = l;
+        }
+    }
+    let objective = pr.objective(&x, like)?;
+    Ok(Fit { theta, nu: if pr.use_nu { nu } else { Vec::new() }, sd, rho_local, rho_pooled, grad, hess, profile, objective, iterations, converged, exact })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::qsm::joint::joint_table;
 
     fn prior() -> PriorParams {
-        PriorParams { lam_prior: 1.0, lam_sd: 2.0, sig_ell: 1.0, sig_eta: 0.05, mu_fork: 0.0, sig_fork: 0.17, sig_root: 0.5, sig_delta: 0.02, centre_rel: 0.3, centre_abs: 0.003, scan_abs: 0.002, scan_rel: 0.05 }
+        PriorParams { lam_prior: 1.0, lam_sd: 2.0, sig_ell: 1.0, sig_eta: 0.05, mu_fork: 0.0, sig_fork: 0.17, sig_root: 0.5, r_tip: 0.0, sig_tip: 0.3, sig_delta: 0.02, centre_rel: 0.3, centre_abs: 0.003, scan_abs: 0.002, scan_rel: 0.05 }
+    }
+
+    fn like() -> JointParams {
+        JointParams { exit: 0.007, divergence: 0.35e-3, sigma_r: 0.005, rough: 0.03, tau: 0.17, edge: 0.25, eps: 0.1, eps_min: 0.01, mp_len: 0.5 }
+    }
+
+    fn opts() -> FitOptions {
+        FitOptions { schedule: vec![0.3, 0.15, 0.08], iters: 100, tol: 1e-10, threads: 2 }
     }
 
     /// A small tree: a trunk of 3 rows forking into two branches of 2.
@@ -516,7 +675,7 @@ mod tests {
     fn the_branch_tree_solves_the_system_exactly() {
         // a random symmetric positive definite system on the branch structure, against a dense solve
         let (a, b, r, parent) = tree();
-        let rows = Rows { a: &a, b: &b, r_prior: &r, parent: &parent };
+        let rows = Rows { a: &a, b: &b, r_prior: &r, r_max: &[1.0; 7], parent: &parent };
         let pulses: Vec<Pulse> = Vec::new();
         let pr = Problem::new(&pulses, &[], &[], &rows, 2, &prior(), 1).unwrap();
         assert_eq!(pr.blocks.len(), 3, "trunk and two branches");
@@ -553,15 +712,63 @@ mod tests {
     #[test]
     fn without_data_the_fit_is_the_prior() {
         let (a, b, r, parent) = tree();
-        let rows = Rows { a: &a, b: &b, r_prior: &r, parent: &parent };
-        let like = JointParams { exit: 0.007, divergence: 0.35e-3, sigma_r: 0.005, rough: 0.03, tau: 0.17, eps: 0.1, eps_min: 0.01, mp_len: 0.5, thin: 0.0, step: 0.03f64.to_radians() };
-        let opts = FitOptions { schedule: vec![0.3, 0.1], iters: 20, tol: 1e-10, threads: 1 };
-        let f = joint_fit(&[], &[], &[], &rows, 2, &like, &prior(), &opts, None).unwrap();
-        assert!(f.converged);
+        let rows = Rows { a: &a, b: &b, r_prior: &r, r_max: &[1.0; 7], parent: &parent };
+        let f = joint_fit(&[], &[], &[], &rows, 2, &like(), &prior(), &opts(), None).unwrap();
+        assert!(f.converged && f.exact);
         for (k, t) in f.theta.iter().enumerate() {
             assert!((t[2] - r[k].ln()).abs() < 1e-6 && t[0].abs() < 1e-9, "row {k}: {t:?}");
         }
         assert!(f.rho_local.iter().all(|&x| x == 0.0) && f.rho_pooled.iter().all(|x| x.abs() < 1e-9));
-        assert!(joint_fit(&[], &[], &[], &Rows { parent: &[-1, 0, 1, 2, 3, 6, 5], ..rows }, 2, &like, &prior(), &opts, None).is_err());
+        assert!(f.profile.iter().all(|p| p.iter().all(|&l| l == 0.0)));
+        // a tip anchor at 2 cm pulls the tips' radii; a cap holds the trunk under 4.9 cm
+        let (tipped, cap) = (PriorParams { r_tip: 0.02, sig_tip: 0.1, ..prior() }, [0.049, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0]);
+        let g = joint_fit(&[], &[], &[], &Rows { r_max: &cap, ..rows }, 2, &like(), &tipped, &opts(), None).unwrap();
+        assert!(g.converged && g.theta[0][2] <= 0.049f64.ln() + 1e-12);
+        for k in [4, 6] {
+            assert!(g.theta[k][2] < r[k].ln() - 0.05, "tip {k}: {}", g.theta[k][2].exp());
+        }
+        let wide = joint_fit(&[], &[], &[], &rows, 2, &like(), &PriorParams { mu_fork: 0.2, ..prior() }, &opts(), None).unwrap();
+        assert!(wide.theta[3][2] > f.theta[3][2] && wide.theta[5][2] > f.theta[5][2], "a fork adding area thickens its children");
+    }
+
+    #[test]
+    fn inputs_are_checked() {
+        let (a, b, r, parent) = tree();
+        let rows = Rows { a: &a, b: &b, r_prior: &r, r_max: &[1.0; 7], parent: &parent };
+        let fit = |rows: &Rows, p: &PriorParams, t0: Option<&[[f64; 4]]>| joint_fit(&[], &[], &[], rows, 2, &like(), p, &opts(), t0);
+        assert!(fit(&Rows { parent: &[-1, 0, 1, 2, 3, 6, 5], ..rows }, &prior(), None).is_err());
+        assert!(fit(&rows, &prior(), Some(&[[0.0; 4]; 3])).is_err(), "theta0 of the wrong length");
+        assert!(fit(&rows, &PriorParams { sig_eta: 0.0, ..prior() }, None).is_err());
+        assert!(fit(&rows, &PriorParams { lam_prior: -1.0, ..prior() }, None).is_err());
+        assert!(fit(&rows, &PriorParams { centre_rel: 0.0, centre_abs: 0.0, ..prior() }, None).is_err());
+        assert!(fit(&rows, &PriorParams { r_tip: 0.01, sig_tip: 0.0, ..prior() }, None).is_err());
+        let flat = [a[0]; 7];
+        assert!(fit(&Rows { b: &flat, ..rows }, &prior(), None).is_err(), "rows without length");
+        assert!(fit(&Rows { r_max: &[0.0; 7], ..rows }, &prior(), None).is_err());
+    }
+
+    #[test]
+    fn a_fat_claim_on_a_scanned_stem_comes_down_to_it() {
+        // the evidence tests' fan: a 5 cm stem at 5 m, claimed at 8 cm 1 cm off its axis
+        let (scan, a, b) = crate::qsm::evidence::tests::scene(0.05, true);
+        let (a1, b1) = ([a[0] + 0.01, a[1], a[2]], [b[0] + 0.01, b[1], b[2]]);
+        let t = joint_table(&[&scan], &[a1], &[b1], &[0.15], 2).unwrap();
+        let rows = Rows { a: &[a1], b: &[b1], r_prior: &[0.08], r_max: &[0.15], parent: &[-1] };
+        let p = PriorParams { scan_abs: 0.0, scan_rel: 0.0, ..prior() };
+        let f = joint_fit(&t.pulses, &t.row, &t.scan, &rows, 1, &like(), &p, &opts(), None).unwrap();
+        let r = f.theta[0][2].exp();
+        assert!(f.converged && f.exact, "{:?}", f.iterations);
+        assert!((r - 0.05).abs() < 0.003, "R {r}");
+        let (_, e1, e2, _) = frames(&[a1], &[b1])[0];
+        let off = [0, 1, 2].map(|i| f.theta[0][0] * e1[i] + f.theta[0][1] * e2[i]);
+        assert!((off[0] + 0.01).abs() < 0.003 && off[1].abs() < 0.005, "offset {off:?}");
+        assert!(f.sd[0][2] < 0.1 && f.rho_local[0] > 0.9, "sd {} rho {}", f.sd[0][2], f.rho_local[0]);
+        // the profile peaks at the fit, and the message is the likelihood's curvature there
+        let best = f.profile[0].iter().enumerate().max_by(|x, y| x.1.total_cmp(y.1)).unwrap().0;
+        assert!((best as i64 - 12).abs() <= 1, "profile peaks at offset {}", profile_grid()[best]);
+        assert!(f.grad[0].iter().all(|g| g.is_finite()) && f.hess[0][2][2] < 0.0);
+        // a cap below the stem holds the radius there
+        let capped = joint_fit(&t.pulses, &t.row, &t.scan, &Rows { r_max: &[0.04], ..rows }, 1, &like(), &p, &opts(), None).unwrap();
+        assert!((capped.theta[0][2].exp() - 0.04).abs() < 1e-9);
     }
 }

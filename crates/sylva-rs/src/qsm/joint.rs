@@ -3,10 +3,10 @@
 // Free software under the GNU General Public License v3.0 or later;
 // see the LICENSE file. There is no warranty, to the extent permitted by law.
 //! The per-pulse likelihood of a joint wood, foliage and ray model, with its
-//! exact gradient and Hessian: the hot path of a fit whose orchestration
-//! (continuation, the tree prior, the sparse solve) stays outside.
+//! exact gradient and Hessian, and its pair table; [`crate::qsm::joint_fit`]
+//! fits it.
 //!
-//! Each row of the table is a pulse that reached the disc around a cylinder
+//! Each row of the table is a pulse that reached the tube around a cylinder
 //! (see [`crate::qsm::evidence::pairs`]), measured once from a starting axis:
 //! signed impact `b`, range of closest approach `t`, `sin` of its angle to
 //! the axis, how both move with an offset of the axis (`jb`, `jt`), the
@@ -15,11 +15,12 @@
 //! (two numbers, the cylinder's own plus its scan's nuisance), `eta =
 //! log R` and `ell = log lambda` (foliage per metre). Along the pulse,
 //! foliage and opaque wood compete to stop it; the wood's echo sits at the
-//! centroid depth of the circle over a uniform footprint, Gaussian about it
+//! centroid depth of the circle over a uniform footprint (a sliver narrower
+//! than a fiftieth of it averaged as if that wide), Gaussian about it
 //! or a mixed pixel behind; a pass is censoring at the chord's end. Each
 //! pulse is conditioned on having been recorded: a pass needs something
-//! behind (`q`), and an export thinned to one echo per `thin` metres keeps a
-//! stop at range `x` with `min(1, (x step / thin)^2)`.
+//! behind (`q`). A stop needs the footprint's share `tau` on the wood, with an
+//! edge `edge w` wide (w the footprint's width).
 //!
 //! The derivatives come from evaluating the likelihood once on second-order
 //! dual numbers in the four state variables, so a term added to the
@@ -302,16 +303,15 @@ pub struct JointParams {
     /// Range noise (m), and surface roughness as a share of the radius.
     pub sigma_r: f64,
     pub rough: f64,
-    /// Energy share of the footprint an echo needs.
+    /// Energy share of the footprint an echo needs, and the sd of the
+    /// detection edge as a share of the footprint's width.
     pub tau: f64,
+    pub edge: f64,
     /// Mixed-pixel share: `eps_min + eps (1 - f)`, f the footprint's share on the wood, landing up to
     /// `mp_len` m behind the surface.
     pub eps: f64,
     pub eps_min: f64,
     pub mp_len: f64,
-    /// The export's thinning (m; 0: none) and the scan's angular step (rad).
-    pub thin: f64,
-    pub step: f64,
 }
 
 /// One pulse-cylinder pair, measured once from a starting axis (see the
@@ -358,6 +358,12 @@ fn h_int(y: D, r: D) -> D {
     out
 }
 
+/// The width (a share of the footprint's) below which a sliver of the footprint
+/// on the circle is averaged as if that wide: the centroid depth is then smooth
+/// at the silhouette. Wider (a quarter of the footprint) moved the bench's
+/// trunks 0.8 % fatter (research 74 §18).
+const SLIVER: f64 = 0.02;
+
 /// One pair's log likelihood at state `[offset1, offset2, eta, ell]`, in
 /// whatever [`Num`] the state is given in.
 fn pair<N: Num>(pu: &Pulse, s: [N; 4], p: &JointParams) -> N {
@@ -367,13 +373,16 @@ fn pair<N: Num>(pu: &Pulse, s: [N; 4], p: &JointParams) -> N {
     let bp = N::c(pu.b) - (d1 * pu.jb[0] + d2 * pu.jb[1]);
     let tp = N::c(pu.t) + (d1 * pu.jt[0] + d2 * pu.jt[1]);
     let w = p.exit + p.divergence * pu.t;
-    // the footprint on the circle: its share f, and the surface's centroid depth hbar
+    // the footprint on the circle: its share f, and the surface's centroid depth hbar. A sliver's centroid
+    // goes as the root of its width, an infinite slope at the silhouette that traps Newton (research 74 §18):
+    // slivers narrower than SLIVER w are averaged over a width that doesn't vanish
     let y1 = (bp + (-w / 2.0)).max(-r);
     let y2 = (bp + w / 2.0).min(r);
     let width = (y2 - y1).max(N::c(0.0));
     let f = width * (1.0 / w);
-    let hbar = if width.v() > 1e-9 { (N::h_int(y2, r) - N::h_int(y1, r)) / width } else { N::c(0.0) };
-    let zdet = (r + w * (0.5 - p.tau) - bp.abs()) * (4.0 / w);
+    let e = SLIVER * w;
+    let hbar = (N::h_int(y2, r) - N::h_int(y1, r)) / (width + (width * (-1.0 / e)).exp() * e);
+    let zdet = (r + w * (0.5 - p.tau) - bp.abs()) * (1.0 / (p.edge * w));
     let (lp, lq) = (zdet.log_ndtr(), (-zdet).log_ndtr());
     let (c0, c1) = (N::c(pu.c0), N::c(pu.c1));
     let xw = (tp - hbar * (1.0 / pu.sin)).clamp(c0, c1);
@@ -394,14 +403,8 @@ fn pair<N: Num>(pu: &Pulse, s: [N; 4], p: &JointParams) -> N {
     let l_stop = logaddexp(l_wood, l_leaf);
     let q = pu.q;
     let p_pass = l_pass.min(N::c(0.0)).exp();
-    if p.thin > 0.0 {
-        let lk = (2.0 * (pu.t.max(0.1) * p.step / p.thin).ln()).min(0.0);
-        let sel = if pu.early { N::c(0.0) } else { ((-p_pass + 1.0) * lk.exp() + p_pass * q).ln() };
-        (if pu.stop { l_stop + lk } else { l_pass + q.ln() }) - sel
-    } else {
-        let sel = if pu.early { N::c(0.0) } else { (p_pass * (-(1.0 - q))).log1p() };
-        (if pu.stop { l_stop } else { l_pass + q.ln() }) - sel
-    }
+    let sel = if pu.early { N::c(0.0) } else { (p_pass * (-(1.0 - q))).log1p() };
+    (if pu.stop { l_stop } else { l_pass + q.ln() }) - sel
 }
 
 /// Where each pair's state comes from: its row's `[delta1, delta2, eta,
@@ -530,7 +533,8 @@ fn cross(a: &Point, b: &Point) -> Point {
 /// fate there (the first echo inside the chord is a stop; otherwise the pulse
 /// went on, a pass). `q` is 1: what is behind recorded every pass. A pass by
 /// a pulse whose echoes the export partly deleted is left out: the deleted
-/// echo may have been its stop here (research 74 §2.5).
+/// echo may have been its stop here (research 74 §2.5). So is a pulse along
+/// the axis, which has no impact.
 pub fn joint_table(scans: &[&crate::qsm::evidence::ScanIndex], a: &[Point], b: &[Point], window: &[f64], threads: usize) -> Result<JointPairs> {
     use crate::transform::dot;
     let pp = crate::qsm::evidence::pairs(scans, a, b, window, threads)?;
@@ -543,6 +547,9 @@ pub fn joint_table(scans: &[&crate::qsm::evidence::ScanIndex], a: &[Point], b: &
             let o = scans[pp.scan[i] as usize].origin();
             let cr = cross(&u, &d);
             let sin = dot(&cr, &cr).sqrt();
+            if sin < 1e-9 {
+                continue;
+            }
             let nrm = cr.map(|x| x / sin);
             let bimp = dot(&crate::transform::sub(&o, &a[c]), &nrm);
             let du = dot(&d, &u);
@@ -586,7 +593,7 @@ mod tests {
     use super::*;
 
     fn params() -> JointParams {
-        JointParams { exit: 0.007, divergence: 0.35e-3, sigma_r: 0.005, rough: 0.03, tau: 0.17, eps: 0.1, eps_min: 0.01, mp_len: 0.5, thin: 0.0, step: 0.03f64.to_radians() }
+        JointParams { exit: 0.007, divergence: 0.35e-3, sigma_r: 0.005, rough: 0.03, tau: 0.17, edge: 0.25, eps: 0.1, eps_min: 0.01, mp_len: 0.5 }
     }
 
     /// A few pulses past a 5 cm stem at 8 m: on the surface, inside it, passing, and a leaf in front.
@@ -627,6 +634,45 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn the_table_measures_each_pulse_from_the_axis() {
+        // the evidence tests' fan: a 5 cm stem at 5 m with a wall at 8 m behind it
+        let (scan, a, b) = crate::qsm::evidence::tests::scene(0.05, true);
+        let t = joint_table(&[&scan], &[a], &[b], &[0.15], 2).unwrap();
+        let m = t.pulses.len();
+        assert!(m > 200 && t.row.iter().all(|&r| r == 0) && t.scan.len() == m && t.n_echo.len() == m);
+        for pu in &t.pulses {
+            assert!(pu.b.abs() < 0.15 && pu.c0 < pu.t && pu.t < pu.c1 && pu.sin > 0.99);
+            // a stop on the stem's near face, at the depth of the circle; passes went on to the wall
+            if pu.stop {
+                let face = pu.t - (0.05f64 * 0.05 - pu.b * pu.b).max(0.0).sqrt() / pu.sin;
+                assert!(pu.b.abs() < 0.0505 && (pu.x - face).abs() < 2e-3, "stop at {} (b {}) against the face at {face}", pu.x, pu.b);
+            } else {
+                assert!(pu.b.abs() > 0.0495, "a pass through the stem at {}", pu.b);
+            }
+            assert!(!pu.early && pu.q == 1.0);
+        }
+        let stops = t.pulses.iter().filter(|p| p.stop).count();
+        assert!(stops > 50 && m - stops > 50);
+        // an axis moved across itself moves each pulse's impact by jb and its range by jt
+        let (_, e1, e2, _) = frames(&[a], &[b])[0];
+        let off = [0.004, -0.003];
+        let shift = [0, 1, 2].map(|k| off[0] * e1[k] + off[1] * e2[k]);
+        let (a2, b2) = ([0, 1, 2].map(|k| a[k] + shift[k]), [0, 1, 2].map(|k| b[k] + shift[k]));
+        let moved = joint_table(&[&scan], &[a2], &[b2], &[0.15], 2).unwrap();
+        let before: std::collections::HashMap<u32, &Pulse> = t.pulse.iter().copied().zip(&t.pulses).collect();
+        let mut checked = 0;
+        for (k, pu) in moved.pulse.iter().zip(&moved.pulses) {
+            if let Some(p0) = before.get(k) {
+                let b = p0.b - (p0.jb[0] * off[0] + p0.jb[1] * off[1]);
+                let tt = p0.t + (p0.jt[0] * off[0] + p0.jt[1] * off[1]);
+                assert!((pu.b - b).abs() < 1e-6 && (pu.t - tt).abs() < 1e-4, "b {} vs {b}, t {} vs {tt}", pu.b, pu.t);
+                checked += 1;
+            }
+        }
+        assert!(checked > 200);
     }
 
     #[test]

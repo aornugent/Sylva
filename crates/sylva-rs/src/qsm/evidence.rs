@@ -217,7 +217,8 @@ fn pool(threads: usize) -> Result<rayon::ThreadPool> {
 }
 
 /// One scan's pulses, indexed by direction: what [`evidence`] reads. About
-/// 16 bytes per pulse and 4 per echo, plus a 6.5 MB cell table.
+/// 16 bytes per pulse (17 with the number of returns) and 4 per echo (8 with
+/// reflectance and deviation), plus a 6.5 MB cell table.
 ///
 /// [`ScanIndex::pulses_near`], [`ScanIndex::origin`] and
 /// [`ScanIndex::misses`] are all that [`evidence`] asks of it, so the storage
@@ -240,7 +241,8 @@ pub struct ScanIndex {
     cell_start: Vec<u32>,
 }
 
-/// The echo attributes a [`ScanIndex`] keeps, where the store has them.
+/// The attributes a [`ScanIndex`] keeps, where the store has them: the
+/// echoes' reflectance and deviation, and their pulse's number of returns.
 const CHARACTER: [&str; 3] = ["reflectance", "deviation", "las_number_of_returns"];
 
 impl ScanIndex {
@@ -837,7 +839,7 @@ fn calliper(hit_d: &[f64], pass_d: &[f64], slack: usize) -> (f64, f64) {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::io::shots::{write_shots, ShotsWriteOptions};
     use crate::shots::Shots;
@@ -893,7 +895,7 @@ mod tests {
         index
     }
 
-    fn scene(r: f64, misses: bool) -> (ScanIndex, Point, Point) {
+    pub(crate) fn scene(r: f64, misses: bool) -> (ScanIndex, Point, Point) {
         (index(&shots(r, misses), ShotsWriteOptions::default().row_group_size), [0.0, 5.0, -1.0], [0.0, 5.0, 1.0])
     }
 
