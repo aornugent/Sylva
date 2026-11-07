@@ -621,7 +621,7 @@ fn qsm_joint_fit<'py>(py: Python<'py>, table: Bound<'py, PyDict>, a: PyReadonlyA
 
 const JOINT_LIKE: [&str; 10] = ["exit", "divergence", "sigma_r", "rough", "tau", "edge", "eps", "eps_min", "mp_len", "hide"];
 const JOINT_PRIOR: [&str; 14] = ["lam_prior", "lam_sd", "sig_ell", "sig_eta", "mu_fork", "sig_fork", "sig_root", "r_tip", "sig_tip", "sig_delta", "centre_rel", "centre_abs", "scan_abs", "scan_rel"];
-const JOINT_TREE: [&str; 9] = ["version", "iters", "tol", "sweeps", "split_share", "split_min_r", "split_through", "split_min_votes", "drop"];
+const JOINT_TREE: [&str; 8] = ["version", "iters", "tol", "sweeps", "split_min_r", "split_through", "split_min_votes", "drop"];
 
 /// The default settings of `qsm_joint_tree`, flat.
 #[pyfunction]
@@ -639,7 +639,6 @@ fn qsm_joint_defaults(py: Python<'_>) -> PyResult<Bound<'_, PyDict>> {
     d.set_item("iters", t.iters)?;
     d.set_item("tol", t.tol)?;
     d.set_item("sweeps", t.sweeps)?;
-    d.set_item("split_share", t.split_share)?;
     d.set_item("split_min_r", t.split_min_r)?;
     d.set_item("split_through", t.split_through)?;
     d.set_item("split_min_votes", t.split_min_votes)?;
@@ -665,7 +664,7 @@ fn tree_params(d: &Bound<'_, PyDict>) -> PyResult<TreeParams> {
         return Err(PyValueError::new_err("joint params: unexpected fields"));
     }
     let prior = PriorParams { lam_prior: f("lam_prior")?, lam_sd: f("lam_sd")?, sig_ell: f("sig_ell")?, sig_eta: f("sig_eta")?, mu_fork: f("mu_fork")?, sig_fork: f("sig_fork")?, sig_root: f("sig_root")?, r_tip: f("r_tip")?, sig_tip: f("sig_tip")?, sig_delta: f("sig_delta")?, centre_rel: f("centre_rel")?, centre_abs: f("centre_abs")?, scan_abs: f("scan_abs")?, scan_rel: f("scan_rel")? };
-    Ok(TreeParams { like: joint_params(d)?, prior, iters: u("iters")?, tol: f("tol")?, sweeps: u("sweeps")?, split_share: f("split_share")?, split_min_r: f("split_min_r")?, split_through: f("split_through")?, split_min_votes: u("split_min_votes")?, drop: f("drop")? })
+    Ok(TreeParams { like: joint_params(d)?, prior, iters: u("iters")?, tol: f("tol")?, sweeps: u("sweeps")?, split_min_r: f("split_min_r")?, split_through: f("split_through")?, split_min_votes: u("split_min_votes")?, drop: f("drop")? })
 }
 
 /// Fits the joint model to one tree (see `sylva.qsm.joint_tree`).
@@ -699,6 +698,7 @@ fn qsm_joint_tree<'py>(py: Python<'py>, scans: Vec<Bound<'py, PyScanIndex>>, a: 
     d.set_item("n_pairs", f.n_pairs.into_pyarray(py))?;
     d.set_item("grad", f.grad.concat().into_pyarray(py).reshape([n, 4])?)?;
     d.set_item("hess", f.hess.iter().flatten().flatten().copied().collect::<Vec<f64>>().into_pyarray(py).reshape([n, 4, 4])?)?;
+    d.set_item("split_gain", f.split_gain.into_pyarray(py))?;
     d.set_item("u", f.u)?;
     d.set_item("objective", f.objective)?;
     d.set_item("converged", f.converged)?;

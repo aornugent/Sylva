@@ -88,9 +88,7 @@ class JointParams:
     tol: float = _DEFAULTS["tol"]
     #: Rounds of ownership (each stop to the row whose surface explains it) and fitting.
     sweeps: int = _DEFAULTS["sweeps"]
-    #: A row is tried as a clump when this share of its complete pulses aimed within half its prior radius of its
-    #: axis pass (a solid stem's is ~0), and its prior radius is at least ``split_min_r`` (m).
-    split_share: float = _DEFAULTS["split_share"]
+    #: A row is tried as a clump when its prior radius is at least this (m).
     split_min_r: float = _DEFAULTS["split_min_r"]
     #: A circle found in a clump's stops is a stem when at most this share of the pulses crossing its core went
     #: through it, and at least ``split_min_votes`` stops lie on it.
@@ -108,9 +106,9 @@ def joint_tree(scans, a, b, r_prior, parent, context=None, params: JointParams =
                threads: int = 0) -> dict:
     """Fits the joint model to one tree: its rows in, a fitted row per stem out.
 
-    Each row's pairs are taken in a tube around it, sized from its prior radius. A row whose pulses aimed at its
-    core partly pass is a clump: the solid stems its stops show (circles whose core stops the pulses crossing it)
-    replace it as child rows, parallel to it; one with none stays. The neighbours' cylinders (``context``) are held
+    Each row's pairs are taken in a tube around it, sized from its prior radius. A row may be a clump: the solid
+    stems its stops show (circles whose core stops the pulses crossing it) replace it as child rows, parallel to it,
+    when they explain its own pulses better than it does whole, by more than a BIC price (``split_gain``). The neighbours' cylinders (``context``) are held
     at their claims and keep the stops their surfaces explain. Then rounds of ownership and fitting, and per row
     the evidence that it is wood: its log likelihood at its fit against its best without wood (foliage refitted),
     less a BIC price for the three wood unknowns, as ``p_wood``.
@@ -127,7 +125,8 @@ def joint_tree(scans, a, b, r_prior, parent, context=None, params: JointParams =
     params
         :class:`JointParams`.
     split
-        ``(n,)`` bool: the rows to try splitting (default: by ``params.split_share``).
+        ``(n,)`` bool: the rows to split wherever they show solid stems (default: each row of at least
+        ``params.split_min_r``, split only where the evidence says so).
     threads
         Threads to use (0: one per core).
 
@@ -146,7 +145,9 @@ def joint_tree(scans, a, b, r_prior, parent, context=None, params: JointParams =
     - ``grad`` ``(m, 4)``, ``hess`` ``(m, 4, 4)``: its likelihood message at the fit, in its state (offsets
       along ``e1``, ``e2`` ``(m, 3)``, log R, log lambda);
 
-    and per tree ``u`` (the volume share the rays don't determine), ``objective`` and ``converged``.
+    per input row ``split_gain`` ``(n,)``: the log evidence for its solid stems over it whole, less the price (NaN
+    where none was weighed; near 0 is contested); and per tree ``u`` (the volume share the rays don't determine),
+    ``objective`` and ``converged``.
     """
     if not all(isinstance(s, ScanIndex) for s in scans):
         raise TypeError("joint_tree: scans must be ScanIndex")

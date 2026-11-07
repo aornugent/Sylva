@@ -8,13 +8,15 @@
 //!
 //! - The tube a row's pairs are taken in is decided once, from its prior
 //!   radius ([`window`]).
-//! - **Split.** A row whose pulses aimed at its core partly pass is a clump
-//!   (§18-19): its stops are put in its cross-section, circles are found
-//!   there (a greedy Hough transform over front-face arcs), and each circle
-//!   that is solid (the pulses crossing its core stop at its front, as on
-//!   wood, not through it, as in a cluster of phyllodes) becomes a child row:
-//!   parallel to the row, through the circle's centre, with its radius as the
-//!   prior. A row with no solid circle stays as it is.
+//! - **Split.** A row may be a clump of stems (§18-19): its stops are put in
+//!   its cross-section, circles are found there (a greedy Hough transform over
+//!   front-face arcs, circles that don't overlap), and the circles that are
+//!   solid (the pulses crossing its core stop at its front, as on wood, not
+//!   through it, as in a cluster of phyllodes) are its candidate stems. They
+//!   replace the row, as child rows parallel to it through their centres with
+//!   their radii as priors, when they explain the row's own pulses better
+//!   than the row whole, by more than a BIC price ([`split_gain`], §5's
+//!   proposals ranked by evidence). Otherwise the row stays as it is.
 //! - **Ownership and fit.** The rows' and the neighbours' pairs share one
 //!   table. Each stop seen by several rows belongs to the one whose surface
 //!   it lies nearest; the neighbours, held at their claims, keep theirs and
@@ -50,10 +52,7 @@ pub struct TreeParams {
     pub tol: f64,
     /// Rounds of ownership and fitting.
     pub sweeps: usize,
-    /// A row is tried as a clump when this share of its complete pulses aimed
-    /// within half its prior radius of its axis pass (a solid stem's is ~0),
-    /// and its prior radius is at least `split_min_r` (m).
-    pub split_share: f64,
+    /// A row is tried as a clump when its prior radius is at least this (m).
     pub split_min_r: f64,
     /// A circle is a stem when at most this share of the pulses crossing its
     /// core went through it, and at least `split_min_votes` stops lie on it.
@@ -65,12 +64,12 @@ pub struct TreeParams {
 
 impl TreeParams {
     /// Bumped whenever the fit changes for the same settings.
-    pub const VERSION: u32 = 1;
+    pub const VERSION: u32 = 2;
 }
 
 impl Default for TreeParams {
     fn default() -> Self {
-        TreeParams { like: JointParams::default(), prior: PriorParams::default(), iters: 100, tol: 1e-8, sweeps: 2, split_share: 0.05, split_min_r: 0.02, split_through: 0.1, split_min_votes: 60, drop: 2.0 }
+        TreeParams { like: JointParams::default(), prior: PriorParams::default(), iters: 100, tol: 1e-8, sweeps: 2, split_min_r: 0.02, split_through: 0.1, split_min_votes: 60, drop: 2.0 }
     }
 }
 
@@ -117,6 +116,9 @@ pub struct TreeFit {
     pub hess: Vec<[[f64; 4]; 4]>,
     pub e1: Vec<Point>,
     pub e2: Vec<Point>,
+    /// Per input row: the evidence for its solid stems over it whole (see
+    /// [`split_gain`]; NaN where none was weighed). Near 0 is contested.
+    pub split_gain: Vec<f64>,
     /// The share of the tree's volume the rays don't determine (`sum v (1 - rho_local) / sum v`).
     pub u: f64,
     pub objective: f64,
@@ -136,7 +138,8 @@ struct Stems {
 /// Fits the joint model to one tree: `rows` (with `r_max` ignored: each
 /// row's tube is [`window`] of its prior radius), against `scans`, with the
 /// neighbours' cylinders `ctx_a -> ctx_b` of radius `ctx_r` held fixed.
-/// `split`: the rows to try splitting (default: by `params.split_share`).
+/// `split`: the rows to split wherever they show solid stems (default: every
+/// row of at least `split_min_r`, split only where the evidence says so).
 #[allow(clippy::too_many_arguments)]
 pub fn joint_tree(scans: &[&ScanIndex], rows: &Rows, ctx_a: &[Point], ctx_b: &[Point], ctx_r: &[f64], params: &TreeParams, split: Option<&[bool]>, threads: usize) -> Result<TreeFit> {
     let n = rows.a.len();
@@ -158,9 +161,9 @@ pub fn joint_tree(scans: &[&ScanIndex], rows: &Rows, ctx_a: &[Point], ctx_b: &[P
     let claim = table(scans, &rows0, ctx_a, ctx_b, ctx_r, threads)?;
     let try_split: Vec<bool> = match split {
         Some(s) => s.to_vec(),
-        None => (0..n).map(|k| rows.r_prior[k] >= params.split_min_r && core_pass(&claim, k, rows.r_prior[k]) >= params.split_share).collect(),
+        None => rows.r_prior.iter().map(|&r| r >= params.split_min_r).collect(),
     };
-    let stems = split_rows(&rows0, &claim, &try_split, params);
+    let (stems, split_gain) = split_rows(&rows0, &claim, &try_split, split.is_none(), scans.len(), params, threads)?;
 
     // ownership and the fit, `sweeps` times, starting from the claims
     let t = table(scans, &stems, ctx_a, ctx_b, ctx_r, threads)?;
@@ -269,7 +272,7 @@ pub fn joint_tree(scans: &[&ScanIndex], rows: &Rows, ctx_a: &[Point], ctx_b: &[P
     // the outputs
     let fr = frames(&stems.a, &stems.b);
     let grid = profile_grid();
-    let mut out = TreeFit { src: stems.src.clone(), parent: stems.parent.clone(), a: Vec::new(), b: Vec::new(), r: Vec::new(), sd_log_r: Vec::new(), lo: Vec::new(), hi: Vec::new(), flat: Vec::new(), lam: Vec::new(), log_odds: Vec::new(), p_wood: Vec::new(), reason: Vec::new(), rho_local: fit.rho_local.clone(), rho_pooled: fit.rho_pooled.clone(), n_pairs: n_pairs.clone(), grad: fit.grad.clone(), hess: fit.hess.clone(), e1: Vec::new(), e2: Vec::new(), u: 0.0, objective: fit.objective, converged: fit.converged };
+    let mut out = TreeFit { src: stems.src.clone(), parent: stems.parent.clone(), a: Vec::new(), b: Vec::new(), r: Vec::new(), sd_log_r: Vec::new(), lo: Vec::new(), hi: Vec::new(), flat: Vec::new(), lam: Vec::new(), log_odds: Vec::new(), p_wood: Vec::new(), reason: Vec::new(), rho_local: fit.rho_local.clone(), rho_pooled: fit.rho_pooled.clone(), n_pairs: n_pairs.clone(), grad: fit.grad.clone(), hess: fit.hess.clone(), e1: Vec::new(), e2: Vec::new(), split_gain, u: 0.0, objective: fit.objective, converged: fit.converged };
     let (mut v_all, mut v_open) = (0.0, 0.0);
     for k in 0..m {
         let (_, e1, e2, len) = fr[k];
@@ -314,17 +317,72 @@ fn table(scans: &[&ScanIndex], stems: &Stems, ctx_a: &[Point], ctx_b: &[Point], 
     joint_table(scans, &a, &b, &w, threads)
 }
 
-/// The share of row `k`'s complete pulses (no deleted echo in reach) aimed
-/// within half of `r` of its axis that pass.
-fn core_pass(t: &JointPairs, k: usize, r: f64) -> f64 {
-    let (mut n, mut pass) = (0usize, 0usize);
-    for (pu, &row) in t.pulses.iter().zip(&t.row) {
-        if row as usize == k && !pu.deleted && pu.b.abs() < 0.5 * r {
-            n += 1;
-            pass += usize::from(!pu.stop);
+/// A pair measured from its row's axis moved by `d` across it: the same pulse
+/// and chord (so the same foliage exposure), seen from a parallel axis.
+fn shifted(pu: &Pulse, d: [f64; 2]) -> Pulse {
+    Pulse { b: pu.b - (d[0] * pu.jb[0] + d[1] * pu.jb[1]), t: pu.t + (d[0] * pu.jt[0] + d[1] * pu.jt[1]), ..*pu }
+}
+
+/// Which of several parallel circles (offsets and radii in the row's frame)
+/// a pair meets first: of those its footprint touches, the one whose front it
+/// reaches first; if none, the one whose silhouette it passes nearest. Solid
+/// stems don't overlap, so a pulse's fate in the disc is the first one's.
+fn first_circle(pu: &Pulse, circles: &[(f64, f64, f64)], p: &JointParams) -> usize {
+    let w = p.exit + p.divergence * pu.t;
+    let mut best = (false, f64::INFINITY, 0);
+    for (i, &(cx, cy, r)) in circles.iter().enumerate() {
+        let s = shifted(pu, [cx, cy]);
+        let touch = s.b.abs() < r + 0.5 * w;
+        let key = if touch { s.t - (r * r - s.b * s.b).max(0.0).sqrt() / s.sin.max(1e-9) } else { s.b.abs() - r };
+        if (touch && !best.0) || (touch == best.0 && key < best.1) {
+            best = (touch, key, i);
         }
     }
-    if n == 0 { 1.0 } else { pass as f64 / n as f64 }
+    best.2
+}
+
+/// The evidence for a row's candidate stems over the row whole, on the same
+/// pulses: the row's own pairs (its tube's, one per pulse, with the same
+/// chords), fitted as one stem and as the stems. The stems are rows parallel
+/// to the row through the circles' centres; each pair is seen from the stem
+/// it meets first ([`first_circle`]), and each stem has its own foliage.
+/// One stem has several modes (§5), so the whole row is fitted from its
+/// claim and from the strongest circle, and the better kept. Returns the
+/// stems' log likelihood at their fit less the whole row's at its, less
+/// BIC's price for the extra unknowns, `2 (n - 1) ln(pairs)` (four per
+/// stem): above 0, the stems explain the pulses better. Small circles along
+/// one trunk's arcs leave the pulses aimed between them unexplained.
+#[allow(clippy::too_many_arguments)]
+fn split_gain(pulses: &[Pulse], scan: &[u32], n_scans: usize, a: Point, b: Point, r: f64, circles: &[(f64, f64, f64)], params: &TreeParams, threads: usize) -> Result<f64> {
+    let p = &params.like;
+    let opts = FitOptions { schedule: SCHEDULE.to_vec(), iters: params.iters, tol: params.tol, threads };
+    let (_, e1, e2, _) = frames(&[a], &[b])[0];
+    // the log likelihood of the pulses as the stems `cs` (offsets and radii in the row's frame), at their fit
+    let stems = |cs: &[(f64, f64, f64)]| -> Result<f64> {
+        let at = |c: &(f64, f64, f64), x: Point| -> Point { std::array::from_fn(|i| x[i] + c.0 * e1[i] + c.1 * e2[i]) };
+        let (sa, sb): (Vec<Point>, Vec<Point>) = cs.iter().map(|c| (at(c, a), at(c, b))).unzip();
+        let sr: Vec<f64> = cs.iter().map(|c| c.2).collect();
+        let sw: Vec<f64> = sr.iter().map(|&r| window(r)).collect();
+        let parent = vec![-1i64; cs.len()];
+        let assign = |cs: &[(f64, f64, f64)]| -> (Vec<Pulse>, Vec<Owner>) {
+            pulses.iter().map(|pu| {
+                let i = first_circle(pu, cs, p);
+                (shifted(pu, [cs[i].0, cs[i].1]), Owner { row: i as u32, nu: u32::MAX })
+            }).unzip()
+        };
+        let (sp, own) = assign(cs);
+        let row: Vec<u32> = own.iter().map(|o| o.row).collect();
+        let rows = Rows { a: &sa, b: &sb, r_prior: &sr, r_max: &sw, parent: &parent };
+        let f = joint_fit(&sp, &row, scan, &rows, n_scans, p, &params.prior, &opts, None)?;
+        // each pair again from the fitted stem it meets first (a stem's frame is the row's: they are parallel)
+        let fitted: Vec<(f64, f64, f64)> = cs.iter().zip(&f.theta).map(|(c, t)| (c.0 + t[0], c.1 + t[1], t[2].exp())).collect();
+        let (sp, own) = assign(&fitted);
+        let theta: Vec<[f64; 4]> = f.theta.iter().map(|t| [0.0, 0.0, t[2], t[3]]).collect();
+        Ok(joint_loglik(&sp, &own, &theta, &[], p, threads)?.iter().sum())
+    };
+    let l_whole = stems(&[(0.0, 0.0, r)])?.max(stems(&circles[..1])?);
+    let l_split = stems(circles)?;
+    Ok(l_split - l_whole - 2.0 * (circles.len() as f64 - 1.0) * (pulses.len().max(1) as f64).ln())
 }
 
 /// Which pairs each row keeps: a stop seen by several rows stays with the one
@@ -345,19 +403,28 @@ fn owners(t: &JointPairs, state: &[[f64; 4]], p: &JointParams) -> Vec<bool> {
 }
 
 /// `rows` with each row in `try_split` replaced by the solid circles its stops
-/// show (left as it is where there are none). A stem continues the parent
-/// row's stem whose end is nearest its start.
-fn split_rows(rows: &Stems, t: &JointPairs, try_split: &[bool], params: &TreeParams) -> Stems {
+/// show (left as it is where there are none), and with `weigh`, only where
+/// they beat the row whole ([`split_gain`] > 0); and each row's gain (NaN
+/// where none was weighed). A stem continues the parent row's stem whose end
+/// is nearest its start.
+#[allow(clippy::too_many_arguments)]
+fn split_rows(rows: &Stems, t: &JointPairs, try_split: &[bool], weigh: bool, n_scans: usize, params: &TreeParams, threads: usize) -> Result<(Stems, Vec<f64>)> {
     let fr = frames(&rows.a, &rows.b);
     let mut out = Stems { a: Vec::new(), b: Vec::new(), r: Vec::new(), parent: Vec::new(), src: Vec::new() };
+    let mut gains = vec![f64::NAN; rows.a.len()];
     let mut new: Vec<Vec<usize>> = Vec::with_capacity(rows.a.len());
     for k in 0..rows.a.len() {
         let (_, e1, e2, _) = fr[k];
         let mut parts = vec![(rows.a[k], rows.b[k], rows.r[k])];
         if try_split[k] {
-            let mine: Vec<&Pulse> = t.pulses.iter().zip(&t.row).filter(|&(_, &r)| r as usize == k).map(|(pu, _)| pu).collect();
-            let solid: Vec<(f64, f64, f64)> = circles(&mine, rows.r[k], params.split_min_votes).into_iter().filter(|&c| opacity(&mine, c) <= params.split_through).collect();
-            if !solid.is_empty() {
+            let (mine, scan): (Vec<Pulse>, Vec<u32>) = t.pulses.iter().zip(&t.row).zip(&t.scan).filter(|&((_, &r), _)| r as usize == k).map(|((pu, _), &s)| (*pu, s)).unzip();
+            let refs: Vec<&Pulse> = mine.iter().collect();
+            let solid: Vec<(f64, f64, f64)> = circles(&refs, rows.r[k], params.split_min_votes).into_iter().filter(|&c| opacity(&refs, c) <= params.split_through).collect();
+            // weighed: one solid circle is one stem, which the fit finds from the claim (and its profile's restart)
+            if weigh && solid.len() >= 2 {
+                gains[k] = split_gain(&mine, &scan, n_scans, rows.a[k], rows.b[k], rows.r[k], &solid, params, threads)?;
+            }
+            if if weigh { gains[k] > 0.0 } else { !solid.is_empty() } {
                 parts = solid.iter().map(|&(cx, cy, r)| {
                     let off: Point = std::array::from_fn(|i| cx * e1[i] + cy * e2[i]);
                     (std::array::from_fn(|i| rows.a[k][i] + off[i]), std::array::from_fn(|i| rows.b[k][i] + off[i]), r)
@@ -380,7 +447,7 @@ fn split_rows(rows: &Stems, t: &JointPairs, try_split: &[bool], params: &TreePar
         }
         new.push(here);
     }
-    out
+    Ok((out, gains))
 }
 
 /// A stop's place in its row's cross-section (frame `e1, e2`, from the axis)
@@ -399,7 +466,8 @@ fn cross_section(pu: &Pulse) -> ([f64; 2], [f64; 2]) {
 /// radius up to `r_max`) most stops lie on (within 6 mm) with its centre
 /// behind them (a stop hit a front face), then again among the stops left,
 /// until the best has fewer than `min_votes` stops or a quarter of the
-/// strongest's, at most six. Returns `(cx, cy, r)` in the row's frame.
+/// strongest's, at most six, none overlapping another. Returns `(cx, cy, r)`
+/// in the row's frame.
 fn circles(pairs: &[&Pulse], r_max: f64, min_votes: usize) -> Vec<(f64, f64, f64)> {
     const TOL: f64 = 0.006;
     const CELL: f64 = 0.004;
@@ -473,6 +541,9 @@ fn circles(pairs: &[&Pulse], r_max: f64, min_votes: usize) -> Vec<(f64, f64, f64
         for &(_, flat) in &peaks[..top] {
             let (i, rest) = (flat / (nx * ny), flat % (nx * ny));
             let c = [lo[0] + ((rest / ny) as f64 + 0.5) * CELL, lo[1] + ((rest % ny) as f64 + 0.5) * CELL];
+            if found.iter().any(|f| (c[0] - f.0).hypot(c[1] - f.1) < radii[i] + f.2 - TOL) {
+                continue; // solid stems don't overlap: not a second circle on one stem's arcs
+            }
             let votes = pts.iter().zip(&left).filter(|&(&(y, v), &l)| l && on(c, radii[i], y, v)).count();
             if best.is_none_or(|b| votes > b.0) {
                 best = Some((votes, c, radii[i]));
@@ -532,6 +603,7 @@ mod tests {
         let params = TreeParams { like: JointParams { tau: 0.17, edge: 0.25, hide: 0.0, ..JointParams::default() }, prior: PriorParams { scan_abs: 0.0, scan_rel: 0.0, centre_rel: 0.3, ..PriorParams::default() }, ..TreeParams::default() };
         let f = joint_tree(&[&scan], &rows, &[[0.3, 5.0, -1.0]], &[[0.3, 5.0, 1.0]], &[0.02], &params, None, 2).unwrap();
         assert_eq!(f.src, vec![0], "a solid stem isn't split");
+        assert!(!(f.split_gain[0] > 0.0), "kept whole: gain {}", f.split_gain[0]);
         assert!((f.r[0] - 0.05).abs() < 0.003 && (f.a[0][0]).abs() < 0.003, "R {} at x {}", f.r[0], f.a[0][0]);
         assert!(f.p_wood[0] > 0.99 && f.reason[0] == reason::MEASURED && f.lo[0] < 0.05 && f.hi[0] > 0.05 && !f.flat[0]);
         assert!(f.converged && f.u < 0.5 && f.n_pairs[0] > 200);
@@ -540,6 +612,28 @@ mod tests {
         assert_eq!(g.src, vec![0]);
         assert!((g.r[0] - 0.05).abs() < 0.003);
         assert!(joint_tree(&[&scan], &rows, &[], &[], &[], &params, Some(&[true, false]), 2).is_err());
+    }
+
+    #[test]
+    fn a_shifted_pair_is_the_pair_seen_from_the_moved_axis() {
+        let (scan, a, b) = crate::qsm::evidence::tests::scene(0.05, true);
+        let t = joint_table(&[&scan], &[a], &[b], &[window(0.08)], 2).unwrap();
+        let p = JointParams { tau: 0.17, edge: 0.25, hide: 0.0, ..JointParams::default() };
+        let d = [0.012, -0.007];
+        let moved: Vec<Pulse> = t.pulses.iter().map(|pu| shifted(pu, d)).collect();
+        let own: Vec<Owner> = t.pulses.iter().map(|_| Owner { row: 0, nu: u32::MAX }).collect();
+        let at = joint_loglik(&t.pulses, &own, &[[d[0], d[1], 0.05f64.ln(), 0.0]], &[], &p, 2).unwrap();
+        let from = joint_loglik(&moved, &own, &[[0.0, 0.0, 0.05f64.ln(), 0.0]], &[], &p, 2).unwrap();
+        // equal but for the footprint, taken at the moved range of closest approach (divergence x the shift)
+        let worst = at.iter().zip(&from).map(|(x, y)| (x - y).abs()).fold(0.0, f64::max);
+        assert!(worst < 0.01, "worst {worst}");
+        // a pulse aimed at the stem meets it before a circle behind it; a pulse aimed between two meets the nearer
+        let hit = t.pulses.iter().find(|pu| pu.stop && pu.b.abs() < 0.01).unwrap();
+        let v = [hit.jt[0] * hit.sin, hit.jt[1] * hit.sin];
+        let l = (v[0] * v[0] + v[1] * v[1]).sqrt();
+        let behind = (0.12 * v[0] / l, 0.12 * v[1] / l, 0.03);
+        assert_eq!(first_circle(hit, &[behind, (0.0, 0.0, 0.05)], &p), 1);
+        assert_eq!(first_circle(hit, &[(0.0, 0.0, 0.05), behind], &p), 0);
     }
 
     #[test]
