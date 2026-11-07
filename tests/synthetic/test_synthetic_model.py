@@ -394,6 +394,26 @@ def test_reflectance_and_detection():
     assert synthetic.scan(cloud, reflectance=0.1, detection_threshold=0.2, **kw).n_echoes == 0
 
 
+def test_solid_cylinders_are_exact_opaque_wood():
+    # a solid stem of radius 2 cm at 6 m in front of a wall at 10 m; point 0 stands for the stem
+    cloud = _cloud(_wall(10.0, -1, 1, -1, 1, 0.005))
+    cls = np.full(len(cloud), 2, np.uint8)
+    cls[0] = 5
+    cloud = cloud.with_attrs(classification=cls)
+    solids = dict(a=[[0, 6, -1]], b=[[0, 6, 1]], r=[0.02], point=[0])
+    s = synthetic.scan(cloud, origin=(0, 0, 0), resolution_deg=0.05, min_zenith_deg=89.5, max_zenith_deg=90.5,
+                       scanner="vz400i", range_noise=0.0, target_radius=0.005, solids=solids)
+    first = s.echo_range[s.echo_start[s.echo_count > 0]]
+    d = s.direction[s.echo_count > 0]
+    stem = s.echo_attrs["classification"][s.echo_start[s.echo_count > 0]] == 5
+    y = first * d[:, 1]
+    assert stem.sum() > 20
+    assert np.all((y[stem] > 6 - 0.021) & (y[stem] < 6))  # on the near face, never inside
+    assert np.isclose(s.echo_attrs["reflectance"][s.echo_start[s.echo_count > 0]][stem].max(), 10 * np.log10(0.5))
+    with pytest.raises(ValueError, match="solid"):
+        synthetic.scan(cloud, scanner="vz400i", solids=dict(a=[[0, 6, -1]], b=[[0, 6, 1]], r=[0.0], point=[0]))
+
+
 def test_scanner_presets_and_misses():
     cloud = _cloud(_wall(5.0, -1, 1, -1, 1, 0.01))
     s = synthetic.scan(cloud, origin=(0, 0, 0), resolution_deg=1.0, scanner="vz400")
