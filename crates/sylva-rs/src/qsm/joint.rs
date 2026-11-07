@@ -243,32 +243,24 @@ pub struct JointParams {
     pub step: f64,
 }
 
-/// The table of pulse-cylinder pairs, one entry per pair (`jb`, `jt` two
-/// per pair).
-#[derive(Debug, Clone, Default)]
-pub struct JointTable {
-    pub b: Vec<f64>,
-    pub t: Vec<f64>,
-    pub sin: Vec<f64>,
-    pub jb: Vec<[f64; 2]>,
-    pub jt: Vec<[f64; 2]>,
-    pub c0: Vec<f64>,
-    pub c1: Vec<f64>,
-    pub stop: Vec<bool>,
-    pub x: Vec<f64>,
-    pub early: Vec<bool>,
-    pub q: Vec<f64>,
-}
-
-impl JointTable {
-    fn check(&self) -> Result<()> {
-        let n = self.b.len();
-        let lens = [self.t.len(), self.sin.len(), self.jb.len(), self.jt.len(), self.c0.len(), self.c1.len(), self.stop.len(), self.x.len(), self.early.len(), self.q.len()];
-        if lens.iter().any(|&l| l != n) {
-            return Err(Error::invalid("joint: the table's columns must have one entry per pair"));
-        }
-        Ok(())
-    }
+/// One pulse-cylinder pair, measured once from a starting axis (see the
+/// module documentation).
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct Pulse {
+    pub b: f64,
+    pub t: f64,
+    pub sin: f64,
+    pub jb: [f64; 2],
+    pub jt: [f64; 2],
+    pub c0: f64,
+    pub c1: f64,
+    /// A stop's range (unused for a pass).
+    pub x: f64,
+    pub stop: bool,
+    /// It echoed before the disc (recorded whatever happened in it).
+    pub early: bool,
+    /// The chance something behind records a pass.
+    pub q: f64,
 }
 
 /// `∫ sqrt(R^2 - y^2) dy` at `y` clipped to the circle, exact in value and
@@ -296,13 +288,13 @@ fn h_int(y: D, r: D) -> D {
 }
 
 /// One pair's log likelihood at state (offset, eta, ell), with derivatives.
-fn pair(tab: &JointTable, i: usize, s: [f64; 4], p: &JointParams) -> D {
+fn pair(pu: &Pulse, s: [f64; 4], p: &JointParams) -> D {
     let (d1, d2, eta, ell) = (D::var(s[0], 0), D::var(s[1], 1), D::var(s[2], 2), D::var(s[3], 3));
     let r = eta.exp();
     let lam = ell.exp();
-    let bp = D::c(tab.b[i]) - (d1 * tab.jb[i][0] + d2 * tab.jb[i][1]);
-    let tp = D::c(tab.t[i]) + (d1 * tab.jt[i][0] + d2 * tab.jt[i][1]);
-    let w = p.exit + p.divergence * tab.t[i];
+    let bp = D::c(pu.b) - (d1 * pu.jb[0] + d2 * pu.jb[1]);
+    let tp = D::c(pu.t) + (d1 * pu.jt[0] + d2 * pu.jt[1]);
+    let w = p.exit + p.divergence * pu.t;
     // the footprint on the circle: its share f, and the surface's centroid depth hbar
     let y1 = (bp + (-w / 2.0)).max(-r);
     let y2 = (bp + w / 2.0).min(r);
@@ -311,13 +303,13 @@ fn pair(tab: &JointTable, i: usize, s: [f64; 4], p: &JointParams) -> D {
     let hbar = if width.v > 1e-9 { (h_int(y2, r) - h_int(y1, r)) / width } else { D::c(0.0) };
     let zdet = (r + w * (0.5 - p.tau) - bp.abs()) * (4.0 / w);
     let (lp, lq) = (zdet.log_ndtr(), (-zdet).log_ndtr());
-    let (c0, c1) = (D::c(tab.c0[i]), D::c(tab.c1[i]));
-    let xw = (tp - hbar * (1.0 / tab.sin[i])).clamp(c0, c1);
+    let (c0, c1) = (D::c(pu.c0), D::c(pu.c1));
+    let xw = (tp - hbar * (1.0 / pu.sin)).clamp(c0, c1);
     let zw = xw - c0;
-    let ln = tab.c1[i] - tab.c0[i];
+    let ln = pu.c1 - pu.c0;
     let sig = (r.sq() * (p.rough * p.rough) + p.sigma_r * p.sigma_r).sqrt();
     let eps = (-(f.clamp(D::c(0.0), D::c(1.0))) + 1.0) * p.eps + p.eps_min;
-    let x = D::c(tab.x[i]);
+    let x = D::c(pu.x);
     let z = (x - c0).max(D::c(0.0));
     let u = (x - xw) / sig;
     let log_sqrt2pi = 0.5 * (2.0 * std::f64::consts::PI).ln();
@@ -328,41 +320,39 @@ fn pair(tab: &JointTable, i: usize, s: [f64; 4], p: &JointParams) -> D {
     let over = ((xw + p.mp_len - c1) * (1.0 / p.mp_len)).clamp(D::c(1e-12), D::c(1.0));
     let l_pass = logaddexp(lq - lam * ln, lp - lam * zw + (eps + 1e-300).ln() + over.ln());
     let l_stop = logaddexp(l_wood, l_leaf);
-    let q = tab.q[i];
+    let q = pu.q;
     let p_pass = l_pass.min(D::c(0.0)).exp();
     if p.thin > 0.0 {
-        let lk = (2.0 * (tab.t[i].max(0.1) * p.step / p.thin).ln()).min(0.0);
-        let sel = if tab.early[i] { D::c(0.0) } else { ((-p_pass + 1.0) * lk.exp() + p_pass * q).ln() };
-        (if tab.stop[i] { l_stop + lk } else { l_pass + q.ln() }) - sel
+        let lk = (2.0 * (pu.t.max(0.1) * p.step / p.thin).ln()).min(0.0);
+        let sel = if pu.early { D::c(0.0) } else { ((-p_pass + 1.0) * lk.exp() + p_pass * q).ln() };
+        (if pu.stop { l_stop + lk } else { l_pass + q.ln() }) - sel
     } else {
-        let sel = if tab.early[i] { D::c(0.0) } else { (p_pass * (-(1.0 - q))).log1p() };
-        (if tab.stop[i] { l_stop } else { l_pass + q.ln() }) - sel
+        let sel = if pu.early { D::c(0.0) } else { (p_pass * (-(1.0 - q))).log1p() };
+        (if pu.stop { l_stop } else { l_pass + q.ln() }) - sel
     }
 }
 
 /// Per pair log likelihood at `state[i] = [offset1, offset2, eta, ell]`.
-pub fn joint_loglik(tab: &JointTable, state: &[[f64; 4]], p: &JointParams, threads: usize) -> Result<Vec<f64>> {
-    tab.check()?;
-    if state.len() != tab.b.len() {
+pub fn joint_loglik(pulses: &[Pulse], state: &[[f64; 4]], p: &JointParams, threads: usize) -> Result<Vec<f64>> {
+    if state.len() != pulses.len() {
         return Err(Error::invalid("joint: one state per pair"));
     }
-    pool(threads)?.install(|| Ok((0..tab.b.len()).into_par_iter().map(|i| pair(tab, i, state[i], p).v).collect()))
+    pool(threads)?.install(|| Ok(pulses.par_iter().zip(state).map(|(pu, s)| pair(pu, *s, p).v).collect()))
 }
 
 /// Sums by group of the pairs' log likelihood, gradient and Hessian in their
 /// own four state variables: `(value (n,), gradient (n, 4), Hessian (n, 4,
 /// 4))`, group `group[i]` of `n_groups`.
 #[allow(clippy::type_complexity)]
-pub fn joint_blocks(tab: &JointTable, state: &[[f64; 4]], group: &[u32], n_groups: usize, p: &JointParams, threads: usize) -> Result<(Vec<f64>, Vec<[f64; 4]>, Vec<[[f64; 4]; 4]>)> {
-    tab.check()?;
-    let n = tab.b.len();
+pub fn joint_blocks(pulses: &[Pulse], state: &[[f64; 4]], group: &[u32], n_groups: usize, p: &JointParams, threads: usize) -> Result<(Vec<f64>, Vec<[f64; 4]>, Vec<[[f64; 4]; 4]>)> {
+    let n = pulses.len();
     if state.len() != n || group.len() != n || group.iter().any(|&g| g as usize >= n_groups) {
         return Err(Error::invalid("joint: one state and one group (below n_groups) per pair"));
     }
     pool(threads)?.install(|| {
         let empty = || (vec![0.0; n_groups], vec![[0.0; 4]; n_groups], vec![[[0.0; 4]; 4]; n_groups]);
         Ok((0..n).into_par_iter().fold(empty, |mut acc, i| {
-            let d = pair(tab, i, state[i], p);
+            let d = pair(&pulses[i], state[i], p);
             let k = group[i] as usize;
             acc.0[k] += d.v;
             for a in 0..4 {
@@ -400,22 +390,10 @@ mod tests {
     }
 
     /// A few pulses past a 5 cm stem at 8 m: on the surface, inside it, passing, and a leaf in front.
-    fn table() -> JointTable {
-        let mut t = JointTable::default();
-        for (b, stop, x, early, q) in [(0.0, true, 7.95, false, 1.0), (0.04, true, 7.97, false, 0.6), (0.07, false, 0.0, false, 0.6), (0.02, true, 7.88, true, 1.0), (0.03, false, 0.0, false, 1.0)] {
-            t.b.push(b);
-            t.t.push(8.0);
-            t.sin.push(0.95);
-            t.jb.push([0.9, 0.1]);
-            t.jt.push([0.05, 0.9]);
-            t.c0.push(7.85);
-            t.c1.push(8.15);
-            t.stop.push(stop);
-            t.x.push(x);
-            t.early.push(early);
-            t.q.push(q);
-        }
-        t
+    fn table() -> Vec<Pulse> {
+        [(0.0, true, 7.95, false, 1.0), (0.04, true, 7.97, false, 0.6), (0.07, false, 0.0, false, 0.6), (0.02, true, 7.88, true, 1.0), (0.03, false, 0.0, false, 1.0)]
+            .map(|(b, stop, x, early, q)| Pulse { b, t: 8.0, sin: 0.95, jb: [0.9, 0.1], jt: [0.05, 0.9], c0: 7.85, c1: 8.15, x, stop, early, q })
+            .to_vec()
     }
 
     #[test]
@@ -431,14 +409,14 @@ mod tests {
     fn derivatives_match_finite_differences() {
         let (tab, p) = (table(), params());
         let s0 = [0.003, -0.002, (0.05f64).ln(), (1.5f64).ln()];
-        for i in 0..tab.b.len() {
-            let d = pair(&tab, i, s0, &p);
+        for (i, pu) in tab.iter().enumerate() {
+            let d = pair(pu, s0, &p);
             let h = [1e-5, 1e-5, 1e-4, 1e-4];
             for a in 0..4 {
                 let (mut sp, mut sm) = (s0, s0);
                 sp[a] += h[a];
                 sm[a] -= h[a];
-                let (fp, fm) = (pair(&tab, i, sp, &p), pair(&tab, i, sm, &p));
+                let (fp, fm) = (pair(pu, sp, &p), pair(pu, sm, &p));
                 let g = (fp.v - fm.v) / (2.0 * h[a]);
                 assert!((g - d.g[a]).abs() < 1e-3 * g.abs().max(1.0), "pair {i} grad {a}: {g} vs {}", d.g[a]);
                 for b in 0..4 {
@@ -452,7 +430,7 @@ mod tests {
     #[test]
     fn blocks_sum_their_pairs_and_inputs_are_checked() {
         let (tab, p) = (table(), params());
-        let st = vec![[0.0, 0.0, (0.05f64).ln(), 0.0]; tab.b.len()];
+        let st = vec![[0.0, 0.0, (0.05f64).ln(), 0.0]; tab.len()];
         let (f, g, _) = joint_blocks(&tab, &st, &[0, 1, 1, 0, 1], 2, &p, 2).unwrap();
         let ll = joint_loglik(&tab, &st, &p, 2).unwrap();
         assert!((f[0] - (ll[0] + ll[3])).abs() < 1e-9 && (f[1] - (ll[1] + ll[2] + ll[4])).abs() < 1e-9);

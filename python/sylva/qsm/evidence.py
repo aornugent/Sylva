@@ -118,13 +118,13 @@ class ScanIndex:
         return np.asarray(self._core.origin, np.float64)
 
 
-def pairs(scans, a, b, window: float, threads: int = 0) -> dict[str, np.ndarray]:
+def pairs(scans, a, b, window, threads: int = 0) -> dict[str, np.ndarray]:
     """Every pulse near each cylinder ``a[i] -> b[i]``, with all its echoes.
 
     The raw table a per-pulse likelihood reads, which :func:`evidence`
     reduces inside. A row is a pulse whose line comes closest to the axis
-    within the segment (ends included), closer than ``window``, ahead of the
-    scanner, and that reached the tube of radius ``window`` around the axis
+    within the segment (ends included), closer than its cylinder's ``window``,
+    ahead of the scanner, and that reached the tube of that radius around the axis
     (its last echo is at or beyond where its line enters the tube, or it
     missed): a pulse that stopped short says nothing about what is in the
     tube. Every row carries all its pulse's echoes, so whether it echoed
@@ -138,7 +138,7 @@ def pairs(scans, a, b, window: float, threads: int = 0) -> dict[str, np.ndarray]
     a, b
         ``(n, 3)`` cylinder axes.
     window
-        Radius (m) of the disc around each axis.
+        Radius (m) of the tube around each axis: one for all, or ``(n,)``.
     threads
         Threads to use (0: one per core).
 
@@ -161,7 +161,8 @@ def pairs(scans, a, b, window: float, threads: int = 0) -> dict[str, np.ndarray]
     a, b = np.ascontiguousarray(a, np.float64), np.ascontiguousarray(b, np.float64)
     if a.ndim != 2 or a.shape[1] != 3 or a.shape != b.shape:
         raise ValueError(f"a and b must both have shape (n, 3), got {a.shape} and {b.shape}")
-    return _core.qsm_pairs([s._core for s in scans], a, b, float(window), int(threads))
+    window = np.ascontiguousarray(np.broadcast_to(np.asarray(window, np.float64), (len(a),)))
+    return _core.qsm_pairs([s._core for s in scans], a, b, window, int(threads))
 
 
 def evidence(scans, a, b, r_claim=None, params: EvidenceParams = EvidenceParams(), threads: int = 0) -> dict[str, np.ndarray]:

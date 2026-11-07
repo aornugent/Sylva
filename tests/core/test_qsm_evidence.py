@@ -57,6 +57,9 @@ def test_pairs_hold_each_pulse_that_reached_the_disc_with_its_echoes(tmp_path):
     assert np.isnan(p["reflectance"]).all()
     with pytest.raises(ValueError):
         pairs([scan], a, b, window=0.0)
+    q = pairs([scan], np.r_[a, a], np.r_[b, b], window=[0.15, 0.08])  # each cylinder its own tube
+    n0 = q["cyl_start"][1]
+    assert q["cyl_start"][2] - n0 < n0 and np.all(q["d"][n0:] < 0.08)
 
 
 def test_thin_wood_without_misses_rests_on_the_prior(tmp_path):
