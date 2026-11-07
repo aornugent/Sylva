@@ -16,7 +16,7 @@ use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList};
 use sylva_rs::qsm::buttress::{Buttress, ButtressParams};
 use sylva_rs::qsm::evidence::{self, Beam, EvidenceParams, ScanIndex};
-use sylva_rs::qsm::joint::{self, JointParams, Pulse};
+use sylva_rs::qsm::joint::{self, JointParams, Owner, Pulse};
 use sylva_rs::qsm::QsmParams;
 use sylva_rs::qsm::ops::{self as ops, Row, Segment};
 use sylva_rs::qsm::plot::{self as plot, ButtressView, PlotEntry, PlotParams};
@@ -502,68 +502,79 @@ fn qsm_pairs<'py>(py: Python<'py>, scans: Vec<Bound<'py, PyScanIndex>>, a: PyRea
     Ok(d)
 }
 
-/// The joint model's pairs and constants from Python: `table` maps each
-/// `Pulse` field to an `(m,)` array (`jb`, `jt`: `(m, 2)`; `stop`, `early`:
-/// bool), `params` each `JointParams` field to its value.
-fn joint_inputs(table: &Bound<'_, PyDict>, params: &Bound<'_, PyDict>) -> PyResult<(Vec<Pulse>, JointParams)> {
-    let col = |k: &str| -> PyResult<Vec<f64>> {
-        let a: PyReadonlyArray1<f64> = table.get_item(k)?.ok_or_else(|| PyValueError::new_err(format!("joint table: no {k:?}")))?.extract()?;
-        Ok(a.as_array().to_vec())
-    };
-    let pair = |k: &str| -> PyResult<Vec<[f64; 2]>> {
-        let a: PyReadonlyArray2<f64> = table.get_item(k)?.ok_or_else(|| PyValueError::new_err(format!("joint table: no {k:?}")))?.extract()?;
-        let a = a.as_array();
-        if a.ncols() != 2 {
-            return Err(PyValueError::new_err(format!("joint table: {k:?} must be (m, 2)")));
-        }
-        Ok(a.rows().into_iter().map(|r| [r[0], r[1]]).collect())
-    };
-    let flag = |k: &str| -> PyResult<Vec<bool>> {
-        let a: PyReadonlyArray1<bool> = table.get_item(k)?.ok_or_else(|| PyValueError::new_err(format!("joint table: no {k:?}")))?.extract()?;
-        Ok(a.as_array().to_vec())
-    };
-    let (b, t, sin, jb, jt, c0, c1, x, q, stop, early) = (col("b")?, col("t")?, col("sin")?, pair("jb")?, pair("jt")?, col("c0")?, col("c1")?, col("x")?, col("q")?, flag("stop")?, flag("early")?);
-    let n = b.len();
-    if [t.len(), sin.len(), jb.len(), jt.len(), c0.len(), c1.len(), x.len(), q.len(), stop.len(), early.len()].iter().any(|&l| l != n) {
-        return Err(PyValueError::new_err("joint table: every column must have one entry per pair"));
-    }
-    let pulses = (0..n).map(|i| Pulse { b: b[i], t: t[i], sin: sin[i], jb: jb[i], jt: jt[i], c0: c0[i], c1: c1[i], x: x[i], stop: stop[i], early: early[i], q: q[i] }).collect();
+/// A joint model's pairs, held on the Rust side for the life of a fit:
+/// `table` maps each `Pulse` field to an `(m,)` array (`jb`, `jt`: `(m, 2)`;
+/// `stop`, `early`: bool) plus `row` and `nu` (each pair's row, and its
+/// nuisance offset or -1) and `group` (its block, below `n_groups`).
+#[pyclass(name = "JointTable", frozen)]
+pub(crate) struct PyJointTable {
+    pulses: Vec<Pulse>,
+    owners: Vec<Owner>,
+    group: Vec<u32>,
+    n_groups: usize,
+}
+
+fn joint_params(params: &Bound<'_, PyDict>) -> PyResult<JointParams> {
     let get = |k: &str| -> PyResult<f64> { params.get_item(k)?.ok_or_else(|| PyValueError::new_err(format!("joint params: no {k:?}")))?.extract() };
-    let p = JointParams { exit: get("exit")?, divergence: get("divergence")?, sigma_r: get("sigma_r")?, rough: get("rough")?, tau: get("tau")?, eps: get("eps")?, eps_min: get("eps_min")?, mp_len: get("mp_len")?, thin: get("thin")?, step: get("step")? };
-    Ok((pulses, p))
+    Ok(JointParams { exit: get("exit")?, divergence: get("divergence")?, sigma_r: get("sigma_r")?, rough: get("rough")?, tau: get("tau")?, eps: get("eps")?, eps_min: get("eps_min")?, mp_len: get("mp_len")?, thin: get("thin")?, step: get("step")? })
 }
 
-fn states(state: PyReadonlyArray2<f64>) -> PyResult<Vec<[f64; 4]>> {
-    let s = state.as_array();
-    if s.ncols() != 4 {
-        return Err(PyValueError::new_err("joint: state must be (m, 4)"));
+fn rows<const K: usize>(a: PyReadonlyArray2<f64>, what: &str) -> PyResult<Vec<[f64; K]>> {
+    let a = a.as_array();
+    if a.ncols() != K {
+        return Err(PyValueError::new_err(format!("joint: {what} must be (n, {K})")));
     }
-    Ok((0..s.nrows()).map(|i| [s[[i, 0]], s[[i, 1]], s[[i, 2]], s[[i, 3]]]).collect())
+    Ok(a.rows().into_iter().map(|r| std::array::from_fn(|k| r[k])).collect())
 }
 
-#[pyfunction]
-fn qsm_joint_loglik<'py>(py: Python<'py>, table: Bound<'py, PyDict>, state: PyReadonlyArray2<f64>, params: Bound<'py, PyDict>, threads: usize) -> PyResult<Bound<'py, PyArray1<f64>>> {
-    let (pulses, p) = joint_inputs(&table, &params)?;
-    let st = states(state)?;
-    let ll = py.detach(|| joint::joint_loglik(&pulses, &st, &p, threads)).map_err(err)?;
-    Ok(ll.into_pyarray(py))
-}
+#[pymethods]
+impl PyJointTable {
+    #[new]
+    fn new(table: Bound<'_, PyDict>, n_groups: usize) -> PyResult<Self> {
+        let item = |k: &str| table.get_item(k)?.ok_or_else(|| PyValueError::new_err(format!("joint table: no {k:?}")));
+        let col = |k: &str| -> PyResult<Vec<f64>> { Ok(item(k)?.extract::<PyReadonlyArray1<f64>>()?.as_array().to_vec()) };
+        let flag = |k: &str| -> PyResult<Vec<bool>> { Ok(item(k)?.extract::<PyReadonlyArray1<bool>>()?.as_array().to_vec()) };
+        let int = |k: &str| -> PyResult<Vec<i64>> { Ok(item(k)?.extract::<PyReadonlyArray1<i64>>()?.as_array().to_vec()) };
+        let (b, t, sin, c0, c1, x, q) = (col("b")?, col("t")?, col("sin")?, col("c0")?, col("c1")?, col("x")?, col("q")?);
+        let (jb, jt) = (rows::<2>(item("jb")?.extract()?, "jb")?, rows::<2>(item("jt")?.extract()?, "jt")?);
+        let (stop, early, row, nu, group) = (flag("stop")?, flag("early")?, int("row")?, int("nu")?, int("group")?);
+        let n = b.len();
+        if [t.len(), sin.len(), jb.len(), jt.len(), c0.len(), c1.len(), x.len(), q.len(), stop.len(), early.len(), row.len(), nu.len(), group.len()].iter().any(|&l| l != n) {
+            return Err(PyValueError::new_err("joint table: every column must have one entry per pair"));
+        }
+        if row.iter().any(|&r| r < 0) || group.iter().any(|&g| g < 0 || g as usize >= n_groups) {
+            return Err(PyValueError::new_err("joint table: rows must be >= 0 and groups below n_groups"));
+        }
+        Ok(PyJointTable {
+            pulses: (0..n).map(|i| Pulse { b: b[i], t: t[i], sin: sin[i], jb: jb[i], jt: jt[i], c0: c0[i], c1: c1[i], x: x[i], stop: stop[i], early: early[i], q: q[i] }).collect(),
+            owners: (0..n).map(|i| Owner { row: row[i] as u32, nu: if nu[i] < 0 { u32::MAX } else { nu[i] as u32 } }).collect(),
+            group: group.iter().map(|&g| g as u32).collect(),
+            n_groups,
+        })
+    }
 
-#[pyfunction]
-#[allow(clippy::type_complexity)]
-fn qsm_joint_blocks<'py>(py: Python<'py>, table: Bound<'py, PyDict>, state: PyReadonlyArray2<f64>, group: PyReadonlyArray1<u32>, n_groups: usize, params: Bound<'py, PyDict>, threads: usize) -> PyResult<(Bound<'py, PyArray1<f64>>, Bound<'py, PyArray2<f64>>, Bound<'py, PyArray3<f64>>)> {
-    let (pulses, p) = joint_inputs(&table, &params)?;
-    let st = states(state)?;
-    let g = group.as_array().to_vec();
-    let (f, grad, hess) = py.detach(|| joint::joint_blocks(&pulses, &st, &g, n_groups, &p, threads)).map_err(err)?;
-    let grad: Vec<f64> = grad.iter().flatten().copied().collect();
-    let hess: Vec<f64> = hess.iter().flatten().flatten().copied().collect();
-    Ok((f.into_pyarray(py), grad.into_pyarray(py).reshape([n_groups, 4])?, hess.into_pyarray(py).reshape([n_groups, 4, 4])?))
+    /// Each pair's log likelihood at row states `theta` (n, 4) and nuisances `nu` (g, 2).
+    fn loglik<'py>(&self, py: Python<'py>, theta: PyReadonlyArray2<f64>, nu: PyReadonlyArray2<f64>, params: Bound<'py, PyDict>, threads: usize) -> PyResult<Bound<'py, PyArray1<f64>>> {
+        let (theta, nu, p) = (rows::<4>(theta, "theta")?, rows::<2>(nu, "nu")?, joint_params(&params)?);
+        let ll = py.detach(|| joint::joint_loglik(&self.pulses, &self.owners, &theta, &nu, &p, threads)).map_err(err)?;
+        Ok(ll.into_pyarray(py))
+    }
+
+    /// Per group: the log likelihood, its gradient (n_groups, 4) and Hessian (n_groups, 4, 4) in the group's
+    /// own state variables.
+    #[allow(clippy::type_complexity)]
+    fn blocks<'py>(&self, py: Python<'py>, theta: PyReadonlyArray2<f64>, nu: PyReadonlyArray2<f64>, params: Bound<'py, PyDict>, threads: usize) -> PyResult<(Bound<'py, PyArray1<f64>>, Bound<'py, PyArray2<f64>>, Bound<'py, PyArray3<f64>>)> {
+        let (theta, nu, p) = (rows::<4>(theta, "theta")?, rows::<2>(nu, "nu")?, joint_params(&params)?);
+        let k = self.n_groups;
+        let (f, grad, hess) = py.detach(|| joint::joint_blocks(&self.pulses, &self.owners, &self.group, k, &theta, &nu, &p, threads)).map_err(err)?;
+        let grad: Vec<f64> = grad.iter().flatten().copied().collect();
+        let hess: Vec<f64> = hess.iter().flatten().flatten().copied().collect();
+        Ok((f.into_pyarray(py), grad.into_pyarray(py).reshape([k, 4])?, hess.into_pyarray(py).reshape([k, 4, 4])?))
+    }
 }
 
 pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
-    m.add_function(wrap_pyfunction!(qsm_joint_loglik, m)?)?;
-    m.add_function(wrap_pyfunction!(qsm_joint_blocks, m)?)?;
+    m.add_class::<PyJointTable>()?;
     m.add_class::<PyScanIndex>()?;
     m.add_function(wrap_pyfunction!(qsm_evidence, m)?)?;
     m.add_function(wrap_pyfunction!(qsm_pairs, m)?)?;
