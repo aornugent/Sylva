@@ -148,7 +148,7 @@ impl Num for f64 {
         f64::abs(self)
     }
     fn log_ndtr(self) -> f64 {
-        log_ndtr_mills(self).0
+        log_ndtr_value(self)
     }
     fn h_int(y: f64, r: f64) -> f64 {
         let yc = Num::clamp(y, -r, r);
@@ -200,17 +200,30 @@ fn logaddexp<N: Num>(a: N, b: N) -> N {
 /// z = -37, where erfc underflows, the asymptotic series of the Mills ratio;
 /// the ratio from the logs.
 fn log_ndtr_mills(z: f64) -> (f64, f64) {
-    use std::f64::consts::{PI, SQRT_2};
-    let log_pdf = -0.5 * z * z - 0.5 * (2.0 * PI).ln();
-    let lphi = if z > 0.0 {
-        (-0.5 * libm::erfc(z / SQRT_2)).ln_1p()
+    let lphi = log_ndtr_value(z);
+    (lphi, (log_pdf(z) - lphi).exp())
+}
+
+fn log_pdf(z: f64) -> f64 {
+    -0.5 * z * z - 0.5 * (2.0 * std::f64::consts::PI).ln()
+}
+
+/// `log Phi(z)` alone (see [`log_ndtr_mills`]).
+fn log_ndtr_value(z: f64) -> f64 {
+    use std::f64::consts::SQRT_2;
+    if z > 0.0 {
+        // erfc is exactly 0 from 28 on (libm), so log Phi is exactly -0 there: skip the call
+        let x = z / SQRT_2;
+        if x >= 28.0 {
+            return -0.0;
+        }
+        (-0.5 * libm::erfc(x)).ln_1p()
     } else if z > -37.0 {
         (0.5 * libm::erfc(-z / SQRT_2)).ln()
     } else {
         let w = 1.0 / (z * z);
-        log_pdf - (-z).ln() + (1.0 - w + 3.0 * w * w - 15.0 * w * w * w).ln()
-    };
-    (lphi, (log_pdf - lphi).exp())
+        log_pdf(z) - (-z).ln() + (1.0 - w + 3.0 * w * w - 15.0 * w * w * w).ln()
+    }
 }
 
 impl Add for D {
@@ -414,26 +427,32 @@ fn pair<N: Num>(pu: &Pulse, s: [N; 4], p: &JointParams) -> N {
     let (c0, c1) = (N::c(pu.c0), N::c(pu.c1));
     let xw = (tp - hbar * (1.0 / pu.sin)).clamp(c0, c1);
     let zw = xw - c0;
-    let sig = (r.sq() * (p.rough * p.rough) + p.sigma_r * p.sigma_r).sqrt();
     let eps = (-(f.clamp(N::c(0.0), N::c(1.0))) + 1.0) * p.eps + p.eps_min;
-    let x = N::c(pu.x);
-    let z = (x - c0).max(N::c(0.0));
-    let u = (x - xw) / sig;
-    let log_sqrt2pi = 0.5 * (2.0 * std::f64::consts::PI).ln();
-    let l_gauss = (-eps).log1p() - u.sq() * 0.5 - sig.ln() + (-log_sqrt2pi);
-    let l_tail = (eps + 1e-300).ln() + (-p.mp_len.ln()) + u.log_ndtr() + ((xw + p.mp_len - x) / sig).log_ndtr();
-    let l_wood = lp - lam * zw + logaddexp(l_gauss, l_tail);
-    let l_leaf = ell - lam * z + logaddexp(lq, lp + (-u).log_ndtr());
     let ln = pu.c1 - pu.c0;
     let over = ((xw + p.mp_len - c1) * (1.0 / p.mp_len)).clamp(N::c(1e-12), N::c(1.0));
     let l_pass = logaddexp(lq - lam * ln, lp - lam * zw + (eps + 1e-300).ln() + over.ln());
-    let l_stop = logaddexp(l_wood, l_leaf);
     let q = pu.q;
     let p_pass = l_pass.min(N::c(0.0)).exp();
     let sel = if pu.early { N::c(0.0) } else { (p_pass * (-(1.0 - q))).log1p() };
-    // a recorded pass where a deleted echo could lie: a pass, or a stop whose echo the export deleted
-    let l_seen = if pu.deleted && p.hide > 0.0 { logaddexp(l_pass, (-p_pass).log1p() + p.hide.ln()) } else { l_pass };
-    (if pu.stop { l_stop } else { l_seen + q.ln() }) - sel
+    let l = if pu.stop {
+        // a stop: the wood's echo or foliage's (only a stop needs these terms)
+        let sig = (r.sq() * (p.rough * p.rough) + p.sigma_r * p.sigma_r).sqrt();
+        let x = N::c(pu.x);
+        let z = (x - c0).max(N::c(0.0));
+        let u = (x - xw) / sig;
+        let log_sqrt2pi = 0.5 * (2.0 * std::f64::consts::PI).ln();
+        let l_gauss = (-eps).log1p() - u.sq() * 0.5 - sig.ln() + (-log_sqrt2pi);
+        let l_tail = (eps + 1e-300).ln() + (-p.mp_len.ln()) + u.log_ndtr() + ((xw + p.mp_len - x) / sig).log_ndtr();
+        let l_wood = lp - lam * zw + logaddexp(l_gauss, l_tail);
+        let l_leaf = ell - lam * z + logaddexp(lq, lp + (-u).log_ndtr());
+        logaddexp(l_wood, l_leaf)
+    } else if pu.deleted && p.hide > 0.0 {
+        // a recorded pass where a deleted echo could lie: a pass, or a stop whose echo the export deleted
+        logaddexp(l_pass, (-p_pass).log1p() + p.hide.ln()) + q.ln()
+    } else {
+        l_pass + q.ln()
+    };
+    l - sel
 }
 
 /// How far a stop lies from the wood surface the row's state `s` predicts for
@@ -665,8 +684,22 @@ pub fn deleted(range: &[f32], number: &[u8], returns: u8) -> Vec<(f64, f64)> {
     }).collect()
 }
 
-fn pool(threads: usize) -> Result<rayon::ThreadPool> {
-    rayon::ThreadPoolBuilder::new().num_threads(threads).build().map_err(|e| Error::invalid(format!("thread pool: {e}")))
+/// A pool of `threads` threads, built once per calling thread and size (a fit
+/// calls the likelihood thousands of times; a pool per caller keeps
+/// concurrent fits, such as trees fitted in parallel, from sharing one).
+pub(crate) fn pool(threads: usize) -> Result<std::rc::Rc<rayon::ThreadPool>> {
+    use std::{cell::RefCell, collections::HashMap, rc::Rc};
+    thread_local! {
+        static POOLS: RefCell<HashMap<usize, Rc<rayon::ThreadPool>>> = RefCell::new(HashMap::new());
+    }
+    POOLS.with(|m| {
+        if let Some(p) = m.borrow().get(&threads) {
+            return Ok(p.clone());
+        }
+        let p = Rc::new(rayon::ThreadPoolBuilder::new().num_threads(threads).build().map_err(|e| Error::invalid(format!("thread pool: {e}")))?);
+        m.borrow_mut().insert(threads, p.clone());
+        Ok(p)
+    })
 }
 
 #[cfg(test)]
@@ -682,6 +715,15 @@ mod tests {
         [(0.0, true, 7.95, false, 1.0), (0.04, true, 7.97, false, 0.6), (0.07, false, 0.0, false, 0.6), (0.02, true, 7.88, true, 1.0), (0.03, false, 0.0, false, 1.0)]
             .map(|(b, stop, x, early, q)| Pulse { b, t: 8.0, sin: 0.95, jb: [0.9, 0.1], jt: [0.05, 0.9], c0: 7.85, c1: 8.15, x, deleted: !stop, stop, early, q })
             .to_vec()
+    }
+
+    #[test]
+    fn log_ndtr_skips_erfc_only_where_it_is_zero() {
+        for i in 0..200_000 {
+            let z = 30.0 + i as f64 * 1e-4;
+            let want = (-0.5 * libm::erfc(z / std::f64::consts::SQRT_2)).ln_1p();
+            assert_eq!(log_ndtr_value(z).to_bits(), want.to_bits(), "z {z}");
+        }
     }
 
     #[test]

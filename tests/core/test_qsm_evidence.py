@@ -190,8 +190,9 @@ def test_a_clump_of_stems_comes_out_as_its_stems(tmp_path):
     centre = stems[:, :2].mean(0)
     a, b = np.array([[*centre, 0.5], [*centre, 0.8]]), np.array([[*centre, 0.8], [*centre, 1.1]])
     params = JointParams(tau=0.17, edge=0.25, hide=0.0, mu_fork=0.0, centre_rel=0.3, scan_rel=0.05)
-    f = joint_tree(scans, a, b, [0.093, 0.093], [-1, 0], params=params, split=[True, True])
+    f = joint_tree(scans, a, b, [0.093, 0.093], [-1, 0], params=params)  # the core's own rule: by the evidence
     assert list(f["src"]) == [0, 0, 0, 1, 1, 1] and list(f["parent"][3:]) != [-1, -1, -1]
+    assert (f["split_gain"] > 100).all()  # the stems beat the envelope by far on the same pulses
     for row in (0, 1):
         mine = f["src"] == row
         centres = f["a"][mine, :2]

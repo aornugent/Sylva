@@ -2,6 +2,7 @@
 
 `main` mirrors upstream; `develop` is ours (`git log main..develop`). Newest first.
 
+- `qsm.joint_tree` decides a split by evidence. Stems found in a row are weighed against the row whole on the same pulses (each pulse seen from the stem it meets first, a BIC price per extra stem; `split_gain` per row), where the old rule (a share of core pulses passing) missed dense clumps. Circles found in one row may no longer overlap. The per-scan nuisance is one offset per (scan, branch) in the branch's frame: it was added in each row's own frame, and those turn along a branch. `converged` covers every sweep. Thread pools are kept per calling thread, not built per call; the plain-value likelihood is cheaper (bit-identical); the claims' table is freed after the split. `TreeParams::VERSION` 2. Changes `joint_tree`'s outputs.
 - `qsm.joint_tree` (Python `sylva.qsm.joint_tree`, with `JointParams` and `JointReason`) fits the joint model to one tree in one call: its rows and its neighbours' cylinders in, a fitted row per stem out. 3dtrees' screen and candidates call it per tree, as they call `evidence`; its table, ownership, split and existence were Python orchestration. Inside:
   - each row's tube is decided once (`qsm.joint::window`);
   - clump rows are split into their solid stems as child rows (`src`);
