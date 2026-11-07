@@ -21,7 +21,8 @@
 //! pulse is conditioned on having been recorded: a pass needs something
 //! behind (`q`), and a pass by a pulse that lost an echo where it could lie
 //! may be a stop whose echo the export deleted (`hide`). A stop needs the footprint's share `tau` on the wood, with an
-//! edge `edge w` wide (w the footprint's width).
+//! edge `edge w` wide (w the footprint's width), and wood wide enough to give
+//! that share at all.
 //!
 //! The derivatives come from evaluating the likelihood once on second-order
 //! dual numbers in the four state variables, so a term added to the
@@ -319,6 +320,13 @@ pub struct JointParams {
     pub hide: f64,
 }
 
+impl Default for JointParams {
+    /// The calibration for TERN's RIEGL VZ-400i exports (3dtrees research 74 §§13-19: Alice Mulga).
+    fn default() -> Self {
+        JointParams { exit: 0.007, divergence: 0.35e-3, sigma_r: 0.005, rough: 0.03, tau: 0.11, edge: 0.5, eps: 0.1, eps_min: 0.01, mp_len: 0.5, hide: 0.09 }
+    }
+}
+
 /// One pulse-cylinder pair, measured once from a starting axis (see the
 /// module documentation).
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
@@ -372,6 +380,12 @@ fn h_int(y: D, r: D) -> D {
 /// trunks 0.8 % fatter (research 74 §18).
 const SLIVER: f64 = 0.02;
 
+/// The softness (a share of the footprint) of the wood's capacity to make an
+/// echo: wood of width 2 R gives at most the share 2 R / w, and needs tau.
+/// Without it a radius near 0 still detects pulses near its axis (research
+/// 74 §20), so "no wood" wasn't.
+pub(crate) const CAPACITY_SD: f64 = 0.02;
+
 /// One pair's log likelihood at state `[offset1, offset2, eta, ell]`, in
 /// whatever [`Num`] the state is given in.
 fn pair<N: Num>(pu: &Pulse, s: [N; 4], p: &JointParams) -> N {
@@ -390,8 +404,13 @@ fn pair<N: Num>(pu: &Pulse, s: [N; 4], p: &JointParams) -> N {
     let f = width * (1.0 / w);
     let e = SLIVER * w;
     let hbar = (N::h_int(y2, r) - N::h_int(y1, r)) / (width + (width * (-1.0 / e)).exp() * e);
-    let zdet = (r + w * (0.5 - p.tau) - bp.abs()) * (1.0 / (p.edge * w));
-    let (lp, lq) = (zdet.log_ndtr(), (-zdet).log_ndtr());
+    // detected: the footprint's share on the wood reaches tau (a soft edge at the silhouette), and the wood is wide
+    // enough to give that share at all (2 R / w >= tau: a twig thinner than that can't make an echo, however it
+    // sits); P(miss) = (1 - p1) + p1 (1 - p2)
+    let z1 = (r + w * (0.5 - p.tau) - bp.abs()) * (1.0 / (p.edge * w));
+    let z2 = (r * (2.0 / w) + (-p.tau)) * (1.0 / CAPACITY_SD);
+    let (lp1, lq1, lp2, lq2) = (z1.log_ndtr(), (-z1).log_ndtr(), z2.log_ndtr(), (-z2).log_ndtr());
+    let (lp, lq) = (lp1 + lp2, logaddexp(lq1, lp1 + lq2));
     let (c0, c1) = (N::c(pu.c0), N::c(pu.c1));
     let xw = (tp - hbar * (1.0 / pu.sin)).clamp(c0, c1);
     let zw = xw - c0;
@@ -415,6 +434,32 @@ fn pair<N: Num>(pu: &Pulse, s: [N; 4], p: &JointParams) -> N {
     // a recorded pass where a deleted echo could lie: a pass, or a stop whose echo the export deleted
     let l_seen = if pu.deleted && p.hide > 0.0 { logaddexp(l_pass, (-p_pass).log1p() + p.hide.ln()) } else { l_pass };
     (if pu.stop { l_stop } else { l_seen + q.ln() }) - sel
+}
+
+/// How far a stop lies from the wood surface the row's state `s` predicts for
+/// it, in sds of the range kernel; infinite where the footprint misses the
+/// circle. Who owns a stop seen by several rows (research 74 §5's outer step).
+/// The chance wood of radius `r` can make an echo in a footprint `w` wide at
+/// all (it gives at most the share `2 r / w`, and an echo needs `tau`).
+pub(crate) fn capacity(r: f64, w: f64, p: &JointParams) -> f64 {
+    log_ndtr_mills((2.0 * r / w - p.tau) / CAPACITY_SD).0.exp()
+}
+
+pub(crate) fn surface_residual(pu: &Pulse, s: [f64; 4], p: &JointParams) -> f64 {
+    let [d1, d2, eta, _] = s;
+    let r = eta.exp();
+    let bp = pu.b - (d1 * pu.jb[0] + d2 * pu.jb[1]);
+    let tp = pu.t + (d1 * pu.jt[0] + d2 * pu.jt[1]);
+    let w = p.exit + p.divergence * pu.t;
+    if bp.abs() >= r + w / 2.0 {
+        return f64::INFINITY;
+    }
+    let (y1, y2) = ((bp - w / 2.0).max(-r), (bp + w / 2.0).min(r));
+    let width = (y2 - y1).max(0.0);
+    let e = SLIVER * w;
+    let hbar = (<f64 as Num>::h_int(y2, r) - <f64 as Num>::h_int(y1, r)) / (width + (-width / e).exp() * e);
+    let xw = (tp - hbar / pu.sin).clamp(pu.c0, pu.c1);
+    (pu.x - xw).abs() / (r * r * p.rough * p.rough + p.sigma_r * p.sigma_r).sqrt()
 }
 
 /// Where each pair's state comes from: its row's `[delta1, delta2, eta,
@@ -514,6 +559,12 @@ pub struct JointPairs {
     pub scan: Vec<u32>,
     pub pulse: Vec<u32>,
     pub n_echo: Vec<u32>,
+}
+
+/// The radius of a row's tube, from its prior radius: wide enough for the
+/// claim and the axis to move, capped above a trunk's.
+pub fn window(r_prior: f64) -> f64 {
+    (2.0 * r_prior + 0.03).clamp(0.04, (1.3 * r_prior + 0.05).max(0.25))
 }
 
 /// Unit axis and two directions across it, per cylinder: the frame the axis

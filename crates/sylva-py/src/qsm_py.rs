@@ -18,6 +18,7 @@ use sylva_rs::qsm::buttress::{Buttress, ButtressParams};
 use sylva_rs::qsm::evidence::{self, Beam, EvidenceParams, ScanIndex};
 use sylva_rs::qsm::joint::{self, JointParams, Owner, Pulse};
 use sylva_rs::qsm::joint_fit::{self, FitOptions, PriorParams, Rows};
+use sylva_rs::qsm::joint_tree::{self, TreeParams};
 use sylva_rs::qsm::QsmParams;
 use sylva_rs::qsm::ops::{self as ops, Row, Segment};
 use sylva_rs::qsm::plot::{self as plot, ButtressView, PlotEntry, PlotParams};
@@ -618,7 +619,96 @@ fn qsm_joint_fit<'py>(py: Python<'py>, table: Bound<'py, PyDict>, a: PyReadonlyA
     Ok(d)
 }
 
+const JOINT_LIKE: [&str; 10] = ["exit", "divergence", "sigma_r", "rough", "tau", "edge", "eps", "eps_min", "mp_len", "hide"];
+const JOINT_PRIOR: [&str; 14] = ["lam_prior", "lam_sd", "sig_ell", "sig_eta", "mu_fork", "sig_fork", "sig_root", "r_tip", "sig_tip", "sig_delta", "centre_rel", "centre_abs", "scan_abs", "scan_rel"];
+const JOINT_TREE: [&str; 9] = ["version", "iters", "tol", "sweeps", "split_share", "split_min_r", "split_through", "split_min_votes", "drop"];
+
+/// The default settings of `qsm_joint_tree`, flat.
+#[pyfunction]
+fn qsm_joint_defaults(py: Python<'_>) -> PyResult<Bound<'_, PyDict>> {
+    let t = TreeParams::default();
+    let (l, p) = (t.like, t.prior);
+    let d = PyDict::new(py);
+    for (k, v) in JOINT_LIKE.iter().zip([l.exit, l.divergence, l.sigma_r, l.rough, l.tau, l.edge, l.eps, l.eps_min, l.mp_len, l.hide]) {
+        d.set_item(k, v)?;
+    }
+    for (k, v) in JOINT_PRIOR.iter().zip([p.lam_prior, p.lam_sd, p.sig_ell, p.sig_eta, p.mu_fork, p.sig_fork, p.sig_root, p.r_tip, p.sig_tip, p.sig_delta, p.centre_rel, p.centre_abs, p.scan_abs, p.scan_rel]) {
+        d.set_item(k, v)?;
+    }
+    d.set_item("version", TreeParams::VERSION)?;
+    d.set_item("iters", t.iters)?;
+    d.set_item("tol", t.tol)?;
+    d.set_item("sweeps", t.sweeps)?;
+    d.set_item("split_share", t.split_share)?;
+    d.set_item("split_min_r", t.split_min_r)?;
+    d.set_item("split_through", t.split_through)?;
+    d.set_item("split_min_votes", t.split_min_votes)?;
+    d.set_item("drop", t.drop)?;
+    Ok(d)
+}
+
+/// The names of the `reason` codes of `qsm_joint_tree`.
+#[pyfunction]
+fn qsm_joint_reasons() -> Vec<(&'static str, u8)> {
+    use joint_tree::reason::*;
+    vec![("MEASURED", MEASURED), ("FLAT", FLAT), ("NO_WOOD", NO_WOOD)]
+}
+
+fn tree_params(d: &Bound<'_, PyDict>) -> PyResult<TreeParams> {
+    let what = "joint params";
+    let f = |k: &str| -> PyResult<f64> { dict_item(d, k, what)?.extract() };
+    let u = |k: &str| -> PyResult<usize> { dict_item(d, k, what)?.extract() };
+    if u("version")? != TreeParams::VERSION as usize {
+        return Err(PyValueError::new_err(format!("joint params: version {} is not this Sylva's ({})", u("version")?, TreeParams::VERSION)));
+    }
+    if d.len() != JOINT_LIKE.len() + JOINT_PRIOR.len() + JOINT_TREE.len() {
+        return Err(PyValueError::new_err("joint params: unexpected fields"));
+    }
+    let prior = PriorParams { lam_prior: f("lam_prior")?, lam_sd: f("lam_sd")?, sig_ell: f("sig_ell")?, sig_eta: f("sig_eta")?, mu_fork: f("mu_fork")?, sig_fork: f("sig_fork")?, sig_root: f("sig_root")?, r_tip: f("r_tip")?, sig_tip: f("sig_tip")?, sig_delta: f("sig_delta")?, centre_rel: f("centre_rel")?, centre_abs: f("centre_abs")?, scan_abs: f("scan_abs")?, scan_rel: f("scan_rel")? };
+    Ok(TreeParams { like: joint_params(d)?, prior, iters: u("iters")?, tol: f("tol")?, sweeps: u("sweeps")?, split_share: f("split_share")?, split_min_r: f("split_min_r")?, split_through: f("split_through")?, split_min_votes: u("split_min_votes")?, drop: f("drop")? })
+}
+
+/// Fits the joint model to one tree (see `sylva.qsm.joint_tree`).
+#[pyfunction]
+#[pyo3(signature = (scans, a, b, r_prior, parent, ctx_a, ctx_b, ctx_r, params, split=None, threads=0))]
+#[allow(clippy::too_many_arguments)]
+fn qsm_joint_tree<'py>(py: Python<'py>, scans: Vec<Bound<'py, PyScanIndex>>, a: PyReadonlyArray2<f64>, b: PyReadonlyArray2<f64>, r_prior: PyReadonlyArray1<f64>, parent: PyReadonlyArray1<i64>, ctx_a: PyReadonlyArray2<f64>, ctx_b: PyReadonlyArray2<f64>, ctx_r: PyReadonlyArray1<f64>, params: Bound<'py, PyDict>, split: Option<PyReadonlyArray1<bool>>, threads: usize) -> PyResult<Bound<'py, PyDict>> {
+    let (a, b, ctx_a, ctx_b) = (xyz_from_py(a)?, xyz_from_py(b)?, xyz_from_py(ctx_a)?, xyz_from_py(ctx_b)?);
+    let (r_prior, parent, ctx_r) = (r_prior.as_array().to_vec(), parent.as_array().to_vec(), ctx_r.as_array().to_vec());
+    let split = split.map(|s| s.as_array().to_vec());
+    let p = tree_params(&params)?;
+    let refs: Vec<&ScanIndex> = scans.iter().map(|s| &s.get().inner).collect();
+    let f = py.detach(|| {
+        let rows = Rows { a: &a, b: &b, r_prior: &r_prior, r_max: &[], parent: &parent };
+        joint_tree::joint_tree(&refs, &rows, &ctx_a, &ctx_b, &ctx_r, &p, split.as_deref(), threads)
+    }).map_err(err)?;
+    let n = f.r.len();
+    let d = PyDict::new(py);
+    let xyz = |v: &[[f64; 3]]| v.concat().into_pyarray(py).reshape([n, 3]);
+    d.set_item("src", f.src.into_pyarray(py))?;
+    d.set_item("parent", f.parent.into_pyarray(py))?;
+    d.set_item("a", xyz(&f.a)?)?;
+    d.set_item("b", xyz(&f.b)?)?;
+    d.set_item("e1", xyz(&f.e1)?)?;
+    d.set_item("e2", xyz(&f.e2)?)?;
+    for (k, v) in [("r", f.r), ("sd_log_r", f.sd_log_r), ("lo", f.lo), ("hi", f.hi), ("lam", f.lam), ("log_odds", f.log_odds), ("p_wood", f.p_wood), ("rho_local", f.rho_local), ("rho_pooled", f.rho_pooled)] {
+        d.set_item(k, v.into_pyarray(py))?;
+    }
+    d.set_item("flat", f.flat.into_pyarray(py))?;
+    d.set_item("reason", f.reason.into_pyarray(py))?;
+    d.set_item("n_pairs", f.n_pairs.into_pyarray(py))?;
+    d.set_item("grad", f.grad.concat().into_pyarray(py).reshape([n, 4])?)?;
+    d.set_item("hess", f.hess.iter().flatten().flatten().copied().collect::<Vec<f64>>().into_pyarray(py).reshape([n, 4, 4])?)?;
+    d.set_item("u", f.u)?;
+    d.set_item("objective", f.objective)?;
+    d.set_item("converged", f.converged)?;
+    Ok(d)
+}
+
 pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
+    m.add_function(wrap_pyfunction!(qsm_joint_defaults, m)?)?;
+    m.add_function(wrap_pyfunction!(qsm_joint_reasons, m)?)?;
+    m.add_function(wrap_pyfunction!(qsm_joint_tree, m)?)?;
     m.add_function(wrap_pyfunction!(qsm_joint_loglik, m)?)?;
     m.add_function(wrap_pyfunction!(qsm_joint_table, m)?)?;
     m.add_function(wrap_pyfunction!(qsm_joint_fit, m)?)?;
