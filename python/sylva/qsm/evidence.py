@@ -151,6 +151,8 @@ def pairs(scans, a, b, window, threads: int = 0) -> dict[str, np.ndarray]:
     - ``t``, ``s``, ``d``: closest approach of the pulse's line to the axis
       line, as the range along the pulse, the position along the axis from
       ``a``, and the distance between the lines;
+    - ``lost``: the export deleted some of the pulse's echoes (the scanner
+      counted more returns than the store holds; False where it doesn't say);
     - ``echo_start`` ``(m + 1,)``: row ``i``'s echoes, all of its pulse's,
       nearest first, are ``echo_start[i]:echo_start[i + 1]`` of ``range``,
       ``reflectance`` (dB) and ``deviation`` (NaN where the store has none).
