@@ -111,6 +111,54 @@ class ScanIndex:
         """The memory the index holds (bytes)."""
         return self._core.nbytes
 
+    @property
+    def origin(self) -> np.ndarray:
+        """The scanner position, ``(3,)``."""
+        return np.asarray(self._core.origin, np.float64)
+
+
+def pairs(scans, a, b, window: float, threads: int = 0) -> dict[str, np.ndarray]:
+    """Every pulse near each cylinder ``a[i] -> b[i]``, with all its echoes.
+
+    The raw table a per-pulse likelihood reads, which :func:`evidence`
+    reduces inside. A row is a pulse whose line comes closest to the axis
+    within the segment, closer than ``window``, ahead of the scanner, and
+    that reached the disc of radius ``window`` around the axis there (its
+    last echo is at or beyond the disc, or it missed): a pulse that stopped
+    short says nothing about what is in the disc.
+
+    Parameters
+    ----------
+    scans
+        :class:`ScanIndex` of each scan to use.
+    a, b
+        ``(n, 3)`` cylinder axes.
+    window
+        Radius (m) of the disc around each axis.
+    threads
+        Threads to use (0: one per core).
+
+    Returns
+    -------
+    dict of arrays, cylinder ``c``'s rows ``cyl_start[c]:cyl_start[c + 1]``:
+
+    - ``scan``, ``pulse``: the scan (index into ``scans``) and its pulse;
+    - ``dir`` ``(m, 3)``: the pulse's unit direction;
+    - ``t``, ``s``, ``d``: closest approach of the pulse's line to the axis
+      line, as the range along the pulse, the position along the axis from
+      ``a``, and the distance between the lines;
+    - ``echo_start`` ``(m + 1,)``: row ``i``'s echoes, all of its pulse's,
+      nearest first, are ``echo_start[i]:echo_start[i + 1]`` of ``range``,
+      ``reflectance`` (dB) and ``deviation`` (NaN where the store has none).
+    """
+    scans = list(scans)
+    if not all(isinstance(s, ScanIndex) for s in scans):
+        raise TypeError("scans must be ScanIndex objects")
+    a, b = np.ascontiguousarray(a, np.float64), np.ascontiguousarray(b, np.float64)
+    if a.ndim != 2 or a.shape[1] != 3 or a.shape != b.shape:
+        raise ValueError(f"a and b must both have shape (n, 3), got {a.shape} and {b.shape}")
+    return _core.qsm_pairs([s._core for s in scans], a, b, float(window), int(threads))
+
 
 def evidence(scans, a, b, r_claim=None, params: EvidenceParams = EvidenceParams(), threads: int = 0) -> dict[str, np.ndarray]:
     """The evidence the rays of ``scans`` give about cylinders ``a[i] -> b[i]``.

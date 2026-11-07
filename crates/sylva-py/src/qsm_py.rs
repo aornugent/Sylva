@@ -380,6 +380,12 @@ impl PyScanIndex {
     fn nbytes(&self) -> usize {
         self.inner.nbytes()
     }
+
+    #[getter]
+    fn origin(&self) -> (f64, f64, f64) {
+        let o = self.inner.origin();
+        (o[0], o[1], o[2])
+    }
 }
 
 /// The fields of `EvidenceParams`, flat, with the beam's prefixed `beam_`
@@ -473,9 +479,31 @@ fn qsm_evidence<'py>(py: Python<'py>, scans: Vec<Bound<'py, PyScanIndex>>, a: Py
     Ok(d)
 }
 
+#[pyfunction]
+fn qsm_pairs<'py>(py: Python<'py>, scans: Vec<Bound<'py, PyScanIndex>>, a: PyReadonlyArray2<f64>, b: PyReadonlyArray2<f64>, window: f64, threads: usize) -> PyResult<Bound<'py, PyDict>> {
+    let (a, b) = (xyz_from_py(a)?, xyz_from_py(b)?);
+    let refs: Vec<&ScanIndex> = scans.iter().map(|s| &s.get().inner).collect();
+    let p = py.detach(|| evidence::pairs(&refs, &a, &b, window, threads)).map_err(err)?;
+    let d = PyDict::new(py);
+    let dir: Vec<f32> = p.dir.iter().flatten().copied().collect();
+    d.set_item("cyl_start", p.cyl_start.into_pyarray(py))?;
+    d.set_item("scan", p.scan.into_pyarray(py))?;
+    d.set_item("pulse", p.pulse.into_pyarray(py))?;
+    d.set_item("dir", dir.into_pyarray(py).reshape([p.t.len(), 3])?)?;
+    d.set_item("t", p.t.into_pyarray(py))?;
+    d.set_item("s", p.s.into_pyarray(py))?;
+    d.set_item("d", p.d.into_pyarray(py))?;
+    d.set_item("echo_start", p.echo_start.into_pyarray(py))?;
+    d.set_item("range", p.range.into_pyarray(py))?;
+    d.set_item("reflectance", p.reflectance.into_pyarray(py))?;
+    d.set_item("deviation", p.deviation.into_pyarray(py))?;
+    Ok(d)
+}
+
 pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyScanIndex>()?;
     m.add_function(wrap_pyfunction!(qsm_evidence, m)?)?;
+    m.add_function(wrap_pyfunction!(qsm_pairs, m)?)?;
     m.add_function(wrap_pyfunction!(qsm_evidence_defaults, m)?)?;
     m.add_function(wrap_pyfunction!(qsm_evidence_reasons, m)?)?;
     for f in [
