@@ -56,6 +56,10 @@
 //! Speed comes from looking only where wood is: each scan is indexed once by
 //! pulse direction ([`ScanIndex`]), each cylinder visits only the pulses near
 //! its axis, and cylinders run in parallel.
+//!
+//! [`pairs`] returns the same enumeration before any reduction: every pulse
+//! near each cylinder with all its echoes, for a per-pulse likelihood fitted
+//! outside.
 
 use std::path::Path;
 
@@ -600,18 +604,23 @@ pub struct Pairs {
 }
 
 /// The [`Pairs`] of cylinders `a[i] -> b[i]`: each pulse whose line comes
-/// closest to the axis within the segment, closer than `window`, ahead of the
-/// scanner, and that reached the disc of radius `window` around the axis
-/// there (its last echo is at or beyond the disc, or it missed). A pulse that
-/// stopped short of the disc says nothing about what is in it and is left
-/// out. Runs on `threads` threads (0: one per core).
+/// closest to the axis within the segment (ends included, so a pulse exactly
+/// at a shared end belongs to both; [`evidence`] counts it in neither),
+/// closer than `window`, ahead of the scanner, and that reached the tube of
+/// radius `window` around the axis (its last echo is at or beyond where its
+/// line enters the tube, or it missed). A pulse that stopped short of the
+/// tube says nothing about what is in it and is left out. Runs on `threads`
+/// threads (0: one per core).
 pub fn pairs(scans: &[&ScanIndex], a: &[Point], b: &[Point], window: f64, threads: usize) -> Result<Pairs> {
     let n = a.len();
     if b.len() != n {
         return Err(Error::invalid("pairs: a and b must have one row per cylinder"));
     }
-    if !(window > 0.0) {
-        return Err(Error::invalid("pairs: window must be positive"));
+    if scans.len() >= u32::MAX as usize {
+        return Err(Error::invalid("pairs: too many scans"));
+    }
+    if !(window.is_finite() && window > 0.0) {
+        return Err(Error::invalid("pairs: window must be positive and finite"));
     }
     struct Row {
         scan: u32,
@@ -620,8 +629,7 @@ pub fn pairs(scans: &[&ScanIndex], a: &[Point], b: &[Point], window: f64, thread
         t: f32,
         s: f32,
         d: f32,
-        first: usize,
-        n_echo: usize,
+        echoes: Vec<f32>,
     }
     pool(threads)?.install(|| {
         let found: Vec<Vec<Row>> = (0..n).into_par_iter().map(|c| {
@@ -650,8 +658,7 @@ pub fn pairs(scans: &[&ScanIndex], a: &[Point], b: &[Point], window: f64, thread
                     if last < entry {
                         return;
                     }
-                    let first = sc.echo_start[pulse as usize] as usize;
-                    rows.push(Row { scan: si as u32, pulse, dir: d.map(|x| x as f32), t: t_ray as f32, s: s_ax as f32, d: dist as f32, first, n_echo: echoes.len() });
+                    rows.push(Row { scan: si as u32, pulse, dir: d.map(|x| x as f32), t: t_ray as f32, s: s_ax as f32, d: dist as f32, echoes: echoes.to_vec() });
                 });
             }
             rows
@@ -666,10 +673,11 @@ pub fn pairs(scans: &[&ScanIndex], a: &[Point], b: &[Point], window: f64, thread
                 out.t.push(r.t);
                 out.s.push(r.s);
                 out.d.push(r.d);
-                for e in r.first..r.first + r.n_echo {
-                    out.range.push(sc.range[e]);
-                    out.reflectance.push(sc.reflectance.get(e).map_or(f32::NAN, |&x| x as f32 / 100.0));
-                    out.deviation.push(sc.deviation.get(e).map_or(f32::NAN, |&x| x as f32));
+                for (k, &range) in r.echoes.iter().enumerate() {
+                    let (refl, dev) = sc.character(r.pulse, k as u32);
+                    out.range.push(range);
+                    out.reflectance.push(refl as f32);
+                    out.deviation.push(dev as f32);
                 }
                 out.echo_start.push(out.range.len() as u64);
             }
