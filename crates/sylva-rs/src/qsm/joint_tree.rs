@@ -183,6 +183,8 @@ pub fn joint_tree(scans: &[&ScanIndex], rows: &Rows, ctx_a: &[Point], ctx_b: &[P
     let mut mine = JointPairs::default();
     let centre = profile_grid().iter().position(|&d| d == 0.0).expect("the profile holds the fit");
     let mut restarted = false;
+    // every fit converged, not only the last: a sweep that ran out of iterations leaves the next one a poorer start
+    let mut converged = true;
     let mut sweep = 0;
     loop {
         if sweep >= params.sweeps.max(1) {
@@ -215,6 +217,7 @@ pub fn joint_tree(scans: &[&ScanIndex], rows: &Rows, ctx_a: &[Point], ctx_b: &[P
         let opts = FitOptions { schedule: if sweep == 0 { SCHEDULE.to_vec() } else { Vec::new() }, iters: params.iters, tol: params.tol, threads };
         let f = joint_fit(&mine.pulses, &mine.row, &mine.scan, &fit_rows, scans.len(), p, &params.prior, &opts, Some(&theta))?;
         theta = f.theta.clone();
+        converged &= f.converged;
         fit = Some(f);
         sweep += 1;
     }
@@ -279,7 +282,7 @@ pub fn joint_tree(scans: &[&ScanIndex], rows: &Rows, ctx_a: &[Point], ctx_b: &[P
     // the outputs
     let fr = frames(&stems.a, &stems.b);
     let grid = profile_grid();
-    let mut out = TreeFit { src: stems.src.clone(), parent: stems.parent.clone(), a: Vec::new(), b: Vec::new(), r: Vec::new(), sd_log_r: Vec::new(), lo: Vec::new(), hi: Vec::new(), flat: Vec::new(), lam: Vec::new(), log_odds: Vec::new(), p_wood: Vec::new(), reason: Vec::new(), rho_local: fit.rho_local.clone(), rho_pooled: fit.rho_pooled.clone(), n_pairs: n_pairs.clone(), grad: fit.grad.clone(), hess: fit.hess.clone(), e1: Vec::new(), e2: Vec::new(), split_gain, u: 0.0, objective: fit.objective, converged: fit.converged };
+    let mut out = TreeFit { src: stems.src.clone(), parent: stems.parent.clone(), a: Vec::new(), b: Vec::new(), r: Vec::new(), sd_log_r: Vec::new(), lo: Vec::new(), hi: Vec::new(), flat: Vec::new(), lam: Vec::new(), log_odds: Vec::new(), p_wood: Vec::new(), reason: Vec::new(), rho_local: fit.rho_local.clone(), rho_pooled: fit.rho_pooled.clone(), n_pairs: n_pairs.clone(), grad: fit.grad.clone(), hess: fit.hess.clone(), e1: Vec::new(), e2: Vec::new(), split_gain, u: 0.0, objective: fit.objective, converged };
     let (mut v_all, mut v_open) = (0.0, 0.0);
     for k in 0..m {
         let (_, e1, e2, len) = fr[k];

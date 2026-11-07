@@ -181,6 +181,8 @@ struct Problem<'a> {
     blocks: Vec<Block>,
     factors: Vec<Factor>,
     nu_w: Vec<f64>,
+    /// Per row, its branch's nuisance (in the branch's first row's frame) in the row's frame.
+    nu_t: Vec<Matrix2<f64>>,
     cap: Vec<f64>,
     eta_max: Vec<f64>,
     n_var: usize,
@@ -298,10 +300,17 @@ impl<'a> Problem<'a> {
                 cap[4 * n + i..4 * n + i + 2].fill(0.2 * r + 0.001);
             }
         }
-        let owners = row.iter().zip(scan).map(|(&k, &s)| Owner { row: k, nu: if use_nu { (s as usize * nb + branch[k as usize]) as u32 } else { u32::MAX } }).collect();
+        // a branch's nuisance is an offset in its first row's frame, seen in each row's own (frames turn along a branch)
+        let nu_t = (0..n).map(|k| {
+            let f = blocks[branch[k]].rows[0];
+            let (ek, ef) = ([fr[k].1, fr[k].2], [fr[f].1, fr[f].2]);
+            if f == k { return Matrix2::identity() }
+            Matrix2::from_fn(|j, i| (0..3).map(|x| ek[j][x] * ef[i][x]).sum())
+        }).collect();
+        let owners = row.iter().zip(scan).map(|(&k, &s)| Owner { row: k, nu: if use_nu { (s as usize * n + k as usize) as u32 } else { u32::MAX } }).collect();
         let group = row.iter().zip(scan).map(|(&k, &s)| (k as usize * n_scans + s as usize) as u32).collect();
         let eta_max = rows.r_max.iter().map(|r| r.ln()).collect();
-        Ok(Problem { pulses, owners, group, n, s: n_scans, use_nu, branch, rowpos, blocks, factors, nu_w, cap, eta_max, n_var, threads })
+        Ok(Problem { pulses, owners, group, n, s: n_scans, use_nu, branch, rowpos, blocks, factors, nu_w, nu_t, cap, eta_max, n_var, threads })
     }
 
     /// Block and position of a global unknown.
@@ -331,6 +340,19 @@ impl<'a> Problem<'a> {
         (theta, nu)
     }
 
+    /// Each (scan, row)'s nuisance in the row's frame, from the (scan, branch) ones.
+    fn row_nu(&self, nu: &[[f64; 2]]) -> Vec<[f64; 2]> {
+        if !self.use_nu {
+            return nu.to_vec();
+        }
+        let nb = self.blocks.len();
+        (0..self.s * self.n).map(|i| {
+            let (s, k) = (i / self.n, i % self.n);
+            let v = self.nu_t[k] * nalgebra::Vector2::from(nu[s * nb + self.branch[k]]);
+            [v[0], v[1]]
+        }).collect()
+    }
+
     /// Caps each radius at its row's largest.
     fn project(&self, x: &mut [f64]) {
         for k in 0..self.n {
@@ -340,7 +362,7 @@ impl<'a> Problem<'a> {
 
     /// Each row's own pairs' log likelihood at row states `theta`.
     fn row_loglik(&self, theta: &[[f64; 4]], nu: &[[f64; 2]], like: &JointParams) -> Result<Vec<f64>> {
-        let ll = joint_loglik(self.pulses, &self.owners, theta, nu, like, self.threads)?;
+        let ll = joint_loglik(self.pulses, &self.owners, theta, &self.row_nu(nu), like, self.threads)?;
         let mut out = vec![0.0; self.n];
         for (o, l) in self.owners.iter().zip(ll) {
             out[o.row as usize] += l;
@@ -350,7 +372,7 @@ impl<'a> Problem<'a> {
 
     fn objective(&self, x: &[f64], like: &JointParams) -> Result<f64> {
         let (theta, nu) = self.split(x);
-        let ll: f64 = joint_loglik(self.pulses, &self.owners, &theta, &nu, like, self.threads)?.iter().sum();
+        let ll: f64 = joint_loglik(self.pulses, &self.owners, &theta, &self.row_nu(&nu), like, self.threads)?.iter().sum();
         let prior: f64 = self.factors.iter().map(|f| {
             let r = f.vars.iter().map(|&(v, c)| c * x[v]).sum::<f64>() - f.mean;
             -0.5 * f.w * r * r
@@ -403,7 +425,7 @@ impl<'a> Problem<'a> {
 
     fn groups(&self, x: &[f64], like: &JointParams) -> Result<Groups> {
         let (theta, nu) = self.split(x);
-        let (_, grad, hess) = joint_blocks(self.pulses, &self.owners, &self.group, self.n * self.s, &theta, &nu, like, self.threads)?;
+        let (_, grad, hess) = joint_blocks(self.pulses, &self.owners, &self.group, self.n * self.s, &theta, &self.row_nu(&nu), like, self.threads)?;
         Ok((grad, hess))
     }
 
@@ -427,13 +449,17 @@ impl<'a> Problem<'a> {
             let h = if exact { -hq } else { abs_eig(&hq) };
             let (bi, rp) = (self.branch[k], 4 * self.rowpos[k]);
             let np = 4 * self.blocks[bi].rows.len() + 2 * s;
-            let at = |a: usize| -> Vec<usize> { if a < 2 && self.use_nu { vec![rp + a, np + a] } else { vec![rp + a] } };
+            // an offset moves the row's state with weight 1 and its branch's nuisance through the row's frame
+            let t = &self.nu_t[k];
+            let at = |a: usize| -> Vec<(usize, f64)> {
+                if a < 2 && self.use_nu { vec![(rp + a, 1.0), (np, t[(a, 0)]), (np + 1, t[(a, 1)])] } else { vec![(rp + a, 1.0)] }
+            };
             for a in 0..4 {
-                for &pa in &at(a) {
-                    sys.g[bi][pa] += grad[q][a];
+                for &(pa, ca) in &at(a) {
+                    sys.g[bi][pa] += ca * grad[q][a];
                     for b in 0..4 {
-                        for &pb in &at(b) {
-                            sys.h[bi][(pa, pb)] += h[(a, b)];
+                        for &(pb, cb) in &at(b) {
+                            sys.h[bi][(pa, pb)] += ca * cb * h[(a, b)];
                         }
                     }
                 }
@@ -625,8 +651,9 @@ pub fn joint_fit(pulses: &[Pulse], row: &[u32], scan: &[u32], rows: &Rows, n_sca
         let h = abs_eig(&Matrix4::from(hq[q]));
         info[k] += if pr.use_nu {
             let w = pr.nu_w[2 * (s * nb + pr.branch[k])];
-            let bm = h.fixed_columns::<2>(0).into_owned();
-            let c = h.fixed_view::<2, 2>(0, 0).into_owned() + Matrix2::identity() * w;
+            let t = pr.nu_t[k];
+            let bm = h.fixed_columns::<2>(0).into_owned() * t;
+            let c = t.transpose() * h.fixed_view::<2, 2>(0, 0).into_owned() * t + Matrix2::identity() * w;
             c.try_inverse().map_or(h, |ci| h - bm * ci * bm.transpose())
         } else {
             h
@@ -778,5 +805,48 @@ mod tests {
         // a cap below the stem holds the radius there
         let capped = joint_fit(&t.pulses, &t.row, &t.scan, &Rows { r_max: &[0.04], ..rows }, 1, &like(), &p, &opts(), None).unwrap();
         assert!((capped.theta[0][2].exp() - 0.04).abs() < 1e-9);
+    }
+
+    #[test]
+    fn a_branch_nuisance_is_one_world_offset_along_a_bent_branch() {
+        // a stem bent past the frames' reference switch (|u_z| 0.9), so its two rows' frames turn
+        let (scan, a, b) = crate::qsm::evidence::tests::scene(0.05, true);
+        let mid: Point = std::array::from_fn(|i| 0.5 * (a[i] + b[i]));
+        let h = 0.5 * (b[2] - a[2]);
+        let top = [mid[0] + 0.6 * h, mid[1], mid[2] + 0.8 * h];
+        let (ra, rb) = (vec![a, mid], vec![mid, top]);
+        let t = joint_table(&[&scan], &ra, &rb, &[0.15, 0.15], 2).unwrap();
+        let rows = Rows { a: &ra, b: &rb, r_prior: &[0.05, 0.05], r_max: &[0.15, 0.15], parent: &[-1, 0] };
+        let pr = Problem::new(&t.pulses, &t.row, &t.scan, &rows, 1, &prior(), 2).unwrap();
+        assert!(pr.use_nu && pr.blocks.len() == 1);
+        // the same world offset in both rows (each sees its share across its own axis)
+        let fr = frames(&ra, &rb);
+        assert!(fr[0].1[0] * fr[1].1[0] + fr[0].1[1] * fr[1].1[1] + fr[0].1[2] * fr[1].1[2] < 0.0, "the frames turn (here e1 flips)");
+        let nu = [[0.004, -0.003]];
+        let w: Point = std::array::from_fn(|i| nu[0][0] * fr[0].1[i] + nu[0][1] * fr[0].2[i]);
+        for (k, v) in pr.row_nu(&nu).iter().enumerate() {
+            let (u, e1, e2, _) = fr[k];
+            let along: f64 = (0..3).map(|i| w[i] * u[i]).sum();
+            for i in 0..3 {
+                assert!((v[0] * e1[i] + v[1] * e2[i] - (w[i] - along * u[i])).abs() < 1e-12, "row {k}");
+            }
+        }
+        // the system's gradient in the nuisance is the objective's
+        let mut x = vec![0.0; pr.n_var];
+        for k in 0..2 {
+            x[4 * k..4 * k + 4].copy_from_slice(&[0.003, -0.002, (0.05f64).ln(), 0.0]);
+        }
+        x[8] = 0.002;
+        x[9] = 0.001;
+        let sys = pr.system(&x, &pr.groups(&x, &like()).unwrap(), true);
+        let g = pr.gather(&sys.g);
+        for v in [0, 1, 4, 5, 8, 9] {
+            let e = 1e-6;
+            let (mut up, mut dn) = (x.clone(), x.clone());
+            up[v] += e;
+            dn[v] -= e;
+            let fd = (pr.objective(&up, &like()).unwrap() - pr.objective(&dn, &like()).unwrap()) / (2.0 * e);
+            assert!((g[v] - fd).abs() < 1e-4 * (1.0 + fd.abs()), "d/dx[{v}] {} vs {fd}", g[v]);
+        }
     }
 }
