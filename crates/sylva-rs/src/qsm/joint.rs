@@ -30,6 +30,7 @@ use std::ops::{Add, Div, Mul, Neg, Sub};
 use rayon::prelude::*;
 
 use crate::error::{Error, Result};
+use crate::Point;
 
 /// A value with its gradient and Hessian in four variables.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -488,6 +489,87 @@ pub fn joint_blocks(pulses: &[Pulse], owners: &[Owner], group: &[u32], n_groups:
         }
         Ok((f, g, h))
     })
+}
+
+/// A tree's pulse-cylinder pairs as the likelihood reads them, with where each
+/// came from: its row (cylinder), scan and pulse, and how many echoes the
+/// pulse recorded (0: a miss).
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct JointPairs {
+    pub pulses: Vec<Pulse>,
+    pub row: Vec<u32>,
+    pub scan: Vec<u32>,
+    pub pulse: Vec<u32>,
+    pub n_echo: Vec<u32>,
+}
+
+/// Unit axis and two directions across it, per cylinder: the frame the axis
+/// offsets are measured in (`e1 = u x z`, or `u x x` for a near-vertical
+/// axis; `e2 = u x e1`).
+pub fn frames(a: &[Point], b: &[Point]) -> Vec<(Point, Point, Point, f64)> {
+    let unit = |v: Point| {
+        let l = crate::transform::norm(&v);
+        (v.map(|x| x / l), l)
+    };
+    a.iter().zip(b).map(|(a, b)| {
+        let (u, len) = unit(crate::transform::sub(b, a));
+        let reference = if u[2].abs() < 0.9 { [0.0, 0.0, 1.0] } else { [1.0, 0.0, 0.0] };
+        let (e1, _) = unit(cross(&u, &reference));
+        (u, e1, cross(&u, &e1), len)
+    }).collect()
+}
+
+fn cross(a: &Point, b: &Point) -> Point {
+    [a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0]]
+}
+
+/// The [`JointPairs`] of cylinders `a[i] -> b[i]`, each with its tube of
+/// radius `window[i]` (see [`crate::qsm::evidence::pairs`]), measured from
+/// those axes: each pulse's signed impact and range of closest approach, how
+/// both move with an offset of the axis, its chord through the tube, and its
+/// fate there (the first echo inside the chord is a stop; otherwise the pulse
+/// went on, a pass). `q` is 1: what is behind recorded every pass.
+pub fn joint_table(scans: &[&crate::qsm::evidence::ScanIndex], a: &[Point], b: &[Point], window: &[f64], threads: usize) -> Result<JointPairs> {
+    use crate::transform::dot;
+    let pp = crate::qsm::evidence::pairs(scans, a, b, window, threads)?;
+    let fr = frames(a, b);
+    let mut out = JointPairs::default();
+    for c in 0..a.len() {
+        let (u, e1, e2, _) = fr[c];
+        for i in pp.cyl_start[c] as usize..pp.cyl_start[c + 1] as usize {
+            let d = pp.dir[i].map(|x| x as f64);
+            let o = scans[pp.scan[i] as usize].origin();
+            let cr = cross(&u, &d);
+            let sin = dot(&cr, &cr).sqrt();
+            let nrm = cr.map(|x| x / sin);
+            let bimp = dot(&crate::transform::sub(&o, &a[c]), &nrm);
+            let du = dot(&d, &u);
+            let p_hat = [0, 1, 2].map(|k| (d[k] - du * u[k]) / sin);
+            let t = pp.t[i] as f64;
+            let half = (window[c] * window[c] - bimp * bimp).max(0.0).sqrt() / sin;
+            let (c0, c1) = (t - half, t + half);
+            let echoes = &pp.range[pp.echo_start[i] as usize..pp.echo_start[i + 1] as usize];
+            let first_inside = echoes.iter().map(|&e| e as f64).find(|&e| e >= c0 && e <= c1);
+            out.pulses.push(Pulse {
+                b: bimp,
+                t,
+                sin,
+                jb: [dot(&nrm, &e1), dot(&nrm, &e2)],
+                jt: [dot(&p_hat, &e1) / sin, dot(&p_hat, &e2) / sin],
+                c0,
+                c1,
+                x: first_inside.unwrap_or(0.0),
+                stop: first_inside.is_some(),
+                early: echoes.first().is_some_and(|&e| (e as f64) < c0),
+                q: 1.0,
+            });
+            out.row.push(c as u32);
+            out.scan.push(pp.scan[i]);
+            out.pulse.push(pp.pulse[i]);
+            out.n_echo.push(echoes.len() as u32);
+        }
+    }
+    Ok(out)
 }
 
 fn pool(threads: usize) -> Result<rayon::ThreadPool> {
