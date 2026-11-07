@@ -5,7 +5,7 @@ import numpy as np
 import pytest
 
 from sylva import Shots
-from sylva.qsm import EvidenceParams, Reason, ScanIndex, contradicted, evidence
+from sylva.qsm import EvidenceParams, Reason, ScanIndex, contradicted, evidence, pairs
 
 
 def fan(tmp_path, r=0.05, misses=True):
@@ -41,6 +41,22 @@ def test_a_measured_cylinder_gets_its_radius_a_calliper_and_an_audit(tmp_path):
     assert e["n_contra"][0] > 0 and contradicted(e)[0]  # passes inside a 50 % fat claim
     honest = evidence([scan], a, b, r_claim=[0.05])
     assert honest["n_contra"][0] == 0 and not contradicted(honest)[0]
+
+
+def test_pairs_hold_each_pulse_that_reached_the_disc_with_its_echoes(tmp_path):
+    scan, a, b = fan(tmp_path)
+    assert np.allclose(scan.origin, 0)
+    p = pairs([scan], np.r_[a, a], np.r_[b, a], window=0.15)
+    n = len(p["t"])
+    assert list(p["cyl_start"]) == [0, n, n] and n > 200  # a cylinder without length has none
+    assert p["dir"].shape == (n, 3) and len(p["echo_start"]) == n + 1
+    assert np.all(p["d"] < 0.15) and np.all((p["s"] >= 0) & (p["s"] <= 2))
+    first = p["range"][p["echo_start"][:-1][np.diff(p["echo_start"]) > 0]]
+    on_stem = np.abs(first - p["t"][np.diff(p["echo_start"]) > 0]) < 0.06
+    assert on_stem.sum() > 100 and (~on_stem).sum() > 100  # hits on the stem and passes to the wall
+    assert np.isnan(p["reflectance"]).all()
+    with pytest.raises(ValueError):
+        pairs([scan], a, b, window=0.0)
 
 
 def test_thin_wood_without_misses_rests_on_the_prior(tmp_path):

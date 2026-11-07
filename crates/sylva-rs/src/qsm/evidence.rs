@@ -573,6 +573,112 @@ fn evidence_on(scans: &[&ScanIndex], a: &[Point], b: &[Point], r_claim: Option<&
     }
 }
 
+/// Every pulse near each cylinder, with all its echoes: the raw table a
+/// per-pulse likelihood reads (what [`evidence`] reduces inside).
+///
+/// Cylinder `c`'s rows are `cyl_start[c]..cyl_start[c + 1]`; row `i`'s echoes
+/// (all of its pulse's, nearest first) are `echo_start[i]..echo_start[i + 1]`.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Pairs {
+    pub cyl_start: Vec<u64>,
+    /// The scan (its index in the `scans` given) and pulse (in that scan's index).
+    pub scan: Vec<u32>,
+    pub pulse: Vec<u32>,
+    /// The pulse's unit direction.
+    pub dir: Vec<[f32; 3]>,
+    /// Closest approach of the pulse's line to the axis line: its range `t`
+    /// along the pulse, its position `s` along the axis from `a` (m), and the
+    /// distance `d` between the lines.
+    pub t: Vec<f32>,
+    pub s: Vec<f32>,
+    pub d: Vec<f32>,
+    pub echo_start: Vec<u64>,
+    pub range: Vec<f32>,
+    /// Each echo's reflectance (dB) and deviation, NaN where the store has none.
+    pub reflectance: Vec<f32>,
+    pub deviation: Vec<f32>,
+}
+
+/// The [`Pairs`] of cylinders `a[i] -> b[i]`: each pulse whose line comes
+/// closest to the axis within the segment, closer than `window`, ahead of the
+/// scanner, and that reached the disc of radius `window` around the axis
+/// there (its last echo is at or beyond the disc, or it missed). A pulse that
+/// stopped short of the disc says nothing about what is in it and is left
+/// out. Runs on `threads` threads (0: one per core).
+pub fn pairs(scans: &[&ScanIndex], a: &[Point], b: &[Point], window: f64, threads: usize) -> Result<Pairs> {
+    let n = a.len();
+    if b.len() != n {
+        return Err(Error::invalid("pairs: a and b must have one row per cylinder"));
+    }
+    if !(window > 0.0) {
+        return Err(Error::invalid("pairs: window must be positive"));
+    }
+    struct Row {
+        scan: u32,
+        pulse: u32,
+        dir: [f32; 3],
+        t: f32,
+        s: f32,
+        d: f32,
+        first: usize,
+        n_echo: usize,
+    }
+    pool(threads)?.install(|| {
+        let found: Vec<Vec<Row>> = (0..n).into_par_iter().map(|c| {
+            let mut rows = Vec::new();
+            let len = norm(&sub(&b[c], &a[c]));
+            if !(len > 0.0) {
+                return rows;
+            }
+            let u = sub(&b[c], &a[c]).map(|x| x / len);
+            for (si, sc) in scans.iter().enumerate() {
+                let w0 = sub(&sc.origin(), &a[c]);
+                let dd = dot(&w0, &u);
+                sc.pulses_near(&a[c], &b[c], window, |pulse, d, echoes| {
+                    let (bb, ee) = (dot(&d, &u), dot(&d, &w0));
+                    let den = (1.0 - bb * bb).max(1e-12);
+                    let (t_ray, s_ax) = ((bb * dd - ee) / den, (dd - bb * ee) / den);
+                    if !(t_ray > 0.0 && s_ax >= 0.0 && s_ax <= len) {
+                        return;
+                    }
+                    let dist = norm(&sub(&add(&w0, &scale(&d, t_ray)), &scale(&u, s_ax)));
+                    if !(dist < window) {
+                        return;
+                    }
+                    let entry = t_ray - (window * window - dist * dist).sqrt() / den.sqrt();
+                    let last = echoes.last().map_or(f64::INFINITY, |&r| r as f64);
+                    if last < entry {
+                        return;
+                    }
+                    let first = sc.echo_start[pulse as usize] as usize;
+                    rows.push(Row { scan: si as u32, pulse, dir: d.map(|x| x as f32), t: t_ray as f32, s: s_ax as f32, d: dist as f32, first, n_echo: echoes.len() });
+                });
+            }
+            rows
+        }).collect();
+        let mut out = Pairs { cyl_start: vec![0], echo_start: vec![0], ..Default::default() };
+        for rows in found {
+            for r in rows {
+                let sc = scans[r.scan as usize];
+                out.scan.push(r.scan);
+                out.pulse.push(r.pulse);
+                out.dir.push(r.dir);
+                out.t.push(r.t);
+                out.s.push(r.s);
+                out.d.push(r.d);
+                for e in r.first..r.first + r.n_echo {
+                    out.range.push(sc.range[e]);
+                    out.reflectance.push(sc.reflectance.get(e).map_or(f32::NAN, |&x| x as f32 / 100.0));
+                    out.deviation.push(sc.deviation.get(e).map_or(f32::NAN, |&x| x as f32));
+                }
+                out.echo_start.push(out.range.len() as u64);
+            }
+            out.cyl_start.push(out.scan.len() as u64);
+        }
+        Ok(out)
+    })
+}
+
 /// One cylinder in a round: its hits (per pulse, the echo it won nearest its
 /// surface `r_prev`), its pairs within the window `win` as hits, passes or
 /// neither, and what they say. `misses[s]`: whether scan `s` kept misses.
@@ -756,6 +862,33 @@ mod tests {
 
     fn scene(r: f64, misses: bool) -> (ScanIndex, Point, Point) {
         (index(&shots(r, misses), ShotsWriteOptions::default().row_group_size), [0.0, 5.0, -1.0], [0.0, 5.0, 1.0])
+    }
+
+    #[test]
+    fn pairs_hold_every_pulse_that_reached_the_disc_with_its_echoes() {
+        let r = 0.05;
+        let (s, a, b) = scene(r, true);
+        let w = 0.15;
+        let p = pairs(&[&s], &[a, a], &[b, a], w, 2).unwrap();
+        assert_eq!(p.cyl_start, vec![0, p.scan.len() as u64, p.scan.len() as u64], "no axis, no pairs");
+        let n = p.scan.len();
+        assert!(n > 200 && p.echo_start.len() == n + 1);
+        let (mut hits, mut passes) = (0, 0);
+        for i in 0..n {
+            assert!((p.d[i] as f64) < w && p.s[i] >= 0.0 && p.s[i] <= 2.0);
+            let echoes = &p.range[p.echo_start[i] as usize..p.echo_start[i + 1] as usize];
+            // the scene's echo is on the stem (near t) or on the wall behind; a miss went on
+            if echoes.first().is_some_and(|&x| (x - p.t[i]).abs() < 0.06) {
+                hits += 1;
+                assert!((p.d[i] as f64) < r + 1e-3, "a hit's line passes inside the stem");
+            } else {
+                passes += 1;
+                assert!((p.d[i] as f64) > r - 1e-3, "a pass's line misses the stem");
+            }
+            assert!(p.reflectance[p.echo_start[i] as usize..p.echo_start[i + 1] as usize].iter().all(|x| x.is_nan()));
+        }
+        assert!(hits > 100 && passes > 100, "hits {hits} passes {passes}");
+        assert!(pairs(&[&s], &[a], &[b], 0.0, 1).is_err());
     }
 
     #[test]
