@@ -497,6 +497,8 @@ fn qsm_pairs<'py>(py: Python<'py>, scans: Vec<Bound<'py, PyScanIndex>>, a: PyRea
     d.set_item("s", p.s.into_pyarray(py))?;
     d.set_item("d", p.d.into_pyarray(py))?;
     d.set_item("lost", p.lost.into_pyarray(py))?;
+    d.set_item("returns", p.returns.into_pyarray(py))?;
+    d.set_item("return_number", p.return_number.into_pyarray(py))?;
     d.set_item("echo_start", p.echo_start.into_pyarray(py))?;
     d.set_item("range", p.range.into_pyarray(py))?;
     d.set_item("reflectance", p.reflectance.into_pyarray(py))?;
@@ -506,7 +508,7 @@ fn qsm_pairs<'py>(py: Python<'py>, scans: Vec<Bound<'py, PyScanIndex>>, a: PyRea
 
 fn joint_params(params: &Bound<'_, PyDict>) -> PyResult<JointParams> {
     let get = |k: &str| -> PyResult<f64> { params.get_item(k)?.ok_or_else(|| PyValueError::new_err(format!("joint params: no {k:?}")))?.extract() };
-    Ok(JointParams { exit: get("exit")?, divergence: get("divergence")?, sigma_r: get("sigma_r")?, rough: get("rough")?, tau: get("tau")?, edge: get("edge")?, eps: get("eps")?, eps_min: get("eps_min")?, mp_len: get("mp_len")? })
+    Ok(JointParams { exit: get("exit")?, divergence: get("divergence")?, sigma_r: get("sigma_r")?, rough: get("rough")?, tau: get("tau")?, edge: get("edge")?, eps: get("eps")?, eps_min: get("eps_min")?, mp_len: get("mp_len")?, hide: get("hide")? })
 }
 
 fn rows<const K: usize>(a: PyReadonlyArray2<f64>, what: &str) -> PyResult<Vec<[f64; K]>> {
@@ -529,12 +531,12 @@ fn pulses_from(table: &Bound<'_, PyDict>) -> PyResult<Vec<Pulse>> {
     let flag = |k: &str| -> PyResult<Vec<bool>> { Ok(dict_item(table, k, what)?.extract::<PyReadonlyArray1<bool>>()?.as_array().to_vec()) };
     let (b, t, sin, c0, c1, x, q) = (col("b")?, col("t")?, col("sin")?, col("c0")?, col("c1")?, col("x")?, col("q")?);
     let (jb, jt) = (rows::<2>(dict_item(table, "jb", what)?.extract()?, "jb")?, rows::<2>(dict_item(table, "jt", what)?.extract()?, "jt")?);
-    let (stop, early) = (flag("stop")?, flag("early")?);
+    let (stop, early, deleted) = (flag("stop")?, flag("early")?, flag("deleted")?);
     let n = b.len();
-    if [t.len(), sin.len(), jb.len(), jt.len(), c0.len(), c1.len(), x.len(), q.len(), stop.len(), early.len()].iter().any(|&l| l != n) {
+    if [t.len(), sin.len(), jb.len(), jt.len(), c0.len(), c1.len(), x.len(), q.len(), deleted.len(), stop.len(), early.len()].iter().any(|&l| l != n) {
         return Err(PyValueError::new_err("joint table: every column must have one entry per pair"));
     }
-    Ok((0..n).map(|i| Pulse { b: b[i], t: t[i], sin: sin[i], jb: jb[i], jt: jt[i], c0: c0[i], c1: c1[i], x: x[i], stop: stop[i], early: early[i], q: q[i] }).collect())
+    Ok((0..n).map(|i| Pulse { b: b[i], t: t[i], sin: sin[i], jb: jb[i], jt: jt[i], c0: c0[i], c1: c1[i], x: x[i], deleted: deleted[i], stop: stop[i], early: early[i], q: q[i] }).collect())
 }
 
 /// Each pair's log likelihood at its own state `state` (m, 4: two offsets, log R, log lambda), the pairs as
@@ -571,6 +573,7 @@ fn qsm_joint_table<'py>(py: Python<'py>, scans: Vec<Bound<'py, PyScanIndex>>, a:
     d.set_item("jt", jt.into_pyarray(py).reshape([m, 2])?)?;
     d.set_item("stop", t.pulses.iter().map(|p| p.stop).collect::<Vec<bool>>().into_pyarray(py))?;
     d.set_item("early", t.pulses.iter().map(|p| p.early).collect::<Vec<bool>>().into_pyarray(py))?;
+    d.set_item("deleted", t.pulses.iter().map(|p| p.deleted).collect::<Vec<bool>>().into_pyarray(py))?;
     d.set_item("row", t.row.into_pyarray(py))?;
     d.set_item("scan", t.scan.into_pyarray(py))?;
     d.set_item("pulse", t.pulse.into_pyarray(py))?;

@@ -19,7 +19,9 @@ The parameters are a mapping of named numbers:
   ``rough`` (surface roughness as a share of R), ``tau`` (the footprint's share
   on the wood an echo needs), ``edge`` (the detection edge's sd, a share of the
   footprint's width), ``eps``, ``eps_min`` and ``mp_len`` (mixed pixels:
-  their share ``eps_min + eps (1 - f)`` and how far behind the surface, m);
+  their share ``eps_min + eps (1 - f)`` and how far behind the surface, m),
+  ``hide`` (the share of stops whose echo the export deleted, among pulses
+  that lost an echo where it could lie: such a recorded pass may be one);
 - the prior: ``lam_prior`` and ``lam_sd`` (foliage's median, 1/m, and log
   sd), ``sig_ell`` (its random walk), ``sig_eta`` (the taper's random walk per
   sqrt(m)), ``mu_fork`` and ``sig_fork`` (soft Leonardo's log area ratio and
@@ -45,8 +47,10 @@ def joint_table(scans, a, b, window, threads: int = 0) -> dict[str, np.ndarray]:
     its signed impact on the axis and range of closest approach, how both move
     when the axis moves across itself, its chord through the tube, and its fate
     there: the first echo inside the chord is a stop; otherwise the pulse went
-    on. A pass by a pulse whose echoes the export partly deleted is left out,
-    since the deleted echo may have been its stop.
+    on. ``deleted`` says the export deleted an echo of the pulse that could lie
+    in the chord before its first recorded one (``las_return_number`` and
+    ``las_number_of_returns`` say which, and so between which recorded echoes
+    it lay; without return numbers, anywhere).
 
     Parameters
     ----------
@@ -69,6 +73,8 @@ def joint_table(scans, a, b, window, threads: int = 0) -> dict[str, np.ndarray]:
       offset along the row's two cross directions;
     - ``c0``, ``c1``: the chord through the tube along the pulse (m);
     - ``stop``, ``x``: whether an echo lay inside the chord, and its range;
+    - ``deleted``: a deleted echo could lie in the chord before the first
+      recorded one;
     - ``early``: the pulse echoed before the tube (recorded whatever happened);
     - ``q``: the chance something behind records a pass (1);
     - ``row``, ``scan``, ``pulse``, ``n_echo``: where the pair came from.
