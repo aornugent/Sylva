@@ -80,8 +80,9 @@ class ScanIndex:
     Built once per scan and reused by every :func:`evidence`, :func:`pairs` and
     :func:`~sylva.qsm.joint_table` call (about 16 bytes per pulse, 17 where the
     store has ``las_number_of_returns``, and 4 per echo, 8 where it has
-    reflectance and deviation, held on the Rust side). Only the angles, the
-    echo ranges and those three attributes are read.
+    reflectance and deviation and 1 more with ``las_return_number``, held on
+    the Rust side). Only the angles, the echo ranges and those four attributes
+    are read.
 
     Parameters
     ----------
@@ -154,9 +155,13 @@ def pairs(scans, a, b, window, threads: int = 0) -> dict[str, np.ndarray]:
       ``a``, and the distance between the lines;
     - ``lost``: the export deleted some of the pulse's echoes (the scanner
       counted more returns than the store holds; False where it doesn't say);
+    - ``returns``: the pulse's number of returns as the scanner counted them
+      (0 where the store doesn't say);
     - ``echo_start`` ``(m + 1,)``: row ``i``'s echoes, all of its pulse's,
       nearest first, are ``echo_start[i]:echo_start[i + 1]`` of ``range``,
-      ``reflectance`` (dB) and ``deviation`` (NaN where the store has none).
+      ``reflectance`` (dB) and ``deviation`` (NaN where the store has none) and
+      ``return_number`` (0 where it has none; a number missing below
+      ``returns`` is an echo the export deleted).
     """
     scans = list(scans)
     if not all(isinstance(s, ScanIndex) for s in scans):

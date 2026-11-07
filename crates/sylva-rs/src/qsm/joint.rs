@@ -19,7 +19,8 @@
 //! than a fiftieth of it averaged as if that wide), Gaussian about it
 //! or a mixed pixel behind; a pass is censoring at the chord's end. Each
 //! pulse is conditioned on having been recorded: a pass needs something
-//! behind (`q`). A stop needs the footprint's share `tau` on the wood, with an
+//! behind (`q`), and a pass by a pulse that lost an echo where it could lie
+//! may be a stop whose echo the export deleted (`hide`). A stop needs the footprint's share `tau` on the wood, with an
 //! edge `edge w` wide (w the footprint's width).
 //!
 //! The derivatives come from evaluating the likelihood once on second-order
@@ -312,6 +313,10 @@ pub struct JointParams {
     pub eps: f64,
     pub eps_min: f64,
     pub mp_len: f64,
+    /// The share of stops whose echo the export deleted, among pulses that
+    /// lost an echo where it could lie (research 74 §19; 0: a recorded pass is
+    /// a pass).
+    pub hide: f64,
 }
 
 /// One pulse-cylinder pair, measured once from a starting axis (see the
@@ -327,6 +332,9 @@ pub struct Pulse {
     pub c1: f64,
     /// A stop's range (unused for a pass).
     pub x: f64,
+    /// An echo the export deleted could lie in the chord before the first
+    /// recorded one (see [`deleted`]): a pass may then hide a stop.
+    pub deleted: bool,
     pub stop: bool,
     /// It echoed before the disc (recorded whatever happened in it).
     pub early: bool,
@@ -387,7 +395,6 @@ fn pair<N: Num>(pu: &Pulse, s: [N; 4], p: &JointParams) -> N {
     let (c0, c1) = (N::c(pu.c0), N::c(pu.c1));
     let xw = (tp - hbar * (1.0 / pu.sin)).clamp(c0, c1);
     let zw = xw - c0;
-    let ln = pu.c1 - pu.c0;
     let sig = (r.sq() * (p.rough * p.rough) + p.sigma_r * p.sigma_r).sqrt();
     let eps = (-(f.clamp(N::c(0.0), N::c(1.0))) + 1.0) * p.eps + p.eps_min;
     let x = N::c(pu.x);
@@ -398,13 +405,16 @@ fn pair<N: Num>(pu: &Pulse, s: [N; 4], p: &JointParams) -> N {
     let l_tail = (eps + 1e-300).ln() + (-p.mp_len.ln()) + u.log_ndtr() + ((xw + p.mp_len - x) / sig).log_ndtr();
     let l_wood = lp - lam * zw + logaddexp(l_gauss, l_tail);
     let l_leaf = ell - lam * z + logaddexp(lq, lp + (-u).log_ndtr());
+    let ln = pu.c1 - pu.c0;
     let over = ((xw + p.mp_len - c1) * (1.0 / p.mp_len)).clamp(N::c(1e-12), N::c(1.0));
     let l_pass = logaddexp(lq - lam * ln, lp - lam * zw + (eps + 1e-300).ln() + over.ln());
     let l_stop = logaddexp(l_wood, l_leaf);
     let q = pu.q;
     let p_pass = l_pass.min(N::c(0.0)).exp();
     let sel = if pu.early { N::c(0.0) } else { (p_pass * (-(1.0 - q))).log1p() };
-    (if pu.stop { l_stop } else { l_pass + q.ln() }) - sel
+    // a recorded pass where a deleted echo could lie: a pass, or a stop whose echo the export deleted
+    let l_seen = if pu.deleted && p.hide > 0.0 { logaddexp(l_pass, (-p_pass).log1p() + p.hide.ln()) } else { l_pass };
+    (if pu.stop { l_stop } else { l_seen + q.ln() }) - sel
 }
 
 /// Where each pair's state comes from: its row's `[delta1, delta2, eta,
@@ -531,10 +541,10 @@ fn cross(a: &Point, b: &Point) -> Point {
 /// those axes: each pulse's signed impact and range of closest approach, how
 /// both move with an offset of the axis, its chord through the tube, and its
 /// fate there (the first echo inside the chord is a stop; otherwise the pulse
-/// went on, a pass). `q` is 1: what is behind recorded every pass. A pass by
-/// a pulse whose echoes the export partly deleted is left out: the deleted
-/// echo may have been its stop here (research 74 §2.5). So is a pulse along
-/// the axis, which has no impact.
+/// went on, a pass). `q` is 1: what is behind recorded every pass. `deleted`
+/// says the export deleted an echo of the pulse that could lie in the chord
+/// before its first recorded one (see [`deleted`]; research 74 §19). A pulse
+/// along the axis, which has no impact, is left out.
 pub fn joint_table(scans: &[&crate::qsm::evidence::ScanIndex], a: &[Point], b: &[Point], window: &[f64], threads: usize) -> Result<JointPairs> {
     use crate::transform::dot;
     let pp = crate::qsm::evidence::pairs(scans, a, b, window, threads)?;
@@ -559,9 +569,9 @@ pub fn joint_table(scans: &[&crate::qsm::evidence::ScanIndex], a: &[Point], b: &
             let (c0, c1) = (t - half, t + half);
             let echoes = &pp.range[pp.echo_start[i] as usize..pp.echo_start[i + 1] as usize];
             let first_inside = echoes.iter().map(|&e| e as f64).find(|&e| e >= c0 && e <= c1);
-            if first_inside.is_none() && pp.lost[i] {
-                continue;
-            }
+            let numbers = &pp.return_number[pp.echo_start[i] as usize..pp.echo_start[i + 1] as usize];
+            let limit = first_inside.unwrap_or(c1);
+            let hidden = deleted(echoes, numbers, pp.returns[i]).into_iter().any(|(lo, hi)| lo < limit && hi > c0);
             out.pulses.push(Pulse {
                 b: bimp,
                 t,
@@ -571,6 +581,7 @@ pub fn joint_table(scans: &[&crate::qsm::evidence::ScanIndex], a: &[Point], b: &
                 c0,
                 c1,
                 x: first_inside.unwrap_or(0.0),
+                deleted: hidden,
                 stop: first_inside.is_some(),
                 early: echoes.first().is_some_and(|&e| (e as f64) < c0),
                 q: 1.0,
@@ -584,6 +595,25 @@ pub fn joint_table(scans: &[&crate::qsm::evidence::ScanIndex], a: &[Point], b: &
     Ok(out)
 }
 
+/// Where each echo the export deleted from a pulse could lie, `(lo, hi)` in
+/// range: between its recorded neighbours by return number (`range` and
+/// `number`, the pulse's recorded echoes; `returns` the scanner's count). One
+/// `(0, inf)` per deleted echo where the store has no return numbers.
+pub fn deleted(range: &[f32], number: &[u8], returns: u8) -> Vec<(f64, f64)> {
+    let k = range.len();
+    if (returns as usize) <= k {
+        return Vec::new();
+    }
+    if number.len() != k || number.contains(&0) {
+        return vec![(0.0, f64::INFINITY); returns as usize - k];
+    }
+    (1..=returns).filter(|m| !number.contains(m)).map(|m| {
+        let lo = range.iter().zip(number).filter(|&(_, &n)| n < m).map(|(&r, _)| r as f64).fold(0.0, f64::max);
+        let hi = range.iter().zip(number).filter(|&(_, &n)| n > m).map(|(&r, _)| r as f64).fold(f64::INFINITY, f64::min);
+        (lo, hi)
+    }).collect()
+}
+
 fn pool(threads: usize) -> Result<rayon::ThreadPool> {
     rayon::ThreadPoolBuilder::new().num_threads(threads).build().map_err(|e| Error::invalid(format!("thread pool: {e}")))
 }
@@ -593,13 +623,13 @@ mod tests {
     use super::*;
 
     fn params() -> JointParams {
-        JointParams { exit: 0.007, divergence: 0.35e-3, sigma_r: 0.005, rough: 0.03, tau: 0.17, edge: 0.25, eps: 0.1, eps_min: 0.01, mp_len: 0.5 }
+        JointParams { exit: 0.007, divergence: 0.35e-3, sigma_r: 0.005, rough: 0.03, tau: 0.17, edge: 0.25, eps: 0.1, eps_min: 0.01, mp_len: 0.5, hide: 0.1 }
     }
 
     /// A few pulses past a 5 cm stem at 8 m: on the surface, inside it, passing, and a leaf in front.
     fn table() -> Vec<Pulse> {
         [(0.0, true, 7.95, false, 1.0), (0.04, true, 7.97, false, 0.6), (0.07, false, 0.0, false, 0.6), (0.02, true, 7.88, true, 1.0), (0.03, false, 0.0, false, 1.0)]
-            .map(|(b, stop, x, early, q)| Pulse { b, t: 8.0, sin: 0.95, jb: [0.9, 0.1], jt: [0.05, 0.9], c0: 7.85, c1: 8.15, x, stop, early, q })
+            .map(|(b, stop, x, early, q)| Pulse { b, t: 8.0, sin: 0.95, jb: [0.9, 0.1], jt: [0.05, 0.9], c0: 7.85, c1: 8.15, x, deleted: !stop, stop, early, q })
             .to_vec()
     }
 
@@ -673,6 +703,32 @@ mod tests {
             }
         }
         assert!(checked > 200);
+    }
+
+    #[test]
+    fn a_deleted_echo_lies_between_its_neighbours() {
+        // returns 1 and 3 of 3 recorded: return 2 lies between them
+        assert_eq!(deleted(&[5.0, 9.0], &[1, 3], 3), vec![(5.0f32 as f64, 9.0)]);
+        // the first of 2 deleted: before the second
+        assert_eq!(deleted(&[7.0], &[2], 2), vec![(0.0, 7.0)]);
+        // the last deleted: anywhere beyond
+        assert_eq!(deleted(&[7.0], &[1], 2), vec![(7.0, f64::INFINITY)]);
+        assert!(deleted(&[7.0], &[1], 1).is_empty() && deleted(&[7.0], &[0], 0).is_empty());
+        // numbers unknown: anywhere
+        assert_eq!(deleted(&[7.0], &[0], 3), vec![(0.0, f64::INFINITY); 2]);
+    }
+
+    #[test]
+    fn a_pass_that_may_hide_a_deleted_stop_says_less() {
+        // a pulse 3 cm off a 5 cm stem at 8 m: a pass through the wood is unlikely; if the pulse lost an echo that
+        // could have been the stem's, the pass is that likely or a deleted stop (hide)
+        let p = params();
+        let s = [0.0, 0.0, (0.05f64).ln(), (0.5f64).ln()];
+        let pass = Pulse { b: 0.03, t: 8.0, sin: 1.0, jb: [1.0, 0.0], jt: [0.0, 1.0], c0: 7.85, c1: 8.15, x: 0.0, deleted: false, stop: false, early: false, q: 1.0 };
+        let (plain, hid): (f64, f64) = (pair(&pass, s, &p), pair(&Pulse { deleted: true, ..pass }, s, &p));
+        let want = (plain.exp() + 0.1 * (1.0 - plain.exp())).ln();
+        assert!(plain < -3.0 && (hid - want).abs() < 1e-12 && hid > plain, "plain {plain}, deleted {hid}");
+        assert_eq!(pair(&Pulse { deleted: true, ..pass }, s, &JointParams { hide: 0.0, ..p }), plain);
     }
 
     #[test]
