@@ -13,6 +13,7 @@ pub mod buttress;
 pub mod buttress_detect;
 pub mod cylinder;
 pub mod evidence;
+pub mod joint;
 pub mod metrics;
 pub mod model;
 pub mod ops;
