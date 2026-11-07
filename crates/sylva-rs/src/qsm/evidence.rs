@@ -234,11 +234,14 @@ pub struct ScanIndex {
     /// Each echo's reflectance (0.01 dB) and deviation, in `range` order; empty where the store has none.
     reflectance: Vec<i16>,
     deviation: Vec<u16>,
+    /// Each pulse's number of returns as the scanner counted them (`las_number_of_returns`), in pulse order;
+    /// empty where the store has none. More than its recorded echoes: the export deleted some.
+    returns: Vec<u8>,
     cell_start: Vec<u32>,
 }
 
 /// The echo attributes a [`ScanIndex`] keeps, where the store has them.
-const CHARACTER: [&str; 2] = ["reflectance", "deviation"];
+const CHARACTER: [&str; 3] = ["reflectance", "deviation", "las_number_of_returns"];
 
 impl ScanIndex {
     /// Index a single-position Shots file, reading only angles and ranges,
@@ -263,14 +266,15 @@ impl ScanIndex {
                 }
             }
             let mut attr = |name| names.iter().position(|&a| a == name).map(|i| std::mem::take(&mut rays.attrs[i])).unwrap_or_default();
-            let (refl, dev) = (attr("reflectance"), attr("deviation"));
-            Self::build(origin, rays, &refl, &dev)
+            let (refl, dev, nr) = (attr("reflectance"), attr("deviation"), attr("las_number_of_returns"));
+            Self::build(origin, rays, &refl, &dev, &nr)
         })
     }
 
     /// Put the pulses in direction-cell order (a stable counting sort), with
-    /// the echoes' reflectance (dB) and deviation, if any (else empty).
-    fn build(origin: Point, rays: Rays, refl: &[f32], dev: &[f32]) -> Result<Self> {
+    /// the echoes' reflectance (dB) and deviation and the pulses' number of
+    /// returns (per echo in the store: each pulse's first), if any (else empty).
+    fn build(origin: Point, rays: Rays, refl: &[f32], dev: &[f32], nr: &[f32]) -> Result<Self> {
         let n = rays.zenith.len();
         if n >= u32::MAX as usize || rays.range.len() >= u32::MAX as usize {
             return Err(Error::invalid("ScanIndex: too many pulses or echoes for one scan"));
@@ -307,7 +311,8 @@ impl ScanIndex {
         // `as` saturates: +-327 dB and deviations above 65535 are out of any scanner's range anyway
         let reflectance = echoes(refl).into_iter().map(|x| (x * 100.0).round() as i16).collect();
         let deviation = echoes(dev).into_iter().map(|x| x.round() as u16).collect();
-        Ok(ScanIndex { origin, misses, dir, echo_start, range, reflectance, deviation, cell_start })
+        let returns = if nr.is_empty() { Vec::new() } else { src.iter().map(|&p| if rays.echo_count[p as usize] > 0 { nr[from[p as usize] as usize].round() as u8 } else { 0 }).collect() };
+        Ok(ScanIndex { origin, misses, dir, echo_start, range, reflectance, deviation, returns, cell_start })
     }
 
     /// The reflectance (dB) and deviation of echo `k` of `pulse`, NaN where
@@ -315,6 +320,14 @@ impl ScanIndex {
     pub fn character(&self, pulse: u32, k: u32) -> (f64, f64) {
         let e = self.echo_start[pulse as usize] as usize + k as usize;
         (self.reflectance.get(e).map_or(f64::NAN, |&x| x as f64 / 100.0), self.deviation.get(e).map_or(f64::NAN, |&x| x as f64))
+    }
+
+    /// Whether the export deleted some of `pulse`'s echoes: the scanner
+    /// counted more returns than the store holds (false where the store
+    /// doesn't say).
+    pub fn lost_echoes(&self, pulse: u32) -> bool {
+        let p = pulse as usize;
+        self.returns.get(p).is_some_and(|&n| n as u32 > self.echo_start[p + 1] - self.echo_start[p])
     }
 
     /// The scanner position.
@@ -335,7 +348,7 @@ impl ScanIndex {
 
     /// The bytes the index holds.
     pub fn nbytes(&self) -> usize {
-        size_of_val(&self.dir[..]) + size_of_val(&self.echo_start[..]) + size_of_val(&self.range[..]) + size_of_val(&self.reflectance[..]) + size_of_val(&self.deviation[..]) + size_of_val(&self.cell_start[..])
+        size_of_val(&self.dir[..]) + size_of_val(&self.echo_start[..]) + size_of_val(&self.range[..]) + size_of_val(&self.reflectance[..]) + size_of_val(&self.deviation[..]) + size_of_val(&self.returns[..]) + size_of_val(&self.cell_start[..])
     }
 
     /// Calls `f(pulse, direction, echo ranges)` for every pulse whose line
@@ -606,6 +619,8 @@ pub struct Pairs {
     pub t: Vec<f32>,
     pub s: Vec<f32>,
     pub d: Vec<f32>,
+    /// The export deleted some of the pulse's echoes (see [`ScanIndex::lost_echoes`]).
+    pub lost: Vec<bool>,
     pub echo_start: Vec<u64>,
     pub range: Vec<f32>,
     /// Each echo's reflectance (dB) and deviation, NaN where the store has none.
@@ -682,6 +697,7 @@ pub fn pairs(scans: &[&ScanIndex], a: &[Point], b: &[Point], window: &[f64], thr
                 out.t.push(r.t);
                 out.s.push(r.s);
                 out.d.push(r.d);
+                out.lost.push(sc.lost_echoes(r.pulse));
                 for (k, &range) in r.echoes.iter().enumerate() {
                     let (refl, dev) = sc.character(r.pulse, k as u32);
                     out.range.push(range);

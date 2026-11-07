@@ -528,7 +528,9 @@ fn cross(a: &Point, b: &Point) -> Point {
 /// those axes: each pulse's signed impact and range of closest approach, how
 /// both move with an offset of the axis, its chord through the tube, and its
 /// fate there (the first echo inside the chord is a stop; otherwise the pulse
-/// went on, a pass). `q` is 1: what is behind recorded every pass.
+/// went on, a pass). `q` is 1: what is behind recorded every pass. A pass by
+/// a pulse whose echoes the export partly deleted is left out: the deleted
+/// echo may have been its stop here (research 74 §2.5).
 pub fn joint_table(scans: &[&crate::qsm::evidence::ScanIndex], a: &[Point], b: &[Point], window: &[f64], threads: usize) -> Result<JointPairs> {
     use crate::transform::dot;
     let pp = crate::qsm::evidence::pairs(scans, a, b, window, threads)?;
@@ -550,6 +552,9 @@ pub fn joint_table(scans: &[&crate::qsm::evidence::ScanIndex], a: &[Point], b: &
             let (c0, c1) = (t - half, t + half);
             let echoes = &pp.range[pp.echo_start[i] as usize..pp.echo_start[i + 1] as usize];
             let first_inside = echoes.iter().map(|&e| e as f64).find(|&e| e >= c0 && e <= c1);
+            if first_inside.is_none() && pp.lost[i] {
+                continue;
+            }
             out.pulses.push(Pulse {
                 b: bimp,
                 t,

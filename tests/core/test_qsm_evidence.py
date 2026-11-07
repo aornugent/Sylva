@@ -62,6 +62,21 @@ def test_pairs_hold_each_pulse_that_reached_the_disc_with_its_echoes(tmp_path):
     assert q["cyl_start"][2] - n0 < n0 and np.all(q["d"][n0:] < 0.08)
 
 
+def test_pairs_say_which_pulses_lost_echoes_to_the_export(tmp_path):
+    # the fan's pulses, every other one counted 2 returns by the scanner but holding 1 echo
+    scan, a, b = fan(tmp_path)
+    s = Shots.load(tmp_path / "scan_0.05_True.parquet")
+    nr = np.ones(s.n_echoes, np.uint8)
+    nr[::2] = 2
+    lossy = Shots(origin=s.origin, direction=s.direction, echo_start=s.echo_start, echo_count=s.echo_count,
+                  echo_range=s.echo_range, echo_attrs={"las_number_of_returns": nr})
+    lossy.save(tmp_path / "lossy.parquet")
+    p = pairs([ScanIndex(tmp_path / "lossy.parquet", threads=2)], a, b, window=0.15)
+    has = np.diff(p["echo_start"]) > 0
+    assert p["lost"][has].any() and not p["lost"][has].all()
+    assert not pairs([scan], a, b, window=0.15)["lost"].any()  # a store without the attribute loses nothing
+
+
 def test_thin_wood_without_misses_rests_on_the_prior(tmp_path):
     scan, a, b = fan(tmp_path, r=0.01, misses=False)
     e = evidence([scan], a, b)

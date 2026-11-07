@@ -496,6 +496,7 @@ fn qsm_pairs<'py>(py: Python<'py>, scans: Vec<Bound<'py, PyScanIndex>>, a: PyRea
     d.set_item("t", p.t.into_pyarray(py))?;
     d.set_item("s", p.s.into_pyarray(py))?;
     d.set_item("d", p.d.into_pyarray(py))?;
+    d.set_item("lost", p.lost.into_pyarray(py))?;
     d.set_item("echo_start", p.echo_start.into_pyarray(py))?;
     d.set_item("range", p.range.into_pyarray(py))?;
     d.set_item("reflectance", p.reflectance.into_pyarray(py))?;
