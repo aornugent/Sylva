@@ -458,6 +458,18 @@ struct Round {
     deviation: f64,
 }
 
+/// Closest approach of a pulse's line (unit direction `d`) to a cylinder's
+/// axis line (unit `u`), given `w0 = origin - a` and `dd = w0 . u`: the range
+/// along the pulse `t`, the position along the axis from `a` `s`, and
+/// `1 - (d . u)^2` (the squared sine of their angle, floored). The distance
+/// between the lines is the caller's: whether `s` is clamped to the segment
+/// first is its choice.
+fn closest(d: &Point, u: &Point, w0: &Point, dd: f64) -> (f64, f64, f64) {
+    let (bb, ee) = (dot(d, u), dot(d, w0));
+    let den = (1.0 - bb * bb).max(1e-12);
+    ((bb * dd - ee) / den, (dd - bb * ee) / den, den)
+}
+
 /// The evidence the `scans` give about cylinders `a[i] -> b[i]`; `r_claim`,
 /// if given, the claimed radii to audit. Runs on `threads` threads (0: one
 /// per core).
@@ -490,9 +502,7 @@ fn evidence_on(scans: &[&ScanIndex], a: &[Point], b: &[Point], r_claim: Option<&
             let w0 = sub(&s.origin(), &a[c]);
             let dd = dot(&w0, &u[c]);
             s.pulses_near(&a[c], &b[c], cap, |pulse, d, echoes| {
-                let (bb, ee) = (dot(&d, &u[c]), dot(&d, &w0));
-                let den = (1.0 - bb * bb).max(1e-12);
-                let (t_ray, s_ax) = ((bb * dd - ee) / den, (dd - bb * ee) / den);
+                let (t_ray, s_ax, _) = closest(&d, &u[c], &w0, dd);
                 let dist = norm(&sub(&add(&w0, &scale(&d, t_ray)), &scale(&u[c], s_ax.clamp(0.0, len[c]))));
                 if !(dist < cap && t_ray > 0.0) {
                     return;
@@ -603,24 +613,24 @@ pub struct Pairs {
     pub deviation: Vec<f32>,
 }
 
-/// The [`Pairs`] of cylinders `a[i] -> b[i]`: each pulse whose line comes
-/// closest to the axis within the segment (ends included, so a pulse exactly
-/// at a shared end belongs to both; [`evidence`] counts it in neither),
-/// closer than `window`, ahead of the scanner, and that reached the tube of
-/// radius `window` around the axis (its last echo is at or beyond where its
-/// line enters the tube, or it missed). A pulse that stopped short of the
-/// tube says nothing about what is in it and is left out. Runs on `threads`
-/// threads (0: one per core).
-pub fn pairs(scans: &[&ScanIndex], a: &[Point], b: &[Point], window: f64, threads: usize) -> Result<Pairs> {
+/// The [`Pairs`] of cylinders `a[i] -> b[i]`, each with its own tube of
+/// radius `window[i]` around the axis: each pulse whose line comes closest to
+/// the axis within the segment (ends included, so a pulse exactly at a shared
+/// end belongs to both; [`evidence`] counts it in neither), inside the tube,
+/// ahead of the scanner, and that reached the tube (its last echo is at or
+/// beyond where its line enters it, or it missed). A pulse that stopped short
+/// of the tube says nothing about what is in it and is left out. Runs on
+/// `threads` threads (0: one per core).
+pub fn pairs(scans: &[&ScanIndex], a: &[Point], b: &[Point], window: &[f64], threads: usize) -> Result<Pairs> {
     let n = a.len();
-    if b.len() != n {
-        return Err(Error::invalid("pairs: a and b must have one row per cylinder"));
+    if b.len() != n || window.len() != n {
+        return Err(Error::invalid("pairs: a, b and window must have one row per cylinder"));
     }
     if scans.len() >= u32::MAX as usize {
         return Err(Error::invalid("pairs: too many scans"));
     }
-    if !(window.is_finite() && window > 0.0) {
-        return Err(Error::invalid("pairs: window must be positive and finite"));
+    if !window.iter().all(|w| w.is_finite() && *w > 0.0) {
+        return Err(Error::invalid("pairs: every window must be positive and finite"));
     }
     struct Row {
         scan: u32,
@@ -639,13 +649,12 @@ pub fn pairs(scans: &[&ScanIndex], a: &[Point], b: &[Point], window: f64, thread
                 return rows;
             }
             let u = sub(&b[c], &a[c]).map(|x| x / len);
+            let window = window[c];
             for (si, sc) in scans.iter().enumerate() {
                 let w0 = sub(&sc.origin(), &a[c]);
                 let dd = dot(&w0, &u);
                 sc.pulses_near(&a[c], &b[c], window, |pulse, d, echoes| {
-                    let (bb, ee) = (dot(&d, &u), dot(&d, &w0));
-                    let den = (1.0 - bb * bb).max(1e-12);
-                    let (t_ray, s_ax) = ((bb * dd - ee) / den, (dd - bb * ee) / den);
+                    let (t_ray, s_ax, den) = closest(&d, &u, &w0, dd);
                     if !(t_ray > 0.0 && s_ax >= 0.0 && s_ax <= len) {
                         return;
                     }
@@ -877,7 +886,7 @@ mod tests {
         let r = 0.05;
         let (s, a, b) = scene(r, true);
         let w = 0.15;
-        let p = pairs(&[&s], &[a, a], &[b, a], w, 2).unwrap();
+        let p = pairs(&[&s], &[a, a], &[b, a], &[w, w], 2).unwrap();
         assert_eq!(p.cyl_start, vec![0, p.scan.len() as u64, p.scan.len() as u64], "no axis, no pairs");
         let n = p.scan.len();
         assert!(n > 200 && p.echo_start.len() == n + 1);
@@ -896,7 +905,12 @@ mod tests {
             assert!(p.reflectance[p.echo_start[i] as usize..p.echo_start[i + 1] as usize].iter().all(|x| x.is_nan()));
         }
         assert!(hits > 100 && passes > 100, "hits {hits} passes {passes}");
-        assert!(pairs(&[&s], &[a], &[b], 0.0, 1).is_err());
+        assert!(pairs(&[&s], &[a], &[b], &[0.0], 1).is_err());
+        assert!(pairs(&[&s], &[a], &[b], &[w, w], 1).is_err());
+        // each cylinder's own tube: the narrower one holds a subset, all within it
+        let q = pairs(&[&s], &[a, a], &[b, b], &[w, 0.08], 2).unwrap();
+        let (n0, n1) = ((q.cyl_start[1] - q.cyl_start[0]) as usize, (q.cyl_start[2] - q.cyl_start[1]) as usize);
+        assert!(n1 < n0 && q.d[n0..].iter().all(|&d| d < 0.08), "{n0} {n1}");
     }
 
     #[test]
