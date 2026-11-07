@@ -19,6 +19,8 @@
 //! or, for a sphere, at the point's closest approach, so a surface is not
 //! brought forward by the radius. Discs seen edge-on are not hit, so a
 //! stem's silhouette is not widened by the radius (a sphere widens it).
+//! Solid capped cylinders ([`Solid`]) can stand beside the points: exact,
+//! opaque wood, met at its surface.
 //!
 //! The receiver separates echoes as a discrete-return scanner does: hits
 //! closer in range than `echo_separation` form one echo. With
@@ -99,11 +101,14 @@ pub struct BeamScan {
     pub reflectance: Reflectance,
     pub max_range: f64,
     pub seed: u64,
+    /// Solid cylinders in the scene besides its points (see [`Solid`]). The
+    /// points they name stand for them only, and are not patches themselves.
+    pub solids: Vec<Solid>,
 }
 
 impl BeamScan {
     pub fn new(origin: Point) -> BeamScan {
-        BeamScan { origin, resolution_deg: 0.25, min_zenith_deg: 0.0, max_zenith_deg: 130.0, max_echoes: 2, echo_separation: 0.5, range_noise: 0.0, range_noise_slope: 0.0, divergence_mrad: 0.0, exit_diameter: 0.0, footprint_samples: 1, mixed_pixels: true, target_radius: None, oriented: true, detection_threshold: 0.0, reflectance: Reflectance::default(), max_range: f64::INFINITY, seed: 0 }
+        BeamScan { origin, resolution_deg: 0.25, min_zenith_deg: 0.0, max_zenith_deg: 130.0, max_echoes: 2, echo_separation: 0.5, range_noise: 0.0, range_noise_slope: 0.0, divergence_mrad: 0.0, exit_diameter: 0.0, footprint_samples: 1, mixed_pixels: true, target_radius: None, oriented: true, detection_threshold: 0.0, reflectance: Reflectance::default(), max_range: f64::INFINITY, seed: 0, solids: Vec::new() }
     }
 }
 
@@ -147,15 +152,15 @@ pub fn footprint_offsets(n: usize) -> Vec<[f64; 2]> {
     }).collect()
 }
 
-/// Points indexed in a regular 3-D grid for ray casting; each point is
-/// listed in every cell its sphere of radius `r` reaches.
+/// Items indexed in a regular 3-D grid for ray casting; each item is listed
+/// in every cell its bounding sphere reaches (a point's patch, or a solid
+/// cylinder's).
 struct Grid {
     lo: Point,
     cell: f64,
     n: [usize; 3],
     start: Vec<u32>,
     idx: Vec<u32>,
-    r: f64,
 }
 
 impl Grid {
@@ -173,29 +178,32 @@ impl Grid {
     /// The cell size grows until the grid fits in a sensible number of cells,
     /// so a scene spread over a large area does not ask for an enormous and
     /// mostly empty grid.
-    fn new(points: &[Point], targets: &[usize], r: f64) -> Result<Grid> {
+    fn new(points: &[Point], targets: &[usize], radius: impl Fn(usize) -> f64) -> Result<Grid> {
         let (mut lo, mut hi) = ([f64::INFINITY; 3], [f64::NEG_INFINITY; 3]);
+        let mut r_max = 0.0f64;
         for &i in targets {
+            let r = radius(i);
+            r_max = r_max.max(r);
             for k in 0..3 {
                 lo[k] = lo[k].min(points[i][k] - r);
                 hi[k] = hi[k].max(points[i][k] + r);
             }
         }
         if targets.is_empty() {
-            return Ok(Grid { lo: [0.0; 3], cell: 1.0, n: [0, 0, 0], start: vec![0], idx: vec![], r });
+            return Ok(Grid { lo: [0.0; 3], cell: 1.0, n: [0, 0, 0], start: vec![0], idx: vec![] });
         }
-        let vol = (0..3).map(|k| (hi[k] - lo[k]).max(r)).product::<f64>();
-        let cell = (2.0 * r).max((vol / (1u64 << 24) as f64).cbrt());
+        let vol = (0..3).map(|k| (hi[k] - lo[k]).max(r_max)).product::<f64>();
+        let cell = (2.0 * r_max).max((vol / (1u64 << 24) as f64).cbrt());
         let n: [usize; 3] = std::array::from_fn(|k| (((hi[k] - lo[k]) / cell).floor() as usize + 1).max(1));
         let cells = n[0] * n[1] * n[2];
         limits::check_cells(cells as u128 + 8 * targets.len() as u128, 4, "the ray-casting index of the scene", "a smaller scene or a larger target_radius")?;
-        let span = |v: f64, k: usize| (((v - r - lo[k]) / cell).floor().max(0.0) as usize, (((v + r - lo[k]) / cell).floor() as usize).min(n[k] - 1));
+        let span = |v: f64, r: f64, k: usize| (((v - r - lo[k]) / cell).floor().max(0.0) as usize, (((v + r - lo[k]) / cell).floor() as usize).min(n[k] - 1));
         let mut count = vec![0u32; cells + 1];
         let each = |i: usize, f: &mut dyn FnMut(usize)| {
-            let p = points[i];
-            let (x0, x1) = span(p[0], 0);
-            let (y0, y1) = span(p[1], 1);
-            let (z0, z1) = span(p[2], 2);
+            let (p, r) = (points[i], radius(i));
+            let (x0, x1) = span(p[0], r, 0);
+            let (y0, y1) = span(p[1], r, 1);
+            let (z0, z1) = span(p[2], r, 2);
             for z in z0..=z1 {
                 for y in y0..=y1 {
                     for x in x0..=x1 {
@@ -219,14 +227,13 @@ impl Grid {
                 fill[c] += 1;
             });
         }
-        Ok(Grid { lo, cell, n, start: count, idx, r })
+        Ok(Grid { lo, cell, n, start: count, idx })
     }
 
-    /// First patch the ray `o + t d` meets at `t` in `(t_min, t_max)`:
-    /// `(range, index)`. A point with a unit normal is a disc of radius `r`
-    /// facing along it; with a zero normal, a sphere (range to the point's
-    /// closest approach).
-    fn cast(&self, points: &[Point], normals: &[Point], o: &Point, d: &Point, t_min: f64, t_max: f64) -> Option<(f64, usize)> {
+    /// First item the ray `o + t d` meets at `t` in `(t_min, t_max)`:
+    /// `(range, index)`. `hit(i)` is item `i`'s entry range along the ray and
+    /// the range it reports, if the ray meets it.
+    fn cast(&self, o: &Point, d: &Point, t_min: f64, t_max: f64, hit: impl Fn(usize) -> Option<(f64, f64)>) -> Option<(f64, usize)> {
         if self.n[0] == 0 {
             return None;
         }
@@ -259,35 +266,13 @@ impl Grid {
             }
         });
         let dt: [f64; 3] = std::array::from_fn(|k| if d[k] == 0.0 { f64::INFINITY } else { self.cell / d[k].abs() });
-        let r2 = self.r * self.r;
         let mut best: Option<(f64, f64, usize)> = None;
         loop {
             let t_exit = t_next[0].min(t_next[1]).min(t_next[2]).min(tb);
             let cid = ((c[2] as usize * self.n[1]) + c[1] as usize) * self.n[0] + c[0] as usize;
             for &j in &self.idx[self.start[cid] as usize..self.start[cid + 1] as usize] {
                 let i = j as usize;
-                let q = points[i];
-                let v = [q[0] - o[0], q[1] - o[1], q[2] - o[2]];
-                let n = normals[i];
-                let (te, tc) = if n == [0.0; 3] {
-                    let tc = v[0] * d[0] + v[1] * d[1] + v[2] * d[2];
-                    let perp2 = v[0] * v[0] + v[1] * v[1] + v[2] * v[2] - tc * tc;
-                    if perp2 >= r2 {
-                        continue;
-                    }
-                    (tc - (r2 - perp2).sqrt(), tc)
-                } else {
-                    let den = d[0] * n[0] + d[1] * n[1] + d[2] * n[2];
-                    if den.abs() < 1e-9 {
-                        continue;
-                    }
-                    let t = (v[0] * n[0] + v[1] * n[1] + v[2] * n[2]) / den;
-                    let w = [o[0] + t * d[0] - q[0], o[1] + t * d[1] - q[1], o[2] + t * d[2] - q[2]];
-                    if w[0] * w[0] + w[1] * w[1] + w[2] * w[2] >= r2 {
-                        continue;
-                    }
-                    (t, t)
-                };
+                let Some((te, tc)) = hit(i) else { continue };
                 if te > t_min && te < t_max && best.is_none_or(|(bt, _, bi)| te < bt || (te == bt && i < bi)) {
                     best = Some((te, tc, i));
                 }
@@ -304,6 +289,79 @@ impl Grid {
         }
         best.map(|(_, tc, i)| (tc, i))
     }
+}
+
+/// Where the ray `o + t d` meets a point's patch of radius `r` (`r2 = r^2`):
+/// a disc facing along a unit normal `n`, or, with a zero normal, a sphere,
+/// reported at the point's closest approach so a surface is not brought
+/// forward by the radius. `(entry, reported range)`.
+fn patch_hit(q: &Point, n: &Point, r2: f64, o: &Point, d: &Point) -> Option<(f64, f64)> {
+    let v = [q[0] - o[0], q[1] - o[1], q[2] - o[2]];
+    if *n == [0.0; 3] {
+        let tc = v[0] * d[0] + v[1] * d[1] + v[2] * d[2];
+        let perp2 = v[0] * v[0] + v[1] * v[1] + v[2] * v[2] - tc * tc;
+        return (perp2 < r2).then(|| (tc - (r2 - perp2).sqrt(), tc));
+    }
+    let den = d[0] * n[0] + d[1] * n[1] + d[2] * n[2];
+    if den.abs() < 1e-9 {
+        return None;
+    }
+    let t = (v[0] * n[0] + v[1] * n[1] + v[2] * n[2]) / den;
+    let w = [o[0] + t * d[0] - q[0], o[1] + t * d[1] - q[1], o[2] + t * d[2] - q[2]];
+    (w[0] * w[0] + w[1] * w[1] + w[2] * w[2] < r2).then_some((t, t))
+}
+
+/// A solid, opaque capped cylinder of the scene, from `a` to `b` with radius
+/// `r`: a sub-beam that meets it stops on its surface, and the echo takes the
+/// attributes and reflectance of scene point `point`. Wood drawn this way is
+/// exact (its silhouette is `r`, and nothing passes through it), where wood
+/// drawn as surface points is only as closed as their patches.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Solid {
+    pub a: Point,
+    pub b: Point,
+    pub r: f64,
+    pub point: usize,
+}
+
+/// First entry of the ray `o + t d` into a capped cylinder: the side, or a
+/// cap where the ray comes in through an end.
+fn solid_hit(s: &Solid, o: &Point, d: &Point) -> Option<(f64, f64)> {
+    let dot = |x: &Point, y: &Point| x[0] * y[0] + x[1] * y[1] + x[2] * y[2];
+    let ab = [s.b[0] - s.a[0], s.b[1] - s.a[1], s.b[2] - s.a[2]];
+    let len = dot(&ab, &ab).sqrt();
+    if !(len > 0.0) {
+        return None;
+    }
+    let u = [ab[0] / len, ab[1] / len, ab[2] / len];
+    let w = [o[0] - s.a[0], o[1] - s.a[1], o[2] - s.a[2]];
+    let (du, wu) = (dot(d, &u), dot(&w, &u));
+    let dp = [d[0] - du * u[0], d[1] - du * u[1], d[2] - du * u[2]];
+    let wp = [w[0] - wu * u[0], w[1] - wu * u[1], w[2] - wu * u[2]];
+    let r2 = s.r * s.r;
+    let mut best = f64::INFINITY;
+    let qa = dot(&dp, &dp);
+    if qa > 1e-18 {
+        let (qb, qc) = (2.0 * dot(&dp, &wp), dot(&wp, &wp) - r2);
+        let disc = qb * qb - 4.0 * qa * qc;
+        if disc >= 0.0 {
+            let t = (-qb - disc.sqrt()) / (2.0 * qa);
+            let along = wu + t * du;
+            if (0.0..=len).contains(&along) {
+                best = t;
+            }
+        }
+    }
+    if du.abs() > 1e-12 {
+        for plane in [0.0, len] {
+            let t = (plane - wu) / du;
+            let p = [wp[0] + t * dp[0], wp[1] + t * dp[1], wp[2] + t * dp[2]];
+            if dot(&p, &p) <= r2 && t < best {
+                best = t;
+            }
+        }
+    }
+    best.is_finite().then_some((best, best))
 }
 
 fn check(p: &BeamScan) -> Result<()> {
@@ -404,7 +462,15 @@ struct Echo {
 pub fn scan_beam(cloud: &PointCloud, p: &BeamScan) -> Result<Shots> {
     check(p)?;
     let rho = point_reflectance(cloud, &p.reflectance)?;
-    let targets: Vec<usize> = (0..cloud.len()).filter(|&i| cloud.xyz[i].iter().all(|v| v.is_finite()) && rho[i] > 0.0).collect();
+    let mut stands_for_solid = vec![false; cloud.len()];
+    for (k, s) in p.solids.iter().enumerate() {
+        let ok = s.a.iter().chain(&s.b).all(|v| v.is_finite()) && s.r.is_finite() && s.r > 0.0 && s.point < cloud.len();
+        if !ok {
+            return Err(Error::invalid(format!("solid {k} needs finite ends, a positive radius and one of the cloud's points")));
+        }
+        stands_for_solid[s.point] = true;
+    }
+    let targets: Vec<usize> = (0..cloud.len()).filter(|&i| !stands_for_solid[i] && cloud.xyz[i].iter().all(|v| v.is_finite()) && rho[i] > 0.0).collect();
     let r = match p.target_radius {
         Some(r) => r,
         None => {
@@ -414,7 +480,16 @@ pub fn scan_beam(cloud: &PointCloud, p: &BeamScan) -> Result<Shots> {
         }
     };
     let normals = patch_normals(cloud, &targets, p.oriented);
-    let grid = Grid::new(&cloud.xyz, &targets, r)?;
+    let grid = Grid::new(&cloud.xyz, &targets, |_| r)?;
+    let r2 = r * r;
+    // the solids, by bounding sphere: centre at the middle, radius half the length and the radius
+    let mid: Vec<Point> = p.solids.iter().map(|s| std::array::from_fn(|k| (s.a[k] + s.b[k]) / 2.0)).collect();
+    let bound = |i: usize| {
+        let s = &p.solids[i];
+        let h = ((0..3).map(|k| (s.b[k] - s.a[k]).powi(2)).sum::<f64>()).sqrt() / 2.0;
+        (h * h + s.r * s.r).sqrt()
+    };
+    let solid_grid = Grid::new(&mid, &(0..p.solids.len()).collect::<Vec<_>>(), bound)?;
     let res = p.resolution_deg;
     let n_zen = ((p.max_zenith_deg - p.min_zenith_deg) / res).round().max(1.0) as usize;
     let n_az = (360.0 / res).round().max(1.0) as usize;
@@ -460,7 +535,12 @@ pub fn scan_beam(cloud: &PointCloud, p: &BeamScan) -> Result<Shots> {
                 let ds: Point = std::array::from_fn(|k| d[k] + half_div * lat[k]);
                 let nn = (ds[0] * ds[0] + ds[1] * ds[1] + ds[2] * ds[2]).sqrt();
                 let ds = [ds[0] / nn, ds[1] / nn, ds[2] / nn];
-                grid.cast(&cloud.xyz, &normals, &os, &ds, 0.1, p.max_range)
+                let patch = grid.cast(&os, &ds, 0.1, p.max_range, |i| patch_hit(&cloud.xyz[i], &normals[i], r2, &os, &ds));
+                let solid = solid_grid.cast(&os, &ds, 0.1, p.max_range, |i| solid_hit(&p.solids[i], &os, &ds)).map(|(t, i)| (t, p.solids[i].point));
+                match (patch, solid) {
+                    (Some(x), Some(y)) => Some(if y.0 < x.0 { y } else { x }),
+                    (x, y) => x.or(y),
+                }
             }).collect();
             // Sub-rays that came back from nearly the same distance are one
             // echo: a real scanner cannot separate returns closer together
@@ -646,6 +726,48 @@ mod tests {
         p.oriented = false;
         let w = width(&scan_beam(&cloud, &p).unwrap());
         assert!(w > 0.42, "{w}");
+    }
+
+    #[test]
+    fn a_solid_cylinder_stops_every_sub_beam_on_its_near_face() {
+        // a vertical solid stem of radius 1.5 cm at 5 m, with a wall behind it at 8 m; the stem's echoes take
+        // the attributes of point 0, which is not a patch itself (it sits where the wall would show it)
+        let r = 0.015;
+        let mut pts = wall(8.0, -0.3, 0.3, -0.3, 0.3, 0.004);
+        pts[0] = [0.0, 8.0, 0.0];
+        let mut cloud = PointCloud::new(pts);
+        let n = cloud.len();
+        cloud.attrs.insert("classification".into(), Attr::U8((0..n).map(|i| if i == 0 { 5 } else { 2 }).collect()));
+        let mut p = params();
+        p.resolution_deg = 0.02;
+        p.min_zenith_deg = 89.5;
+        p.max_zenith_deg = 90.5;
+        p.exit_diameter = 0.007;
+        p.divergence_mrad = 0.35;
+        p.footprint_samples = 19;
+        p.solids = vec![Solid { a: [0.0, 5.0, -0.5], b: [0.0, 5.0, 0.5], r, point: 0 }];
+        let s = scan_beam(&cloud, &p).unwrap();
+        let class = match &s.echo_attrs["classification"] { Attr::U8(v) => v.clone(), _ => unreachable!() };
+        let (mut stem, mut beyond) = (0, 0);
+        for c in 0..s.n_shots() {
+            let d = s.direction[c];
+            let b = d[0] / (d[0] * d[0] + d[1] * d[1]).sqrt() * 5.0; // impact across the stem, at its range
+            for e in s.echo_start[c]..s.echo_start[c] + s.echo_count[c] as usize {
+                let y = s.echo_range[e] * d[1];
+                if class[e] == 5 {
+                    stem += 1;
+                    // every echo of the stem lies on its near face, never inside or behind the axis
+                    assert!(y < 5.0 && y > 5.0 - r - 1e-3, "y {y}");
+                    assert!(b.abs() < r + 0.004, "b {b}");
+                } else if b.abs() < r - 0.005 && (y - 8.0).abs() < 0.1 {
+                    beyond += 1;
+                }
+            }
+        }
+        assert!(stem > 50, "stem echoes {stem}");
+        assert_eq!(beyond, 0, "no sub-beam of a pulse whose footprint lies on the stem reaches the wall");
+        p.solids[0].r = -1.0;
+        assert!(scan_beam(&cloud, &p).is_err());
     }
 
     #[test]

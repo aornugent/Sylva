@@ -142,7 +142,7 @@ def scan(cloud: PointCloud, origin=(10.0, 10.0, 1.5), resolution_deg: float = 0.
          footprint_samples: int | None = None, mixed_pixels: bool | None = None,
          reflectance=None, target_radius: float | None = None, oriented: bool | None = None,
          detection_threshold: float | None = None, max_range: float | None = None,
-         seed: int = 0) -> Shots:
+         seed: int = 0, solids: dict | None = None) -> Shots:
     """A pseudo terrestrial scan of ``cloud`` from ``origin``.
 
     Pulses are fired on a regular zenith / azimuth grid. The points falling in
@@ -236,6 +236,15 @@ def scan(cloud: PointCloud, origin=(10.0, 10.0, 1.5), resolution_deg: float = 0.
         Longest range (m); unlimited by default.
     seed
         Seed of the range noise (beam model only).
+    solids
+        Solid, opaque capped cylinders in the scene besides its points (beam
+        model only): ``dict(a=(n, 3), b=(n, 3), r=(n,), point=(n,))``. A
+        sub-beam that meets one stops on its surface, and the echo takes the
+        attributes and reflectance of the cloud's point ``point``, which
+        stands for the cylinder only and is not a patch itself. Wood drawn
+        this way is exact: its silhouette is ``r`` and nothing passes through
+        it, where wood drawn as surface points is only as closed, and as
+        thin, as their patches allow.
 
     Returns
     -------
@@ -251,7 +260,7 @@ def scan(cloud: PointCloud, origin=(10.0, 10.0, 1.5), resolution_deg: float = 0.
     """
     o = tuple(float(v) for v in origin)
     beam = (scanner, min_zenith_deg, range_noise, beam_divergence, exit_diameter, footprint_samples,
-            mixed_pixels, reflectance, target_radius, oriented, detection_threshold, max_range)
+            mixed_pixels, reflectance, target_radius, oriented, detection_threshold, max_range, solids)
     if all(v is None for v in beam):
         d = _core.synthetic_scan(cloud.xyz, cloud.attrs, o, float(resolution_deg),
                                  float(max_zenith_deg), int(max_echoes), float(echo_separation))
@@ -285,8 +294,19 @@ def scan(cloud: PointCloud, origin=(10.0, 10.0, 1.5), resolution_deg: float = 0.
         True if mixed_pixels is None else bool(mixed_pixels),
         None if target_radius is None else float(target_radius), True if oriented is None else bool(oriented),
         0.0 if detection_threshold is None else float(detection_threshold), refl_map, 0.4, refl_attr,
-        refl_const, float("inf") if max_range is None else float(max_range), int(seed))
+        refl_const, float("inf") if max_range is None else float(max_range), int(seed),
+        *_solids(solids))
     return Shots._from_core(d)
+
+
+def _solids(solids):
+    """The solids' arrays for the core (four Nones without)."""
+    if solids is None:
+        return None, None, None, None
+    a = np.ascontiguousarray(solids["a"], np.float64).reshape(-1, 3)
+    b = np.ascontiguousarray(solids["b"], np.float64).reshape(-1, 3)
+    return (a, b, np.ascontiguousarray(solids["r"], np.float64).ravel(),
+            np.ascontiguousarray(solids["point"], np.int64).ravel())
 
 
 @dataclass
