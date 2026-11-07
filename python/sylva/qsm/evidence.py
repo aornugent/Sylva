@@ -10,7 +10,8 @@ cylinder the log radius of its echoes with a calibrated precision, the beam
 calliper bounding the radius from pulses that hit or passed close by, and an
 audit count of passes inside a claimed radius. Pass every cylinder near the
 ones of interest (a whole tile): each echo goes to the one cylinder whose
-surface it lies nearest.
+surface it lies nearest. :func:`pairs` returns the per-pulse table these
+come from, for a likelihood fitted outside.
 """
 
 from __future__ import annotations
@@ -76,7 +77,7 @@ Reason = IntEnum("Reason", _core.qsm_evidence_reasons())
 class ScanIndex:
     """One scan's pulses, read from a single-position Shots file and indexed by direction.
 
-    Built once per scan and reused by every :func:`evidence` call (about 16
+    Built once per scan and reused by every :func:`evidence` and :func:`pairs` call (about 16
     bytes per pulse and 4 per echo, 8 where the store has reflectance and
     deviation, held on the Rust side). Only the angles, the echo ranges and
     those two attributes are read.
@@ -122,10 +123,13 @@ def pairs(scans, a, b, window: float, threads: int = 0) -> dict[str, np.ndarray]
 
     The raw table a per-pulse likelihood reads, which :func:`evidence`
     reduces inside. A row is a pulse whose line comes closest to the axis
-    within the segment, closer than ``window``, ahead of the scanner, and
-    that reached the disc of radius ``window`` around the axis there (its
-    last echo is at or beyond the disc, or it missed): a pulse that stopped
-    short says nothing about what is in the disc.
+    within the segment (ends included), closer than ``window``, ahead of the
+    scanner, and that reached the tube of radius ``window`` around the axis
+    (its last echo is at or beyond where its line enters the tube, or it
+    missed): a pulse that stopped short says nothing about what is in the
+    tube. Every row carries all its pulse's echoes, so whether it echoed
+    before the tube (an echoes-only export then recorded it anyway) is
+    ``range`` against that entry.
 
     Parameters
     ----------
@@ -140,7 +144,7 @@ def pairs(scans, a, b, window: float, threads: int = 0) -> dict[str, np.ndarray]
 
     Returns
     -------
-    dict of arrays, cylinder ``c``'s rows ``cyl_start[c]:cyl_start[c + 1]``:
+    dict of arrays; ``cyl_start`` ``(n + 1,)``, cylinder ``c``'s rows ``cyl_start[c]:cyl_start[c + 1]``:
 
     - ``scan``, ``pulse``: the scan (index into ``scans``) and its pulse;
     - ``dir`` ``(m, 3)``: the pulse's unit direction;
