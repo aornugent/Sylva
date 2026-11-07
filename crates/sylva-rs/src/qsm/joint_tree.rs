@@ -159,11 +159,18 @@ pub fn joint_tree(scans: &[&ScanIndex], rows: &Rows, ctx_a: &[Point], ctx_b: &[P
 
     // the split, from the claims' own pairs
     let claim = table(scans, &rows0, ctx_a, ctx_b, ctx_r, threads)?;
+    // each row's pairs, in table order
+    let mut by_row: Vec<Vec<usize>> = vec![Vec::new(); n];
+    for (i, &k) in claim.row.iter().enumerate() {
+        if (k as usize) < n {
+            by_row[k as usize].push(i);
+        }
+    }
     let try_split: Vec<bool> = match split {
         Some(s) => s.to_vec(),
         None => rows.r_prior.iter().map(|&r| r >= params.split_min_r).collect(),
     };
-    let (stems, split_gain) = split_rows(&rows0, &claim, &try_split, split.is_none(), scans.len(), params, threads)?;
+    let (stems, split_gain) = split_rows(&rows0, &claim, &by_row, &try_split, split.is_none(), scans.len(), params, threads)?;
 
     // ownership and the fit, `sweeps` times, starting from the claims
     let t = table(scans, &stems, ctx_a, ctx_b, ctx_r, threads)?;
@@ -408,21 +415,29 @@ fn owners(t: &JointPairs, state: &[[f64; 4]], p: &JointParams) -> Vec<bool> {
 /// where none was weighed). A stem continues the parent row's stem whose end
 /// is nearest its start.
 #[allow(clippy::too_many_arguments)]
-fn split_rows(rows: &Stems, t: &JointPairs, try_split: &[bool], weigh: bool, n_scans: usize, params: &TreeParams, threads: usize) -> Result<(Stems, Vec<f64>)> {
+fn split_rows(rows: &Stems, t: &JointPairs, by_row: &[Vec<usize>], try_split: &[bool], weigh: bool, n_scans: usize, params: &TreeParams, threads: usize) -> Result<(Stems, Vec<f64>)> {
+    use rayon::prelude::*;
     let fr = frames(&rows.a, &rows.b);
     let mut out = Stems { a: Vec::new(), b: Vec::new(), r: Vec::new(), parent: Vec::new(), src: Vec::new() };
     let mut gains = vec![f64::NAN; rows.a.len()];
     let mut new: Vec<Vec<usize>> = Vec::with_capacity(rows.a.len());
+    // the rows' solid circles, each row on its own (in parallel)
+    let solids: Vec<Vec<(f64, f64, f64)>> = crate::qsm::joint::pool(threads)?.install(|| (0..rows.a.len()).into_par_iter().map(|k| {
+        if !try_split[k] {
+            return Vec::new();
+        }
+        let mine: Vec<&Pulse> = by_row[k].iter().map(|&i| &t.pulses[i]).collect();
+        circles(&mine, rows.r[k], params.split_min_votes).into_iter().filter(|&c| opacity(&mine, c) <= params.split_through).collect()
+    }).collect());
     for k in 0..rows.a.len() {
         let (_, e1, e2, _) = fr[k];
         let mut parts = vec![(rows.a[k], rows.b[k], rows.r[k])];
         if try_split[k] {
-            let (mine, scan): (Vec<Pulse>, Vec<u32>) = t.pulses.iter().zip(&t.row).zip(&t.scan).filter(|&((_, &r), _)| r as usize == k).map(|((pu, _), &s)| (*pu, s)).unzip();
-            let refs: Vec<&Pulse> = mine.iter().collect();
-            let solid: Vec<(f64, f64, f64)> = circles(&refs, rows.r[k], params.split_min_votes).into_iter().filter(|&c| opacity(&refs, c) <= params.split_through).collect();
+            let solid = &solids[k];
             // weighed: one solid circle is one stem, which the fit finds from the claim (and its profile's restart)
             if weigh && solid.len() >= 2 {
-                gains[k] = split_gain(&mine, &scan, n_scans, rows.a[k], rows.b[k], rows.r[k], &solid, params, threads)?;
+                let (mine, scan): (Vec<Pulse>, Vec<u32>) = by_row[k].iter().map(|&i| (t.pulses[i], t.scan[i])).unzip();
+                gains[k] = split_gain(&mine, &scan, n_scans, rows.a[k], rows.b[k], rows.r[k], solid, params, threads)?;
             }
             if if weigh { gains[k] > 0.0 } else { !solid.is_empty() } {
                 parts = solid.iter().map(|&(cx, cy, r)| {
