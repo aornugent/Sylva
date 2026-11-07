@@ -76,34 +76,13 @@ impl D {
         self.chain(s, 0.5 / s, -0.25 / (s * s * s))
     }
 
-    fn asin(self) -> D {
-        let one = (1.0 - self.v * self.v).max(1e-300);
-        self.chain(self.v.asin(), one.powf(-0.5), self.v * one.powf(-1.5))
-    }
-
     fn log1p(self) -> D {
         let a = 1.0 + self.v;
         self.chain(self.v.ln_1p(), 1.0 / a, -1.0 / (a * a))
     }
 
-    fn sq(self) -> D {
-        self * self
-    }
-
     fn abs(self) -> D {
         if self.v < 0.0 { -self } else { self }
-    }
-
-    fn max(self, o: D) -> D {
-        if o.v > self.v { o } else { self }
-    }
-
-    fn min(self, o: D) -> D {
-        if o.v < self.v { o } else { self }
-    }
-
-    fn clamp(self, lo: D, hi: D) -> D {
-        self.max(lo).min(hi)
     }
 
     /// log Phi(z), the standard normal's log CDF, stable far into both tails.
@@ -113,10 +92,101 @@ impl D {
     }
 }
 
+/// What the likelihood is written in: a plain value (`f64`, for the
+/// objective) or a value carrying its gradient and Hessian (`D`, for the
+/// Newton blocks). One source for both, so they can't drift apart; where a
+/// choice is made (max, min, clamp at a tie) both make the same one.
+trait Num: Copy + Add<Output = Self> + Sub<Output = Self> + Mul<Output = Self> + Div<Output = Self> + Neg<Output = Self> + Add<f64, Output = Self> + Mul<f64, Output = Self> {
+    fn c(v: f64) -> Self;
+    fn v(&self) -> f64;
+    fn exp(self) -> Self;
+    fn ln(self) -> Self;
+    fn sqrt(self) -> Self;
+    fn log1p(self) -> Self;
+    fn abs(self) -> Self;
+    fn log_ndtr(self) -> Self;
+    /// `∫ sqrt(r^2 - y^2) dy` at `y` clipped to the circle (see [`h_int`]).
+    fn h_int(y: Self, r: Self) -> Self;
+    fn max(self, o: Self) -> Self {
+        if o.v() > self.v() { o } else { self }
+    }
+    fn min(self, o: Self) -> Self {
+        if o.v() < self.v() { o } else { self }
+    }
+    fn clamp(self, lo: Self, hi: Self) -> Self {
+        self.max(lo).min(hi)
+    }
+    fn sq(self) -> Self {
+        self * self
+    }
+}
+
+impl Num for f64 {
+    fn c(v: f64) -> f64 {
+        v
+    }
+    fn v(&self) -> f64 {
+        *self
+    }
+    fn exp(self) -> f64 {
+        f64::exp(self)
+    }
+    fn ln(self) -> f64 {
+        f64::ln(self)
+    }
+    fn sqrt(self) -> f64 {
+        f64::sqrt(self)
+    }
+    fn log1p(self) -> f64 {
+        self.ln_1p()
+    }
+    fn abs(self) -> f64 {
+        f64::abs(self)
+    }
+    fn log_ndtr(self) -> f64 {
+        log_ndtr_mills(self).0
+    }
+    fn h_int(y: f64, r: f64) -> f64 {
+        let yc = Num::clamp(y, -r, r);
+        let ratio = Num::clamp(yc / r, -1.0, 1.0);
+        0.5 * (yc * (r * r - yc * yc).max(0.0).sqrt() + r * r * ratio.asin())
+    }
+}
+
+impl Num for D {
+    fn c(v: f64) -> D {
+        D::c(v)
+    }
+    fn v(&self) -> f64 {
+        self.v
+    }
+    fn exp(self) -> D {
+        D::exp(self)
+    }
+    fn ln(self) -> D {
+        D::ln(self)
+    }
+    fn sqrt(self) -> D {
+        D::sqrt(self)
+    }
+    fn log1p(self) -> D {
+        D::log1p(self)
+    }
+    fn abs(self) -> D {
+        D::abs(self)
+    }
+    fn log_ndtr(self) -> D {
+        D::log_ndtr(self)
+    }
+    fn h_int(y: D, r: D) -> D {
+        h_int(y, r)
+    }
+}
+
 /// `log(exp(a) + exp(b))`.
-fn logaddexp(a: D, b: D) -> D {
-    let (hi, lo) = if a.v >= b.v { (a, b) } else { (b, a) };
-    if lo.v == f64::NEG_INFINITY {
+fn logaddexp<N: Num>(a: N, b: N) -> N {
+    let (hi, lo) = if a.v() >= b.v() { (a, b) } else { (b, a) };
+    if lo.v() == f64::NEG_INFINITY {
         return hi;
     }
     hi + (lo - hi).exp().log1p()
@@ -268,7 +338,7 @@ pub struct Pulse {
 /// depth's curvature is infinite at the silhouette, so only the second
 /// derivatives floor that root at 1e-6 R.
 fn h_int(y: D, r: D) -> D {
-    let yc = y.clamp(-r, r);
+    let yc = Num::clamp(y, -r, r);
     let (yv, rv) = (yc.v, r.v);
     let root = (rv * rv - yv * yv).max(0.0).sqrt();
     let ratio = (yv / rv).clamp(-1.0, 1.0);
@@ -287,93 +357,136 @@ fn h_int(y: D, r: D) -> D {
     out
 }
 
-/// One pair's log likelihood at state (offset, eta, ell), with derivatives.
-fn pair(pu: &Pulse, s: [f64; 4], p: &JointParams) -> D {
-    let (d1, d2, eta, ell) = (D::var(s[0], 0), D::var(s[1], 1), D::var(s[2], 2), D::var(s[3], 3));
+/// One pair's log likelihood at state `[offset1, offset2, eta, ell]`, in
+/// whatever [`Num`] the state is given in.
+fn pair<N: Num>(pu: &Pulse, s: [N; 4], p: &JointParams) -> N {
+    let [d1, d2, eta, ell] = s;
     let r = eta.exp();
     let lam = ell.exp();
-    let bp = D::c(pu.b) - (d1 * pu.jb[0] + d2 * pu.jb[1]);
-    let tp = D::c(pu.t) + (d1 * pu.jt[0] + d2 * pu.jt[1]);
+    let bp = N::c(pu.b) - (d1 * pu.jb[0] + d2 * pu.jb[1]);
+    let tp = N::c(pu.t) + (d1 * pu.jt[0] + d2 * pu.jt[1]);
     let w = p.exit + p.divergence * pu.t;
     // the footprint on the circle: its share f, and the surface's centroid depth hbar
     let y1 = (bp + (-w / 2.0)).max(-r);
     let y2 = (bp + w / 2.0).min(r);
-    let width = (y2 - y1).max(D::c(0.0));
+    let width = (y2 - y1).max(N::c(0.0));
     let f = width * (1.0 / w);
-    let hbar = if width.v > 1e-9 { (h_int(y2, r) - h_int(y1, r)) / width } else { D::c(0.0) };
+    let hbar = if width.v() > 1e-9 { (N::h_int(y2, r) - N::h_int(y1, r)) / width } else { N::c(0.0) };
     let zdet = (r + w * (0.5 - p.tau) - bp.abs()) * (4.0 / w);
     let (lp, lq) = (zdet.log_ndtr(), (-zdet).log_ndtr());
-    let (c0, c1) = (D::c(pu.c0), D::c(pu.c1));
+    let (c0, c1) = (N::c(pu.c0), N::c(pu.c1));
     let xw = (tp - hbar * (1.0 / pu.sin)).clamp(c0, c1);
     let zw = xw - c0;
     let ln = pu.c1 - pu.c0;
     let sig = (r.sq() * (p.rough * p.rough) + p.sigma_r * p.sigma_r).sqrt();
-    let eps = (-(f.clamp(D::c(0.0), D::c(1.0))) + 1.0) * p.eps + p.eps_min;
-    let x = D::c(pu.x);
-    let z = (x - c0).max(D::c(0.0));
+    let eps = (-(f.clamp(N::c(0.0), N::c(1.0))) + 1.0) * p.eps + p.eps_min;
+    let x = N::c(pu.x);
+    let z = (x - c0).max(N::c(0.0));
     let u = (x - xw) / sig;
     let log_sqrt2pi = 0.5 * (2.0 * std::f64::consts::PI).ln();
     let l_gauss = (-eps).log1p() - u.sq() * 0.5 - sig.ln() + (-log_sqrt2pi);
     let l_tail = (eps + 1e-300).ln() + (-p.mp_len.ln()) + u.log_ndtr() + ((xw + p.mp_len - x) / sig).log_ndtr();
     let l_wood = lp - lam * zw + logaddexp(l_gauss, l_tail);
     let l_leaf = ell - lam * z + logaddexp(lq, lp + (-u).log_ndtr());
-    let over = ((xw + p.mp_len - c1) * (1.0 / p.mp_len)).clamp(D::c(1e-12), D::c(1.0));
+    let over = ((xw + p.mp_len - c1) * (1.0 / p.mp_len)).clamp(N::c(1e-12), N::c(1.0));
     let l_pass = logaddexp(lq - lam * ln, lp - lam * zw + (eps + 1e-300).ln() + over.ln());
     let l_stop = logaddexp(l_wood, l_leaf);
     let q = pu.q;
-    let p_pass = l_pass.min(D::c(0.0)).exp();
+    let p_pass = l_pass.min(N::c(0.0)).exp();
     if p.thin > 0.0 {
         let lk = (2.0 * (pu.t.max(0.1) * p.step / p.thin).ln()).min(0.0);
-        let sel = if pu.early { D::c(0.0) } else { ((-p_pass + 1.0) * lk.exp() + p_pass * q).ln() };
+        let sel = if pu.early { N::c(0.0) } else { ((-p_pass + 1.0) * lk.exp() + p_pass * q).ln() };
         (if pu.stop { l_stop + lk } else { l_pass + q.ln() }) - sel
     } else {
-        let sel = if pu.early { D::c(0.0) } else { (p_pass * (-(1.0 - q))).log1p() };
+        let sel = if pu.early { N::c(0.0) } else { (p_pass * (-(1.0 - q))).log1p() };
         (if pu.stop { l_stop } else { l_pass + q.ln() }) - sel
     }
 }
 
-/// Per pair log likelihood at `state[i] = [offset1, offset2, eta, ell]`.
-pub fn joint_loglik(pulses: &[Pulse], state: &[[f64; 4]], p: &JointParams, threads: usize) -> Result<Vec<f64>> {
-    if state.len() != pulses.len() {
-        return Err(Error::invalid("joint: one state per pair"));
+/// Where each pair's state comes from: its row's `[delta1, delta2, eta,
+/// ell]` and, unless `nu` is `u32::MAX`, its scan's nuisance offset added to
+/// the delta.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Owner {
+    pub row: u32,
+    pub nu: u32,
+}
+
+fn state(o: &Owner, theta: &[[f64; 4]], nu: &[[f64; 2]]) -> [f64; 4] {
+    let mut s = theta[o.row as usize];
+    if o.nu != u32::MAX {
+        let v = nu[o.nu as usize];
+        s[0] += v[0];
+        s[1] += v[1];
     }
-    pool(threads)?.install(|| Ok(pulses.par_iter().zip(state).map(|(pu, s)| pair(pu, *s, p).v).collect()))
+    s
+}
+
+fn check(pulses: &[Pulse], owners: &[Owner], theta: &[[f64; 4]], nu: &[[f64; 2]]) -> Result<()> {
+    if owners.len() != pulses.len() {
+        return Err(Error::invalid("joint: one owner per pair"));
+    }
+    if owners.iter().any(|o| o.row as usize >= theta.len() || (o.nu != u32::MAX && o.nu as usize >= nu.len())) {
+        return Err(Error::invalid("joint: an owner's row or nu is out of range"));
+    }
+    Ok(())
+}
+
+/// Each pair's log likelihood, at row states `theta` and nuisances `nu`.
+pub fn joint_loglik(pulses: &[Pulse], owners: &[Owner], theta: &[[f64; 4]], nu: &[[f64; 2]], p: &JointParams, threads: usize) -> Result<Vec<f64>> {
+    check(pulses, owners, theta, nu)?;
+    pool(threads)?.install(|| Ok(pulses.par_iter().zip(owners).map(|(pu, o)| pair(pu, state(o, theta, nu), p)).collect()))
 }
 
 /// Sums by group of the pairs' log likelihood, gradient and Hessian in their
 /// own four state variables: `(value (n,), gradient (n, 4), Hessian (n, 4,
 /// 4))`, group `group[i]` of `n_groups`.
-#[allow(clippy::type_complexity)]
-pub fn joint_blocks(pulses: &[Pulse], state: &[[f64; 4]], group: &[u32], n_groups: usize, p: &JointParams, threads: usize) -> Result<(Vec<f64>, Vec<[f64; 4]>, Vec<[[f64; 4]; 4]>)> {
+#[allow(clippy::type_complexity, clippy::too_many_arguments)]
+pub fn joint_blocks(pulses: &[Pulse], owners: &[Owner], group: &[u32], n_groups: usize, theta: &[[f64; 4]], nu: &[[f64; 2]], p: &JointParams, threads: usize) -> Result<(Vec<f64>, Vec<[f64; 4]>, Vec<[[f64; 4]; 4]>)> {
+    check(pulses, owners, theta, nu)?;
     let n = pulses.len();
-    if state.len() != n || group.len() != n || group.iter().any(|&g| g as usize >= n_groups) {
-        return Err(Error::invalid("joint: one state and one group (below n_groups) per pair"));
+    if group.len() != n || group.iter().any(|&g| g as usize >= n_groups) {
+        return Err(Error::invalid("joint: one group (below n_groups) per pair"));
     }
+    // the same sums on any number of threads (a fold over pairs adds in a different order each run, and a sharp
+    // objective can follow that to another optimum): pairs sorted by group, cut into fixed chunks summed in order
+    // in parallel, the chunks' sums merged in order. Fixed chunks keep a trunk's many pairs from serialising.
+    const CHUNK: usize = 4096;
+    let mut order: Vec<usize> = (0..n).collect();
+    order.sort_by_key(|&i| group[i]);
+    type Acc = (f64, [f64; 4], [[f64; 4]; 4]);
     pool(threads)?.install(|| {
-        let empty = || (vec![0.0; n_groups], vec![[0.0; 4]; n_groups], vec![[[0.0; 4]; 4]; n_groups]);
-        Ok((0..n).into_par_iter().fold(empty, |mut acc, i| {
-            let d = pair(&pulses[i], state[i], p);
-            let k = group[i] as usize;
-            acc.0[k] += d.v;
-            for a in 0..4 {
-                acc.1[k][a] += d.g[a];
-                for b in 0..4 {
-                    acc.2[k][a][b] += d.h[a][b];
+        let parts: Vec<Vec<(u32, Acc)>> = order.par_chunks(CHUNK).map(|chunk| {
+            let mut out: Vec<(u32, Acc)> = Vec::new();
+            for &i in chunk {
+                let s = state(&owners[i], theta, nu);
+                let d = pair(&pulses[i], [D::var(s[0], 0), D::var(s[1], 1), D::var(s[2], 2), D::var(s[3], 3)], p);
+                if out.last().is_none_or(|(g, _)| *g != group[i]) {
+                    out.push((group[i], (0.0, [0.0; 4], [[0.0; 4]; 4])));
                 }
-            }
-            acc
-        }).reduce(empty, |mut x, y| {
-            for k in 0..n_groups {
-                x.0[k] += y.0[k];
+                let acc = &mut out.last_mut().unwrap().1;
+                acc.0 += d.v;
                 for a in 0..4 {
-                    x.1[k][a] += y.1[k][a];
+                    acc.1[a] += d.g[a];
                     for b in 0..4 {
-                        x.2[k][a][b] += y.2[k][a][b];
+                        acc.2[a][b] += d.h[a][b];
                     }
                 }
             }
-            x
-        }))
+            out
+        }).collect();
+        let (mut f, mut g, mut h) = (vec![0.0; n_groups], vec![[0.0; 4]; n_groups], vec![[[0.0; 4]; 4]; n_groups]);
+        for (k, acc) in parts.into_iter().flatten() {
+            let k = k as usize;
+            f[k] += acc.0;
+            for a in 0..4 {
+                g[k][a] += acc.1[a];
+                for b in 0..4 {
+                    h[k][a][b] += acc.2[a][b];
+                }
+            }
+        }
+        Ok((f, g, h))
     })
 }
 
@@ -409,14 +522,16 @@ mod tests {
     fn derivatives_match_finite_differences() {
         let (tab, p) = (table(), params());
         let s0 = [0.003, -0.002, (0.05f64).ln(), (1.5f64).ln()];
+        let dual = |s: [f64; 4]| [D::var(s[0], 0), D::var(s[1], 1), D::var(s[2], 2), D::var(s[3], 3)];
         for (i, pu) in tab.iter().enumerate() {
-            let d = pair(pu, s0, &p);
+            let d = pair(pu, dual(s0), &p);
+            assert!((d.v - pair(pu, s0, &p)).abs() < 1e-12 * d.v.abs().max(1.0), "pair {i}: f64 and dual values differ");
             let h = [1e-5, 1e-5, 1e-4, 1e-4];
             for a in 0..4 {
                 let (mut sp, mut sm) = (s0, s0);
                 sp[a] += h[a];
                 sm[a] -= h[a];
-                let (fp, fm) = (pair(pu, sp, &p), pair(pu, sm, &p));
+                let (fp, fm) = (pair(pu, dual(sp), &p), pair(pu, dual(sm), &p));
                 let g = (fp.v - fm.v) / (2.0 * h[a]);
                 assert!((g - d.g[a]).abs() < 1e-3 * g.abs().max(1.0), "pair {i} grad {a}: {g} vs {}", d.g[a]);
                 for b in 0..4 {
@@ -430,12 +545,20 @@ mod tests {
     #[test]
     fn blocks_sum_their_pairs_and_inputs_are_checked() {
         let (tab, p) = (table(), params());
-        let st = vec![[0.0, 0.0, (0.05f64).ln(), 0.0]; tab.len()];
-        let (f, g, _) = joint_blocks(&tab, &st, &[0, 1, 1, 0, 1], 2, &p, 2).unwrap();
-        let ll = joint_loglik(&tab, &st, &p, 2).unwrap();
+        // two rows; pairs 2 and 4 see row 1 through a nuisance offset
+        let theta = [[0.0, 0.0, (0.05f64).ln(), 0.0], [0.001, 0.0, (0.04f64).ln(), 0.5]];
+        let nu = [[0.002, -0.001]];
+        let owners: Vec<Owner> = [(0, u32::MAX), (1, u32::MAX), (1, 0), (0, u32::MAX), (1, 0)].map(|(row, nu)| Owner { row, nu }).to_vec();
+        let (f, g, _) = joint_blocks(&tab, &owners, &[0, 1, 1, 0, 1], 2, &theta, &nu, &p, 2).unwrap();
+        let ll = joint_loglik(&tab, &owners, &theta, &nu, &p, 2).unwrap();
         assert!((f[0] - (ll[0] + ll[3])).abs() < 1e-9 && (f[1] - (ll[1] + ll[2] + ll[4])).abs() < 1e-9);
+        assert!((ll[2] - pair(&tab[2], [0.003, -0.001, (0.04f64).ln(), 0.5], &p)).abs() < 1e-12, "nu is added to delta");
         assert!(g.iter().all(|x| x.iter().all(|v| v.is_finite())));
-        assert!(joint_blocks(&tab, &st, &[0, 1, 2, 0, 1], 2, &p, 1).is_err());
-        assert!(joint_loglik(&tab, &st[..2], &p, 1).is_err());
+        let one = joint_blocks(&tab, &owners, &[0, 1, 1, 0, 1], 2, &theta, &nu, &p, 1).unwrap();
+        assert_eq!(one, joint_blocks(&tab, &owners, &[0, 1, 1, 0, 1], 2, &theta, &nu, &p, 4).unwrap(), "the same sums on any number of threads");
+        assert!(joint_blocks(&tab, &owners, &[0, 1, 2, 0, 1], 2, &theta, &nu, &p, 1).is_err());
+        assert!(joint_loglik(&tab, &owners[..2], &theta, &nu, &p, 1).is_err());
+        let bad: Vec<Owner> = owners.iter().map(|o| Owner { row: 5, ..*o }).collect();
+        assert!(joint_loglik(&tab, &bad, &theta, &nu, &p, 1).is_err());
     }
 }
