@@ -171,6 +171,7 @@ pub fn joint_tree(scans: &[&ScanIndex], rows: &Rows, ctx_a: &[Point], ctx_b: &[P
         None => rows.r_prior.iter().map(|&r| r >= params.split_min_r).collect(),
     };
     let (stems, split_gain) = split_rows(&rows0, &claim, &by_row, &try_split, split.is_none(), scans.len(), params, threads)?;
+    drop((by_row, claim)); // the claims' table is done with: a big tree's is ~100 MB
 
     // ownership and the fit, `sweeps` times, starting from the claims
     let t = table(scans, &stems, ctx_a, ctx_b, ctx_r, threads)?;
