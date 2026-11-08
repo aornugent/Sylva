@@ -1200,7 +1200,6 @@ dependencies = [
  "geojson",
  "kiddo",
  "las",
- "libc",
  "libloading",
  "libm",
  "nalgebra",

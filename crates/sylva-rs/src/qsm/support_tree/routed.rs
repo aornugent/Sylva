@@ -26,7 +26,7 @@
 //!   kept: the same foliage for every stem). A stop that a context cylinder
 //!   (the tree's measured and bounded pieces) explains better than every seed
 //!   is the context's. Every other pulse is fitted, or fewer where the piece
-//!   has more than [`FIT_PAIRS`] (a scan's pulses are about five times more
+//!   has more than twice [`FIT_PAIRS`] (a scan's pulses are about five times more
 //!   correlated than the likelihood assumes: research 93 §17's
 //!   `exist_scale`). Then `k = 1, 2, ...` stems, each from
 //!   its seed on its own axis ([`fit_stems`]: each pulse seen from the stem
@@ -40,12 +40,16 @@
 //!   pulses' correlation ([`JointParams::exist_scale`]), with
 //!   [`JointParams::model_sd`] added to its variances as a measured piece's
 //!   are; the lean is its seed's, with the seed's variance.
+//! - **Refusal,** decided here alone ([`exact_piece`], a [`refusal`] bit): no
+//!   seed (no fallback: no seed, no fit), no pulse left, Newton unconverged, a
+//!   stem not finite or saying nothing of its radius ([`UNINFORMED_SD`]), or one
+//!   stem narrower than the piece's detection bound.
 //! - TODO: passes through a context cylinder aren't removed (context is the
 //!   stops it explains); nor are other trees' cylinders context.
 
 use nalgebra::{Matrix2, Matrix3, Matrix4, Matrix5, SymmetricEigen, Vector5};
 
-use super::{fate, measure, median, p_wood, phase, profile_runs, solve_row, spacing, weights, Circle, Clock, Fate, Group, Stats, DEPTH_TOL, HULL_BEHIND, HULL_SHARE, RUN_HITS};
+use super::{fate, measure, median, p_wood, profile_runs, refusal, solve_row, spacing, weights, Circle, Fate, Group, Stats, DEPTH_TOL, HULL_BEHIND, HULL_SHARE, RUN_HITS};
 use crate::error::Result;
 use crate::qsm::evidence::ScanIndex;
 use crate::qsm::joint::{frames, joint_table, joint_wood_share, path, window, Echoes, JointParams, Owner, Pulse};
@@ -71,10 +75,13 @@ pub(super) const EXACT_K: usize = 4;
 /// tempered message's sd).
 const EXACT_ITERS: usize = 20;
 const EXACT_TOL: f64 = 3e-4;
-/// One pulse in at least [`THIN`] (by its index in its scan) is fitted, and in more where a piece has more than
-/// [`FIT_PAIRS`] pairs (a trunk near a scanner is the most oversampled).
+/// One pulse in at least [`THIN`] (by [`kept`]) is fitted, and in more on a piece of more than twice
+/// [`FIT_PAIRS`] pairs, so that at most about that many are (a trunk near a scanner is the most oversampled).
 const THIN: u32 = 2;
 const FIT_PAIRS: usize = 4000;
+/// A stem whose message's sd of log R exceeds this says nothing of its radius (a factor of e either way): the fit is
+/// refused, as no measurement of the stem (tree 849 row 81's had 4e4).
+const UNINFORMED_SD: f64 = 1.0;
 
 /// A seed: a stem's centre at the piece's middle and lean (along the piece's `e1, e2`, the lean per m), its radius,
 /// and its lean's variance.
@@ -143,7 +150,8 @@ fn proposals(gs: &[Group], r_claim: f64, p: &JointParams, lean_sd: f64) -> Vec<(
     out
 }
 
-/// A routed piece's seeds (see the module documentation), strongest first; none where no run makes one.
+/// A routed piece's seeds (see the module documentation), strongest first; none where no run makes one (the piece
+/// is then refused [`refusal::NO_SEED`]).
 pub(super) fn seeds(gs: &[Group], r_claim: f64, p: &JointParams, lean_sd: f64) -> Vec<Seed> {
     let props = proposals(gs, r_claim, p, lean_sd);
     if props.is_empty() {
@@ -221,11 +229,6 @@ pub(super) fn seeds(gs: &[Group], r_claim: f64, p: &JointParams, lean_sd: f64) -
         }
         out.push(*c);
     }
-    if out.is_empty() {
-        if let Some((c, _)) = cands.first() {
-            out.push(*c);
-        }
-    }
     out
 }
 
@@ -248,24 +251,53 @@ fn remeasure(pu: &Pulse, (o, d): (Point, Point), a: &Point, (u, e1, e2): (Point,
     }
 }
 
-/// A routed piece's exact fit (see [`exact_piece`]): its stems' summaries as measurements of the piece's `[c1, c2,
-/// t1, t2, R]` (in the order fitted), whether the fit converged, the evidence for them over one stem, its pairs
-/// (the context's stops aside; every other one fitted, or fewer) and the pair evaluations, and its stops classified
-/// (`node`: the stem).
+/// A routed piece's accepted exact fit (see [`exact_piece`]): its stems' summaries as measurements of the piece's
+/// `[c1, c2, t1, t2, R]` (in the order fitted), the evidence for them over one stem, its pairs (the context's stops
+/// aside; every other one fitted, or fewer) and the pair evaluations, and its stops classified (`node`: the stem).
 pub(super) struct Exact {
     pub stems: Vec<Circle>,
-    pub converged: bool,
     pub gain: f64,
     pub n_pairs: u32,
     pub evals: [u64; 2],
     pub echoes: Echoes,
 }
 
+/// What became of a routed piece's exact fit: accepted, or refused (a [`refusal`] bit) with what it cost.
+pub(super) enum Fitted {
+    Accepted(Exact),
+    Refused { why: u8, n_pairs: u32, evals: [u64; 2] },
+}
+
+/// The pulses fitted on a piece of `n_all` pairs: one in `thin`, at least `min` (see [`THIN`]), and more on pieces
+/// of more than `2 FIT_PAIRS`, so that at most about [`FIT_PAIRS`] are.
+fn thinning(n_all: usize, min: u32) -> u32 {
+    (n_all.div_ceil(FIT_PAIRS) as u32).max(min)
+}
+
+/// Whether the pulse of direction `d` is one of the `1 / thin` fitted: by a hash of its direction (splitmix64), so
+/// the choice is the pulse's own, not its place in a file (a scan cut to a tree's pulses fits the same ones).
+fn kept(d: Point, thin: u32) -> bool {
+    let mut z = d.iter().fold(0u64, |h, x| h.rotate_left(21) ^ x.to_bits()).wrapping_add(0x9e37_79b9_7f4a_7c15);
+    z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+    (z ^ (z >> 31)) % thin as u64 == 0
+}
+
 /// The seeded exact fit of a routed piece (claimed from `a0`, frame `frame`; see the module documentation) from
-/// its `seeds`, with `ctx` (each cylinder's ends and radius) owning the stops it explains better. None where no
-/// pulse is left.
+/// its `seeds`, with `ctx` (each cylinder's ends and radius) owning the stops it explains better; refused (see
+/// [`refusal`]) where there is no seed or no pulse, where Newton didn't converge, where a stem isn't finite or says
+/// nothing of its radius, or where one stem is narrower than the piece's detection bound `lower` (log R).
 #[allow(clippy::too_many_arguments)]
-pub(super) fn exact_piece(scans: &[&ScanIndex], a0: &Point, frame: Frame, seeds: &[Seed], ctx: &[(Point, Point, f64)], like: &JointParams, prior: &PriorParams, clock: &Clock) -> Result<Option<Exact>> {
+pub(super) fn exact_piece(scans: &[&ScanIndex], a0: &Point, frame: Frame, seeds: &[Seed], ctx: &[(Point, Point, f64)], lower: f64, like: &JointParams, prior: &PriorParams) -> Result<Fitted> {
+    exact_thinned(scans, a0, frame, seeds, ctx, lower, like, prior, THIN)
+}
+
+/// [`exact_piece`], fitting one pulse in at least `min_thin`.
+#[allow(clippy::too_many_arguments)]
+fn exact_thinned(scans: &[&ScanIndex], a0: &Point, frame: Frame, seeds: &[Seed], ctx: &[(Point, Point, f64)], lower: f64, like: &JointParams, prior: &PriorParams, min_thin: u32) -> Result<Fitted> {
+    if seeds.is_empty() {
+        return Ok(Fitted::Refused { why: refusal::NO_SEED, n_pairs: 0, evals: [0; 2] });
+    }
     let (u, e1, e2, len) = frame;
     let mid: Point = std::array::from_fn(|i| a0[i] + 0.5 * len * u[i]);
     let fb: Point = std::array::from_fn(|i| a0[i] + len * u[i]);
@@ -280,7 +312,7 @@ pub(super) fn exact_piece(scans: &[&ScanIndex], a0: &Point, frame: Frame, seeds:
         (f.0, f.1, f.2)
     }).collect();
     let tube = seeds.iter().map(|s| s.c[0].hypot(s.c[1]) + 0.5 * len * s.t[0].hypot(s.t[1]) + window(s.r)).fold(0.0, f64::max);
-    let t = clock.time(phase::TABLE, || joint_table(scans, &[*a0], &[fb], &[tube], 1))?;
+    let t = joint_table(scans, &[*a0], &[fb], &[tube], 1)?;
     let ray = |i: usize| -> (Point, Point) {
         let sc = scans[t.scan[i] as usize];
         (sc.origin(), sc.direction(t.pulse[i]))
@@ -293,7 +325,7 @@ pub(super) fn exact_piece(scans: &[&ScanIndex], a0: &Point, frame: Frame, seeds:
     };
     // context: of the cylinders near the piece, the stops each explains better than every seed does (each cylinder
     // tested only where the stop lies within its reach)
-    let keep: Vec<bool> = clock.time(phase::CONTEXT, || {
+    let keep: Vec<bool> = {
         let near: Vec<(&(Point, Point, f64), Point, f64)> = ctx.iter().filter_map(|c| {
             let (a, b, r) = c;
             let m: Point = std::array::from_fn(|i| 0.5 * (a[i] + b[i]));
@@ -321,20 +353,20 @@ pub(super) fn exact_piece(scans: &[&ScanIndex], a0: &Point, frame: Frame, seeds:
                 dc < own
             })
         }).collect()
-    });
+    };
     // the pairs within some seed's own tube (the table's holds them all, and is wider where the seeds are apart)
-    let idx: Vec<usize> = clock.time(phase::TABLE, || (0..t.pulses.len()).filter(|&i| keep[i] && seeds.iter().enumerate().any(|(j, s)| {
+    let idx: Vec<usize> = (0..t.pulses.len()).filter(|&i| keep[i] && seeds.iter().enumerate().any(|(j, s)| {
         remeasure(&t.pulses[i], ray(i), &axes[j].0, sfr[j]).b.abs() < window(s.r)
-    })).collect());
+    })).collect();
     let n_all = idx.len();
-    let thin = (n_all.div_ceil(FIT_PAIRS) as u32).max(THIN);
-    let fit_idx: Vec<usize> = idx.iter().copied().filter(|&i| t.pulse[i] % thin == 0).collect();
+    let thin = thinning(n_all, min_thin);
+    let fit_idx: Vec<usize> = idx.iter().copied().filter(|&i| kept(ray(i).1, thin)).collect();
     let n = fit_idx.len();
     if n == 0 {
-        return Ok(None);
+        return Ok(Fitted::Refused { why: refusal::NO_PULSES, n_pairs: n_all as u32, evals: [0; 2] });
     }
     // each seed's view of the fitted pairs, from its own axis
-    let views: Vec<Vec<Pulse>> = clock.time(phase::TABLE, || seeds.iter().enumerate().map(|(j, _)| fit_idx.iter().map(|&i| remeasure(&t.pulses[i], ray(i), &axes[j].0, sfr[j])).collect()).collect());
+    let views: Vec<Vec<Pulse>> = seeds.iter().enumerate().map(|(j, _)| fit_idx.iter().map(|&i| remeasure(&t.pulses[i], ray(i), &axes[j].0, sfr[j])).collect()).collect();
     let range: Vec<f64> = fit_idx.iter().map(|&i| t.pulses[i].t).collect();
     let scan: Vec<u32> = fit_idx.iter().map(|&i| t.scan[i]).collect();
     let opts = FitOptions { schedule: Vec::new(), iters: EXACT_ITERS, tol: EXACT_TOL, threads: 1, local: false, profile: false };
@@ -344,41 +376,42 @@ pub(super) fn exact_piece(scans: &[&ScanIndex], a0: &Point, frame: Frame, seeds:
     type State = Vec<(usize, [f64; 2], f64)>;
     let mut best: Option<(f64, State, crate::qsm::joint_tree::StemFit)> = None;
     let mut bic1 = f64::NAN;
-    clock.time(phase::FIT, || -> Result<()> {
-        for k in 1..=seeds.len() {
-            let st: State = best.as_ref().map_or(Vec::new(), |b| b.1.clone()).into_iter().chain([(k - 1, [0.0, 0.0], seeds[k - 1].r)]).collect();
-            let moved: Vec<(Point, Point)> = st.iter().map(|&(j, d, _)| {
-                let (_, f1, f2) = sfr[j];
-                let off: Point = std::array::from_fn(|i| d[0] * f1[i] + d[1] * f2[i]);
-                (std::array::from_fn(|i| axes[j].0[i] + off[i]), std::array::from_fn(|i| axes[j].1[i] + off[i]))
-            }).collect();
-            let radii: Vec<f64> = st.iter().map(|s| s.2).collect();
-            let see = |q: usize, i: usize, d: [f64; 2]| shifted(&views[st[q].0][i], [st[q].1[0] + d[0], st[q].1[1] + d[1]]);
-            let sf = fit_stems(&range, &see, &moved, &radii, &scan, scans.len(), like, prior, &opts)?;
-            evals[0] += sf.fit.evals[0];
-            evals[1] += sf.fit.evals[1];
-            // an unconverged fit of k > 1 stems isn't weighed; one stem's is kept, to be refused as a message, and
-            // no more are tried
-            if k > 1 && !sf.fit.converged {
-                break;
-            }
-            let more = sf.fit.converged;
-            let bic = sf.ll - 2.0 * (k as f64 - 1.0) * (n as f64).ln();
-            if k == 1 {
-                bic1 = bic;
-            }
-            if best.as_ref().is_some_and(|b| bic <= b.0) {
-                break;
-            }
-            let fitted: State = st.iter().zip(&sf.stems).map(|(&(j, d, _), &(o, r))| (j, [d[0] + o[0], d[1] + o[1]], r)).collect();
-            best = Some((bic, fitted, sf));
-            if !more {
-                break;
-            }
+    for k in 1..=seeds.len() {
+        let st: State = best.as_ref().map_or(Vec::new(), |b| b.1.clone()).into_iter().chain([(k - 1, [0.0, 0.0], seeds[k - 1].r)]).collect();
+        let moved: Vec<(Point, Point)> = st.iter().map(|&(j, d, _)| {
+            let (_, f1, f2) = sfr[j];
+            let off: Point = std::array::from_fn(|i| d[0] * f1[i] + d[1] * f2[i]);
+            (std::array::from_fn(|i| axes[j].0[i] + off[i]), std::array::from_fn(|i| axes[j].1[i] + off[i]))
+        }).collect();
+        let radii: Vec<f64> = st.iter().map(|s| s.2).collect();
+        let see = |q: usize, i: usize, d: [f64; 2]| shifted(&views[st[q].0][i], [st[q].1[0] + d[0], st[q].1[1] + d[1]]);
+        let sf = fit_stems(&range, &see, &moved, &radii, &scan, scans.len(), like, prior, &opts)?;
+        evals[0] += sf.fit.evals[0];
+        evals[1] += sf.fit.evals[1];
+        // an unconverged fit of k > 1 stems isn't weighed; one stem's is kept, to be refused as a message, and
+        // no more are tried
+        if k > 1 && !sf.fit.converged {
+            break;
         }
-        Ok(())
-    })?;
-    let Some((bic, st, sf)) = best else { return Ok(None) };
+        let more = sf.fit.converged;
+        let bic = sf.ll - 2.0 * (k as f64 - 1.0) * (n as f64).ln();
+        if k == 1 {
+            bic1 = bic;
+        }
+        if best.as_ref().is_some_and(|b| bic <= b.0) {
+            break;
+        }
+        let fitted: State = st.iter().zip(&sf.stems).map(|(&(j, d, _), &(o, r))| (j, [d[0] + o[0], d[1] + o[1]], r)).collect();
+        best = Some((bic, fitted, sf));
+        if !more {
+            break;
+        }
+    }
+    let refused = move |why: u8| Ok(Fitted::Refused { why, n_pairs: n_all as u32, evals });
+    let Some((bic, st, sf)) = best else { return refused(refusal::UNCONVERGED) };
+    if !sf.fit.converged {
+        return refused(refusal::UNCONVERGED);
+    }
     let k = st.len();
     // each stem's message, as a measurement of the piece's [c1, c2, t1, t2, R]
     let stems: Vec<Circle> = st.iter().enumerate().map(|(q, &(j, d, r))| {
@@ -431,9 +464,19 @@ pub(super) fn exact_piece(scans: &[&ScanIndex], a0: &Point, frame: Frame, seeds:
         let h5 = info * y;
         Circle { st: Stats { info, h: h5, yy: y.dot(&h5), n: 5 }, x: y, cov, chi2: f64::NAN }
     }).collect();
+    if !stems.iter().all(|c| c.x.iter().chain(c.st.info.iter()).chain(c.cov.iter()).all(|v| v.is_finite())) {
+        return refused(refusal::NON_FINITE);
+    }
+    // one stem as narrow as the run it was seen in can't be (several may span it together)
+    if k == 1 && stems[0].x[4].ln() < lower {
+        return refused(refusal::BOUND);
+    }
+    if stems.iter().any(|c| c.cov[(4, 4)].sqrt() / c.x[4] > UNINFORMED_SD) {
+        return refused(refusal::UNINFORMED);
+    }
     // the classification: every kept stop (fitted or not) by the softmax of its wood and leaf terms at the fit of
     // the stem it meets first
-    let echoes = clock.time(phase::EXACT_ECHOES, || -> Result<Echoes> {
+    let echoes = {
         let stops: Vec<usize> = idx.iter().copied().filter(|&i| t.pulses[i].stop).collect();
         let radii: Vec<f64> = st.iter().map(|s| s.2).collect();
         let (seen, owners): (Vec<Pulse>, Vec<Owner>) = stops.iter().map(|&i| {
@@ -449,9 +492,9 @@ pub(super) fn exact_piece(scans: &[&ScanIndex], a0: &Point, frame: Frame, seeds:
             let j = owners[q].row;
             out.push(s, scans[s as usize].file_row(t.pulse[i]), t.echo[i], j, path::EXACT, share[q], surface_dist(&seen[q], sf.theta[j as usize]));
         }
-        Ok(out)
-    })?;
-    Ok(Some(Exact { stems, converged: sf.fit.converged, gain: if k > 1 { bic - bic1 } else { f64::NAN }, n_pairs: idx.len() as u32, evals, echoes }))
+        out
+    };
+    Ok(Fitted::Accepted(Exact { stems, gain: if k > 1 { bic - bic1 } else { f64::NAN }, n_pairs: n_all as u32, evals, echoes }))
 }
 
 #[cfg(test)]
@@ -476,5 +519,41 @@ mod tests {
         assert!((pm.b - sh.b).abs() < 1e-12 && (pm.t - sh.t).abs() < 1e-12, "{pm:?} {sh:?}");
         // the chord and the fate are the table's
         assert!(pm.c0 == base.c0 && pm.x == base.x && pm.stop);
+    }
+
+    #[test]
+    fn pieces_of_more_than_8000_pairs_are_thinned_further_and_evenly() {
+        assert_eq!((thinning(10, THIN), thinning(8000, THIN), thinning(8001, THIN), thinning(40_000, THIN)), (2, 2, 3, 10));
+        assert_eq!(thinning(100, 1), 1);
+        // a fan of directions: each thinning keeps its share, whichever pulses the file holds
+        let dirs: Vec<Point> = (0..200_000).map(|i| {
+            let (z, a) = (1.0 + 1e-4 * (i / 500) as f64, 1e-4 * (i % 500) as f64);
+            [z.sin() * a.sin(), z.sin() * a.cos(), z.cos()]
+        }).collect();
+        for thin in [2u32, 3, 7] {
+            let share = dirs.iter().filter(|&&d| kept(d, thin)).count() as f64 / dirs.len() as f64;
+            assert!((share * thin as f64 - 1.0).abs() < 0.03, "thin {thin}: {share}");
+        }
+    }
+
+    #[test]
+    fn the_message_is_scaled_to_all_the_pairs() {
+        // the fan's 5 cm stem, fitted from every pulse and from every other one: the thinned fit's message, scaled
+        // by n_all / n, carries about the information of the whole set's
+        let (scan, a, b) = crate::qsm::evidence::tests::scene(0.05, true);
+        let (a0, b0) = ([a[0], a[1], -0.15], [b[0], b[1], 0.15]);
+        let fr = frames(&[a0], &[b0])[0];
+        let seed = [Seed { c: [0.0, 0.0], t: [0.0, 0.0], r: 0.05, t_var: [0.01, 0.01] }];
+        let fit = |thin: u32| match exact_thinned(&[&scan], &a0, fr, &seed, &[], f64::NEG_INFINITY, &JointParams { tau: 0.17, edge: 0.25, hide: 0.0, ..JointParams::default() }, &PriorParams::default(), thin).unwrap() {
+            Fitted::Accepted(e) => e,
+            Fitted::Refused { why, .. } => panic!("refused {why}"),
+        };
+        let (all, half) = (fit(1), fit(2));
+        assert_eq!(all.n_pairs, half.n_pairs, "n_all is the piece's pairs, fitted or not");
+        let (ia, ih) = (all.stems[0].st.info, half.stems[0].st.info);
+        for i in [0usize, 1, 4] {
+            let ratio = ih[(i, i)] / ia[(i, i)];
+            assert!(ratio > 0.7 && ratio < 1.4, "info[{i}]: thinned {} against all {}", ih[(i, i)], ia[(i, i)]);
+        }
     }
 }
