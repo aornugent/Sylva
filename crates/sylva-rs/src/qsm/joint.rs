@@ -209,7 +209,7 @@ fn log_pdf(z: f64) -> f64 {
 }
 
 /// `log Phi(z)` alone (see [`log_ndtr_mills`]).
-fn log_ndtr_value(z: f64) -> f64 {
+pub(crate) fn log_ndtr_value(z: f64) -> f64 {
     use std::f64::consts::SQRT_2;
     if z > 0.0 {
         // erfc is exactly 0 from 28 on (libm), so log Phi is exactly -0 there: skip the call
@@ -340,14 +340,29 @@ pub struct JointParams {
     pub refl_leaf_sd: f64,
     pub refl_multi: f64,
     pub refl_multi_sd: f64,
+    /// Thin wood reads darker than bark that fills the footprint even above the footprint's width (3dtrees
+    /// research 93 §16: rows under 2 cm at -17.8 dB p50 against -15.9): wood's mean shifts by `refl_thin` dB at
+    /// R <= 1 cm, by none from 3 cm, linearly in log R between. Read by [`crate::qsm::support_tree`] only.
+    pub refl_thin: f64,
+    /// The share of the pulses aimed at a core that stop there, on wood (opaque but for the soft edge) and on
+    /// foliage, and the weight of a scan's existence log odds (its pulses are correlated beyond the beam's
+    /// oversampling): existence's evidence, fitted on `joint_tree`'s wood and NO_WOOD rows (3dtrees research 93 §17
+    /// review). Read by [`crate::qsm::support_tree`] only.
+    pub stop_wood: f64,
+    pub stop_leaf: f64,
+    pub exist_scale: f64,
+    /// The floor on each support measurement's sd (m): non-round sections and a ~4 mm offset between scans that
+    /// no sway explains (3dtrees research 93 §15.6). Read by [`crate::qsm::support_tree`] only.
+    pub model_sd: f64,
 }
 
 impl Default for JointParams {
-    /// The calibration for TERN's RIEGL VZ-400i exports (3dtrees research 74 §§13-19 and 93 §11.2: Alice Mulga).
+    /// The calibration for TERN's RIEGL VZ-400i exports (3dtrees research 74 §§13-19 and 93 §§11.2, 17: Alice Mulga).
     fn default() -> Self {
         JointParams {
             exit: 0.007, divergence: 0.35e-3, sigma_r: 0.005, rough: 0.03, tau: 0.11, edge: 0.5, eps: 0.1, eps_min: 0.01, mp_len: 0.5, hide: 0.09,
             refl_wood: -15.45, refl_wood_sd: 1.0, refl_leaf: -19.7, refl_leaf_sd: 1.4, refl_multi: -3.0, refl_multi_sd: 1.2,
+            refl_thin: -3.0, stop_wood: 0.99, stop_leaf: 0.1, exist_scale: 0.2, model_sd: 0.004,
         }
     }
 }

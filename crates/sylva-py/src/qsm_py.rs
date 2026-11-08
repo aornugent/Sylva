@@ -512,7 +512,8 @@ fn qsm_pairs<'py>(py: Python<'py>, scans: Vec<Bound<'py, PyScanIndex>>, a: PyRea
 fn joint_params(params: &Bound<'_, PyDict>) -> PyResult<JointParams> {
     let get = |k: &str| -> PyResult<f64> { params.get_item(k)?.ok_or_else(|| PyValueError::new_err(format!("joint params: no {k:?}")))?.extract() };
     Ok(JointParams { exit: get("exit")?, divergence: get("divergence")?, sigma_r: get("sigma_r")?, rough: get("rough")?, tau: get("tau")?, edge: get("edge")?, eps: get("eps")?, eps_min: get("eps_min")?, mp_len: get("mp_len")?, hide: get("hide")?,
-        refl_wood: get("refl_wood")?, refl_wood_sd: get("refl_wood_sd")?, refl_leaf: get("refl_leaf")?, refl_leaf_sd: get("refl_leaf_sd")?, refl_multi: get("refl_multi")?, refl_multi_sd: get("refl_multi_sd")? })
+        refl_wood: get("refl_wood")?, refl_wood_sd: get("refl_wood_sd")?, refl_leaf: get("refl_leaf")?, refl_leaf_sd: get("refl_leaf_sd")?, refl_multi: get("refl_multi")?, refl_multi_sd: get("refl_multi_sd")?,
+        refl_thin: get("refl_thin")?, stop_wood: get("stop_wood")?, stop_leaf: get("stop_leaf")?, exist_scale: get("exist_scale")?, model_sd: get("model_sd")? })
 }
 
 fn rows<const K: usize>(a: PyReadonlyArray2<f64>, what: &str) -> PyResult<Vec<[f64; K]>> {
@@ -620,8 +621,8 @@ fn qsm_joint_fit<'py>(py: Python<'py>, table: Bound<'py, PyDict>, a: PyReadonlyA
     Ok(d)
 }
 
-const JOINT_LIKE: [&str; 16] = ["exit", "divergence", "sigma_r", "rough", "tau", "edge", "eps", "eps_min", "mp_len", "hide", "refl_wood", "refl_wood_sd", "refl_leaf", "refl_leaf_sd", "refl_multi", "refl_multi_sd"];
-const JOINT_PRIOR: [&str; 14] = ["lam_prior", "lam_sd", "sig_ell", "sig_eta", "mu_fork", "sig_fork", "sig_root", "r_tip", "sig_tip", "sig_delta", "centre_rel", "centre_abs", "scan_abs", "scan_rel"];
+const JOINT_LIKE: [&str; 21] = ["exit", "divergence", "sigma_r", "rough", "tau", "edge", "eps", "eps_min", "mp_len", "hide", "refl_wood", "refl_wood_sd", "refl_leaf", "refl_leaf_sd", "refl_multi", "refl_multi_sd", "refl_thin", "stop_wood", "stop_leaf", "exist_scale", "model_sd"];
+const JOINT_PRIOR: [&str; 18] = ["lam_prior", "lam_sd", "sig_ell", "sig_eta", "mu_fork", "sig_fork", "sig_root", "r_tip", "sig_tip", "sig_delta", "centre_rel", "centre_abs", "scan_abs", "scan_rel", "lean_sd", "lean_bend", "exist", "exist_off"];
 const JOINT_TREE: [&str; 8] = ["version", "iters", "tol", "sweeps", "split_min_r", "split_through", "split_min_votes", "drop"];
 
 /// The default settings of `qsm_joint_tree`, flat.
@@ -630,10 +631,10 @@ fn qsm_joint_defaults(py: Python<'_>) -> PyResult<Bound<'_, PyDict>> {
     let t = TreeParams::default();
     let (l, p) = (t.like, t.prior);
     let d = PyDict::new(py);
-    for (k, v) in JOINT_LIKE.iter().zip([l.exit, l.divergence, l.sigma_r, l.rough, l.tau, l.edge, l.eps, l.eps_min, l.mp_len, l.hide, l.refl_wood, l.refl_wood_sd, l.refl_leaf, l.refl_leaf_sd, l.refl_multi, l.refl_multi_sd]) {
+    for (k, v) in JOINT_LIKE.iter().zip([l.exit, l.divergence, l.sigma_r, l.rough, l.tau, l.edge, l.eps, l.eps_min, l.mp_len, l.hide, l.refl_wood, l.refl_wood_sd, l.refl_leaf, l.refl_leaf_sd, l.refl_multi, l.refl_multi_sd, l.refl_thin, l.stop_wood, l.stop_leaf, l.exist_scale, l.model_sd]) {
         d.set_item(k, v)?;
     }
-    for (k, v) in JOINT_PRIOR.iter().zip([p.lam_prior, p.lam_sd, p.sig_ell, p.sig_eta, p.mu_fork, p.sig_fork, p.sig_root, p.r_tip, p.sig_tip, p.sig_delta, p.centre_rel, p.centre_abs, p.scan_abs, p.scan_rel]) {
+    for (k, v) in JOINT_PRIOR.iter().zip([p.lam_prior, p.lam_sd, p.sig_ell, p.sig_eta, p.mu_fork, p.sig_fork, p.sig_root, p.r_tip, p.sig_tip, p.sig_delta, p.centre_rel, p.centre_abs, p.scan_abs, p.scan_rel, p.lean_sd, p.lean_bend, p.exist, p.exist_off]) {
         d.set_item(k, v)?;
     }
     d.set_item("version", TreeParams::VERSION)?;
@@ -664,7 +665,8 @@ fn tree_params(d: &Bound<'_, PyDict>) -> PyResult<TreeParams> {
     if d.len() != JOINT_LIKE.len() + JOINT_PRIOR.len() + JOINT_TREE.len() {
         return Err(PyValueError::new_err("joint params: unexpected fields"));
     }
-    let prior = PriorParams { lam_prior: f("lam_prior")?, lam_sd: f("lam_sd")?, sig_ell: f("sig_ell")?, sig_eta: f("sig_eta")?, mu_fork: f("mu_fork")?, sig_fork: f("sig_fork")?, sig_root: f("sig_root")?, r_tip: f("r_tip")?, sig_tip: f("sig_tip")?, sig_delta: f("sig_delta")?, centre_rel: f("centre_rel")?, centre_abs: f("centre_abs")?, scan_abs: f("scan_abs")?, scan_rel: f("scan_rel")? };
+    let prior = PriorParams { lam_prior: f("lam_prior")?, lam_sd: f("lam_sd")?, sig_ell: f("sig_ell")?, sig_eta: f("sig_eta")?, mu_fork: f("mu_fork")?, sig_fork: f("sig_fork")?, sig_root: f("sig_root")?, r_tip: f("r_tip")?, sig_tip: f("sig_tip")?, sig_delta: f("sig_delta")?, centre_rel: f("centre_rel")?, centre_abs: f("centre_abs")?, scan_abs: f("scan_abs")?, scan_rel: f("scan_rel")?,
+        lean_sd: f("lean_sd")?, lean_bend: f("lean_bend")?, exist: f("exist")?, exist_off: f("exist_off")? };
     Ok(TreeParams { like: joint_params(d)?, prior, iters: u("iters")?, tol: f("tol")?, sweeps: u("sweeps")?, split_min_r: f("split_min_r")?, split_through: f("split_through")?, split_min_votes: u("split_min_votes")?, drop: f("drop")? })
 }
 
@@ -710,7 +712,31 @@ fn qsm_joint_tree<'py>(py: Python<'py>, scans: Vec<Bound<'py, PyScanIndex>>, a: 
 #[pyfunction]
 fn qsm_support_flags() -> Vec<(&'static str, u8)> {
     use support_tree::flag::*;
-    vec![("RUNS", RUNS), ("HULL", HULL), ("FEW", FEW), ("POROUS", POROUS)]
+    vec![("RUNS", RUNS), ("HULL", HULL), ("BOUNDS", BOUNDS), ("POROUS", POROUS)]
+}
+
+/// A support fit's rows or pieces as a dict of arrays.
+fn support_fit<'py>(py: Python<'py>, f: support_tree::Fit) -> PyResult<Bound<'py, PyDict>> {
+    let n = f.r.len();
+    let d = PyDict::new(py);
+    let xyz = |v: &[[f64; 3]]| v.concat().into_pyarray(py).reshape([n, 3]);
+    let two = |v: &[[f64; 2]]| v.concat().into_pyarray(py).reshape([n, 2]);
+    d.set_item("a", xyz(&f.a)?)?;
+    d.set_item("b", xyz(&f.b)?)?;
+    d.set_item("e1", xyz(&f.e1)?)?;
+    d.set_item("e2", xyz(&f.e2)?)?;
+    d.set_item("centre", two(&f.centre)?)?;
+    d.set_item("sd_centre", two(&f.sd_centre)?)?;
+    d.set_item("lean", two(&f.lean)?)?;
+    d.set_item("sd_lean", two(&f.sd_lean)?)?;
+    for (k, v) in [("r", f.r), ("sd_log_r", f.sd_log_r), ("r_row", f.r_row), ("sd_r_row", f.sd_r_row), ("chi2", f.chi2), ("chi2_front", f.chi2_front), ("r_lo", f.r_lo), ("r_hi", f.r_hi), ("r_floor", f.r_floor), ("log_odds", f.log_odds), ("p_wood", f.p_wood)] {
+        d.set_item(k, v.into_pyarray(py))?;
+    }
+    d.set_item("flags", f.flags.into_pyarray(py))?;
+    d.set_item("n_runs", f.n_runs.into_pyarray(py))?;
+    d.set_item("n_scans", f.n_scans.into_pyarray(py))?;
+    d.set_item("n_pairs", f.n_pairs.into_pyarray(py))?;
+    Ok(d)
 }
 
 /// Fits one tree from its rows' support summaries (see `sylva.qsm.support_tree`); `params` as `qsm_joint_tree`'s.
@@ -726,25 +752,11 @@ fn qsm_support_tree<'py>(py: Python<'py>, scans: Vec<Bound<'py, PyScanIndex>>, a
         let rows = Rows { a: &a, b: &b, r_prior: &r_prior, r_max: &[], parent: &parent };
         support_tree::support_tree(&refs, &rows, &p.like, &p.prior, threads)
     }).map_err(err)?;
-    let n = f.r.len();
-    let d = PyDict::new(py);
-    let xyz = |v: &[[f64; 3]]| v.concat().into_pyarray(py).reshape([n, 3]);
-    let two = |v: &[[f64; 2]]| v.concat().into_pyarray(py).reshape([n, 2]);
-    d.set_item("a", xyz(&f.a)?)?;
-    d.set_item("b", xyz(&f.b)?)?;
-    d.set_item("e1", xyz(&f.e1)?)?;
-    d.set_item("e2", xyz(&f.e2)?)?;
-    d.set_item("centre", two(&f.centre)?)?;
-    d.set_item("sd_centre", two(&f.sd_centre)?)?;
-    d.set_item("lean", two(&f.lean)?)?;
-    d.set_item("sd_lean", two(&f.sd_lean)?)?;
-    for (k, v) in [("r", f.r), ("sd_log_r", f.sd_log_r), ("r_row", f.r_row), ("sd_r_row", f.sd_r_row), ("chi2", f.chi2), ("chi2_front", f.chi2_front)] {
-        d.set_item(k, v.into_pyarray(py))?;
-    }
-    d.set_item("flags", f.flags.into_pyarray(py))?;
-    d.set_item("n_runs", f.n_runs.into_pyarray(py))?;
-    d.set_item("n_scans", f.n_scans.into_pyarray(py))?;
-    d.set_item("n_pairs", f.n_pairs.into_pyarray(py))?;
+    let d = support_fit(py, f.rows)?;
+    let pieces = support_fit(py, f.pieces)?;
+    pieces.set_item("row", f.piece_row.into_pyarray(py))?;
+    d.set_item("pieces", pieces)?;
+    d.set_item("converged", f.converged)?;
     Ok(d)
 }
 

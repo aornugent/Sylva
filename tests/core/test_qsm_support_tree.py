@@ -59,6 +59,50 @@ def test_separated_stems_upright_and_leaning_are_measured(tmp_path):
     assert (f["sd_log_r"] < 0.2).all() and (np.isnan(f["chi2"]) | (f["chi2"] < 9)).all() and (f["chi2_front"] < 9).all()
 
 
+def test_a_bent_stem_is_a_chain_of_straight_pieces(tmp_path):
+    # a 3 cm stem bending along an arc of radius 2 m (2 cm solids), claimed by the chords of two 0.6 m rows: each
+    # row is three pieces, each nearly straight, so no hull, and the row runs along the bend
+    rho, r = 2.0, 0.03
+    z = np.arange(0.0, 1.62, 0.02)
+    x = rho - np.sqrt(rho ** 2 - z ** 2)
+    pts = np.c_[x, np.zeros_like(z), z]
+    scans = scanned(tmp_path, pts[:-1], pts[1:], np.full(len(z) - 1, r), [(0.3, -8.0), (6.5, 5.0), (-6.0, 5.5)],
+                    zenith=(75.0, 110.0))
+    z0 = np.array([0.2, 0.8])
+    a = np.c_[rho - np.sqrt(rho ** 2 - z0 ** 2), np.zeros(2), z0]
+    b = np.c_[rho - np.sqrt(rho ** 2 - (z0 + 0.6) ** 2), np.zeros(2), z0 + 0.6]
+    f = support_tree(scans, a, b, [1.5 * r] * 2, [-1, 0], params=PARAMS, threads=2)
+    p = f["pieces"]
+    assert (f["flags"] == 0).all() and (p["flags"] == 0).all() and list(p["row"]) == [0, 0, 0, 1, 1, 1]
+    assert np.abs(np.log(p["r"] / r)).max() < 0.05 and np.abs(np.log(f["r"] / r)).max() < 0.05
+    # each piece's middle lies on the arc, though the chord is up to 2.2 cm off it
+    for k in range(len(p["r"])):
+        mid = 0.5 * (p["a"][k] + p["b"][k])
+        assert abs(mid[0] - (rho - np.sqrt(rho ** 2 - mid[2] ** 2))) < 0.003, (k, mid)
+    assert (p["p_wood"] > 0.9).all() and (f["p_wood"] > 0.9).all()
+
+
+def test_thin_stems_far_away_are_bounded_around_their_truth(tmp_path):
+    # stems of 2 to 8 mm seen from two scans 20 m away (a footprint of ~14 mm): where no circle is determined the
+    # radius is the prior cut by the bounds, and both the bounds and the posterior contain the truth; a stem too
+    # thin for its hits' span to say more than the capacity floor has no detection bound
+    radii = np.array([0.002, 0.003, 0.005, 0.008])
+    xs = np.arange(4) * 0.3 - 0.45
+    scans = scanned(tmp_path, np.c_[xs, np.zeros(4), np.zeros(4)], np.c_[xs, np.zeros(4), np.full(4, 1.8)], radii,
+                    [(0.3, -20.0), (14.0, 14.0)], zenith=(75.0, 110.0))
+    a = np.c_[xs + 0.3 * radii, np.zeros(4), np.full(4, 0.75)]
+    f = support_tree(scans, a, a + [0, 0, 0.3], 1.5 * radii, np.full(4, -1), params=PARAMS, threads=2)
+    bounded = (f["flags"] & (SupportFlag.BOUNDS | SupportFlag.POROUS)) > 0
+    assert bounded.sum() >= 2 and not (f["flags"] & (SupportFlag.RUNS | SupportFlag.HULL)).any()
+    assert np.isnan(f["r_row"][bounded]).all() and np.isfinite(f["r_hi"][bounded]).all()
+    lo_ok = np.isnan(f["r_lo"]) | (f["r_lo"] <= radii)
+    held = (lo_ok & (f["r_floor"] <= radii) & (radii <= f["r_hi"]))[bounded]
+    assert held.all() and f["converged"], (f["r_lo"], f["r_floor"], f["r_hi"])
+    lo, hi = f["r"] * np.exp(-1.96 * f["sd_log_r"]), f["r"] * np.exp(1.96 * f["sd_log_r"])
+    # two scans that each see opaque wood: as sure as two scans can make it (exist_scale)
+    assert ((lo <= radii) & (radii <= hi)).all() and (f["p_wood"] > 0.8).all()
+
+
 def test_a_clump_of_stems_is_flagged_as_runs(tmp_path):
     # three solid stems inside one envelope claim (as joint_tree's clump test): the profiles show them apart
     stems = np.array([[0.0, 0.0, 0.045], [0.075, 0.025, 0.04], [0.02, 0.085, 0.035]])
