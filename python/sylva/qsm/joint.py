@@ -204,6 +204,12 @@ def joint_tree(scans, a, b, r_prior, parent, context=None, params: JointParams =
 #: opaque run: existence, and the radius the prior cut by any bounds) are bounded.
 SupportFlag = IntFlag("SupportFlag", _core.qsm_support_flags())
 
+#: Why a ``RUNS`` or ``HULL`` piece's exact fit isn't used (bits of :func:`support_tree`'s ``refused``): ``NO_SEED``
+#: (no run made a seed), ``NO_PULSES`` (none left to fit), ``UNCONVERGED`` (Newton didn't reach its stopping rule),
+#: ``NON_FINITE``, ``BOUND`` (one stem narrower than the piece's detection bound) and ``UNINFORMED`` (a stem whose
+#: message says nothing of its radius).
+SupportRefusal = IntFlag("SupportRefusal", _core.qsm_support_refusals())
+
 #: How a classified echo (``echoes`` of :func:`support_tree` and :func:`joint_tree`) got its ``p_wood``:
 #: ``MEASURED``, ``BOUNDED``, ``POROUS`` and ``ROUTED`` (a routed piece with no exact fit accepted) by whether it lies
 #: on its piece's circle's front arc (the piece's own, or the tree's) times its echo character's weight, off the arc
@@ -244,15 +250,17 @@ def support_tree(scans, a, b, r_prior, parent, params: JointParams = JointParams
     radius (as a piece's own circle is), scored by every scan's woody stops on their front arcs, hulls dropped,
     strongest first and at most 4. Its pulses are taken once about the claim's axis (the measured and bounded pieces
     of a first solve own the stops they explain better), each seed seeing them from its own leaning axis; every other
-    pulse is fitted (fewer on a piece of more than 4,000), and 1, 2, ... stems, each from its seed, by Newton (each
+    pulse is fitted (fewer on a piece of more than 8,000, so about 4,000 are), and 1, 2, ... stems, each from its seed, by Newton (each
     pulse seen from the stem it meets first, each stem its own foliage) while the fits converge and BIC on the same
     pulses rises. Each stem's likelihood message (foliage integrated out), its information scaled to all the pulses
     and discounted by their correlation (``exist_scale``), with ``model_sd`` added to its variances, measures the
-    piece's centre and R in the tree, the lean its seed's: the stem starting nearest its parent's end continues the
-    piece; another continues a stem of a routed parent piece that ends where it starts, or else is a node beside it
-    (its parent's child by a fork term on its share of the stems' area). A fit that didn't converge, or whose one
-    stem is narrower than the piece's detection bound, isn't used: the piece is the prior cut by its upper bound and
-    capacity floor.
+    piece's centre and R in the tree, the lean its seed's: of the stems starting near its parent's end (within the
+    larger radius and 2 cm), the one whose message says most of its radius continues the piece (the nearest where
+    none is that near); another continues a stem of a routed parent piece that ends where it starts, or else is a
+    node beside it (its parent's child by a fork term on its share of the stems' area). A fit is refused
+    (:class:`SupportRefusal`, ``refused``) where there is no seed or no pulse left, Newton didn't converge, a stem
+    isn't finite or its message says nothing of its radius, or its one stem is narrower than the piece's detection
+    bound; the piece is then the prior cut by its upper bound and capacity floor.
 
     Every stop is classified (``echoes``): by whether it lies on its piece's circle's front arc (its own, or the
     tree's) times its echo character's weight, or on a routed piece with an exact fit by the exact likelihood's wood
@@ -303,10 +311,10 @@ def support_tree(scans, a, b, r_prior, parent, params: JointParams = JointParams
     - a routed piece's exact fit (a row's: the most stems and the sums): ``k_stems`` (the stems that entered the
       tree; 0: none, or the fit refused), ``split_gain`` (the BIC of those stems over one, NaN for one), ``n_exact``
       (its routed pulses) and ``evals_value``, ``evals_deriv`` (its pair evaluations, of the value alone and with
-      derivatives: per routed pulse, its passes);
+      derivatives: per routed pulse, its passes), and ``refused`` (:class:`SupportRefusal` bits: why its fit wasn't
+      used, 0 where it was or the piece isn't routed);
 
-    and per tree ``converged``, whether the censored solve settled; ``phases``, the CPU seconds of each part of the
-    fit (exact on one thread); and ``echoes``, one record per stop of the tree
+    and per tree ``converged``, whether the censored solve settled; and ``echoes``, one record per stop of the tree
     (of an echo several pieces saw, the one whose surface it lies nearest), keyed as the tile sidecars are: ``scan``
     (an index into ``scans``), ``pulse`` (the pulse's row in its Shots file), ``echo`` (its place in the pulse);
     with ``p_wood`` (the chance it is wood's echo), ``node`` (its piece or stem, in ``pieces``), ``path``

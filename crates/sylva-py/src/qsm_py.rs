@@ -736,6 +736,13 @@ fn qsm_support_flags() -> Vec<(&'static str, u8)> {
     vec![("RUNS", RUNS), ("HULL", HULL), ("BOUNDS", BOUNDS), ("POROUS", POROUS)]
 }
 
+/// The names of the `refused` bits of `qsm_support_tree`.
+#[pyfunction]
+fn qsm_support_refusals() -> Vec<(&'static str, u8)> {
+    use support_tree::refusal::*;
+    vec![("NO_SEED", NO_SEED), ("NO_PULSES", NO_PULSES), ("UNCONVERGED", UNCONVERGED), ("NON_FINITE", NON_FINITE), ("BOUND", BOUND), ("UNINFORMED", UNINFORMED)]
+}
+
 /// A support fit's rows or pieces as a dict of arrays.
 fn support_fit<'py>(py: Python<'py>, f: support_tree::Fit) -> PyResult<Bound<'py, PyDict>> {
     let n = f.r.len();
@@ -762,6 +769,7 @@ fn support_fit<'py>(py: Python<'py>, f: support_tree::Fit) -> PyResult<Bound<'py
     d.set_item("n_exact", f.n_exact.into_pyarray(py))?;
     d.set_item("evals_value", f.evals_value.into_pyarray(py))?;
     d.set_item("evals_deriv", f.evals_deriv.into_pyarray(py))?;
+    d.set_item("refused", f.refused.into_pyarray(py))?;
     Ok(d)
 }
 
@@ -786,16 +794,12 @@ fn qsm_support_tree<'py>(py: Python<'py>, scans: Vec<Bound<'py, PyScanIndex>>, a
     d.set_item("pieces", pieces)?;
     d.set_item("converged", f.converged)?;
     d.set_item("echoes", echoes_to_py(py, f.echoes)?)?;
-    let phases = PyDict::new(py);
-    for (k, v) in f.phases {
-        phases.set_item(k, v)?;
-    }
-    d.set_item("phases", phases)?;
     Ok(d)
 }
 
 pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(qsm_support_flags, m)?)?;
+    m.add_function(wrap_pyfunction!(qsm_support_refusals, m)?)?;
     m.add_function(wrap_pyfunction!(qsm_echo_paths, m)?)?;
     m.add_function(wrap_pyfunction!(qsm_support_tree, m)?)?;
     m.add_function(wrap_pyfunction!(qsm_joint_defaults, m)?)?;
