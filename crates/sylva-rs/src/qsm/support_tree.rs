@@ -140,6 +140,9 @@ use crate::transform::{cross, dot, sub};
 use crate::Point;
 
 mod routed;
+mod site;
+
+pub use site::{site_prior, SitePrior, REACH_MIN};
 
 /// Why a piece's own summary is not used (bits of [`Fit::flags`]): [`RUNS`] and [`HULL`] pieces are fitted by the
 /// exact likelihood ([`routed`]), [`BOUNDS`] and [`POROUS`] ones are bounded.
@@ -1220,6 +1223,8 @@ struct Nodes {
     frame: Vec<Frame>,
     a: Vec<Point>,
     further: Vec<Option<Further>>,
+    /// The reach at each node's middle: the path to the furthest tip beyond it (m, at least [`REACH_MIN`]).
+    reach: Vec<f64>,
 }
 
 impl Nodes {
@@ -1229,6 +1234,7 @@ impl Nodes {
         self.parent.push(from.or(self.parent[k]));
         self.frame.push(self.frame[k]);
         self.a.push(self.a[k]);
+        self.reach.push(self.reach[k]);
         self.further.push(Some(Further { piece: k, stem, share: from.is_none().then_some(share) }));
     }
 
@@ -1238,7 +1244,8 @@ impl Nodes {
     }
 
     fn of(rows: &Rows, fr: &[Frame]) -> Self {
-        let mut nd = Nodes { row: Vec::new(), first: Vec::new(), parent: Vec::new(), frame: Vec::new(), a: Vec::new(), further: Vec::new() };
+        let mut nd = Nodes { row: Vec::new(), first: Vec::new(), parent: Vec::new(), frame: Vec::new(), a: Vec::new(), further: Vec::new(), reach: Vec::new() };
+        let end = site::reach_ends(rows.parent, &fr.iter().map(|f| f.3).collect::<Vec<_>>());
         for (k, &(u, e1, e2, len)) in fr.iter().enumerate() {
             let m = (len / PIECE_LEN - 1e-9).ceil().max(1.0) as usize;
             let pl = len / m as f64;
@@ -1250,6 +1257,7 @@ impl Nodes {
                     _ => Some(nd.row.len() - 1),
                 });
                 nd.further.push(None);
+                nd.reach.push((end[k] + len - (j as f64 + 0.5) * pl).max(REACH_MIN));
                 nd.row.push(k);
                 nd.frame.push((u, e1, e2, pl));
                 nd.a.push(std::array::from_fn(|i| rows.a[k][i] + j as f64 * pl * u[i]));
@@ -1763,7 +1771,9 @@ fn prior_system(rows: &Rows, nd: &Nodes, p: &PriorParams, forks: &[Option<f64>],
             factors.push((vec![(k, 4, 1.0), (q, 4, -1.0)], m, p.sig_fork / fork_w[k].sqrt()));
             continue;
         }
-        factors.push((vec![(k, 4, 1.0), (q, 4, -1.0)], eta0[k] - eta0[q], p.sig_eta * ls));
+        // the taper's step: the site's rate on the reach where it has one, else RCT's
+        let step = if p.taper.is_nan() { eta0[k] - eta0[q] } else { p.taper * (nd.reach[k].ln() - nd.reach[q].ln()) };
+        factors.push((vec![(k, 4, 1.0), (q, 4, -1.0)], step, p.sig_eta * ls));
         // the child's start (its centre less half its length's lean) at the parent's end, in the child's frame
         let (ek, eq) = ([nd.frame[k].1, nd.frame[k].2], [nd.frame[q].1, nd.frame[q].2]);
         let lq = nd.frame[q].3;
@@ -1881,6 +1891,23 @@ mod tests {
 
     fn summary(outcome: Outcome, bounds: Vec<Bound>) -> Summary {
         Summary { outcome, chi2_front: f64::NAN, n_runs: 1, n_scans: 1, n_pairs: 100, bounds, log_odds: 0.0, seeds: Vec::new(), exact: None, stops: Vec::new() }
+    }
+
+    #[test]
+    fn a_site_taper_steps_by_the_reach_and_rct_steps_by_its_own() {
+        // a chain of three upright 30 cm rows, nothing measured: the reach at their middles is 0.75, 0.45 and 0.15 m
+        let rows_a = [[0.0, 0.0, 0.0], [0.0, 0.0, 0.3], [0.0, 0.0, 0.6]];
+        let rows_b = [[0.0, 0.0, 0.3], [0.0, 0.0, 0.6], [0.0, 0.0, 0.9]];
+        let rows = Rows { a: &rows_a, b: &rows_b, r_prior: &[0.05, 0.05, 0.04], r_max: &[], parent: &[-1, 0, 1] };
+        let fr = frames(&rows_a, &rows_b);
+        let nd = Nodes::of(&rows, &fr);
+        assert!(nd.reach.iter().zip([0.75, 0.45, 0.15]).all(|(a, b)| (a - b).abs() < 1e-12), "{:?}", nd.reach);
+        let sums = vec![summary(Outcome::Bounded, Vec::new()), summary(Outcome::Bounded, Vec::new()), summary(Outcome::Bounded, Vec::new())];
+        let solve = |p: &PriorParams| tree_solve(&rows, &fr, &nd, &sums, p, EP_ROUNDS).unwrap().0.x;
+        let x = solve(&PriorParams { taper: 0.5, ..PriorParams::default() });
+        assert!((x[1][4] - x[0][4] - 0.5 * (0.45f64 / 0.75).ln()).abs() < 1e-9 && (x[2][4] - x[1][4] - 0.5 * (0.15f64 / 0.45).ln()).abs() < 1e-9);
+        let x = solve(&PriorParams::default());
+        assert!((x[1][4] - x[0][4]).abs() < 1e-9 && (x[2][4] - x[1][4] - 0.8f64.ln()).abs() < 1e-9);
     }
 
     #[test]

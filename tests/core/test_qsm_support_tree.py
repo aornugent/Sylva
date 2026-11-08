@@ -4,7 +4,7 @@ import numpy as np
 import pytest
 
 from sylva import PointCloud
-from sylva.qsm import EchoPath, JointParams, ScanIndex, SupportFlag, support_tree
+from sylva.qsm import EchoPath, JointParams, ScanIndex, SupportFlag, site_prior, support_tree
 
 # the synthetic VZ-400i beam's detection share, calibrated on its vertical stems (3dtrees research 93 §10), and its
 # echo character: wood reflects 0.5 (-3 dB) and these scenes hold no leaf
@@ -139,3 +139,33 @@ def test_a_clump_of_stems_is_flagged_as_runs(tmp_path):
         support_tree(scans, a, b, [0.093, 0.093], [0, 0], params=PARAMS)
     with pytest.raises(TypeError):
         support_tree(scans, a, b, [0.093, 0.093], [-1, 0], params=dataclasses.asdict(PARAMS))
+
+
+def test_a_site_prior_is_learned_from_measured_rows_and_is_joint_params():
+    # 30 stems of six 20 cm rows forking into two of six, every radius measured: a taper of 0.3 per log reach between
+    # forks and children of half the area (mu_fork 0), with a little noise (the Rust test recovers noisier truth)
+    rng = np.random.default_rng(1)
+    trees = []
+    for _ in range(30):
+        a = [[0, 0, 0.2 * j] for j in range(6)] + [[s * 0.1 * j, 0, 1.2 + 0.2 * j] for s in (-1, 1) for j in range(6)]
+        b = [[0, 0, 0.2 * (j + 1)] for j in range(6)] + [[s * 0.1 * (j + 1), 0, 1.4 + 0.2 * j] for s in (-1, 1) for j in range(6)]
+        parent = list(range(-1, 5)) + [5, 6, 7, 8, 9, 10] + [5, 12, 13, 14, 15, 16]
+        ln = np.linalg.norm(np.subtract(b, a), axis=1)
+        end = np.zeros(18)
+        for k in range(17, -1, -1):
+            if parent[k] >= 0:
+                end[parent[k]] = max(end[parent[k]], end[k] + ln[k])
+        reach = np.maximum(end + ln / 2, 0.1)
+        eta = np.zeros(18)
+        for k in range(18):
+            q = parent[k]
+            eta[k] = np.log(0.08) if q < 0 else eta[q] + (0.5 * np.log(0.5) if k in (6, 12) else 0.3 * np.log(reach[k] / reach[q]))
+        trees.append((a, b, np.full(18, 0.05), parent, np.exp(eta + 0.02 * rng.standard_normal(18))))
+    sp = site_prior(trees)
+    assert sp["n_forks"] == 60 and sp["n_steps"] == 30 * 15
+    assert abs(sp["taper"] - 0.3) < 0.05 and abs(sp["mu_fork"]) < 0.05 and sp["noise"] < 0.04
+    # its values are JointParams'
+    p = dataclasses.replace(JointParams(), **{k: sp[k] for k in ("mu_fork", "sig_fork", "taper", "sig_eta")})
+    assert p.taper == sp["taper"] and np.isnan(JointParams().taper)
+    with pytest.raises(ValueError, match="at least 10"):
+        site_prior(trees[:2])
