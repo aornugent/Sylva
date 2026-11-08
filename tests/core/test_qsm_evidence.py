@@ -201,6 +201,6 @@ def test_a_clump_of_stems_comes_out_as_its_stems(tmp_path):
             assert np.hypot(*(centres[k] - [x, y])) < 0.01 and abs(np.log(f["r"][mine][k] / r)) < 0.12
     assert (f["p_wood"] > 0.99).all() and (f["reason"] == JointReason.MEASURED).all() and f["converged"]
     whole = joint_tree(scans, a, b, [0.093, 0.093], [-1, 0], params=params, split=[False, False])
-    assert list(whole["src"]) == [0, 1] and (whole["r"] > 0.07).all()  # as claimed, the envelope stays
+    assert list(whole["src"]) == [0, 1] and (whole["r"] > 0.06).all()  # as claimed, the envelope stays (~ the stems' area)
     with pytest.raises(ValueError, match="version"):
         joint_tree(scans, a, b, [0.093, 0.093], [-1, 0], params=dataclasses.replace(params, version=0))

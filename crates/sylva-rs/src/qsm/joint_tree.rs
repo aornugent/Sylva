@@ -21,7 +21,9 @@
 //!   table. Each stop seen by several rows belongs to the one whose surface
 //!   it lies nearest; the neighbours, held at their claims, keep theirs and
 //!   aren't fitted. Ownership from the starting state, then the fit
-//!   ([`joint_fit`]), `sweeps` times.
+//!   ([`joint_fit`]), `sweeps` times. The first fit is each row alone through
+//!   the continuation (its mode: research 74 §21); the tree's fits follow at
+//!   the physical kernel, with local step control.
 //! - **Existence.** Each row's own log likelihood at its fit against its best
 //!   without wood (`R` -> 0, foliage refitted), less a BIC price for the
 //!   three wood unknowns, `sigma(delta - 1.5 ln n_pairs)`, times the chance
@@ -64,7 +66,7 @@ pub struct TreeParams {
 
 impl TreeParams {
     /// Bumped whenever the fit changes for the same settings.
-    pub const VERSION: u32 = 2;
+    pub const VERSION: u32 = 3;
 }
 
 impl Default for TreeParams {
@@ -215,7 +217,24 @@ pub fn joint_tree(scans: &[&ScanIndex], rows: &Rows, ctx_a: &[Point], ctx_b: &[P
             mine.row.push(t.row[i]);
             mine.scan.push(t.scan[i]);
         }
-        let opts = FitOptions { schedule: if sweep == 0 { SCHEDULE.to_vec() } else { Vec::new() }, iters: params.iters, tol: params.tol, threads };
+        if sweep == 0 {
+            // each row's mode: the row alone on its own pairs (ownership held, no tree prior) through the
+            // continuation from its claim. Its likelihood is multimodal (thin wood and foliage, or the wood the claim
+            // says, research 74 §21), and which mode a whole-tree continuation reaches is chaotic in its path; alone,
+            // each row's continuation is short and its own
+            let alone_parent = vec![-1i64; m];
+            let alone = Rows { parent: &alone_parent, ..fit_rows };
+            let o = FitOptions { schedule: SCHEDULE.to_vec(), iters: params.iters, tol: params.tol, threads, local: true };
+            let f = joint_fit(&mine.pulses, &mine.row, &mine.scan, &alone, scans.len(), p, &params.prior, &o, Some(&theta))?;
+            converged &= f.converged;
+            theta = f.theta;
+            // the tree's first fit starts from the rows' modes, with the stops they own
+            if params.sweeps > 1 {
+                sweep += 1;
+                continue;
+            }
+        }
+        let opts = FitOptions { schedule: Vec::new(), iters: params.iters, tol: params.tol, threads, local: true };
         let f = joint_fit(&mine.pulses, &mine.row, &mine.scan, &fit_rows, scans.len(), p, &params.prior, &opts, Some(&theta))?;
         theta = f.theta.clone();
         converged &= f.converged;
@@ -366,7 +385,7 @@ fn first_circle(pu: &Pulse, circles: &[(f64, f64, f64)], p: &JointParams) -> usi
 #[allow(clippy::too_many_arguments)]
 fn split_gain(pulses: &[Pulse], scan: &[u32], n_scans: usize, a: Point, b: Point, r: f64, circles: &[(f64, f64, f64)], params: &TreeParams, threads: usize) -> Result<f64> {
     let p = &params.like;
-    let opts = FitOptions { schedule: SCHEDULE.to_vec(), iters: params.iters, tol: params.tol, threads };
+    let opts = FitOptions { schedule: SCHEDULE.to_vec(), iters: params.iters, tol: params.tol, threads, local: false };
     let (_, e1, e2, _) = frames(&[a], &[b])[0];
     // the log likelihood of the pulses as the stems `cs` (offsets and radii in the row's frame), at their fit
     let stems = |cs: &[(f64, f64, f64)]| -> Result<f64> {
