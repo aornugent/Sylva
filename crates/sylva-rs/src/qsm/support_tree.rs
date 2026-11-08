@@ -1370,7 +1370,7 @@ pub fn support_tree(scans: &[&ScanIndex], rows: &Rows, like: &JointParams, prior
         let area: f64 = e.stems.iter().map(|c| c.x[4] * c.x[4]).sum();
         let mut node = vec![k as u32; e.stems.len()];
         let mut taken: Vec<usize> = Vec::new();
-        for (j, c) in e.stems.iter().enumerate().filter(|&(j, _)| j != lead) {
+        for (s, (j, c)) in e.stems.iter().enumerate().filter(|&(j, _)| j != lead).enumerate() {
             let from = nd.parent[k].and_then(|q| further[q].iter().copied().filter(|m| !taken.contains(m))
                 .map(|m| (m, gap(&ends[m], &start(c))))
                 .filter(|&(m, d)| d < c.x[4].max(sums[m].exact.map_or(0.0, |x| x.x[4])) + 0.02)
@@ -1378,7 +1378,7 @@ pub fn support_tree(scans: &[&ScanIndex], rows: &Rows, like: &JointParams, prior
             taken.extend(from);
             node[j] = nd.row.len() as u32;
             further[k].push(nd.row.len());
-            nd.push_stem(k, j as u32, from, c.x[4] * c.x[4] / area);
+            nd.push_stem(k, s as u32 + 1, from, c.x[4] * c.x[4] / area);
             let s = &sums[k];
             sums.push(Summary { outcome: s.outcome, chi2_front: f64::NAN, n_runs: s.n_runs, n_scans: s.n_scans, n_pairs: 0, bounds: Vec::new(), log_odds: s.log_odds, seeds: Vec::new(), exact: Some(*c), stops: Vec::new() });
             exact.push(ExactOut::default());
