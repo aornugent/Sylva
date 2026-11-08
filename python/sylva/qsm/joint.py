@@ -250,7 +250,7 @@ def support_tree(scans, a, b, r_prior, parent, params: JointParams = JointParams
     radius (as a piece's own circle is), scored by every scan's woody stops on their front arcs, hulls dropped,
     strongest first and at most 4. Its pulses are taken once about the claim's axis (the measured and bounded pieces
     of a first solve own the stops they explain better), each seed seeing them from its own leaning axis; every other
-    pulse is fitted (fewer on a piece of more than 8,000, so about 4,000 are), and 1, 2, ... stems, each from its seed, by Newton (each
+    pulse is fitted (fewer on a piece of more than 8,000, so at most about 4,000 are), and 1, 2, ... stems, each from its seed, by Newton (each
     pulse seen from the stem it meets first, each stem its own foliage) while the fits converge and BIC on the same
     pulses rises. Each stem's likelihood message (foliage integrated out), its information scaled to all the pulses
     and discounted by their correlation (``exist_scale``), with ``model_sd`` added to its variances, measures the
