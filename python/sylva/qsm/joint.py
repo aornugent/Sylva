@@ -16,7 +16,7 @@ neighbours' cylinders in, a fitted row per stem out, with existence and the
 split of clumps into stems. :func:`joint_table` and :func:`joint_fit` are its
 parts, for research: the pairs, and the fit of a table.
 
-The parameters are a mapping of named numbers:
+The parameters are a :class:`JointParams`, whose fields are:
 
 - the likelihood: ``exit`` and ``divergence`` (the beam's diameter at the
   aperture, m, and full divergence, rad), ``sigma_r`` (range noise, m),
@@ -223,7 +223,7 @@ def joint_fit(table, a, b, r_prior, parent, n_scans: int, params, *, r_max=None,
     n_scans
         Number of scans the table's ``scan`` indexes.
     params
-        The likelihood's and the prior's named numbers (module documentation).
+        :class:`JointParams` (its likelihood's and prior's fields).
     r_max
         ``(n,)`` largest radius each row can take, the tube its pairs were
         taken in (default: unbounded).
@@ -262,5 +262,7 @@ def joint_fit(table, a, b, r_prior, parent, n_scans: int, params, *, r_max=None,
     parent = np.ascontiguousarray(parent, np.int64)
     if theta0 is not None:
         theta0 = np.ascontiguousarray(theta0, np.float64)
-    return _core.qsm_joint_fit(table, a, b, r_prior, r_max, parent, int(n_scans), dict(params), [float(s) for s in schedule],
+    if not isinstance(params, JointParams):
+        raise TypeError("joint_fit: params must be JointParams")
+    return _core.qsm_joint_fit(table, a, b, r_prior, r_max, parent, int(n_scans), dataclasses.asdict(params), [float(s) for s in schedule],
                                int(iters), float(tol), theta0, int(threads))
