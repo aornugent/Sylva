@@ -431,8 +431,10 @@ def tile_ray_clouds(files, out, width: float = 25.0, buffer: float = 5.0, voxel:
     first echo per ``voxel`` in file order, and written with their rays from
     the scanner. Misses are not written (``rayextract`` ignores them).
 
-    Writes ``out/tiles/<kx>_<ky>/cloud.ply`` (``time`` = row), ``scan.u16``
-    (each ray's index into ``files``) and ``out/terrain.ply`` (each tile's own
+    Writes ``out/tiles/<kx>_<ky>/cloud.ply`` (``time`` = row) with sidecars in
+    cloud order that name each ray's echo exactly: ``scan.u16`` (its index into
+    ``files``), ``pulse.u32`` (its pulse's row in that file) and ``echo.u8``
+    (its place in the pulse, from 0); and ``out/terrain.ply`` (each tile's own
     cell at ``terrain_voxel``). Memory is one row group per file and
     ``threads`` tiles at a time.
 
