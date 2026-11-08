@@ -354,6 +354,10 @@ pub struct JointParams {
     /// The floor on each support measurement's sd (m): non-round sections and a ~4 mm offset between scans that
     /// no sway explains (3dtrees research 93 §15.6). Read by [`crate::qsm::support_tree`] only.
     pub model_sd: f64,
+    /// Which pulses a routed piece of more pairs than its budget fits ([`crate::qsm::support_tree`]'s thinning, a
+    /// hash of each pulse's direction and this): 0 in production; the bench varies it to measure the thinning's noise
+    /// (3dtrees research 93 §19). Read by [`crate::qsm::support_tree`] only.
+    pub thin_seed: u64,
 }
 
 impl Default for JointParams {
@@ -362,7 +366,7 @@ impl Default for JointParams {
         JointParams {
             exit: 0.007, divergence: 0.35e-3, sigma_r: 0.005, rough: 0.03, tau: 0.11, edge: 0.5, eps: 0.1, eps_min: 0.01, mp_len: 0.5, hide: 0.09,
             refl_wood: -15.45, refl_wood_sd: 1.0, refl_leaf: -19.7, refl_leaf_sd: 1.4, refl_multi: -3.0, refl_multi_sd: 1.2,
-            refl_thin: -3.0, stop_wood: 0.99, stop_leaf: 0.1, exist_scale: 0.2, model_sd: 0.004,
+            refl_thin: -3.0, stop_wood: 0.99, stop_leaf: 0.1, exist_scale: 0.2, model_sd: 0.004, thin_seed: 0,
         }
     }
 }

@@ -513,7 +513,8 @@ fn joint_params(params: &Bound<'_, PyDict>) -> PyResult<JointParams> {
     let get = |k: &str| -> PyResult<f64> { params.get_item(k)?.ok_or_else(|| PyValueError::new_err(format!("joint params: no {k:?}")))?.extract() };
     Ok(JointParams { exit: get("exit")?, divergence: get("divergence")?, sigma_r: get("sigma_r")?, rough: get("rough")?, tau: get("tau")?, edge: get("edge")?, eps: get("eps")?, eps_min: get("eps_min")?, mp_len: get("mp_len")?, hide: get("hide")?,
         refl_wood: get("refl_wood")?, refl_wood_sd: get("refl_wood_sd")?, refl_leaf: get("refl_leaf")?, refl_leaf_sd: get("refl_leaf_sd")?, refl_multi: get("refl_multi")?, refl_multi_sd: get("refl_multi_sd")?,
-        refl_thin: get("refl_thin")?, stop_wood: get("stop_wood")?, stop_leaf: get("stop_leaf")?, exist_scale: get("exist_scale")?, model_sd: get("model_sd")? })
+        refl_thin: get("refl_thin")?, stop_wood: get("stop_wood")?, stop_leaf: get("stop_leaf")?, exist_scale: get("exist_scale")?, model_sd: get("model_sd")?,
+        thin_seed: params.get_item("thin_seed")?.ok_or_else(|| PyValueError::new_err("joint params: no \"thin_seed\""))?.extract()? })
 }
 
 fn rows<const K: usize>(a: PyReadonlyArray2<f64>, what: &str) -> PyResult<Vec<[f64; K]>> {
@@ -623,7 +624,7 @@ fn qsm_joint_fit<'py>(py: Python<'py>, table: Bound<'py, PyDict>, a: PyReadonlyA
 
 const JOINT_LIKE: [&str; 21] = ["exit", "divergence", "sigma_r", "rough", "tau", "edge", "eps", "eps_min", "mp_len", "hide", "refl_wood", "refl_wood_sd", "refl_leaf", "refl_leaf_sd", "refl_multi", "refl_multi_sd", "refl_thin", "stop_wood", "stop_leaf", "exist_scale", "model_sd"];
 const JOINT_PRIOR: [&str; 18] = ["lam_prior", "lam_sd", "sig_ell", "sig_eta", "mu_fork", "sig_fork", "sig_root", "r_tip", "sig_tip", "sig_delta", "centre_rel", "centre_abs", "scan_abs", "scan_rel", "lean_sd", "lean_bend", "exist", "exist_off"];
-const JOINT_TREE: [&str; 8] = ["version", "iters", "tol", "sweeps", "split_min_r", "split_through", "split_min_votes", "drop"];
+const JOINT_TREE: [&str; 9] = ["version", "thin_seed", "iters", "tol", "sweeps", "split_min_r", "split_through", "split_min_votes", "drop"];
 
 /// The default settings of `qsm_joint_tree`, flat.
 #[pyfunction]
@@ -638,6 +639,7 @@ fn qsm_joint_defaults(py: Python<'_>) -> PyResult<Bound<'_, PyDict>> {
         d.set_item(k, v)?;
     }
     d.set_item("version", TreeParams::VERSION)?;
+    d.set_item("thin_seed", l.thin_seed)?;
     d.set_item("iters", t.iters)?;
     d.set_item("tol", t.tol)?;
     d.set_item("sweeps", t.sweeps)?;
