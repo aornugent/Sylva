@@ -156,9 +156,7 @@ def test_a_cylinder_without_length_gets_no_evidence(tmp_path):
     assert e["mu"][1] == evidence([scan], a, b)["mu"][0]
 
 
-JOINT = dict(exit=0.007, divergence=0.35e-3, sigma_r=0.005, rough=0.03, tau=0.17, edge=0.25, eps=0.1, eps_min=0.01, mp_len=0.5, hide=0.0,
-             lam_prior=1.0, lam_sd=2.0, sig_ell=1.0, sig_eta=0.05, mu_fork=0.0, sig_fork=0.17, sig_root=0.5, r_tip=0.0,
-             sig_tip=0.3, sig_delta=0.02, centre_rel=0.3, centre_abs=0.003, scan_abs=0.0, scan_rel=0.0)
+JOINT = JointParams(tau=0.17, edge=0.25, hide=0.0, mu_fork=0.0, centre_rel=0.3, scan_abs=0.0, scan_rel=0.0)
 
 
 def test_the_joint_fit_brings_a_fat_claim_down_to_the_stem(tmp_path):
@@ -169,9 +167,11 @@ def test_the_joint_fit_brings_a_fat_claim_down_to_the_stem(tmp_path):
     assert f["converged"] and f["exact"] and np.exp(f["theta"][0, 2]) == pytest.approx(0.05, abs=0.003)
     assert f["profile"].shape == (1, 21) and f["hess"].shape == (1, 4, 4) and f["rho_local"][0] > 0.9
     with pytest.raises(ValueError, match="sig_eta"):
-        joint_fit(t, a, b, r_prior=[0.08], parent=[-1], n_scans=1, params={**JOINT, "sig_eta": 0.0})
-    with pytest.raises(ValueError, match="edge"):
-        joint_fit(t, a, b, r_prior=[0.08], parent=[-1], n_scans=1, params={k: v for k, v in JOINT.items() if k != "edge"})
+        joint_fit(t, a, b, r_prior=[0.08], parent=[-1], n_scans=1, params=dataclasses.replace(JOINT, sig_eta=0.0))
+    with pytest.raises(ValueError, match="version"):
+        joint_fit(t, a, b, r_prior=[0.08], parent=[-1], n_scans=1, params=dataclasses.replace(JOINT, version=0))
+    with pytest.raises(TypeError):
+        joint_fit(t, a, b, r_prior=[0.08], parent=[-1], n_scans=1, params=dataclasses.asdict(JOINT))
 
 
 def test_a_clump_of_stems_comes_out_as_its_stems(tmp_path):

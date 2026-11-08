@@ -425,7 +425,8 @@ fn evidence_params_from_py(d: &Bound<'_, PyDict>) -> PyResult<EvidenceParams> {
     if get("version")?.extract::<u32>()? != EvidenceParams::VERSION {
         return Err(PyValueError::new_err(format!("evidence params: version {} is not this Sylva's ({})", get("version")?, EvidenceParams::VERSION)));
     }
-    if d.len() != 17 {
+    let known = evidence_params_to_py(d.py(), &EvidenceParams::default())?;
+    if d.len() != known.len() || d.keys().iter().any(|k| !known.contains(&k).unwrap_or(false)) {
         return Err(PyValueError::new_err("evidence params: unexpected fields"));
     }
     Ok(EvidenceParams {
@@ -545,7 +546,7 @@ fn pulses_from(table: &Bound<'_, PyDict>) -> PyResult<Vec<Pulse>> {
 #[pyfunction]
 #[pyo3(signature = (table, state, params, threads=0))]
 fn qsm_joint_loglik<'py>(py: Python<'py>, table: Bound<'py, PyDict>, state: PyReadonlyArray2<f64>, params: Bound<'py, PyDict>, threads: usize) -> PyResult<Bound<'py, PyArray1<f64>>> {
-    let (pulses, state, p) = (pulses_from(&table)?, rows::<4>(state, "state")?, joint_params(&params)?);
+    let (pulses, state, p) = (pulses_from(&table)?, rows::<4>(state, "state")?, tree_params(&params)?.like);
     if state.len() != pulses.len() {
         return Err(PyValueError::new_err("joint: one state per pair"));
     }
@@ -592,9 +593,7 @@ fn qsm_joint_fit<'py>(py: Python<'py>, table: Bound<'py, PyDict>, a: PyReadonlyA
     let scan = dict_item(&table, "scan", "joint table")?.extract::<PyReadonlyArray1<u32>>()?.as_array().to_vec();
     let (a, b) = (xyz_from_py(a)?, xyz_from_py(b)?);
     let (r_prior, r_max, parent) = (r_prior.as_array().to_vec(), r_max.as_array().to_vec(), parent.as_array().to_vec());
-    let like = joint_params(&params)?;
-    let get = |k: &str| -> PyResult<f64> { dict_item(&params, k, "joint params")?.extract() };
-    let prior = PriorParams { lam_prior: get("lam_prior")?, lam_sd: get("lam_sd")?, sig_ell: get("sig_ell")?, sig_eta: get("sig_eta")?, mu_fork: get("mu_fork")?, sig_fork: get("sig_fork")?, sig_root: get("sig_root")?, r_tip: get("r_tip")?, sig_tip: get("sig_tip")?, sig_delta: get("sig_delta")?, centre_rel: get("centre_rel")?, centre_abs: get("centre_abs")?, scan_abs: get("scan_abs")?, scan_rel: get("scan_rel")? };
+    let TreeParams { like, prior, .. } = tree_params(&params)?;
     let theta0 = theta0.map(|t| rows::<4>(t, "theta0")).transpose()?;
     let opts = FitOptions { schedule, iters, tol, threads };
     let fit = py.detach(|| {
