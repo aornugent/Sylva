@@ -14,7 +14,9 @@ random walk of the centre and of foliage (3dtrees research 74).
 :func:`joint_tree` is the whole fit of one tree: the tree's rows and its
 neighbours' cylinders in, a fitted row per stem out, with existence and the
 split of clumps into stems. :func:`joint_table` and :func:`joint_fit` are its
-parts, for research: the pairs, and the fit of a table.
+parts, for research: the pairs, and the fit of a table. :func:`support_tree`
+is its fast path: each row's support function per scan and one linear solve
+over the tree, with flags for the rows that need :func:`joint_tree`.
 
 The parameters are a :class:`JointParams`, whose fields are:
 
@@ -39,7 +41,7 @@ The parameters are a :class:`JointParams`, whose fields are:
 from __future__ import annotations
 
 import dataclasses
-from enum import IntEnum
+from enum import IntEnum, IntFlag
 
 import numpy as np
 
@@ -160,6 +162,67 @@ def joint_tree(scans, a, b, r_prior, parent, context=None, params: JointParams =
     return _core.qsm_joint_tree([s._core for s in scans], f64(a), f64(b), f64(r_prior),
                                 np.ascontiguousarray(parent, np.int64), ca, cb, f64(cr), dataclasses.asdict(params),
                                 split, int(threads))
+
+
+#: Why a row's own support summary was left out of :func:`support_tree`'s tree (bits of its ``flags``): ``RUNS``
+#: (a scan's profile shows two or more stems within the claim), ``HULL`` (the support is wider than one circle
+#: explains: a multi-stem or non-round section), ``FEW`` (too few edges or depths to determine the circle),
+#: ``POROUS`` (pulses, but no opaque run).
+SupportFlag = IntFlag("SupportFlag", _core.qsm_support_flags())
+
+
+def support_tree(scans, a, b, r_prior, parent, params: JointParams = JointParams(), threads: int = 0) -> dict:
+    """Fits one tree from the support function of each row's cross-section: the fast path of :func:`joint_tree`.
+
+    Per (row, scan), the pulses in a tube around the row (wide enough for it to lean) reduce to a profile across
+    it: where they stopped, at what depth, and where they passed. Opaque wood's profile measures its section's
+    support function, linear in a circle's centre and radius: the silhouette's edges (each by maximum likelihood on
+    its hit/pass transition, the footprint and ``tau``/``edge`` of ``params``; an edge with no passes beyond it is
+    censored and left out), the front's depth, and the lean along the row. Per row, weighted least squares over its
+    scans gives the centre at its middle, the lean and the radius with their covariance; a stop is a hit only on
+    the first such circle's front arc (the second pass). A row is flagged (:class:`SupportFlag`) where one circle
+    can't summarise it, and its summary then stays out. The tree is one linear solve: the unflagged rows' summaries
+    and the prior of ``params`` (the base's level, the taper's steps, at a fork the child's share of the subtree
+    wood length, the centre's continuity along a branch and its anchor, a weak anchor of the lean), with three
+    Gauss-Newton steps for log R. Flagged rows rest on the prior: they are for :func:`joint_tree`.
+
+    Parameters
+    ----------
+    scans
+        :class:`ScanIndex` of each scan to use.
+    a, b, r_prior, parent
+        The tree's rows: ``(n, 3)`` axes, ``(n,)`` prior radii and parents (int; each before its child, -1 at a
+        base).
+    params
+        :class:`JointParams`: the likelihood's footprint, ``tau``, ``edge``, ``sigma_r`` and ``rough``, and the
+        prior's ``sig_eta``, ``mu_fork``, ``sig_fork``, ``sig_root``, ``sig_delta``, ``centre_rel`` and
+        ``centre_abs``; the rest are unused.
+    threads
+        Threads to use (0: one per core).
+
+    Returns
+    -------
+    dict, per row (``(n,)`` unless noted):
+
+    - ``src`` (the row) and ``parent``, as :func:`joint_tree`'s;
+    - ``a``, ``b`` ``(n, 3)``: the fitted axis, world coordinates (the claim moved by the centre and turned by the
+      lean); ``r``, ``sd_log_r``: the radius and its posterior sd in log;
+    - ``centre``, ``sd_centre``, ``lean``, ``sd_lean`` ``(n, 2)``: the centre at the row's middle (m) and the lean
+      (m per m of axis) along ``e1``, ``e2`` ``(n, 3)``, with their posterior sds;
+    - ``r_row``, ``sd_r_row``, ``chi2``: the row's own summary's radius, its sd, and its misfit (reduced
+      chi-square), NaN where it has none;
+    - ``flags`` (:class:`SupportFlag` bits) and ``measured`` (its summary entered the tree);
+    - ``n_runs`` (the most stems within the claim a scan's profile shows), ``n_scans`` (the scans that measured
+      it), ``n_pairs`` (its pulses).
+    """
+    if not all(isinstance(s, ScanIndex) for s in scans):
+        raise TypeError("support_tree: scans must be ScanIndex")
+    if not isinstance(params, JointParams):
+        raise TypeError("support_tree: params must be JointParams")
+    f64 = lambda x: np.ascontiguousarray(x, np.float64)  # noqa: E731
+    return _core.qsm_support_tree([s._core for s in scans], f64(a).reshape(-1, 3), f64(b).reshape(-1, 3),
+                                  f64(r_prior), np.ascontiguousarray(parent, np.int64), dataclasses.asdict(params),
+                                  int(threads))
 
 
 def joint_table(scans, a, b, window, threads: int = 0) -> dict[str, np.ndarray]:

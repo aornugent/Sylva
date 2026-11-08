@@ -19,6 +19,7 @@ use sylva_rs::qsm::evidence::{self, Beam, EvidenceParams, ScanIndex};
 use sylva_rs::qsm::joint::{self, JointParams, Owner, Pulse};
 use sylva_rs::qsm::joint_fit::{self, FitOptions, PriorParams, Rows};
 use sylva_rs::qsm::joint_tree::{self, TreeParams};
+use sylva_rs::qsm::support_tree;
 use sylva_rs::qsm::QsmParams;
 use sylva_rs::qsm::ops::{self as ops, Row, Segment};
 use sylva_rs::qsm::plot::{self as plot, ButtressView, PlotEntry, PlotParams};
@@ -704,7 +705,54 @@ fn qsm_joint_tree<'py>(py: Python<'py>, scans: Vec<Bound<'py, PyScanIndex>>, a: 
     Ok(d)
 }
 
+/// The names of the `flags` bits of `qsm_support_tree`.
+#[pyfunction]
+fn qsm_support_flags() -> Vec<(&'static str, u8)> {
+    use support_tree::flag::*;
+    vec![("RUNS", RUNS), ("HULL", HULL), ("FEW", FEW), ("POROUS", POROUS)]
+}
+
+/// Fits one tree from its rows' support summaries (see `sylva.qsm.support_tree`); `params` as `qsm_joint_tree`'s.
+#[pyfunction]
+#[pyo3(signature = (scans, a, b, r_prior, parent, params, threads=0))]
+#[allow(clippy::too_many_arguments)]
+fn qsm_support_tree<'py>(py: Python<'py>, scans: Vec<Bound<'py, PyScanIndex>>, a: PyReadonlyArray2<f64>, b: PyReadonlyArray2<f64>, r_prior: PyReadonlyArray1<f64>, parent: PyReadonlyArray1<i64>, params: Bound<'py, PyDict>, threads: usize) -> PyResult<Bound<'py, PyDict>> {
+    let (a, b) = (xyz_from_py(a)?, xyz_from_py(b)?);
+    let (r_prior, parent) = (r_prior.as_array().to_vec(), parent.as_array().to_vec());
+    let p = tree_params(&params)?;
+    let refs: Vec<&ScanIndex> = scans.iter().map(|s| &s.get().inner).collect();
+    let f = py.detach(|| {
+        let rows = Rows { a: &a, b: &b, r_prior: &r_prior, r_max: &[], parent: &parent };
+        support_tree::support_tree(&refs, &rows, &p.like, &p.prior, threads)
+    }).map_err(err)?;
+    let n = f.r.len();
+    let d = PyDict::new(py);
+    let xyz = |v: &[[f64; 3]]| v.concat().into_pyarray(py).reshape([n, 3]);
+    let two = |v: &[[f64; 2]]| v.concat().into_pyarray(py).reshape([n, 2]);
+    d.set_item("src", (0..n as u32).collect::<Vec<u32>>().into_pyarray(py))?;
+    d.set_item("parent", parent.into_pyarray(py))?;
+    d.set_item("a", xyz(&f.a)?)?;
+    d.set_item("b", xyz(&f.b)?)?;
+    d.set_item("e1", xyz(&f.e1)?)?;
+    d.set_item("e2", xyz(&f.e2)?)?;
+    d.set_item("centre", two(&f.centre)?)?;
+    d.set_item("sd_centre", two(&f.sd_centre)?)?;
+    d.set_item("lean", two(&f.lean)?)?;
+    d.set_item("sd_lean", two(&f.sd_lean)?)?;
+    for (k, v) in [("r", f.r), ("sd_log_r", f.sd_log_r), ("r_row", f.r_row), ("sd_r_row", f.sd_r_row), ("chi2", f.chi2)] {
+        d.set_item(k, v.into_pyarray(py))?;
+    }
+    d.set_item("flags", f.flags.into_pyarray(py))?;
+    d.set_item("measured", f.measured.into_pyarray(py))?;
+    d.set_item("n_runs", f.n_runs.into_pyarray(py))?;
+    d.set_item("n_scans", f.n_scans.into_pyarray(py))?;
+    d.set_item("n_pairs", f.n_pairs.into_pyarray(py))?;
+    Ok(d)
+}
+
 pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
+    m.add_function(wrap_pyfunction!(qsm_support_flags, m)?)?;
+    m.add_function(wrap_pyfunction!(qsm_support_tree, m)?)?;
     m.add_function(wrap_pyfunction!(qsm_joint_defaults, m)?)?;
     m.add_function(wrap_pyfunction!(qsm_joint_reasons, m)?)?;
     m.add_function(wrap_pyfunction!(qsm_joint_tree, m)?)?;
