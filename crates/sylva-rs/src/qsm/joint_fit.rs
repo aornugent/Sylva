@@ -70,9 +70,10 @@ pub struct PriorParams {
 
 impl Default for PriorParams {
     /// The calibration for TERN's Alice Mulga exports (3dtrees research 74 §14): real axes and scans are freer
-    /// than a synthetic bench's.
+    /// than a synthetic bench's, and RCT's taper is no guide to the rays' radii there (§21: rows fitted alone
+    /// disagree with its steps by ~1 in log R, which `sig_eta` 0.05 priced at ~10^6 log units).
     fn default() -> Self {
-        PriorParams { lam_prior: 1.0, lam_sd: 2.0, sig_ell: 1.0, sig_eta: 0.05, mu_fork: 0.10, sig_fork: 0.17, sig_root: 0.5, r_tip: 0.0, sig_tip: 0.3, sig_delta: 0.02, centre_rel: 1.0, centre_abs: 0.003, scan_abs: 0.002, scan_rel: 0.3 }
+        PriorParams { lam_prior: 1.0, lam_sd: 2.0, sig_ell: 1.0, sig_eta: 0.5, mu_fork: 0.10, sig_fork: 0.17, sig_root: 0.5, r_tip: 0.0, sig_tip: 0.3, sig_delta: 0.02, centre_rel: 1.0, centre_abs: 0.003, scan_abs: 0.002, scan_rel: 0.3 }
     }
 }
 
@@ -110,6 +111,12 @@ pub struct FitOptions {
     /// its maximum the decrement need not vanish.
     pub tol: f64,
     pub threads: usize,
+    /// Local step control: each row's step (and each nuisance pair's) is held
+    /// within its caps by its own scale, and each branch block backtracks on
+    /// its own share of the objective (the likelihood is separable by block),
+    /// the whole step then checked; else one scale and one line search for
+    /// the whole step, which one stiff row throttles.
+    pub local: bool,
 }
 
 /// The `eta - eta_hat` offsets of [`Fit::profile`].
@@ -381,6 +388,39 @@ impl<'a> Problem<'a> {
         Ok(ll + prior + nu)
     }
 
+    /// The objective split by branch block: its rows' pairs, its nuisances'
+    /// prior, and the prior factors whose first unknown is in it (a fork's
+    /// factor goes to the child's block).
+    /// With `only`, the likelihood of those blocks alone (the others' entries are then their priors only).
+    fn block_objective(&self, x: &[f64], like: &JointParams, only: Option<&[bool]>) -> Result<Vec<f64>> {
+        let (theta, nu) = self.split(x);
+        let mut out = vec![0.0; self.blocks.len()];
+        match only {
+            None => {
+                for (k, l) in self.row_loglik(&theta, &nu, like)?.into_iter().enumerate() {
+                    out[self.branch[k]] += l;
+                }
+            }
+            Some(only) => {
+                let sel: Vec<usize> = (0..self.pulses.len()).filter(|&i| only[self.branch[self.owners[i].row as usize]]).collect();
+                let pu: Vec<Pulse> = sel.iter().map(|&i| self.pulses[i]).collect();
+                let ow: Vec<Owner> = sel.iter().map(|&i| self.owners[i]).collect();
+                for (o, l) in ow.iter().zip(joint_loglik(&pu, &ow, &theta, &self.row_nu(&nu), like, self.threads)?) {
+                    out[self.branch[o.row as usize]] += l;
+                }
+            }
+        }
+        for f in &self.factors {
+            let r = f.vars.iter().map(|&(v, c)| c * x[v]).sum::<f64>() - f.mean;
+            out[self.loc(f.vars[0].0).0] -= 0.5 * f.w * r * r;
+        }
+        for (i, w) in self.nu_w.iter().enumerate() {
+            let v = 4 * self.n + i;
+            out[self.loc(v).0] -= 0.5 * w * x[v] * x[v];
+        }
+        Ok(out)
+    }
+
     fn empty_system(&self) -> System {
         System {
             h: self.blocks.iter().map(|bl| DMatrix::zeros(bl.dim, bl.dim)).collect(),
@@ -537,13 +577,15 @@ impl<'a> Problem<'a> {
     /// returns the iterations taken and whether it converged (see
     /// [`FitOptions::tol`]; else the iterations ran out, or no step along the
     /// Newton direction improved the objective).
-    fn newton(&self, x: &mut [f64], like: &JointParams, iters: usize, tol: f64) -> Result<(usize, bool)> {
+    fn newton(&self, x: &mut [f64], like: &JointParams, iters: usize, tol: f64, local: bool) -> Result<(usize, bool)> {
         const WINDOW: usize = 10;
         let mut obj = self.objective(x, like)?;
         if !obj.is_finite() {
             return Err(Error::invalid("joint fit: the objective isn't finite at the start"));
         }
         let mut history = vec![obj];
+        // the local line search's per-block objective at the accepted step, the next iteration's base
+        let mut next_base: Option<Vec<f64>> = None;
         for it in 0..iters {
             if history.len() > WINDOW && obj - history[history.len() - 1 - WINDOW] <= tol * (1.0 + obj.abs()) {
                 return Ok((it, true));
@@ -564,10 +606,68 @@ impl<'a> Problem<'a> {
             }
             // no unknown moves further than its cap in one step
             let scale = full.iter().zip(&self.cap).map(|(d, c)| d.abs() / c).fold(1.0, f64::max);
-            let (dir, slope) = (full.iter().map(|d| d / scale).collect::<Vec<f64>>(), dec / scale);
+            let uniform = || (full.iter().map(|d| d / scale).collect::<Vec<f64>>(), dec / scale);
+            let (dir, slope) = if local {
+                // each row, and each nuisance pair, within its caps by its own scale
+                let unit = |v: usize| if v < 4 * self.n { v / 4 } else { self.n + (v - 4 * self.n) / 2 };
+                let mut us = vec![1.0f64; self.n + self.n_var];
+                for (v, (d, c)) in full.iter().zip(&self.cap).enumerate() {
+                    us[unit(v)] = us[unit(v)].max(d.abs() / c);
+                }
+                let dir: Vec<f64> = full.iter().enumerate().map(|(v, d)| d / us[unit(v)]).collect();
+                let slope: f64 = g.iter().zip(&dir).map(|(g, d)| g * d).sum();
+                if slope > 0.0 { (dir, slope) } else { uniform() }
+            } else {
+                uniform()
+            };
+            let obj0 = obj;
             let mut alpha = 1.0;
             let mut accepted = false;
-            for _ in 0..40 {
+            if local {
+                // each branch block backtracks on its own share of the objective, then the whole step is checked
+                let nbk = self.blocks.len();
+                let mut slope_b = vec![0.0; nbk];
+                for v in 0..self.n_var {
+                    slope_b[self.loc(v).0] += g[v] * dir[v];
+                }
+                let base = match next_base.take() { Some(b) => b, None => self.block_objective(x, like, None)? };
+                let (mut al, mut done) = (vec![1.0f64; nbk], vec![false; nbk]);
+                let at = |al: &[f64]| -> Vec<f64> { (0..self.n_var).map(|v| x[v] + al[self.loc(v).0] * dir[v]).collect() };
+                for pass in 0..40 {
+                    let undone: Vec<bool> = done.iter().map(|d| !d).collect();
+                    let ob = self.block_objective(&at(&al), like, (pass > 0).then_some(&undone[..]))?;
+                    for b in (0..nbk).filter(|&b| !done[b]).collect::<Vec<_>>() {
+                        // (a block's sums differ in rounding between the full and the subset evaluation)
+                        if ob[b].is_finite() && ob[b] >= base[b] + 1e-4 * al[b] * slope_b[b] - 1e-10 * (1.0 + base[b].abs()) {
+                            done[b] = true;
+                        } else {
+                            al[b] *= 0.5;
+                            if al[b] < 1e-6 {
+                                (al[b], done[b]) = (0.0, true);
+                            }
+                        }
+                    }
+                    if done.iter().all(|&d| d) {
+                        break;
+                    }
+                }
+                for b in (0..nbk).filter(|&b| !done[b]) {
+                    al[b] = 0.0;
+                }
+                let trial = at(&al);
+                let ob = self.block_objective(&trial, like, None)?;
+                let o: f64 = ob.iter().sum();
+                let s: f64 = al.iter().zip(&slope_b).map(|(a, s)| a * s).sum();
+                if o.is_finite() && s > 0.0 && o >= obj + 1e-4 * s {
+                    x.copy_from_slice(&trial);
+                    obj = o;
+                    history.push(o);
+                    accepted = true;
+                    alpha = al.iter().sum::<f64>() / nbk as f64;
+                    next_base = Some(ob);
+                }
+            }
+            for _ in 0..(if accepted { 0 } else { 40 }) {
                 let trial: Vec<f64> = x.iter().zip(&dir).map(|(a, d)| a + alpha * d).collect();
                 let o = self.objective(&trial, like)?;
                 if o.is_finite() && o >= obj + 1e-4 * alpha * slope {
@@ -592,7 +692,12 @@ impl<'a> Problem<'a> {
 fn abs_eig(h: &Matrix4<f64>) -> Matrix4<f64> {
     let e = SymmetricEigen::new(*h);
     let d = Matrix4::from_diagonal(&e.eigenvalues.map(|l| l.abs().max(1e-6)));
-    e.eigenvectors * d * e.eigenvectors.transpose()
+    let out = e.eigenvectors * d * e.eigenvectors.transpose();
+    if out.iter().all(|v| v.is_finite()) {
+        return out;
+    }
+    // the decomposition can fail on a block of extreme range (a radius near zero): its diagonal's magnitudes
+    Matrix4::from_diagonal(&h.diagonal().map(|l| if l.is_finite() { l.abs().max(1e-6) } else { 1e-6 }))
 }
 
 /// Fits the joint model to `pulses` (row and scan of each) on `rows`, from
@@ -617,7 +722,7 @@ pub fn joint_fit(pulses: &[Pulse], row: &[u32], scan: &[u32], rows: &Rows, n_sca
     stages.push(like.rough);
     let (mut iterations, mut converged) = (Vec::new(), true);
     for rough in stages {
-        let (it, ok) = pr.newton(&mut x, &JointParams { rough, ..*like }, opts.iters, opts.tol)?;
+        let (it, ok) = pr.newton(&mut x, &JointParams { rough, ..*like }, opts.iters, opts.tol, opts.local)?;
         iterations.push(it);
         converged &= ok;
     }
@@ -694,7 +799,7 @@ mod tests {
     }
 
     fn opts() -> FitOptions {
-        FitOptions { schedule: vec![0.3, 0.15, 0.08], iters: 100, tol: 1e-10, threads: 2 }
+        FitOptions { schedule: vec![0.3, 0.15, 0.08], iters: 100, tol: 1e-10, threads: 2, local: false }
     }
 
     /// A small tree: a trunk of 3 rows forking into two branches of 2.
@@ -805,6 +910,9 @@ mod tests {
         // a cap below the stem holds the radius there
         let capped = joint_fit(&t.pulses, &t.row, &t.scan, &Rows { r_max: &[0.04], ..rows }, 1, &like(), &p, &opts(), None).unwrap();
         assert!((capped.theta[0][2].exp() - 0.04).abs() < 1e-9);
+        // local step control reaches the same fit
+        let local = joint_fit(&t.pulses, &t.row, &t.scan, &rows, 1, &like(), &p, &FitOptions { local: true, ..opts() }, None).unwrap();
+        assert!(local.converged && (local.theta[0][2].exp() - r).abs() < 1e-3, "R {} vs {r}", local.theta[0][2].exp());
     }
 
     #[test]

@@ -595,7 +595,7 @@ fn qsm_joint_fit<'py>(py: Python<'py>, table: Bound<'py, PyDict>, a: PyReadonlyA
     let (r_prior, r_max, parent) = (r_prior.as_array().to_vec(), r_max.as_array().to_vec(), parent.as_array().to_vec());
     let TreeParams { like, prior, .. } = tree_params(&params)?;
     let theta0 = theta0.map(|t| rows::<4>(t, "theta0")).transpose()?;
-    let opts = FitOptions { schedule, iters, tol, threads };
+    let opts = FitOptions { schedule, iters, tol, threads, local: false };
     let fit = py.detach(|| {
         let rows = Rows { a: &a, b: &b, r_prior: &r_prior, r_max: &r_max, parent: &parent };
         joint_fit::joint_fit(&pulses, &row, &scan, &rows, n_scans, &like, &prior, &opts, theta0.as_deref())
