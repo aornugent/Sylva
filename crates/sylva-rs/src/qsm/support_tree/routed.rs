@@ -261,6 +261,8 @@ fn remeasure(pu: &Pulse, (o, d): (Point, Point), a: &Point, (u, e1, e2): (Point,
 /// the stem).
 pub(super) struct Exact {
     pub stems: Vec<Circle>,
+    /// Each stem's foliage rate at its fit (1/m): its own, as `split_gain`'s stems have.
+    pub lam: Vec<f64>,
     pub gain: f64,
     pub n_pairs: u32,
     pub evals: [u64; 2],
@@ -509,7 +511,7 @@ fn exact_thinned(scans: &[&ScanIndex], a0: &Point, frame: Frame, seeds: &[Seed],
         }
         out
     };
-    Ok(Fitted::Accepted(Exact { stems, gain: if k > 1 { bic - bic1 } else { f64::NAN }, n_pairs: n_all as u32, evals, echoes }))
+    Ok(Fitted::Accepted(Exact { stems, lam: sf.theta.iter().map(|t| t[3].exp()).collect(), gain: if k > 1 { bic - bic1 } else { f64::NAN }, n_pairs: n_all as u32, evals, echoes }))
 }
 
 #[cfg(test)]

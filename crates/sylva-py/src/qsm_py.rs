@@ -759,7 +759,7 @@ fn support_fit<'py>(py: Python<'py>, f: support_tree::Fit) -> PyResult<Bound<'py
     d.set_item("sd_centre", two(&f.sd_centre)?)?;
     d.set_item("lean", two(&f.lean)?)?;
     d.set_item("sd_lean", two(&f.sd_lean)?)?;
-    for (k, v) in [("r", f.r), ("sd_log_r", f.sd_log_r), ("r_row", f.r_row), ("sd_r_row", f.sd_r_row), ("chi2", f.chi2), ("chi2_front", f.chi2_front), ("r_lo", f.r_lo), ("r_hi", f.r_hi), ("r_floor", f.r_floor), ("log_odds", f.log_odds), ("p_wood", f.p_wood)] {
+    for (k, v) in [("r", f.r), ("sd_log_r", f.sd_log_r), ("r_row", f.r_row), ("sd_r_row", f.sd_r_row), ("chi2", f.chi2), ("chi2_front", f.chi2_front), ("r_lo", f.r_lo), ("r_hi", f.r_hi), ("r_floor", f.r_floor), ("log_odds", f.log_odds), ("p_wood", f.p_wood), ("lam", f.lam)] {
         d.set_item(k, v.into_pyarray(py))?;
     }
     d.set_item("flags", f.flags.into_pyarray(py))?;
@@ -795,6 +795,7 @@ fn qsm_support_tree<'py>(py: Python<'py>, scans: Vec<Bound<'py, PyScanIndex>>, a
     pieces.set_item("stem", f.piece_stem.into_pyarray(py))?;
     d.set_item("pieces", pieces)?;
     d.set_item("converged", f.converged)?;
+    d.set_item("rounds", f.rounds)?;
     d.set_item("echoes", echoes_to_py(py, f.echoes)?)?;
     Ok(d)
 }

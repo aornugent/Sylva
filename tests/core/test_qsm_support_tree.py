@@ -132,6 +132,8 @@ def test_a_clump_of_stems_is_flagged_as_runs(tmp_path):
     assert np.median(e["p_wood"][e["dist"] < 0.01]) > 0.9
     # both fits were accepted; each node is one (piece, stem)
     assert (p["refused"] == 0).all() and (f["refused"] == 0).all() and "phases" not in f
+    # each fitted stem reports its own foliage rate (NaN off the exact path), and the solve its rounds
+    assert np.isfinite(p["lam"][p["k_stems"] > 0]).all() and (p["lam"][p["k_stems"] > 0] > 0).all() and 3 <= f["rounds"] <= 300
     assert len(set(zip(p["src"].tolist(), p["stem"].tolist()))) == len(p["src"])
     with pytest.raises(ValueError, match="version"):
         support_tree(scans, a, b, [0.093, 0.093], [-1, 0], params=dataclasses.replace(PARAMS, version=0))
