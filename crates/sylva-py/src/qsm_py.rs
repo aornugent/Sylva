@@ -385,15 +385,6 @@ impl PyScanIndex {
         self.inner.nbytes()
     }
 
-    fn file_row<'py>(&self, py: Python<'py>, pulse: PyReadonlyArray1<u32>) -> PyResult<Bound<'py, PyArray1<u32>>> {
-        let n = self.inner.n_pulses();
-        let p = pulse.as_array();
-        if p.iter().any(|&k| k as usize >= n) {
-            return Err(PyValueError::new_err("ScanIndex.file_row: a pulse is out of range"));
-        }
-        Ok(p.iter().map(|&k| self.inner.file_row(k)).collect::<Vec<u32>>().into_pyarray(py))
-    }
-
     #[getter]
     fn origin(&self) -> (f64, f64, f64) {
         let o = self.inner.origin();
@@ -735,7 +726,7 @@ fn echoes_to_py<'py>(py: Python<'py>, e: Echoes) -> PyResult<Bound<'py, PyDict>>
 #[pyfunction]
 fn qsm_echo_paths() -> Vec<(&'static str, u8)> {
     use joint::path::*;
-    vec![("MEASURED", MEASURED), ("BOUNDED", BOUNDED), ("POROUS", POROUS), ("EXACT", EXACT)]
+    vec![("MEASURED", MEASURED), ("BOUNDED", BOUNDED), ("POROUS", POROUS), ("EXACT", EXACT), ("ROUTED", ROUTED)]
 }
 
 /// The names of the `flags` bits of `qsm_support_tree`.
@@ -795,6 +786,11 @@ fn qsm_support_tree<'py>(py: Python<'py>, scans: Vec<Bound<'py, PyScanIndex>>, a
     d.set_item("pieces", pieces)?;
     d.set_item("converged", f.converged)?;
     d.set_item("echoes", echoes_to_py(py, f.echoes)?)?;
+    let phases = PyDict::new(py);
+    for (k, v) in f.phases {
+        phases.set_item(k, v)?;
+    }
+    d.set_item("phases", phases)?;
     Ok(d)
 }
 

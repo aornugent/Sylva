@@ -16,6 +16,7 @@ categories = ["science", "science::geo"]
 nalgebra = "0.35"
 rayon = "1.12"
 libm = "0.2"
+libc = "0.2"
 kiddo = "6.3"
 las = { version = "0.11", features = ["laz"] }
 thiserror = "2"

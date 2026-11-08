@@ -119,12 +119,6 @@ class ScanIndex:
         """The scanner position, ``(3,)``."""
         return np.asarray(self._core.origin, np.float64)
 
-    def file_row(self, pulse) -> np.ndarray:
-        """Each pulse's row in its Shots file, for pulses as this index numbers them (``pairs``' ``pulse``).
-
-        With an echo's place in its pulse it is the key the tile sidecars carry (``pulse.u32``, ``echo.u8``)."""
-        return self._core.file_row(np.ascontiguousarray(pulse, np.uint32))
-
 
 def pairs(scans, a, b, window, threads: int = 0) -> dict[str, np.ndarray]:
     """Every pulse near each cylinder ``a[i] -> b[i]``, with all its echoes.

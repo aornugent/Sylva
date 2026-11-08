@@ -66,7 +66,7 @@ pub struct TreeParams {
 
 impl TreeParams {
     /// Bumped whenever the fit (`joint_tree`'s or `support_tree`'s) changes for the same settings.
-    pub const VERSION: u32 = 6;
+    pub const VERSION: u32 = 7;
 }
 
 impl Default for TreeParams {
@@ -369,7 +369,7 @@ fn table(scans: &[&ScanIndex], stems: &Stems, ctx_a: &[Point], ctx_b: &[Point], 
 
 /// A pair measured from its row's axis moved by `d` across it: the same pulse
 /// and chord (so the same foliage exposure), seen from a parallel axis.
-fn shifted(pu: &Pulse, d: [f64; 2]) -> Pulse {
+pub(crate) fn shifted(pu: &Pulse, d: [f64; 2]) -> Pulse {
     Pulse { b: pu.b - (d[0] * pu.jb[0] + d[1] * pu.jb[1]), t: pu.t + (d[0] * pu.jt[0] + d[1] * pu.jt[1]), ..*pu }
 }
 
@@ -377,11 +377,18 @@ fn shifted(pu: &Pulse, d: [f64; 2]) -> Pulse {
 /// a pair meets first: of those its footprint touches, the one whose front it
 /// reaches first; if none, the one whose silhouette it passes nearest. Solid
 /// stems don't overlap, so a pulse's fate in the disc is the first one's.
+#[cfg(test)]
 fn first_circle(pu: &Pulse, circles: &[(f64, f64, f64)], p: &JointParams) -> usize {
-    let w = p.footprint(pu.t);
+    let views: Vec<Pulse> = circles.iter().map(|&(cx, cy, _)| shifted(pu, [cx, cy])).collect();
+    first_met(&views, &circles.iter().map(|c| c.2).collect::<Vec<_>>(), p.footprint(pu.t))
+}
+
+/// Which of several circles a pair meets first, from its view from each
+/// circle's centre (`views`, each measured from that circle's axis), their
+/// radii and its footprint `w`: as [`first_circle`].
+pub(crate) fn first_met(views: &[Pulse], radii: &[f64], w: f64) -> usize {
     let mut best = (false, f64::INFINITY, 0);
-    for (i, &(cx, cy, r)) in circles.iter().enumerate() {
-        let s = shifted(pu, [cx, cy]);
+    for (i, (s, &r)) in views.iter().zip(radii).enumerate() {
         let touch = s.b.abs() < r + 0.5 * w;
         let key = if touch { s.t - (r * r - s.b * s.b).max(0.0).sqrt() / s.sin.max(1e-9) } else { s.b.abs() - r };
         if (touch && !best.0) || (touch == best.0 && key < best.1) {
@@ -404,57 +411,66 @@ fn first_circle(pu: &Pulse, circles: &[(f64, f64, f64)], p: &JointParams) -> usi
 /// one trunk's arcs leave the pulses aimed between them unexplained.
 #[allow(clippy::too_many_arguments)]
 fn split_gain(pulses: &[Pulse], scan: &[u32], n_scans: usize, a: Point, b: Point, r: f64, circles: &[(f64, f64, f64)], params: &TreeParams, threads: usize) -> Result<f64> {
-    let opts = FitOptions { schedule: SCHEDULE.to_vec(), iters: params.iters, tol: params.tol, threads, local: false, profile: true };
-    let stems = |cs: &[(f64, f64, f64)]| fit_stems(pulses, scan, n_scans, a, b, cs, &params.like, &params.prior, &opts, threads).map(|s| s.ll);
+    // (the stems' log likelihood is all it reads: no profile)
+    let opts = FitOptions { schedule: SCHEDULE.to_vec(), iters: params.iters, tol: params.tol, threads, local: false, profile: false };
+    let (_, e1, e2, _) = frames(&[a], &[b])[0];
+    let range: Vec<f64> = pulses.iter().map(|pu| pu.t).collect();
+    let stems = |cs: &[(f64, f64, f64)]| {
+        // parallel stems: each sees a pair as the row does, shifted to its centre
+        let at = |c: &(f64, f64, f64), x: Point| -> Point { std::array::from_fn(|i| x[i] + c.0 * e1[i] + c.1 * e2[i]) };
+        let axes: Vec<(Point, Point)> = cs.iter().map(|c| (at(c, a), at(c, b))).collect();
+        let radii: Vec<f64> = cs.iter().map(|c| c.2).collect();
+        let see = |j: usize, i: usize, d: [f64; 2]| shifted(&pulses[i], [cs[j].0 + d[0], cs[j].1 + d[1]]);
+        fit_stems(&range, &see, &axes, &radii, scan, n_scans, &params.like, &params.prior, &opts).map(|s| s.ll)
+    };
     let l_whole = stems(&[(0.0, 0.0, r)])?.max(stems(&circles[..1])?);
     let l_split = stems(circles)?;
     Ok(l_split - l_whole - 2.0 * (circles.len() as f64 - 1.0) * (pulses.len().max(1) as f64).ln())
 }
 
-/// Stems parallel to a row fitted to its pairs (see [`fit_stems`]).
+/// Stems fitted to one set of pairs (see [`fit_stems`]).
 pub(crate) struct StemFit {
     /// The pairs' log likelihood at the fit, each seen from the fitted stem it meets first.
     pub ll: f64,
     pub fit: Fit,
-    /// The fitted stems' offsets and radii in the row's frame, and the stem each pair meets first.
-    pub stems: Vec<(f64, f64, f64)>,
-    pub owner: Vec<u32>,
-    /// Each pair seen from the fitted stem it meets first, and the state it was scored at.
-    pub pulses: Vec<Pulse>,
+    /// Each fitted stem's offset from its own axis (along that axis's frame) and radius, and the state its pairs
+    /// were scored at (seen from it).
+    pub stems: Vec<([f64; 2], f64)>,
     pub theta: Vec<[f64; 4]>,
 }
 
-/// The stems `cs` (offsets and radii in the frame of the row `a -> b`), parallel to it, fitted to the row's own
-/// pairs (`pulses`, measured from its axis, with their `scan`): each pair is seen from the stem it meets first
-/// ([`first_circle`]), each stem a row of its own with its own foliage, fitted by [`joint_fit`] with `opts` from
-/// the circles; then each pair is seen again from the fitted stem it meets first, and scored there. [`split_gain`]'s
-/// stems, and the seeded exact fit of [`crate::qsm::support_tree`]'s routed pieces (3dtrees research 93 §18). The
-/// fit's `evals` count that last pass too.
+/// Stems fitted to one set of pairs, the pair `i` at range `range[i]` (for its footprint) and from `scan[i]`:
+/// `see(j, i, d)` is the pair measured from stem `j`'s axis (`axes[j]`, prior radius `radii[j]`) moved by `d`
+/// across it, along that axis's frame. Each pair is seen from the stem it meets first ([`first_met`]), each stem a
+/// row of its own with its own foliage, fitted by [`joint_fit`] with `opts` from the axes; then each pair is seen
+/// again from the fitted stem it meets first, and scored there. [`split_gain`]'s stems (parallel, each a shift of
+/// the row's view), and the seeded exact fit of [`crate::qsm::support_tree`]'s routed pieces (each stem on its own
+/// leaning axis; 3dtrees research 93 §18). The fit's `evals` count that last pass too.
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn fit_stems(pulses: &[Pulse], scan: &[u32], n_scans: usize, a: Point, b: Point, cs: &[(f64, f64, f64)], p: &JointParams, prior: &PriorParams, opts: &FitOptions, threads: usize) -> Result<StemFit> {
-    let (_, e1, e2, _) = frames(&[a], &[b])[0];
-    let at = |c: &(f64, f64, f64), x: Point| -> Point { std::array::from_fn(|i| x[i] + c.0 * e1[i] + c.1 * e2[i]) };
-    let (sa, sb): (Vec<Point>, Vec<Point>) = cs.iter().map(|c| (at(c, a), at(c, b))).unzip();
-    let sr: Vec<f64> = cs.iter().map(|c| c.2).collect();
-    let sw: Vec<f64> = sr.iter().map(|&r| window(r)).collect();
-    let parent = vec![-1i64; cs.len()];
-    let assign = |cs: &[(f64, f64, f64)]| -> (Vec<Pulse>, Vec<Owner>) {
-        pulses.iter().map(|pu| {
-            let i = first_circle(pu, cs, p);
-            (shifted(pu, [cs[i].0, cs[i].1]), Owner { row: i as u32, nu: u32::MAX })
+pub(crate) fn fit_stems(range: &[f64], see: &(dyn Fn(usize, usize, [f64; 2]) -> Pulse + Sync), axes: &[(Point, Point)], radii: &[f64], scan: &[u32], n_scans: usize, p: &JointParams, prior: &PriorParams, opts: &FitOptions) -> Result<StemFit> {
+    let m = axes.len();
+    let (sa, sb): (Vec<Point>, Vec<Point>) = axes.iter().copied().unzip();
+    let sw: Vec<f64> = radii.iter().map(|&r| window(r)).collect();
+    let parent = vec![-1i64; m];
+    // each pair seen from the stem (moved by its offset, at its radius) it meets first
+    let assign = |st: &[([f64; 2], f64)]| -> (Vec<Pulse>, Vec<Owner>) {
+        let rs: Vec<f64> = st.iter().map(|s| s.1).collect();
+        range.iter().enumerate().map(|(i, &t)| {
+            let views: Vec<Pulse> = (0..m).map(|j| see(j, i, st[j].0)).collect();
+            let k = first_met(&views, &rs, p.footprint(t));
+            (views[k], Owner { row: k as u32, nu: u32::MAX })
         }).unzip()
     };
-    let (sp, own) = assign(cs);
+    let (sp, own) = assign(&radii.iter().map(|&r| ([0.0, 0.0], r)).collect::<Vec<_>>());
     let row: Vec<u32> = own.iter().map(|o| o.row).collect();
-    let rows = Rows { a: &sa, b: &sb, r_prior: &sr, r_max: &sw, parent: &parent };
+    let rows = Rows { a: &sa, b: &sb, r_prior: radii, r_max: &sw, parent: &parent };
     let mut f = joint_fit(&sp, &row, scan, &rows, n_scans, p, prior, opts, None)?;
-    // each pair again from the fitted stem it meets first (a stem's frame is the row's: they are parallel)
-    let fitted: Vec<(f64, f64, f64)> = cs.iter().zip(&f.theta).map(|(c, t)| (c.0 + t[0], c.1 + t[1], t[2].exp())).collect();
+    let fitted: Vec<([f64; 2], f64)> = f.theta.iter().map(|t| ([t[0], t[1]], t[2].exp())).collect();
     let (sp, own) = assign(&fitted);
     let theta: Vec<[f64; 4]> = f.theta.iter().map(|t| [0.0, 0.0, t[2], t[3]]).collect();
-    let ll = joint_loglik(&sp, &own, &theta, &[], p, threads)?.iter().sum();
+    let ll = joint_loglik(&sp, &own, &theta, &[], p, opts.threads)?.iter().sum();
     f.evals[0] += sp.len() as u64;
-    Ok(StemFit { ll, fit: f, stems: fitted, owner: own.iter().map(|o| o.row).collect(), pulses: sp, theta })
+    Ok(StemFit { ll, fit: f, stems: fitted, theta })
 }
 
 /// Which pairs each row keeps: a stop seen by several rows stays with the one
@@ -687,6 +703,13 @@ mod tests {
         assert!((f.r[0] - 0.05).abs() < 0.003 && (f.a[0][0]).abs() < 0.003, "R {} at x {}", f.r[0], f.a[0][0]);
         assert!(f.p_wood[0] > 0.99 && f.reason[0] == reason::MEASURED && f.lo[0] < 0.05 && f.hi[0] > 0.05 && !f.flat[0]);
         assert!(f.converged && f.u < 0.5 && f.n_pairs[0] > 200);
+        // its stops classified: once each, sorted by key, by the exact likelihood, of its one row; on the stem's
+        // surface, bark-free echoes are wood
+        let e = &f.echoes;
+        assert!(e.len() > 100 && e.path.iter().all(|&q| q == path::EXACT) && e.node.iter().all(|&k| k == 0));
+        assert!((1..e.len()).all(|i| (e.scan[i - 1], e.pulse[i - 1], e.echo[i - 1]) < (e.scan[i], e.pulse[i], e.echo[i])));
+        let on: Vec<usize> = (0..e.len()).filter(|&i| e.dist[i] < 0.005).collect();
+        assert!(on.len() > 50 && on.iter().filter(|&&i| e.p_wood[i] > 0.9).count() as f64 > 0.9 * on.len() as f64, "{}", on.len());
         // forced to split, it finds the one stem
         let g = joint_tree(&[&scan], &rows, &[], &[], &[], &params, Some(&[true]), 2).unwrap();
         assert_eq!(g.src, vec![0]);

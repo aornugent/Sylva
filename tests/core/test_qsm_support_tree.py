@@ -128,12 +128,9 @@ def test_a_clump_of_stems_is_flagged_as_runs(tmp_path):
     e = f["echoes"]
     key = np.c_[e["scan"], e["pulse"], e["echo"]]
     assert len(np.unique(key, axis=0)) == len(key) and (e["path"] == EchoPath.EXACT).all()
-    # keyed by the pulse's row in its Shots file: the index holds each row once
-    n = scans[0].n_pulses
-    assert (np.sort(scans[0].file_row(np.arange(n))) == np.arange(n)).all() and (e["pulse"] < max(s.n_pulses for s in scans)).all()
-    with pytest.raises(ValueError):
-        scans[0].file_row([n])
     assert np.median(e["p_wood"][e["dist"] < 0.01]) > 0.9
+    # the fit's CPU by phase
+    assert set(f["phases"]) >= {"pieces", "seeds", "fit", "solve", "classify"} and f["phases"]["fit"] > 0
     with pytest.raises(ValueError, match="version"):
         support_tree(scans, a, b, [0.093, 0.093], [-1, 0], params=dataclasses.replace(PARAMS, version=0))
     with pytest.raises(ValueError, match="parent"):

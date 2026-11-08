@@ -650,6 +650,9 @@ pub mod path {
     pub const POROUS: u8 = 2;
     /// The exact likelihood's: the softmax of the stop's wood and leaf terms ([`super::joint_wood_share`]).
     pub const EXACT: u8 = 3;
+    /// A routed piece's with no exact fit accepted (none, or one that didn't converge or, as one stem, fell below
+    /// the piece's detection bound): on its posterior circle's front arc, times the echo's character.
+    pub const ROUTED: u8 = 4;
 }
 
 /// A tree's echoes classified (3dtrees research 93 §18), one record per echo, keyed as the tile sidecars are
@@ -677,6 +680,17 @@ impl Echoes {
         self.path.push(path);
         self.p_wood.push(p_wood);
         self.dist.push(dist);
+    }
+
+    /// Appends `other`'s records, each node `n` renamed `node(n)`.
+    pub(crate) fn append(&mut self, other: Echoes, node: impl Fn(u32) -> u32) {
+        self.scan.extend(other.scan);
+        self.pulse.extend(other.pulse);
+        self.echo.extend(other.echo);
+        self.node.extend(other.node.into_iter().map(node));
+        self.path.extend(other.path);
+        self.p_wood.extend(other.p_wood);
+        self.dist.extend(other.dist);
     }
 
     pub fn len(&self) -> usize {

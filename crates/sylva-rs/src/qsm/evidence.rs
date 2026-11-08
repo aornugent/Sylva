@@ -936,6 +936,27 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn each_pulse_knows_its_row_in_the_file() {
+        // the index reorders the pulses by direction; each one's file row is the row it was read from (its
+        // direction there), once each
+        let sh = shots(0.05, true);
+        let s = index(&sh, ShotsWriteOptions::default().row_group_size);
+        let n = s.n_pulses();
+        assert_eq!(n, sh.direction.len());
+        let mut seen = vec![false; n];
+        let mut moved = 0;
+        for k in 0..n as u32 {
+            let row = s.file_row(k) as usize;
+            assert!(!seen[row], "row {row} twice");
+            seen[row] = true;
+            let (d, e) = (s.direction(k), sh.direction[row]);
+            assert!((0..3).all(|i| (d[i] - e[i]).abs() < 1e-6), "pulse {k}: {d:?} against row {row}'s {e:?}");
+            moved += usize::from(row != k as usize);
+        }
+        assert!(moved > n / 10, "the index's order is the file's: the check would pass with no mapping");
+    }
+
+    #[test]
     fn pairs_hold_every_pulse_that_reached_the_disc_with_its_echoes() {
         let r = 0.05;
         let (s, a, b) = scene(r, true);

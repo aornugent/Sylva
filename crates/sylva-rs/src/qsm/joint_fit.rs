@@ -857,11 +857,14 @@ pub fn joint_fit(pulses: &[Pulse], row: &[u32], scan: &[u32], rows: &Rows, n_sca
         (tau * var[4 * k + 2]).clamp(0.0, 1.0)
     }).collect();
     let rho_pooled = (0..pr.n).map(|k| 1.0 - var[4 * k + 2] / pvar[4 * k + 2]).collect();
-    let mut profile = if opts.profile { vec![[0.0; 21]; pr.n] } else { Vec::new() };
-    for (j, d) in profile_grid().into_iter().enumerate().filter(|_| opts.profile) {
-        let moved: Vec<[f64; 4]> = theta.iter().map(|t| [t[0], t[1], t[2] + d, t[3]]).collect();
-        for (k, l) in pr.row_loglik(&moved, &nu, like)?.into_iter().enumerate() {
-            profile[k][j] = l;
+    let mut profile = Vec::new();
+    if opts.profile {
+        profile = vec![[0.0; 21]; pr.n];
+        for (j, d) in profile_grid().into_iter().enumerate() {
+            let moved: Vec<[f64; 4]> = theta.iter().map(|t| [t[0], t[1], t[2] + d, t[3]]).collect();
+            for (k, l) in pr.row_loglik(&moved, &nu, like)?.into_iter().enumerate() {
+                profile[k][j] = l;
+            }
         }
     }
     let objective = pr.objective(&x, like)?;
