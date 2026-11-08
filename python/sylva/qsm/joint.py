@@ -213,24 +213,19 @@ SupportFlag = IntFlag("SupportFlag", _core.qsm_support_flags())
 #: message says nothing of its radius).
 SupportRefusal = IntFlag("SupportRefusal", _core.qsm_support_refusals())
 
-#: What a reviewer or the screen should know of a node's fit (bits of :func:`support_tree`'s ``diag``; a row's: its
-#: pieces'), each threshold a constant of ``support_tree.rs`` with its reason:
+#: What a reviewer or the screen should know of a node's fit that no other output says (bits of :func:`support_tree`'s
+#: ``diag``; a row's: its pieces'). Each threshold is a constant of ``support_tree.rs`` (module ``diag``), with its
+#: reason, and isn't restated here:
 #:
-#: - ``ONE_SIDED``: one scan supplies at least 90 % of its informative pulses, or the scans with a tenth of them look
-#:   from within 20 degrees of each other: no other view checks it (3dtrees research 93 §10, §11.1);
-#: - ``SHADOWED``: a side of its silhouette is unseen (no pulse reaches the circle's neighbourhood there from a scan
-#:   that would decide R, as a crossing branch's shadow), so the sides seen leave its radius trading against its
-#:   centre: not determined by its own data. An exact stem's message then says nothing along what its sides leave
-#:   free and its own bounds (the span of its front arc's stops, the capacity floor) enter the tree beside it; a
-#:   measured piece's measurements already leave the unseen edge out, so the tree's prior fills it (flagged only);
-#: - ``SUB_FOOTPRINT``: R below half the footprint at its range;
-#: - ``TUBE_EDGE``: its fitted stem reaches within 1 cm of the tube its pulses were taken in: evidence cut off;
-#: - ``THINNED``: its exact fit used a share of its pulses (over the 8,000-pair budget): k may depend on which;
-#: - ``DELETED``: at least half its pulses have echoes the export deleted;
-#: - ``CONTESTED``: at least half its stops are claimed by context or a neighbouring node;
-#: - ``MISFIT``: its misfit (reduced chi-square within or between scans: non-round, sway or registration) above 4;
-#: - ``REFUSED``: its exact fit was refused (``refused`` says why);
-#: - ``UNSETTLED``: the tree's censored solve didn't settle (``converged`` false).
+#: - ``ONE_SIDED``: one scan supplies almost all its informative pulses, or every pair of the views that carry a share
+#:   of them looks from nearly one direction: no other view checks it (3dtrees research 93 §10, §11.1);
+#: - ``SHADOWED``: an exact stem a side of whose silhouette is unseen (no pulse reaches the circle's neighbourhood
+#:   there from a scan that would decide R, as a crossing branch's shadow), so the sides seen leave its radius trading
+#:   against its centre: its message says nothing along what they leave free, and its own bounds (the span of its
+#:   front arc's stops, the capacity floor) enter the tree beside it. A side past the fit's table isn't judged;
+#: - ``SUB_FOOTPRINT``: R below about half the footprint at its range;
+#: - ``TUBE_EDGE``: its own fitted circle reaches the edge of the tube its pulses were taken in: evidence cut off;
+#: - ``CONTESTED``: most of its stops are claimed by context or a neighbouring node (``contested``).
 SupportDiag = IntFlag("SupportDiag", _core.qsm_support_diags())
 
 #: How a classified echo (``echoes`` of :func:`support_tree` and :func:`joint_tree`) got its ``p_wood``:
@@ -341,10 +336,10 @@ def support_tree(scans, a, b, r_prior, parent, params: JointParams = JointParams
       used, 0 where it was or the piece isn't routed);
     - ``diag`` (:class:`SupportDiag` bits; a row's: its pieces') and three numbers: ``data_share``, the share of log
       R's posterior precision its own data give (its measurement's information on R with its centre and lean unknown,
-      and its bounds' site), 0-1; ``misfit``, the larger reduced chi-square of the measurements to the circle and of
-      the front's stops about it (NaN where there is none, as an exact stem); ``contested``, the share of its stops
-      claimed by context or another node (NaN with none). A row's: the mean share, the largest misfit and the mean
-      contested share of its pieces;
+      and its bounds' EP site), 0-1, NaN where that site's precision came out negative; ``contested``, the share of
+      its stops claimed by context or another node (NaN with none); ``deleted``, the share of its pulses with echoes
+      the export deleted (an exact stem's: its piece's; NaN with none). A row's: its pieces' means. The misfit is
+      ``chi2`` and ``chi2_front``, a refusal ``refused``, a thinned fit ``n_exact`` over the budget;
 
     and per tree ``converged``, whether the censored solve settled; and ``echoes``, one record per stop of the tree
     (of an echo several pieces saw, the one whose surface it lies nearest), keyed as the tile sidecars are: ``scan``

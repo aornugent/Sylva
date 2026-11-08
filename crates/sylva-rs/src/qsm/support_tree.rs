@@ -178,59 +178,48 @@ pub mod refusal {
 }
 
 /// What a reviewer or the screen should know of a node's fit (bits of [`Fit::diag`], 3dtrees research 93 §20; a
-/// row's: its pieces'), beside its three numbers (`data_share`, `misfit`, `contested`). Each threshold is a constant
-/// below with its reason.
+/// row's: its pieces'), beside its three numbers (`data_share`, `contested`, `deleted`): only what no other output
+/// says. Each threshold is a constant below with its reason.
 pub mod diag {
-    /// One scan supplies almost all its pulses ([`super::ONE_SCAN`]), or its scans look from nearly one direction
-    /// ([`super::VIEW_MIN`]): no other view checks it (research 93 §10, §11.1).
+    /// One scan supplies almost all its pulses ([`super::ONE_SCAN`]), or every pair of the views that carry a share of
+    /// them ([`super::VIEW_SHARE`]) lies within [`super::VIEW_MIN`] of each other: no other view checks it (research 93
+    /// §10, §11.1).
     pub const ONE_SIDED: u16 = 1;
-    /// A side of its silhouette is unseen (no pulse reaches the circle's neighbourhood there from a scan that
-    /// would decide R, as behind a crossing branch): its radius isn't determined by its own data ([`super::unseen`]).
-    /// An exact stem's message then says nothing along what its sides leave free and its own bounds enter the tree;
-    /// a measured piece's measurements already leave the unseen edge out, and the tree's prior fills it.
+    /// An exact stem a side of whose silhouette is unseen (no pulse reaches the circle's neighbourhood there from a
+    /// scan that would decide R, as behind a crossing branch): its radius isn't determined by its own data
+    /// ([`super::unseen`]), so its message says nothing along what its sides leave free and its own bounds enter the
+    /// tree. A side the fit's table doesn't reach isn't judged ([`TUBE_EDGE`] says so).
     pub const SHADOWED: u16 = 2;
     /// R below about half the footprint at its range ([`super::SUB_W`]): the edges are the beam's, not the wood's.
     pub const SUB_FOOTPRINT: u16 = 4;
-    /// Its fitted stem reaches within [`super::TUBE_MARGIN`] of the tube its pulses were taken in: evidence beyond
-    /// it is cut off.
+    /// Its own fitted circle reaches within [`super::TUBE_MARGIN`] of the tube its pulses were taken in: evidence
+    /// beyond it is cut off.
     pub const TUBE_EDGE: u16 = 8;
-    /// Its exact fit used a share of its pulses (more than the budget): k may depend on which.
-    pub const THINNED: u16 = 16;
-    /// At least [`super::DELETED_SHARE`] of its pulses have echoes the export deleted.
-    pub const DELETED: u16 = 32;
-    /// At least [`super::CONTESTED_SHARE`] of its stops are claimed by context or a neighbouring node.
-    pub const CONTESTED: u16 = 64;
-    /// Its misfit (reduced chi-square within or between scans: non-round, sway or registration) exceeds
-    /// [`super::MISFIT_CHI2`].
-    pub const MISFIT: u16 = 128;
-    /// Its exact fit was refused ([`super::refusal`] says why, in `refused`).
-    pub const REFUSED: u16 = 256;
-    /// The tree's censored solve didn't settle (`converged` false): every node of the tree.
-    pub const UNSETTLED: u16 = 512;
+    /// At least [`super::CONTESTED_SHARE`] of its stops are claimed by context or a neighbouring node (`contested`).
+    pub const CONTESTED: u16 = 16;
 }
 
 /// [`diag::ONE_SIDED`]: one scan's share of a piece's informative pulses (90 %: the rest can't check it), or the
-/// spread of the directions its scans look from, those with a tenth of its pulses (20 degrees: the support
+/// spread of the directions its scans look from, those with [`VIEW_SHARE`] of its pulses (20 degrees: the support
 /// function's orders beyond the circle need views far apart, research 93 §10).
 const ONE_SCAN: f64 = 0.9;
 const VIEW_MIN: f64 = 20.0;
+/// [`diag::ONE_SIDED`]: the share of a piece's pulses a scan needs for its view to count (a tenth: a scan with fewer
+/// checks too little of the circle to be a second view).
+const VIEW_SHARE: f64 = 0.1;
 /// [`diag::SUB_FOOTPRINT`]: R below this share of the footprint (the brief's "about half": below it the hit
 /// share across the silhouette is the beam's profile).
 const SUB_W: f64 = 0.5;
 /// [`diag::TUBE_EDGE`]: how near the tube's edge a fitted stem reaches (m: a few edge widths of a footprint at
 /// 10-20 m, past which an edge's passes are cut off).
 const TUBE_MARGIN: f64 = 0.01;
-/// [`diag::DELETED`]: the share of a node's pulses with deleted echoes (a half: a pass or stop call is then unsure on
-/// half its pulses; a fifth of the bench's rows, research 93 §20).
-const DELETED_SHARE: f64 = 0.5;
-/// [`diag::CONTESTED`]: the share of a node's stops claimed elsewhere (a half: most of what it saw is another's).
+/// [`diag::CONTESTED`]: the share of a node's stops claimed elsewhere (a half: most of what it saw is another's;
+/// held out over halvings of the bench's trees, research 93 §20).
 const CONTESTED_SHARE: f64 = 0.5;
-/// [`diag::MISFIT`]: the reduced chi-square of a misfit (4: residuals twice their sd; a measured piece routes at
-/// [`HULL_CHI2`]).
-const MISFIT_CHI2: f64 = 4.0;
-/// A circle's radius is undetermined by the sides its scans see where R's sd, against what the same evidence would
-/// give spread evenly (`sd(R)^2` times the sides' total weight), exceeds this: one scan's two edges and front give
-/// 1.2, two edges alone 1; one edge and the front, unbounded; with a second edge of 6 % of the first's weight, 3
+/// A circle's radius is undetermined by the sides its scans see where `var(R) W`, R's variance from the sides
+/// (each a measurement of the support function, of weight `w`) times their total weight `W`, exceeds this squared:
+/// `sqrt(var(R) W)` is R's sd against one measurement of R with all the weight. One scan's two edges and front give
+/// 1.22, two edges alone 1; one edge and the front, unbounded; a second edge of 6 % of the first's weight, 3
 /// (research 93 §20).
 const SHADOW_SD: f64 = 3.0;
 /// A side (an edge's neighbourhood, or the front) is seen by a scan where at least this many pulses reached it.
@@ -423,16 +412,17 @@ pub struct Fit {
     pub refused: Vec<u8>,
     /// A routed piece's stem's foliage rate at its exact fit (1/m; NaN elsewhere; a row's: its pieces' mean).
     pub lam: Vec<f64>,
-    /// The fit's diagnostics ([`diag`] bits; a row's: its pieces'), and three numbers: the share of log R's
-    /// posterior precision its own data give (its measurement's, R's information with the centre and lean unknown,
-    /// and its bounds' site; 0-1), its misfit (the larger reduced chi-square, of the measurements to the circle and of
-    /// the front's stops about it; NaN where it has none, as an exact stem) and the share of its stops claimed by
-    /// context or another node (NaN with none). A row's: its pieces' mean share, largest misfit and mean contested
-    /// share.
+    /// The fit's diagnostics ([`diag`] bits; a row's: its pieces'), and three numbers: `data_share`, the share of log
+    /// R's posterior precision its own data give (its measurement's, R's information with the centre and lean
+    /// unknown, and its bounds' EP site; 0-1, NaN where that site's precision came out negative); `contested`, the
+    /// share of its stops claimed by context or another node (NaN with none); `deleted`, the share of its pulses
+    /// with echoes the export deleted (an exact stem's: its piece's). A row's: its pieces' means. Its misfit is
+    /// `chi2` and `chi2_front`, its refusal `refused`, the solve's `converged`, a thinned fit `n_exact` over the
+    /// budget.
     pub diag: Vec<u16>,
     pub data_share: Vec<f64>,
-    pub misfit: Vec<f64>,
     pub contested: Vec<f64>,
+    pub deleted: Vec<f64>,
 }
 
 /// The fit of one tree: per row (in the input's order) and per node, with each node's row; the nodes are the pieces,
@@ -609,18 +599,22 @@ struct Summary {
     seeds: Vec<routed::Seed>,
     exact: Option<Circle>,
     stops: Vec<Group>,
-    /// Its radius isn't determined by the sides its scans see (research 93 §20): a measured piece's measurements
-    /// already leave the unseen edge out (flagged only); an exact stem's message says nothing along what they leave
-    /// free, and its own bounds enter the tree with it.
+    /// An exact stem whose radius the sides its scans see leave undetermined (research 93 §20): its message says
+    /// nothing along what they leave free, and its own bounds (in `bounds`) enter the tree with it.
     shadowed: bool,
-    /// For the diagnostics: the tube its pulses were taken in (m; an exact stem's, its fit's), their median
-    /// footprint (NaN: none), whether one scan or one view supplies them, the share with deleted echoes, whether its
-    /// exact fit was thinned, and the stops its exact fit's context owned.
+    diag: DiagIn,
+}
+
+/// What a node's diagnostics need beyond its fit, filled where each is known: the tube its pulses were taken in (m;
+/// an exact stem's, its fit's), their median footprint (NaN: none), whether one scan or one view supplies them, the
+/// share with deleted echoes, and the stops its exact fit's context owned (in the seeds' windows, by the stem they
+/// meet first).
+#[derive(Debug, Clone, Copy)]
+struct DiagIn {
     tube: f64,
     w: f64,
     one_sided: bool,
-    lost: f64,
-    thinned: bool,
+    deleted: f64,
     n_ctx: u32,
 }
 
@@ -947,19 +941,17 @@ fn edge(pts: &[(f64, f64, bool, f64)], e0: f64, p_in: f64, p: &JointParams) -> O
     (info > 0.0).then(|| (e, 1.0 / info))
 }
 
-/// What one group says on one pass: its measurements, whether it had enough pulses and an opaque run, and the
-/// information of its measurement of each side of the circle (the edge on `+n`, on `-n`, the front; 0: none).
+/// What one group says on one pass: its measurements, whether it had enough pulses and an opaque run.
 struct GroupOut {
     meas: Vec<Meas>,
     enough: bool,
     run: bool,
-    seen: [f64; 3],
 }
 
 /// One group's measurements, its pulses' fates and weights given; `centre` is where the row's axis is expected
 /// along `n` (`r_claim` its claimed radius).
 fn measure(g: &Group, fates: &[Fate], wt: &[f64], centre: f64, r_claim: f64, depths: (f64, f64), p: &JointParams) -> GroupOut {
-    let mut out = GroupOut { meas: Vec::new(), enough: false, run: false, seen: [0.0; 3] };
+    let mut out = GroupOut { meas: Vec::new(), enough: false, run: false };
     if wt.iter().sum::<f64>() < MIN_PULSES {
         return out;
     }
@@ -1046,8 +1038,6 @@ fn measure(g: &Group, fates: &[Fate], wt: &[f64], centre: f64, r_claim: f64, dep
         }
     }
     let [nx, ny] = g.n;
-    out.seen[0] = edges[0].map_or(0.0, |q| 1.0 / q.1);
-    out.seen[1] = edges[1].map_or(0.0, |q| 1.0 / q.1);
     if let Some((e, var)) = edges[0] {
         out.meas.push(([nx, ny, 0.0, 0.0, 1.0], e, var));
     }
@@ -1087,9 +1077,7 @@ fn measure(g: &Group, fates: &[Fate], wt: &[f64], centre: f64, r_claim: f64, dep
         let s2 = (pts.iter().zip(&res).map(|(q, r)| q.2 * r * r).sum::<f64>() / (m - 2.0)).max(floor);
         let alpha = my - beta * ms;
         let at_mid = if sxx > 1e-6 { ms * ms / sxx } else { 0.0 };
-        let var = s2 * (1.0 / m + at_mid) + p.model_sd * p.model_sd;
-        out.meas.push(([g.v[0], g.v[1], 0.0, 0.0, -1.0], alpha, var));
-        out.seen[2] = 1.0 / var;
+        out.meas.push(([g.v[0], g.v[1], 0.0, 0.0, -1.0], alpha, s2 * (1.0 / m + at_mid) + p.model_sd * p.model_sd));
         if sxx > 1e-6 {
             out.meas.push(([0.0, 0.0, g.v[0], g.v[1], 0.0], beta, s2 / sxx));
         }
@@ -1286,8 +1274,8 @@ impl<'a> Profile<'a> {
 }
 
 /// Whether one scan supplies at least [`ONE_SCAN`] of a piece's informative pulses (not blocked before its tube), or
-/// the scans with a tenth of them look along directions within [`VIEW_MIN`] degrees of each other ([`diag::ONE_SIDED`];
-/// false with none).
+/// every pair of the scans with [`VIEW_SHARE`] of them looks along directions within [`VIEW_MIN`] degrees of each
+/// other ([`diag::ONE_SIDED`]; false with none).
 fn one_sided(gs: &[Group]) -> bool {
     let n: Vec<f64> = gs.iter().map(|g| g.recs.iter().filter(|r| !r.blocked).count() as f64).collect();
     let all: f64 = n.iter().sum();
@@ -1297,7 +1285,7 @@ fn one_sided(gs: &[Group]) -> bool {
     if n.iter().any(|&k| k >= ONE_SCAN * all) {
         return true;
     }
-    let views: Vec<[f64; 2]> = gs.iter().zip(&n).filter(|(_, &k)| k >= 0.1 * all).map(|(g, _)| g.v).collect();
+    let views: Vec<[f64; 2]> = gs.iter().zip(&n).filter(|(_, &k)| k >= VIEW_SHARE * all).map(|(g, _)| g.v).collect();
     let cos = VIEW_MIN.to_radians().cos();
     views.iter().all(|a| views.iter().all(|b| a[0] * b[0] + a[1] * b[1] >= cos))
 }
@@ -1313,9 +1301,10 @@ fn summarise_piece(scans: &[&ScanIndex], a: &Point, b: &Point, frame: Frame, r_c
     let profiles: Vec<Profile> = gs.iter().map(|g| Profile::of(g, r_claim, p)).collect();
     let log_odds = profiles.iter().map(|q| q.log_odds(r_claim, p)).sum();
     let w = if n_pairs > 0 { median(&mut gs.iter().flat_map(|g| g.recs.iter().map(|r| r.w)).collect::<Vec<_>>()) } else { f64::NAN };
-    let lost = gs.iter().map(|g| g.recs.iter().filter(|r| r.lost).count()).sum::<usize>() as f64 / f64::from(n_pairs.max(1));
+    let deleted = if n_pairs > 0 { gs.iter().map(|g| g.recs.iter().filter(|r| r.lost).count()).sum::<usize>() as f64 / f64::from(n_pairs) } else { f64::NAN };
+    let diag = DiagIn { tube, w, one_sided: one_sided(&gs), deleted, n_ctx: 0 };
     let mut out = Summary { outcome: Outcome::Bounded, chi2_front: f64::NAN, n_runs: 0, n_scans: 0, n_pairs, bounds: Vec::new(), log_odds, seeds: Vec::new(), exact: None, stops: Vec::new(),
-        shadowed: false, tube, w, one_sided: one_sided(&gs), lost, thinned: false, n_ctx: 0 };
+        shadowed: false, diag };
     out.outcome = outcome(&gs, r_claim, p, lean_sd, &mut out);
     if !matches!(out.outcome, Outcome::Measured(_)) {
         out.bounds = profiles.iter().flat_map(|q| q.bounds(r_claim, p)).collect();
@@ -1350,13 +1339,11 @@ fn outcome(gs: &[Group], r_claim: f64, p: &JointParams, lean_sd: f64, out: &mut 
     let x = c1.x;
     let mut meas = Vec::new();
     let mut fates2 = Vec::with_capacity(gs.len());
-    let mut sights = Vec::with_capacity(gs.len());
     for g in gs {
         let f: Vec<Fate> = g.recs.iter().map(|r| fate(r, g, Some(&x))).collect();
         let w = weights(g, &f, x[4], p);
         let o = measure(g, &f, &w, g.n[0] * x[0] + g.n[1] * x[1], x[4].max(0.005), (f64::NEG_INFINITY, f64::INFINITY), p);
         out.n_scans += u32::from(!o.meas.is_empty());
-        sights.push(Sight { n: g.n, v: g.v, w: o.seen });
         meas.extend(o.meas);
         fates2.push((f, w));
     }
@@ -1401,15 +1388,9 @@ fn outcome(gs: &[Group], r_claim: f64, p: &JointParams, lean_sd: f64, out: &mut 
     }
     hull |= (on > 0 && behind as f64 > HULL_SHARE * on as f64) || c2.chi2 > HULL_CHI2 || out.chi2_front > HULL_CHI2;
     let runs = out.n_runs >= 2;
-    if runs || hull {
-        return Outcome::Routed { circle: c2, runs, hull };
-    }
-    // a side its scans leave unseen (an edge censored by stops in front of it, or without pulses) can leave R
-    // trading against the centre: flagged. Its measurements already say nothing along that ridge (the edge is left
-    // out), so in the tree the prior's centre fills it; bounding it instead cost its circles (research 93 §20: 0.064
-    // to 0.150 on the bench's 15), whose claimed axes hold the centre well
-    out.shadowed = !unseen(&sights).is_empty();
-    Outcome::Measured(c2)
+    // (a measured piece's measurements already leave an unseen edge out, so in the tree the prior's centre fills the
+    // ridge it leaves; bounding it instead cost its circles, research 93 §20: 0.064 to 0.150 on the bench's 15)
+    if runs || hull { Outcome::Routed { circle: c2, runs, hull } } else { Outcome::Measured(c2) }
 }
 
 /// A routed piece's further stem (3dtrees research 93 §18): the piece it came from and its stem there; and its share
@@ -1512,10 +1493,10 @@ fn enter(k: usize, e: &routed::Exact, nd: &mut Nodes, sums: &mut Vec<Summary>, e
     }.unwrap_or(0);
     ends[k] = (end(&stems[lead]), stems[lead].x[4]);
     sums[k].exact = Some(stems[lead]);
-    (sums[k].tube, sums[k].thinned, sums[k].n_ctx) = (e.tube, e.thinned, e.n_ctx);
-    if e.shadowed[lead] {
+    (sums[k].diag.tube, sums[k].diag.n_ctx) = (e.tube, e.n_ctx[lead]);
+    if let Some(b) = &e.shadow[lead] {
         sums[k].shadowed = true;
-        sums[k].bounds = e.bounds[lead].clone();
+        sums[k].bounds = b.clone();
     }
     let area: f64 = stems.iter().map(|c| c.x[4] * c.x[4]).sum();
     let mut node = vec![k as u32; n];
@@ -1530,8 +1511,8 @@ fn enter(k: usize, e: &routed::Exact, nd: &mut Nodes, sums: &mut Vec<Summary>, e
         further[k].push(nd.row.len());
         nd.push_stem(k, s as u32 + 1, from, c.x[4] * c.x[4] / area);
         let p = &sums[k];
-        sums.push(Summary { outcome: p.outcome, chi2_front: f64::NAN, n_runs: p.n_runs, n_scans: p.n_scans, n_pairs: 0, bounds: if e.shadowed[j] { e.bounds[j].clone() } else { Vec::new() },
-            log_odds: p.log_odds, seeds: Vec::new(), exact: Some(*c), stops: Vec::new(), shadowed: e.shadowed[j], tube: e.tube, w: p.w, one_sided: p.one_sided, lost: p.lost, thinned: e.thinned, n_ctx: 0 });
+        sums.push(Summary { outcome: p.outcome, chi2_front: f64::NAN, n_runs: p.n_runs, n_scans: p.n_scans, n_pairs: 0, bounds: e.shadow[j].clone().unwrap_or_default(),
+            log_odds: p.log_odds, seeds: Vec::new(), exact: Some(*c), stops: Vec::new(), shadowed: e.shadow[j].is_some(), diag: DiagIn { n_ctx: e.n_ctx[j], ..p.diag } });
         ends.push((end(c), c.x[4]));
     }
     node
@@ -1581,10 +1562,7 @@ pub fn support_tree(scans: &[&ScanIndex], rows: &Rows, like: &JointParams, prior
     let mut lam = vec![f64::NAN; n0];
     for (&k, f) in routed.iter().zip(fits) {
         match f? {
-            routed::Fitted::Refused { why, n_pairs, evals } => {
-                exact[k] = ExactOut { n_pairs, evals, refused: why, ..ExactOut::default() };
-                sums[k].thinned = n_pairs as usize > routed::FIT_PAIRS;
-            }
+            routed::Fitted::Refused { why, n_pairs, evals } => exact[k] = ExactOut { n_pairs, evals, refused: why, ..ExactOut::default() },
             routed::Fitted::Accepted(e) => {
                 exact[k] = ExactOut { k: e.stems.len() as u32, gain: e.gain, n_pairs: e.n_pairs, evals: e.evals, refused: 0 };
                 let node = enter(k, &e, &mut nd, &mut sums, &mut ends, &mut further);
@@ -1606,7 +1584,7 @@ pub fn support_tree(scans: &[&ScanIndex], rows: &Rows, like: &JointParams, prior
     }
     // each node's stops before the context and its neighbours took theirs, and after
     let nn = nd.row.len();
-    let mut seen_stops: Vec<u32> = sums.iter().map(|s| s.n_ctx).collect();
+    let mut seen_stops: Vec<u32> = sums.iter().map(|s| s.diag.n_ctx).collect();
     for &q in &echoes.node {
         seen_stops[q as usize] += 1;
     }
@@ -1633,34 +1611,12 @@ pub fn support_tree(scans: &[&ScanIndex], rows: &Rows, like: &JointParams, prior
         if e.is_finite() { e.exp() } else { f64::NAN }
     };
     for (k, s) in sums.iter().enumerate() {
-        let x = &sol.x[k];
-        let r = x[4].exp();
-        let misfit = [s.outcome.circle().map_or(f64::NAN, |c| c.chi2), s.chi2_front].into_iter().filter(|v| v.is_finite()).reduce(f64::max).unwrap_or(f64::NAN);
-        let contested = if seen_stops[k] > 0 { 1.0 - f64::from(kept_stops[k]) / f64::from(seen_stops[k]) } else { f64::NAN };
-        // log R's precision from the node's own data: its measurement's (R's information, the centre and lean
-        // unknown, at the posterior R) and its bounds' site
-        let own_info = s.used().map_or(0.0, |c| info_r(&(c.st.info / c.inflate())) * r * r) + sol.site_tau[k];
-        let data_share = (own_info * sol.cov[k][(4, 4)]).clamp(0.0, 1.0);
-        let (piece, _) = nd.src(k);
-        let h = 0.5 * nd.frame[k].3;
-        let reach = [-h, h].iter().map(|&q| (x[0] + q * x[2]).hypot(x[1] + q * x[3])).fold(0.0, f64::max) + r;
-        let bits = [
-            (s.one_sided, diag::ONE_SIDED),
-            (s.shadowed, diag::SHADOWED),
-            (r < SUB_W * s.w, diag::SUB_FOOTPRINT),
-            (s.used().is_some() && reach > s.tube - TUBE_MARGIN, diag::TUBE_EDGE),
-            (s.thinned, diag::THINNED),
-            (s.lost >= DELETED_SHARE, diag::DELETED),
-            (contested >= CONTESTED_SHARE, diag::CONTESTED),
-            (misfit > MISFIT_CHI2, diag::MISFIT),
-            (exact[piece].refused != 0, diag::REFUSED),
-            (!converged, diag::UNSETTLED),
-        ];
+        let (diag, data_share, contested) = diagnose(s, sol.x[k][4].exp(), sol.cov[k][(4, 4)], sol.site_tau[k], 0.5 * nd.frame[k].3, (seen_stops[k], kept_stops[k]));
         let own = Own {
-            diag: bits.iter().filter(|b| b.0).fold(0, |a, b| a | b.1),
+            diag,
             data_share,
-            misfit,
             contested,
+            deleted: s.diag.deleted,
             r_row: s.used().map_or(f64::NAN, |c| c.x[4]),
             sd_r_row: s.used().map_or(f64::NAN, |c| c.cov[(4, 4)].max(0.0).sqrt()),
             chi2: s.outcome.circle().map_or(f64::NAN, |c| c.chi2),
@@ -1696,8 +1652,8 @@ pub fn support_tree(scans: &[&ScanIndex], rows: &Rows, like: &JointParams, prior
         let own = Own {
             diag: p.diag[k0..k1].iter().fold(0, |a, &f| a | f),
             data_share: mean(&p.data_share),
-            misfit: fold(&p.misfit, f64::max),
             contested: mean(&p.contested),
+            deleted: mean(&p.deleted),
             r_row: eta.exp(),
             sd_r_row: eta.exp() * sd,
             chi2: fold(&p.chi2, f64::max),
@@ -1725,12 +1681,39 @@ pub fn support_tree(scans: &[&ScanIndex], rows: &Rows, like: &JointParams, prior
     Ok(out)
 }
 
+/// A node's diagnostics ([`diag`] bits, `data_share` and `contested`; see [`Fit::diag`]) from its summary, its
+/// posterior R and log R's variance, its bounds' EP site precision, its half-length and its stops before and after
+/// the context and its neighbours took theirs.
+fn diagnose(s: &Summary, r: f64, var_eta: f64, site_tau: f64, half: f64, (seen, kept): (u32, u32)) -> (u16, f64, f64) {
+    let d = &s.diag;
+    let contested = if seen > 0 { 1.0 - f64::from(kept) / f64::from(seen) } else { f64::NAN };
+    // log R's precision from the node's own data: its measurement's (R's information, the centre and lean unknown,
+    // at the posterior R) and its bounds' site; a negative site precision (an EP site that isn't a likelihood's)
+    // leaves it undetermined
+    let own = s.used().map_or(0.0, |c| info_r(&(c.st.info / c.inflate())) * r * r);
+    let data_share = if site_tau < 0.0 { f64::NAN } else { ((own + site_tau) * var_eta).clamp(0.0, 1.0) };
+    // how far its own circle reaches from the claim's axis (over its length), against the tube its pulses came from
+    let tube_edge = s.used().is_some_and(|c| {
+        let x = &c.x;
+        let reach = [-half, half].iter().map(|&q| (x[0] + q * x[2]).hypot(x[1] + q * x[3])).fold(0.0, f64::max) + x[4];
+        reach > d.tube - TUBE_MARGIN
+    });
+    let bits = [
+        (d.one_sided, diag::ONE_SIDED),
+        (s.shadowed, diag::SHADOWED),
+        (r < SUB_W * d.w, diag::SUB_FOOTPRINT),
+        (tube_edge, diag::TUBE_EDGE),
+        (contested >= CONTESTED_SHARE, diag::CONTESTED),
+    ];
+    (bits.iter().filter(|b| b.0).fold(0, |a, b| a | b.1), data_share, contested)
+}
+
 /// A piece's or row's own outputs (see [`Fit`]).
 struct Own {
     diag: u16,
     data_share: f64,
-    misfit: f64,
     contested: f64,
+    deleted: f64,
     r_row: f64,
     sd_r_row: f64,
     chi2: f64,
@@ -1823,8 +1806,8 @@ impl Fit {
         self.lam.push(own.lam);
         self.diag.push(own.diag);
         self.data_share.push(own.data_share);
-        self.misfit.push(own.misfit);
         self.contested.push(own.contested);
+        self.deleted.push(own.deleted);
     }
 }
 
@@ -2204,8 +2187,8 @@ mod tests {
         assert!(seen.iter().all(|&j| q.log_odds[j] > like().exist_scale * LLR_CLIP - 1e-9 && q.p_wood[j] > 0.75) && q.p_wood.iter().all(|&p| p > pp.exist), "log odds {:?} p_wood {:?}", q.log_odds, q.p_wood);
         // its diagnostics: one scan, both edges seen; its own data give most of what the tree says of its measured
         // pieces' R, none of the others'
-        assert!(seen.iter().all(|&j| q.diag[j] == diag::ONE_SIDED && q.data_share[j] > 0.5 && q.data_share[j] <= 1.0 && q.misfit[j].is_finite() && (0.0..=1.0).contains(&q.contested[j])), "diag {:?} share {:?}", q.diag, q.data_share);
-        assert!((0..7).filter(|j| !seen.contains(j)).all(|j| q.diag[j] == 0 && q.data_share[j] == 0.0 && q.contested[j].is_nan()), "diag {:?} share {:?}", q.diag, q.data_share);
+        assert!(seen.iter().all(|&j| q.diag[j] == diag::ONE_SIDED && q.data_share[j] > 0.5 && q.data_share[j] <= 1.0 && q.deleted[j] == 0.0 && (0.0..=1.0).contains(&q.contested[j])), "diag {:?} share {:?}", q.diag, q.data_share);
+        assert!((0..7).filter(|j| !seen.contains(j)).all(|j| q.diag[j] == 0 && q.data_share[j] == 0.0 && q.contested[j].is_nan() && q.deleted[j].is_nan()), "diag {:?} share {:?}", q.diag, q.data_share);
         assert_eq!(f.diag[0], diag::ONE_SIDED);
 
         // the part the fan sees, 48 cm in two pieces: measured, the claim moved back by 1 cm, upright
@@ -2223,7 +2206,7 @@ mod tests {
     /// An accepted exact fit of `stems`, none shadowed.
     fn exact(stems: &[Circle]) -> routed::Exact {
         let n = stems.len();
-        routed::Exact { stems: stems.to_vec(), lam: vec![1.0; n], gain: f64::NAN, n_pairs: 100, evals: [0; 2], echoes: Echoes::default(), shadowed: vec![false; n], bounds: vec![Vec::new(); n], tube: 0.2, thinned: false, n_ctx: 0 }
+        routed::Exact { stems: stems.to_vec(), lam: vec![1.0; n], gain: f64::NAN, n_pairs: 100, evals: [0; 2], echoes: Echoes::default(), shadow: vec![None; n], tube: 0.2, n_ctx: vec![0; n] }
     }
 
     fn circle(x: Vector5<f64>, sd: f64) -> Circle {
@@ -2232,7 +2215,8 @@ mod tests {
     }
 
     fn summary(outcome: Outcome, bounds: Vec<Bound>) -> Summary {
-        Summary { outcome, chi2_front: f64::NAN, n_runs: 1, n_scans: 1, n_pairs: 100, bounds, log_odds: 0.0, seeds: Vec::new(), exact: None, stops: Vec::new(), shadowed: false, tube: 0.1, w: 0.005, one_sided: false, lost: 0.0, thinned: false, n_ctx: 0 }
+        Summary { outcome, chi2_front: f64::NAN, n_runs: 1, n_scans: 1, n_pairs: 100, bounds, log_odds: 0.0, seeds: Vec::new(), exact: None, stops: Vec::new(), shadowed: false,
+            diag: DiagIn { tube: 0.1, w: 0.005, one_sided: false, deleted: 0.0, n_ctx: 0 } }
     }
 
     #[test]
@@ -2539,6 +2523,21 @@ mod tests {
         // and with no evidence, every piece keeps the prior however far out
         let p = existence(&(0..50usize).map(|k| k.checked_sub(1)).collect::<Vec<_>>(), &[0.0; 50], &pp);
         assert!(p.iter().all(|&x| (x - pp.exist).abs() < 1e-9), "{p:?}");
+    }
+
+    #[test]
+    fn diagnostics_judge_the_nodes_own_circle() {
+        // a 9 cm circle 2 cm off the claim's axis in a 10 cm tube: at its edge, though the tree shrank it to 5 cm
+        let mut s = summary(Outcome::Bounded, Vec::new());
+        s.exact = Some(circle(Vector5::new(0.02, 0.0, 0.0, 0.0, 0.09), 0.005));
+        let (bits, share, contested) = diagnose(&s, 0.05, 0.01, 0.0, 0.25, (10, 4));
+        assert_eq!(bits, diag::TUBE_EDGE | diag::CONTESTED);
+        assert!((contested - 0.6).abs() < 1e-12 && share > 0.0 && share <= 1.0, "{share} {contested}");
+        // narrower than half the footprint; no stops; a negative EP site leaves the share undetermined
+        s.exact = Some(circle(Vector5::new(0.0, 0.0, 0.0, 0.0, 0.002), 0.001));
+        let (bits, share, contested) = diagnose(&s, 0.002, 0.01, -1.0, 0.25, (0, 0));
+        assert_eq!(bits, diag::SUB_FOOTPRINT);
+        assert!(share.is_nan() && contested.is_nan());
     }
 
     #[test]
