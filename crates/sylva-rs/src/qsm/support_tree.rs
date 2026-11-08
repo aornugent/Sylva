@@ -85,7 +85,8 @@
 //!   bounds), [`flag::POROUS`] (pulses but no opaque run: existence and
 //!   bounds). RUNS and HULL pieces are fitted by the exact likelihood here.
 //! - **Routed pieces, exactly** (research 93 §18; [`routed`]): seeds from the
-//!   piece's runs, each a circle with its own lean, measured slice by slice;
+//!   runs of a tube [`SEED_WIDEN`] wider than the piece's (§19), each a circle
+//!   with its own lean, measured slice by slice;
 //!   its pulses taken once about the claim's axis, each stem seeing them from
 //!   its own leaning axis, the stops the tree's measured and bounded pieces (a
 //!   first solve without the routed ones) explain better left to them; then
@@ -180,6 +181,8 @@ const MIN_PULSES: f64 = 30.0;
 const RUN_HITS: f64 = 10.0;
 /// The tube's widening for the lean, a share of the piece's length (a lean of up to about 27°).
 const LEAN_TUBE: f64 = 0.25;
+/// How much wider than its own tube a routed piece's seeds are sought (m).
+const SEED_WIDEN: f64 = 0.15;
 /// Rows longer than this (m) are cut into pieces of at most this length.
 pub const PIECE_LEN: f64 = 0.3;
 /// The narrowest bin (m), the depth jump that separates two stems in a run (m), and how far a stop may sit from
@@ -1122,7 +1125,9 @@ fn summarise_piece(scans: &[&ScanIndex], a: &Point, b: &Point, frame: Frame, r_c
         }
     }
     if let Outcome::Routed { .. } = out.outcome {
-        out.seeds = routed::seeds(&gs, r_claim, p, lean_sd);
+        // its seeds from a tube SEED_WIDEN wider than the piece's: a stem leaning out of a hull's claim crosses its
+        // edge (3dtrees research 93 §19: tree 849 row 4's stem A, 23-30 cm off the axis)
+        out.seeds = routed::seeds(&groups(scans, a, b, frame, tube + SEED_WIDEN, p), r_claim, p, lean_sd);
     }
     // the stops, for the classification once the tree is solved (a routed piece's come from its exact fit, where it
     // has one)
