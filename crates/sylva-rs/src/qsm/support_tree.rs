@@ -200,12 +200,19 @@ const FORK_DF: f64 = 2.0;
 /// Where thin wood's reflectance shift is full (R at most this, m) and where it is none (from this).
 const THIN_FULL: f64 = 0.01;
 const THIN_NONE: f64 = 0.03;
-/// The censored solve: at most `EP_ROUNDS` rounds, each site moved `EP_DAMP` of the way, until no site or
-/// linearisation moves by more than `EP_TOL` (in units of its piece's sd) and no fork weight by more than that (tree 849
-/// takes ~110 rounds: a fork term flips from discounted to trusted on the way; a round is one elimination, ~0.1 ms).
+/// The censored solve: at most `EP_ROUNDS` rounds, each site moved `EP_DAMP` of the way (halved, down to
+/// `EP_DAMP_MIN`, each time its step turns back, and grown back by `EP_REGROW` while it doesn't; a fork weight likewise
+/// from a full step), until no linearisation moves, and no site or fork weight would move undamped, by more than
+/// `EP_TOL` (in units of its piece's sd; a fork weight by more than that itself) (tree 849
+/// takes ~200 rounds at 1e-4 and fewer at 1e-3, with the same radii to the bench's precision; a round is one
+/// elimination, ~3 us per piece; 3dtrees research 93 §19).
 const EP_ROUNDS: usize = 300;
 const EP_DAMP: f64 = 0.5;
-const EP_TOL: f64 = 1e-4;
+/// The least damping of a site whose steps keep turning back, and how fast it grows back (up to `EP_DAMP`, a fork
+/// weight's to a full step) while its steps keep their sign.
+const EP_DAMP_MIN: f64 = 0.02;
+const EP_REGROW: f64 = 1.5;
+const EP_TOL: f64 = 1e-3;
 const EP_NODES: usize = 64;
 /// The rounds of the first solve, which only places the routed pieces' context and parents' ends: its bounds'
 /// sites a few steps in, not settled (each round is one elimination).
@@ -269,6 +276,8 @@ pub struct Fit {
     /// Why a routed piece's exact fit wasn't used ([`refusal`] bits, 0 where it was or the piece isn't routed; a
     /// row's: its pieces').
     pub refused: Vec<u8>,
+    /// A routed piece's stem's foliage rate at its exact fit (1/m; NaN elsewhere; a row's: its pieces' mean).
+    pub lam: Vec<f64>,
 }
 
 /// The fit of one tree: per row (in the input's order) and per node, with each node's row; the nodes are the pieces,
@@ -281,8 +290,9 @@ pub struct SupportTree {
     pub piece_row: Vec<u32>,
     pub piece_src: Vec<u32>,
     pub piece_stem: Vec<u32>,
-    /// Whether the censored solve settled within [`EP_ROUNDS`].
+    /// Whether the censored solve settled within [`EP_ROUNDS`], and the rounds it took.
     pub converged: bool,
+    pub rounds: u32,
     pub echoes: Echoes,
 }
 
@@ -1355,6 +1365,7 @@ pub fn support_tree(scans: &[&ScanIndex], rows: &Rows, like: &JointParams, prior
     // each routed piece's further stems' nodes
     let mut ends: Vec<(Point, f64)> = (0..n0).map(|k| (ends_of(&nd, k, &sol0.x[k]).1, sol0.x[k][4].exp())).collect();
     let mut further: Vec<Vec<usize>> = vec![Vec::new(); n0];
+    let mut lam = vec![f64::NAN; n0];
     for (&k, f) in routed.iter().zip(fits) {
         match f? {
             routed::Fitted::Refused { why, n_pairs, evals } => exact[k] = ExactOut { n_pairs, evals, refused: why, ..ExactOut::default() },
@@ -1362,6 +1373,10 @@ pub fn support_tree(scans: &[&ScanIndex], rows: &Rows, like: &JointParams, prior
                 exact[k] = ExactOut { k: e.stems.len() as u32, gain: e.gain, n_pairs: e.n_pairs, evals: e.evals, refused: 0 };
                 let node = enter(k, &e.stems, &mut nd, &mut sums, &mut ends, &mut further);
                 exact.resize(nd.row.len(), ExactOut::default());
+                lam.resize(nd.row.len(), f64::NAN);
+                for (j, &q) in node.iter().enumerate() {
+                    lam[q as usize] = e.lam[j];
+                }
                 echoes.append(e.echoes, |j| node[j as usize]);
             }
         }
@@ -1381,6 +1396,7 @@ pub fn support_tree(scans: &[&ScanIndex], rows: &Rows, like: &JointParams, prior
         piece_src: (0..nd.row.len()).map(|k| nd.src(k).0 as u32).collect(),
         piece_stem: (0..nd.row.len()).map(|k| nd.src(k).1).collect(),
         converged,
+        rounds: sol.rounds as u32,
         echoes: echoes.dedup(),
     };
     // the tightest bound of a side
@@ -1405,6 +1421,7 @@ pub fn support_tree(scans: &[&ScanIndex], rows: &Rows, like: &JointParams, prior
             n_scans: s.n_scans,
             n_pairs: s.n_pairs,
             exact: exact[k],
+            lam: lam[k],
         };
         out.pieces.push(&sol.x[k], &sol.cov[k], nd.frame[k], nd.a[k], own);
     }
@@ -1439,6 +1456,10 @@ pub fn support_tree(scans: &[&ScanIndex], rows: &Rows, like: &JointParams, prior
                 evals: [p.evals_value[k0..k1].iter().sum(), p.evals_deriv[k0..k1].iter().sum()],
                 refused: p.refused[k0..k1].iter().fold(0, |a, &f| a | f),
             },
+            lam: {
+                let v: Vec<f64> = p.lam[k0..k1].iter().copied().filter(|x| x.is_finite()).collect();
+                if v.is_empty() { f64::NAN } else { v.iter().sum::<f64>() / v.len() as f64 }
+            },
         };
         out.rows.push(&x, &cov, fr[k], rows.a[k], own);
     }
@@ -1461,6 +1482,7 @@ struct Own {
     n_scans: u32,
     n_pairs: u32,
     exact: ExactOut,
+    lam: f64,
 }
 
 /// Classifies a piece's stops with no exact fit (see [`Echoes`]): on its circle's front arc (the tree's posterior
@@ -1535,6 +1557,7 @@ impl Fit {
         self.evals_value.push(own.exact.evals[0]);
         self.evals_deriv.push(own.exact.evals[1]);
         self.refused.push(own.exact.refused);
+        self.lam.push(own.lam);
     }
 }
 
@@ -1580,8 +1603,9 @@ struct Solved {
     x: Vec<Vector5<f64>>,
     cov: Vec<Matrix5<f64>>,
     y: Vec<Matrix5<f64>>,
-    /// The fork terms' weights the solve ended with (1 where a piece has none).
+    /// The fork terms' weights the solve ended with (1 where a piece has none), and the rounds it took.
     fork_w: Vec<f64>,
+    rounds: usize,
 }
 
 /// The tree's posterior (see the module documentation): the prior (its fork terms reweighted as a Student-t's), the
@@ -1591,6 +1615,8 @@ fn tree_solve(rows: &Rows, fr: &[Frame], nd: &Nodes, sums: &[Summary], p: &Prior
     let n = nd.row.len();
     let forks = fork_means(rows, fr, nd, p);
     let mut fork_w = vec![1.0; n];
+    // the prior without its fork terms, once; each round adds those at their weights
+    let (h_prior, c_prior, g_prior) = prior_system(rows, nd, p, &forks, &vec![0.0; n]);
     let mut lin: Vec<f64> = (0..n).map(|k| sums[k].used().map_or(rows.r_prior[nd.row[k]].ln(), |c| c.x[4].ln())).collect();
     // a piece's bounds enter where no circle of its own does; a routed piece's without its detection bound (its woody
     // run can span several stems)
@@ -1600,9 +1626,24 @@ fn tree_solve(rows: &Rows, fr: &[Frame], nd: &Nodes, sums: &[Summary], p: &Prior
     }).filter(|t| !t.1.is_empty()).collect();
     // each piece's site: precision and precision times mean, on its log R
     let mut site = vec![(0.0, 0.0); terms.len()];
+    // each site's damping and its last step: a site whose step turns back is damped harder (an oscillating site,
+    // a base piece's bounds against its linked measurements, held tree 2776's solve for its 300 rounds)
+    let mut damp = vec![EP_DAMP; terms.len()];
+    let mut last = vec![(0.0f64, 0.0f64); terms.len()];
+    // and each fork weight's (the Student-t's reweighting turns with its sites: tree 2776's node 88), at first in full
+    let (mut fork_damp, mut fork_last) = (vec![1.0f64; n], vec![0.0f64; n]);
     let mut round = 0;
     loop {
-        let (mut h, c0, mut g) = prior_system(rows, nd, p, &forks, &fork_w);
+        let (mut h, mut c0, mut g) = (h_prior.clone(), c_prior.clone(), g_prior.clone());
+        for k in 0..n {
+            let (Some(m), Some(q)) = (forks[k], nd.parent[k]) else { continue };
+            let w = fork_w[k] / (p.sig_fork * p.sig_fork);
+            h[k][(4, 4)] += w;
+            h[q][(4, 4)] += w;
+            c0[k][(4, 4)] -= w;
+            g[k][4] += w * m;
+            g[q][4] -= w * m;
+        }
         for k in 0..n {
             let Some(c) = sums[k].used() else { continue };
             // R = rl (1 + eta - log rl) near the linearisation point: x = J x' + off
@@ -1631,9 +1672,12 @@ fn tree_solve(rows: &Rows, fr: &[Frame], nd: &Nodes, sums: &[Summary], p: &Prior
             let (Some(m), Some(q)) = (forks[k], nd.parent[k]) else { continue };
             let cross = -(sol.y[k] * sol.cov[q])[(4, 4)];
             let e2 = (sol.x[k][4] - sol.x[q][4] - m).powi(2) + sol.cov[k][(4, 4)] + sol.cov[q][(4, 4)] - 2.0 * cross;
-            let w = (FORK_DF + 1.0) / (FORK_DF + e2 / (p.sig_fork * p.sig_fork));
-            moved = moved.max((w - fork_w[k]).abs());
-            fork_w[k] = w;
+            let step = (FORK_DF + 1.0) / (FORK_DF + e2 / (p.sig_fork * p.sig_fork)) - fork_w[k];
+            fork_damp[k] = if step * fork_last[k] < 0.0 { (0.5 * fork_damp[k]).max(EP_DAMP_MIN) } else { (EP_REGROW * fork_damp[k]).min(1.0) };
+            fork_last[k] = step;
+            // converged on the step it would take undamped: a damped step is small however far it has to go
+            moved = moved.max(step.abs());
+            fork_w[k] += fork_damp[k] * step;
         }
         for (t, (k, bs)) in terms.iter().enumerate() {
             let k = *k;
@@ -1647,37 +1691,61 @@ fn tree_solve(rows: &Rows, fr: &[Frame], nd: &Nodes, sums: &[Summary], p: &Prior
             let mc = (mu / v - nu) / pc;
             let Some((mh, vh)) = tilted(mc, 1.0 / pc, (mu, v.sqrt()), bs) else { continue };
             let (tau_new, nu_new) = ((1.0 / vh - pc).max(0.0), mh / vh - mc * pc);
-            let next = (tau + EP_DAMP * (tau_new - tau), nu + EP_DAMP * (nu_new - nu));
-            moved = moved.max((next.0 - tau).abs() * v).max((next.1 - nu).abs() * v.sqrt());
-            site[t] = next;
+            let step = (tau_new - tau, nu_new - nu);
+            damp[t] = if step.0 * last[t].0 < 0.0 || step.1 * last[t].1 < 0.0 { (0.5 * damp[t]).max(EP_DAMP_MIN) } else { (EP_REGROW * damp[t]).min(1.0) };
+            last[t] = step;
+            moved = moved.max(step.0.abs() * v).max(step.1.abs() * v.sqrt());
+            site[t] = (tau + damp[t] * step.0, nu + damp[t] * step.1);
         }
         round += 1;
         if (round >= 3 && moved < EP_TOL) || round >= rounds.max(3) {
-            return Ok((Solved { fork_w, ..sol }, moved < EP_TOL));
+            return Ok((Solved { fork_w, rounds: round, ..sol }, moved < EP_TOL));
         }
     }
 }
 
 /// The mean and variance of `N(mu, v)` times a piece's probit terms `bs`, by the trapezoid rule on [`EP_NODES`]
-/// points across `at.0 ± 6 at.1` (the piece's marginal, which the tilted distribution approaches); None where the
-/// grid holds no mass. One site per piece makes the expectation propagation exact for a piece alone (a site per
+/// points across `at.0 ± 6 at.1` (the piece's marginal, which the tilted distribution approaches), or where its mass
+/// peaks at that grid's edge (the cavity far from the bounds: tree 2776's base, research 93 §19), across the cavity's
+/// ±8 sd and the bounds and again about the peak; None where the grid holds no mass. One site per piece makes the
+/// expectation propagation exact for a piece alone (a site per
 /// term would not: two bounds on one piece leave its sd ~10 % wide); across linked pieces it is within ~0.1 sd of
 /// the mean and ~12 % of the sd (research 93 §17 review, against brute-force quadrature).
 fn tilted(mu: f64, v: f64, at: (f64, f64), bs: &[Bound]) -> Option<(f64, f64)> {
-    let h = 12.0 * at.1 / (EP_NODES - 1) as f64;
-    let e: Vec<f64> = (0..EP_NODES).map(|i| at.0 - 6.0 * at.1 + i as f64 * h).collect();
-    let lf: Vec<f64> = e.iter().map(|&x| -0.5 * (x - mu).powi(2) / v + bs.iter().map(|b| b.ln_p(x)).sum::<f64>()).collect();
-    let top = lf.iter().copied().fold(f64::NEG_INFINITY, f64::max);
-    if !top.is_finite() {
-        return None;
+    let lf = |x: f64| -0.5 * (x - mu).powi(2) / v + bs.iter().map(|b| b.ln_p(x)).sum::<f64>();
+    // the trapezoid rule on n points across [lo, hi]: the mean, the variance, the spacing and where the mass peaks
+    let grid = |lo: f64, hi: f64, n: usize| -> Option<(f64, f64, f64, usize)> {
+        let h = (hi - lo) / (n - 1) as f64;
+        let l: Vec<f64> = (0..n).map(|i| lf(lo + i as f64 * h)).collect();
+        let (top_i, top) = l.iter().copied().enumerate().fold((0, f64::NEG_INFINITY), |b, (i, x)| if x > b.1 { (i, x) } else { b });
+        if !top.is_finite() {
+            return None;
+        }
+        let (mut z, mut m1, mut m2) = (0.0, 0.0, 0.0);
+        for (i, &li) in l.iter().enumerate() {
+            let x = lo + i as f64 * h;
+            let w = (li - top).exp() * if i == 0 || i + 1 == n { 0.5 } else { 1.0 };
+            (z, m1, m2) = (z + w, m1 + w * x, m2 + w * x * x);
+        }
+        let m = m1 / z;
+        Some((m, (m2 / z - m * m).max(0.0), h, top_i))
+    };
+    let (m, var, _, top) = grid(at.0 - 6.0 * at.1, at.0 + 6.0 * at.1, EP_NODES)?;
+    if top != 0 && top != EP_NODES - 1 {
+        return Some((m, var.max(1e-6 * at.1 * at.1)));
     }
-    let (mut z, mut m1, mut m2) = (0.0, 0.0, 0.0);
-    for (i, (&x, &l)) in e.iter().zip(&lf).enumerate() {
-        let w = (l - top).exp() * if i == 0 || i + 1 == EP_NODES { 0.5 } else { 1.0 };
-        (z, m1, m2) = (z + w, m1 + w * x, m2 + w * x * x);
+    // the mass lies beyond the marginal's grid (a cavity far from its bounds, as in the first rounds): across the
+    // cavity and the bounds, then again about the peak where that grid is coarse for it
+    let reach = |b: &Bound| 4.0 * b.sd.min(1.0);
+    let lo = bs.iter().map(|b| b.eta - reach(b)).fold(mu - 8.0 * v.sqrt(), f64::min);
+    let hi = bs.iter().map(|b| b.eta + reach(b)).fold(mu + 8.0 * v.sqrt(), f64::max);
+    let (m, var, h, top) = grid(lo, hi, 4 * EP_NODES)?;
+    if var.sqrt() > 2.0 * h {
+        return Some((m, var));
     }
-    let m = m1 / z;
-    Some((m, (m2 / z - m * m).max(1e-6 * at.1 * at.1)))
+    let x = lo + top as f64 * h;
+    let (m, var, h, _) = grid(x - 12.0 * h, x + 12.0 * h, EP_NODES)?;
+    Some((m, var.max(1e-4 * h * h)))
 }
 
 /// Each piece's chance of being wood: its evidence (`log_odds`) under a chain along the branches (a base piece is
@@ -1826,7 +1894,7 @@ fn eliminate(parent: &[Option<usize>], mut h: Vec<Matrix5<f64>>, c: &[Matrix5<f6
             }
         }
     }
-    Ok(Solved { x, cov, y, fork_w: Vec::new() })
+    Ok(Solved { x, cov, y, fork_w: Vec::new(), rounds: 0 })
 }
 
 #[cfg(test)]
@@ -1946,6 +2014,27 @@ mod tests {
         // a block that isn't positive definite is an error, not a silent zero
         let bad = vec![Matrix5::<f64>::zeros()];
         assert!(eliminate(&[None], bad, &[Matrix5::zeros()], vec![Vector5::zeros()]).is_err());
+    }
+
+    #[test]
+    fn tilted_moments_reach_bounds_far_from_the_marginal() {
+        // a cavity at log R -4.7 (sd 0.16) and two-sided bounds 15 sd away at -2.25 (tree 2776's base piece): the
+        // moments lie between the bounds, as brute force on a fine grid says, not at the marginal's grid's edge
+        let bs = [Bound { eta: -2.28, sd: 0.04, side: Side::Lower }, Bound { eta: -2.22, sd: 0.05, side: Side::Upper }];
+        let (mu, v) = (-4.7, 0.16f64.powi(2));
+        let (m, var) = tilted(mu, v, (mu, v.sqrt()), &bs).unwrap();
+        let xs: Vec<f64> = (0..200_001).map(|i| -8.0 + 7.0 * i as f64 / 200_000.0).collect();
+        let lw: Vec<f64> = xs.iter().map(|&x| -0.5 * (x - mu).powi(2) / v + bs.iter().map(|b| b.ln_p(x)).sum::<f64>()).collect();
+        let top = lw.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+        let (z, m1, m2) = xs.iter().zip(&lw).fold((0.0, 0.0, 0.0), |(z, a, b), (&x, &l)| {
+            let w = (l - top).exp();
+            (z + w, a + w * x, b + w * x * x)
+        });
+        let (bm, bv) = (m1 / z, m2 / z - (m1 / z).powi(2));
+        assert!((m - bm).abs() < 0.05 * bv.sqrt() && (var.sqrt() / bv.sqrt() - 1.0).abs() < 0.05, "{m} {} against {bm} {}", var.sqrt(), bv.sqrt());
+        // a marginal that holds the mass: the moments of its own grid, unchanged
+        let (m0, v0) = tilted(-2.25, 0.03f64.powi(2), (-2.25, 0.03), &bs).unwrap();
+        assert!(m0 > -2.3 && m0 < -2.2 && v0 > 0.0);
     }
 
     #[test]

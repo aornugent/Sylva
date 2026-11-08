@@ -130,6 +130,9 @@ class JointParams:
     split_min_votes: int = _DEFAULTS["split_min_votes"]
     #: A row's radius interval is where its own log likelihood is within ``drop`` of its best.
     drop: float = _DEFAULTS["drop"]
+    #: Which pulses :func:`support_tree` fits on a routed piece of more pairs than its budget (a hash of each pulse's
+    #: direction and this): 0 in production; a bench varies it to measure the thinning's noise.
+    thin_seed: int = _DEFAULTS["thin_seed"]
 
 
 #: Why a row's radius is what it is: :func:`joint_tree`'s ``reason``.

@@ -122,8 +122,11 @@ def test_a_clump_of_stems_is_flagged_as_runs(tmp_path):
         d = np.hypot(*(mid - s[:2]).T)
         j = np.argmin(d)
         assert d[j] < 0.012 and abs(np.log(p["r"][j] / s[2])) < 0.25, (s, d[j], p["r"][j])
-    # within the budget of passes per pair (research 93 §18: <= 60)
-    assert ((p["evals_value"] + p["evals_deriv"])[:2] <= 60 * p["n_exact"][:2]).all()
+    # near the budget of passes per pair (research 93 §18: <= 60, set when every other pulse was fitted). Fitting every
+    # pulse (§19) counts the whole ladder's Newton work per pair: this clump climbs three rungs and takes ~65-69 passes;
+    # real routed pieces average ~26 on the bench, where most stop at one or two rungs
+    passes = (p["evals_value"] + p["evals_deriv"])[:2] / p["n_exact"][:2]
+    assert (passes <= 75).all(), passes
     # every stop classified once, by the exact likelihood here, and the stems' echoes are wood
     e = f["echoes"]
     key = np.c_[e["scan"], e["pulse"], e["echo"]]
@@ -131,6 +134,8 @@ def test_a_clump_of_stems_is_flagged_as_runs(tmp_path):
     assert np.median(e["p_wood"][e["dist"] < 0.01]) > 0.9
     # both fits were accepted; each node is one (piece, stem)
     assert (p["refused"] == 0).all() and (f["refused"] == 0).all() and "phases" not in f
+    # each fitted stem reports its own foliage rate (NaN off the exact path), and the solve its rounds
+    assert np.isfinite(p["lam"][p["k_stems"] > 0]).all() and (p["lam"][p["k_stems"] > 0] > 0).all() and 3 <= f["rounds"] <= 300
     assert len(set(zip(p["src"].tolist(), p["stem"].tolist()))) == len(p["src"])
     with pytest.raises(ValueError, match="version"):
         support_tree(scans, a, b, [0.093, 0.093], [-1, 0], params=dataclasses.replace(PARAMS, version=0))
