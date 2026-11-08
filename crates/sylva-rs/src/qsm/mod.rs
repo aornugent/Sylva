@@ -21,6 +21,7 @@ pub mod model;
 pub mod ops;
 pub mod plot;
 pub mod support;
+pub mod support_tree;
 pub mod weighted;
 pub mod wood;
 

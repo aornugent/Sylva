@@ -14,7 +14,9 @@ random walk of the centre and of foliage (3dtrees research 74).
 :func:`joint_tree` is the whole fit of one tree: the tree's rows and its
 neighbours' cylinders in, a fitted row per stem out, with existence and the
 split of clumps into stems. :func:`joint_table` and :func:`joint_fit` are its
-parts, for research: the pairs, and the fit of a table.
+parts, for research: the pairs, and the fit of a table. :func:`support_tree`
+is its fast path: each row's support function per scan and one linear solve
+over the tree, with flags for the rows that need :func:`joint_tree`.
 
 The parameters are a :class:`JointParams`, whose fields are:
 
@@ -26,6 +28,12 @@ The parameters are a :class:`JointParams`, whose fields are:
   their share ``eps_min + eps (1 - f)`` and how far behind the surface, m),
   ``hide`` (the share of stops whose echo the export deleted, among pulses
   that lost an echo where it could lie: such a recorded pass may be one);
+- echo character (3dtrees research 93 §11.2, read by :func:`support_tree`
+  only): ``refl_wood``, ``refl_wood_sd``, ``refl_leaf`` and ``refl_leaf_sd``
+  (the reflectance, dB, of a single return from bark that fills the footprint
+  and from leaf, mean and sd), ``refl_multi`` and ``refl_multi_sd`` (a return
+  that shares its pulse is ``refl_multi`` dB brighter, negative, with
+  ``refl_multi_sd`` more spread in quadrature);
 - the prior: ``lam_prior`` and ``lam_sd`` (foliage's median, 1/m, and log
   sd), ``sig_ell`` (its random walk), ``sig_eta`` (the taper's random walk per
   sqrt(m)), ``mu_fork`` and ``sig_fork`` (soft Leonardo's log area ratio and
@@ -39,7 +47,7 @@ The parameters are a :class:`JointParams`, whose fields are:
 from __future__ import annotations
 
 import dataclasses
-from enum import IntEnum
+from enum import IntEnum, IntFlag
 
 import numpy as np
 
@@ -69,6 +77,12 @@ class JointParams:
     eps_min: float = _DEFAULTS["eps_min"]
     mp_len: float = _DEFAULTS["mp_len"]
     hide: float = _DEFAULTS["hide"]
+    refl_wood: float = _DEFAULTS["refl_wood"]
+    refl_wood_sd: float = _DEFAULTS["refl_wood_sd"]
+    refl_leaf: float = _DEFAULTS["refl_leaf"]
+    refl_leaf_sd: float = _DEFAULTS["refl_leaf_sd"]
+    refl_multi: float = _DEFAULTS["refl_multi"]
+    refl_multi_sd: float = _DEFAULTS["refl_multi_sd"]
     lam_prior: float = _DEFAULTS["lam_prior"]
     lam_sd: float = _DEFAULTS["lam_sd"]
     sig_ell: float = _DEFAULTS["sig_ell"]
@@ -160,6 +174,73 @@ def joint_tree(scans, a, b, r_prior, parent, context=None, params: JointParams =
     return _core.qsm_joint_tree([s._core for s in scans], f64(a), f64(b), f64(r_prior),
                                 np.ascontiguousarray(parent, np.int64), ca, cb, f64(cr), dataclasses.asdict(params),
                                 split, int(threads))
+
+
+#: Why a row's own support summary was left out of :func:`support_tree`'s tree (bits of its ``flags``): ``RUNS``
+#: (a scan's profile shows two or more stems within the claim), ``HULL`` (the support is wider than one circle
+#: explains: a multi-stem or non-round section), ``FEW`` (too few edges or depths to determine the circle),
+#: ``POROUS`` (pulses, but no opaque run).
+SupportFlag = IntFlag("SupportFlag", _core.qsm_support_flags())
+
+
+def support_tree(scans, a, b, r_prior, parent, params: JointParams = JointParams(), threads: int = 0) -> dict:
+    """Fits one tree from the support function of each row's cross-section: the fast path of :func:`joint_tree`.
+
+    Per (row, scan), the pulses in a tube around the row (wide enough for it to lean) reduce to a profile across
+    it: where they stopped, at what depth, and where they passed. Opaque wood's profile measures its section's
+    support function, linear in a circle's centre and radius: the silhouette's edges (each by maximum likelihood on
+    its hit/pass transition, the footprint and ``tau``/``edge`` of ``params``; an edge with stops beyond it is
+    censored and left out, and one with nothing recorded beyond it was seen against the sky and ends half a pulse
+    spacing past its outermost hit), the front's depth, and the lean along the row. A stop counts as wood by its
+    echo character (``refl_*``: the chance of wood against leaf by its reflectance and return position, wood
+    narrower than the footprint reading darker). A row longer than 30 cm is measured in pieces at most that long
+    and their summaries combined into its line. Per row, weighted least squares over its scans gives the centre at
+    its middle, the lean and the radius with their covariance; a stop is a hit only on the first such circle's
+    front arc (the second pass). A row is flagged (:class:`SupportFlag`) where one circle can't summarise it, and
+    its summary then stays out. The tree is one linear solve: the unflagged rows' summaries and a prior after
+    :func:`joint_tree`'s (the base's level, the taper's steps, at a fork the child's share of the subtree wood
+    length rather than of the prior area, the centre's and lean's continuity along a branch, the centre's anchor
+    and a weak anchor of the lean; no tip anchor), with three Gauss-Newton steps for log R. A flagged row's radius
+    (``flags != 0``) is the prior's given the other rows: it is for :func:`joint_tree`.
+
+    Parameters
+    ----------
+    scans
+        :class:`ScanIndex` of each scan to use.
+    a, b, r_prior, parent
+        The tree's rows: ``(n, 3)`` axes, ``(n,)`` prior radii and parents (int; each before its child, -1 at a
+        base).
+    params
+        :class:`JointParams`: the likelihood's footprint, ``tau``, ``edge``, ``sigma_r``, ``rough`` and ``refl_*``,
+        and the prior's ``sig_eta``, ``mu_fork``, ``sig_fork``, ``sig_root``, ``sig_delta``, ``centre_rel`` and
+        ``centre_abs``; the rest are unused.
+    threads
+        Threads to use (0: one per core).
+
+    Returns
+    -------
+    dict, per row (``(n,)`` unless noted):
+
+    - ``a``, ``b`` ``(n, 3)``: the fitted axis, world coordinates (the claim moved by the centre and turned by the
+      lean); ``r``, ``sd_log_r``: the radius and its posterior sd in log (the prior's where ``flags != 0``);
+    - ``centre``, ``sd_centre``, ``lean``, ``sd_lean`` ``(n, 2)``: the centre at the row's middle (m) and the lean
+      (m per m of axis) along ``e1``, ``e2`` ``(n, 3)``, with their posterior sds;
+    - ``r_row``, ``sd_r_row``: the row's own summary's radius and its sd, NaN where it is flagged or has none;
+    - ``chi2``, ``chi2_front``: its misfits (reduced chi-square), of its measurements to its circle (on their
+      rank) and of its front's stops about the circle against the range noise, roughness and a 4 mm floor; NaN
+      where there is none;
+    - ``flags`` (:class:`SupportFlag` bits; 0: its summary entered the tree);
+    - ``n_runs`` (the most stems within the claim a scan's profile shows), ``n_scans`` (the scans that measured
+      it), ``n_pairs`` (its pulses).
+    """
+    if not all(isinstance(s, ScanIndex) for s in scans):
+        raise TypeError("support_tree: scans must be ScanIndex")
+    if not isinstance(params, JointParams):
+        raise TypeError("support_tree: params must be JointParams")
+    f64 = lambda x: np.ascontiguousarray(x, np.float64)  # noqa: E731
+    return _core.qsm_support_tree([s._core for s in scans], f64(a).reshape(-1, 3), f64(b).reshape(-1, 3),
+                                  f64(r_prior), np.ascontiguousarray(parent, np.int64), dataclasses.asdict(params),
+                                  int(threads))
 
 
 def joint_table(scans, a, b, window, threads: int = 0) -> dict[str, np.ndarray]:
