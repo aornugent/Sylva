@@ -3,22 +3,24 @@
 // Free software under the GNU General Public License v3.0 or later;
 // see the LICENSE file. There is no warranty, to the extent permitted by law.
 //! One tree's wood from the support function of each row's cross-section, as
-//! each scan measures it, and one linear solve over the tree (3dtrees
-//! research 93 §10, §16): the fast path of the joint model, with flags that
-//! send the rows it can't summarise to [`crate::qsm::joint_tree`].
+//! each scan measures it, and one solve over the tree (3dtrees research 93
+//! §10, §16, §17): the fast path of the joint model, with flags that send the
+//! pieces it can't summarise (several stems, a hull) to
+//! [`crate::qsm::joint_tree`].
 //!
-//! Within one (row, scan) group the pulses are nearly parallel, so they
+//! Within one (piece, scan) group the pulses are nearly parallel, so they
 //! reduce to a profile across the row: impact `b` (along the group's `n`,
 //! across the beam) and, where a pulse stopped, depth (along `v`, the beam's
 //! direction in the cross-section). For opaque wood that profile measures the
 //! cross-section's support function, linear in a circle's centre `c` and
 //! radius `R`: the silhouette's edges `n.c ± R_app`, `R_app = R + w (1/2 -
-//! tau)` (w the footprint's width), and the front's depth `v.c - R`. The row
-//! may lean: `c(s) = c0 + s t`, `s` along the axis from the row's middle.
-//! A row longer than [`PIECE_LEN`] is measured in pieces no longer than that,
-//! each with its own lean, and their summaries are combined exactly into the
-//! row's line (a bent row then shows as misfit).
+//! tau)` (w the footprint's width), and the front's depth `v.c - R`. The
+//! piece may lean: `c(s) = c0 + s t`, `s` along the axis from its middle.
 //!
+//! - **Pieces.** A row longer than [`PIECE_LEN`] is cut into equal pieces no
+//!   longer than that; each piece is a node of the tree, its parent the piece
+//!   before it (a row's first piece's, the last of its parent row's), so a
+//!   bent row is a chain of straight pieces held together by the prior.
 //! - **Pairs.** Each pulse whose line comes closest to a piece's axis within
 //!   the piece, inside a tube wide enough for the lean (its tube in
 //!   [`crate::qsm::joint::window`] plus a quarter of its length), with its
@@ -34,7 +36,7 @@
 //!   impacts' spacing; runs of mostly-hit bins are cut where the hits' depth
 //!   jumps, so stems side by side in a projection separate. A run of the
 //!   claim overlaps it across the beam and in depth; the one nearest the axis
-//!   is the row's, and the lean is taken again from its own hits and the
+//!   is the piece's, and the lean is taken again from its own hits and the
 //!   profile cut again. Each of its edges comes by maximum likelihood on its
 //!   hit/pass transition (the joint likelihood's probit of sd `edge w`, under
 //!   the run's own hit share), with its variance and the impacts'
@@ -45,29 +47,55 @@
 //!   the run's middle, regressed on `s`, gives `v.c0 - R` and `v.t`. The
 //!   second pass gates each stop by the first pass's circle: on its front arc
 //!   it is a hit, well behind it a pass, in front of it blocked.
-//! - **Per row,** the measurements' information about `(c0, t, R)`, which may
-//!   be rank-deficient (a one-sided row's lean unseen): the tree's prior
+//! - **Per piece,** the measurements' information about `(c0, t, R)`, which
+//!   may be rank-deficient (a one-sided piece's lean unseen): the tree's prior
 //!   fills what it lacks. Its estimate, with a weak anchor of the centre and
 //!   lean, is inflated by the misfit (reduced chi-square on the rank).
+//! - **Where the circle isn't determined** (thin wood, one side seen, no
+//!   opaque run), each group still bounds R (research 93 §17): its woody stops
+//!   at the claim's depth, about the one nearest the axis, span no more than
+//!   the silhouette (a lower bound, `R >= span / 2 - w (1/2 - tau)`), the
+//!   nearest passes either side of them along their stretch of the axis lie
+//!   outside it (an upper bound, `R <= gap / 2 - w (1/2 - tau)`; nothing
+//!   recorded beyond an edge is sky, a stop or blocked pulse there with no
+//!   pass censors it), and wood that was hit fills at least `tau` of the
+//!   footprint (the capacity limit `R >= tau w / 2`). Each is a probit term on
+//!   log R of the edge's sd.
+//! - **Existence.** Each group's stops and passes aimed at the core (its
+//!   woody cluster's span, or the claim's middle half where none) give a log
+//!   odds of wood against foliage: each stop's echo character and, per pulse,
+//!   opacity (wood stops [`STOP_WOOD`] of them, foliage [`STOP_LEAF`]),
+//!   divided by the beam's oversampling `(w / spacing)^2` (research 93 §15.6).
+//!   A chain along the branches (wood doesn't stop and restart) turns the
+//!   pieces' log odds into `p_wood`, exactly by sum-product.
 //! - **Flags:** [`flag::RUNS`] (a group's profile, its stops gated by the
 //!   fitted circle's depth band, shows two or more stems within the claim),
-//!   [`flag::HULL`] (the support is wider than one circle explains: more than
-//!   a share of the stops aimed at the fitted circle's core lie behind its
-//!   front, the measurements or the front's stops misfit it, or the row's run
-//!   is far wider than it), [`flag::FEW`] (R isn't determined), [`flag::POROUS`]
-//!   (pulses but no opaque run). A flagged row's summary doesn't enter the
-//!   tree: its radius there is the prior's, and the exact likelihood is for it.
-//! - **The tree:** the unflagged rows' summaries as Gaussian measurements of
-//!   `(c0, t, R)`, and a Gaussian Markov prior over the rows after the joint
-//!   fit's [`PriorParams`] (the base's level, the taper's steps, at a fork the
-//!   child's share of the subtree wood length rather than of the prior area,
-//!   the centre's and lean's continuity along a branch, the centre's anchor on
-//!   the claim and a weak anchor of the lean; no tip anchor). Every term links
-//!   a row only to its parent, so the system is solved exactly by eliminating
-//!   rows into their parents, leaves first (as [`crate::qsm::joint_fit`]'s
-//!   branch blocks, which without the per-scan offsets are single rows), with
-//!   each row's marginal covariance. The radius is measured in R and modelled
-//!   in log R: three Gauss-Newton steps.
+//!   [`flag::HULL`] (the support is wider than one circle explains within the
+//!   piece: more than a share of the stops aimed at the fitted circle's core
+//!   lie behind its front, the measurements or the front's stops misfit it,
+//!   or the run is far wider than it), [`flag::BOUNDS`] (R isn't determined:
+//!   bounds), [`flag::POROUS`] (pulses but no opaque run: existence and
+//!   bounds). Only RUNS and HULL are for the exact likelihood; their radius
+//!   is the prior's.
+//! - **The tree:** the unflagged pieces' summaries as Gaussian measurements
+//!   of `(c0, t, R)`, the bounds of BOUNDS and POROUS pieces as censored
+//!   measurements of log R, and a Gaussian Markov prior over the pieces after
+//!   the joint fit's [`PriorParams`] (the base's level, the taper's steps, at
+//!   a fork the child's share of the subtree wood length rather than of the
+//!   prior area, the centre's and lean's continuity along a branch, the
+//!   centre's anchor on the claim and a weak anchor of the lean; no tip
+//!   anchor). Every term links a piece only to its parent, so each Gaussian
+//!   system is solved exactly by eliminating pieces into their parents, leaves
+//!   first (as [`crate::qsm::joint_fit`]'s branch blocks, which without the
+//!   per-scan offsets are single rows), with each piece's marginal covariance.
+//!   The radius is measured in R and modelled in log R (Gauss-Newton), and the
+//!   censored terms enter by expectation propagation: each a Gaussian site on
+//!   its piece's log R matched to the moments of its probit times the cavity
+//!   (exact per term), all sites updated from the marginals of one solve and
+//!   damped, until nothing moves. The posterior is then the prior cut by the
+//!   bounds, mean and sd. A row's output is its pieces': the line from the
+//!   first's start to the last's end and the mean of their log R, with the
+//!   covariance of the chain.
 
 use nalgebra::{Matrix5, SymmetricEigen, Vector5};
 use rayon::prelude::*;
@@ -79,15 +107,16 @@ use crate::qsm::joint_fit::{ForkShare, Frame, PriorParams, Rows};
 use crate::transform::{cross, dot, sub};
 use crate::Point;
 
-/// Why a row's own summary is not used (bits of [`SupportTree::flags`]).
+/// Why a piece's own summary is not used (bits of [`Fit::flags`]). Only [`RUNS`] and [`HULL`] are for the exact
+/// likelihood; the others are resolved here.
 pub mod flag {
     /// A group's profile holds two or more stems within the claim.
     pub const RUNS: u8 = 1;
-    /// The support is wider than one circle explains.
+    /// The support is wider than one circle explains within a piece: several stems or a non-round section.
     pub const HULL: u8 = 2;
-    /// Too few edges or depths to determine the circle.
-    pub const FEW: u8 = 4;
-    /// Pulses, but no opaque run.
+    /// The circle isn't determined: the radius is the prior cut by the bounds.
+    pub const BOUNDS: u8 = 4;
+    /// Pulses, but no opaque run: existence (`p_wood`), and the radius the prior cut by any bounds.
     pub const POROUS: u8 = 8;
 }
 
@@ -97,56 +126,94 @@ const MIN_PULSES: f64 = 30.0;
 const RUN_HITS: f64 = 10.0;
 /// The tube's widening for the lean, a share of the piece's length (a lean of up to about 27°).
 const LEAN_TUBE: f64 = 0.25;
-/// Rows longer than this (m) are measured in pieces of at most this length.
+/// Rows longer than this (m) are cut into pieces of at most this length.
 pub const PIECE_LEN: f64 = 0.3;
 /// The lean's anchor (m per m), and the floor on each measurement's sd (m): non-round sections, a ~4 mm offset
 /// between scans that no sway explains (research 93 §15.6; at 2 mm Alice Mulga's clean rows misfit by a reduced
 /// chi-square of 4-9).
 const LEAN_SD: f64 = 0.5;
 const MODEL_SD: f64 = 0.004;
+/// The lean's bend between a row's pieces, per square root of m (research 93 §13.1: rows of 67-98 cm whose centres
+/// drift 8-24 cm along them).
+const LEAN_BEND: f64 = 0.3;
 /// The narrowest bin (m), the depth jump that separates two stems in a run (m), and how far a stop may sit from
 /// a run's depths or a circle's front and still be on it (`DEPTH_TOL + 0.3 R`).
 const BIN_MIN: f64 = 0.002;
 const DEPTH_JUMP: f64 = 0.02;
 const DEPTH_TOL: f64 = 0.02;
-/// A stop aimed at a circle's core is "behind" it this far behind its front (`HULL_BEHIND + 0.1 R`); a row is a
+/// A stop aimed at a circle's core is "behind" it this far behind its front (`HULL_BEHIND + 0.1 R`); a piece is a
 /// hull when more than `HULL_SHARE` of them are, or a misfit (reduced chi-square) exceeds `HULL_CHI2`.
 const HULL_BEHIND: f64 = 0.01;
 const HULL_SHARE: f64 = 0.25;
 const HULL_CHI2: f64 = 9.0;
 /// The bound on a stop's log likelihood ratio of wood to leaf (research 93 §11.2).
 const LLR_CLIP: f64 = 3.0;
+/// The share of the pulses aimed at a core that stop there: on wood (opaque but for the soft edge) and on foliage
+/// (research 93 §11.1: synthetic foliage lets 65 % through).
+const STOP_WOOD: f64 = 0.9;
+const STOP_LEAF: f64 = 0.35;
+/// Existence along a branch: each piece is wood a priori with `EXIST` (about `joint_tree`'s share of RCT's rows on
+/// Alice Mulga tree 849), one after none with `EXIST_OFF` (wood doesn't stop and restart), and one after wood with
+/// `EXIST_ON`, which keeps every piece's prior at `EXIST` however far out it is.
+const EXIST: f64 = 0.8;
+const EXIST_OFF: f64 = 0.02;
+const EXIST_ON: f64 = 1.0 - (1.0 - EXIST) * EXIST_OFF / EXIST;
+/// The capacity limit's sd in log R (`tau` itself is a calibration).
+const CAP_SD: f64 = 0.3;
+/// The censored solve: at most `EP_ROUNDS` rounds, each site moved `EP_DAMP` of the way, until no site or
+/// linearisation moves by more than `EP_TOL` (in units of its piece's sd).
+const EP_ROUNDS: usize = 100;
+const EP_DAMP: f64 = 0.5;
+const EP_TOL: f64 = 1e-4;
+const EP_NODES: usize = 64;
 
-/// The fit of one tree: per row (in the input's order).
-#[derive(Debug, Clone, PartialEq)]
-pub struct SupportTree {
+/// One tree's fit, per row or per piece (the tree's nodes).
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Fit {
     /// The fitted axis (world coordinates: the claim moved by the centre and turned by the lean) and radius, with
-    /// the posterior sd of log R. Where the row is flagged these are the prior's, given the other rows.
+    /// the posterior sd of log R. Where a piece is RUNS or HULL these are the prior's, given the others.
     pub a: Vec<Point>,
     pub b: Vec<Point>,
     pub r: Vec<f64>,
     pub sd_log_r: Vec<f64>,
-    /// The centre at the row's middle and the lean (per m along the axis), along `e1, e2`, with their sds.
+    /// The centre at the middle and the lean (per m along the axis), along `e1, e2`, with their sds.
     pub centre: Vec<[f64; 2]>,
     pub sd_centre: Vec<[f64; 2]>,
     pub lean: Vec<[f64; 2]>,
     pub sd_lean: Vec<[f64; 2]>,
     pub e1: Vec<Point>,
     pub e2: Vec<Point>,
-    /// The row's own summary, NaN where it is flagged or has none: its radius and sd.
+    /// The own summary's radius and sd, NaN where it is flagged or has none (a row's: the geometric mean of its
+    /// measured pieces').
     pub r_row: Vec<f64>,
     pub sd_r_row: Vec<f64>,
-    /// The row's misfits, NaN where it has none: of its measurements to its circle (reduced chi-square on their
-    /// rank), and of its front's stops about that circle against the range noise, roughness and the floor.
+    /// The misfits, NaN where there are none (a row's: its pieces' largest): of the measurements to the circle
+    /// (reduced chi-square on their rank), and of the front's stops about it against the range noise, roughness
+    /// and the floor.
     pub chi2: Vec<f64>,
     pub chi2_front: Vec<f64>,
-    /// [`flag`] bits: the row's summary entered the tree only where 0.
+    /// The bounds on R, the tightest lower and upper, NaN where there are none (a row's: its pieces' widest).
+    pub r_lo: Vec<f64>,
+    pub r_hi: Vec<f64>,
+    /// The existence evidence (log odds of wood against foliage; a row's: its pieces' sum) and the chance of wood
+    /// under the branches' chain (a row's: its pieces' mean, the share of it that is wood).
+    pub log_odds: Vec<f64>,
+    pub p_wood: Vec<f64>,
+    /// [`flag`] bits (a row's: its pieces'): the summary entered the tree only where 0.
     pub flags: Vec<u8>,
-    /// The most runs (stems within the claim) any group shows, the groups that gave measurements, and the
-    /// row's pairs.
+    /// The most runs (stems within the claim) any group shows, the groups that gave measurements, and the pairs
+    /// (a row's: the most, the most, the sum).
     pub n_runs: Vec<u32>,
     pub n_scans: Vec<u32>,
     pub n_pairs: Vec<u32>,
+}
+
+/// The fit of one tree: per row (in the input's order) and per piece, with each piece's row.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SupportTree {
+    pub rows: Fit,
+    pub pieces: Fit,
+    pub piece_row: Vec<u32>,
 }
 
 /// A pulse in a piece's cross-section: impact, axial position from the piece's middle, depth of its stop (NaN:
@@ -200,25 +267,9 @@ impl Stats {
         }
         st
     }
-
-    /// The same measurements of a piece whose middle is `s` along the row, as measurements of the row's state
-    /// (the piece's centre is the row's `c0 + s t`).
-    fn moved(&self, s: f64) -> Self {
-        let mut a = Matrix5::<f64>::identity();
-        a[(0, 2)] = s;
-        a[(1, 3)] = s;
-        Stats { info: a.transpose() * self.info * a, h: a.transpose() * self.h, ..*self }
-    }
-
-    fn add(&mut self, o: &Stats) {
-        self.info += o.info;
-        self.h += o.h;
-        self.yy += o.yy;
-        self.n += o.n;
-    }
 }
 
-/// A row's circle `[c1, c2, t1, t2, R]` (centre at the middle, lean, radius): its measurements' statistics, the
+/// A piece's circle `[c1, c2, t1, t2, R]` (centre at the middle, lean, radius): its measurements' statistics, the
 /// estimate and covariance (with a weak anchor of the centre and lean on the claim, inflated by the misfit) and
 /// the misfit.
 #[derive(Debug, Clone, Copy)]
@@ -235,20 +286,37 @@ impl Circle {
     }
 }
 
-/// What a row's own pulses say.
-struct RowSummary {
+/// A censored measurement of a piece's log R, `log R <= eta` (upper) or `>= eta`, softened by a Gaussian of sd
+/// `sd`: the probit `Phi(±(eta - log R) / sd)`, log-concave.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct Bound {
+    eta: f64,
+    sd: f64,
+    upper: bool,
+}
+
+/// What a piece's own pulses say: its circle and front misfit, flags, runs, scans and pairs, and its bounds and
+/// existence evidence (log odds).
+struct Summary {
     circle: Option<Circle>,
     chi2_front: f64,
     flags: u8,
     n_runs: u32,
     n_scans: u32,
     n_pairs: u32,
+    bounds: Vec<Bound>,
+    log_odds: f64,
 }
 
-impl RowSummary {
-    /// The circle, where the row's summary enters the tree.
+impl Summary {
+    /// The circle, where the piece's summary enters the tree.
     fn used(&self) -> Option<&Circle> {
         if self.flags == 0 { self.circle.as_ref() } else { None }
+    }
+
+    /// The bounds that enter the tree: a piece with no circle, not routed.
+    fn censored(&self) -> &[Bound] {
+        if self.flags & (flag::BOUNDS | flag::POROUS) != 0 && self.flags & (flag::RUNS | flag::HULL) == 0 { &self.bounds } else { &[] }
     }
 }
 
@@ -265,14 +333,12 @@ fn median(v: &mut [f64]) -> f64 {
     *v.select_nth_unstable_by(mid, f64::total_cmp).1
 }
 
-/// The weight of a stop as a hit on wood of radius `r`: the chance its echo came from wood rather than leaf by its
-/// reflectance and return position (research 93 §11.2, even odds, the log ratio clipped to ±[`LLR_CLIP`]), over
-/// that chance at the clip, so an echo as surely wood as the clip allows counts fully (a uniform discount of every
-/// hit would pull each edge inwards). Wood narrower than the footprint `w` fills only `2r/w` of it and reads that
-/// much darker. An echo of unknown reflectance: 1.
-fn p_wood(rec: &Rec, r: f64, p: &JointParams) -> f64 {
+/// A stop's log likelihood ratio of wood of radius `r` to leaf by its reflectance and return position (research 93
+/// §11.2), clipped to ±[`LLR_CLIP`]: wood narrower than the footprint `w` fills only `2r/w` of it and reads that
+/// much darker. An echo of unknown reflectance: 0.
+fn llr(rec: &Rec, r: f64, p: &JointParams) -> f64 {
     if !rec.refl.is_finite() {
-        return 1.0;
+        return 0.0;
     }
     let (shift, var) = if rec.single { (0.0, 0.0) } else { (p.refl_multi, p.refl_multi_sd * p.refl_multi_sd) };
     let thin = 10.0 * (2.0 * r / rec.w).clamp(1e-3, 1.0).log10();
@@ -280,8 +346,17 @@ fn p_wood(rec: &Rec, r: f64, p: &JointParams) -> f64 {
         let s = (sd * sd + var).sqrt();
         -0.5 * ((rec.refl - m) / s).powi(2) - s.ln()
     };
-    let llr = (ll(p.refl_wood + shift + thin, p.refl_wood_sd) - ll(p.refl_leaf + shift, p.refl_leaf_sd)).clamp(-LLR_CLIP, LLR_CLIP);
-    (1.0 + (-LLR_CLIP).exp()) / (1.0 + (-llr).exp())
+    (ll(p.refl_wood + shift + thin, p.refl_wood_sd) - ll(p.refl_leaf + shift, p.refl_leaf_sd)).clamp(-LLR_CLIP, LLR_CLIP)
+}
+
+/// The weight of a stop as a hit on wood of radius `r`: the chance its echo came from wood rather than leaf at even
+/// odds ([`llr`]), over that chance at the clip, so an echo as surely wood as the clip allows counts fully (a
+/// uniform discount of every hit would pull each edge inwards). An echo of unknown reflectance: 1.
+fn p_wood(rec: &Rec, r: f64, p: &JointParams) -> f64 {
+    if !rec.refl.is_finite() {
+        return 1.0;
+    }
+    (1.0 + (-LLR_CLIP).exp()) / (1.0 + (-llr(rec, r, p)).exp())
 }
 
 /// Each pulse's weight for its fate: a hit counts as wood by [`p_wood`] (for wood of radius `r`), a pass fully,
@@ -754,23 +829,123 @@ fn solve_row(st: &Stats, r_claim: f64) -> Option<Circle> {
     Some(Circle { cov, ..c })
 }
 
-/// What one piece's pulses say: its second pass's measurements (None where it never got there), its flags (RUNS,
-/// HULL by the stops behind its circle, POROUS), runs, scans and pairs, and its front's stops' misfit about its
-/// circle (sum of squares in units of their variance, and degrees of freedom).
-struct PieceSummary {
-    st: Option<Stats>,
-    flags: u8,
-    n_runs: u32,
-    n_scans: u32,
-    n_pairs: u32,
-    front: (f64, f64),
+/// What a group says beyond its circle (research 93 §17): its bounds on R, its existence log odds, and the
+/// footprint of its woody stops (0: none) for the capacity limit. See the module documentation.
+///
+/// The bounds are taken per slice across the piece, one pulse spacing along it: there the woody stops contiguous in
+/// impact about the group's woody centre are one run, at least as wide as the silhouette's detection region
+/// (`2 R_app`), and the passes just outside it, where both are passes, at most as far apart. Each slice's numbers
+/// are valid bounds unless clutter joins the run or an echo was lost inside it, so the group's are their medians
+/// (looser than the tightest slice, robust to a minority of corrupted ones).
+fn censored(g: &Group, r_claim: f64, p: &JointParams) -> (Vec<Bound>, f64, f64) {
+    let (d0, d1) = (-2.0 * r_claim - DEPTH_TOL, r_claim + DEPTH_TOL);
+    // at the claim's depth a hit; behind it (or no stop in the tube) a pass; in front of it blocked
+    let fates: Vec<Fate> = g.recs.iter().map(|r| {
+        if r.blocked || r.depth < d0 {
+            Fate::Blocked
+        } else if !r.depth.is_finite() || r.depth > d1 {
+            Fate::Pass
+        } else {
+            Fate::Hit
+        }
+    }).collect();
+    let n = g.recs.len();
+    let woody: Vec<bool> = (0..n).map(|i| fates[i] == Fate::Hit && p_wood(&g.recs[i], r_claim, p) >= 0.5).collect();
+    let w = median(&mut g.recs.iter().map(|r| r.w).collect::<Vec<_>>());
+    let app = p.app(w);
+    let near: Vec<usize> = (0..n).filter(|&i| woody[i] && g.recs[i].b.abs() < 1.5 * r_claim + 0.01).collect();
+    let k = lean_line(&mut near.iter().map(|&i| (g.recs[i].s, g.recs[i].b)).collect::<Vec<_>>()).map_or(0.0, |l| l.0);
+    let bp: Vec<f64> = g.recs.iter().map(|r| r.b - k * r.s).collect();
+    // the pulses' spacing, from their density over the patch they cover (impact by axial position)
+    let inf: Vec<usize> = (0..n).filter(|&i| fates[i] != Fate::Blocked).collect();
+    let span = |v: &mut dyn Iterator<Item = f64>| v.fold((f64::INFINITY, f64::NEG_INFINITY), |(a, b), x| (a.min(x), b.max(x)));
+    let (b0, b1) = span(&mut inf.iter().map(|&i| bp[i]));
+    let (t0, t1) = span(&mut inf.iter().map(|&i| g.recs[i].s));
+    let step = if inf.len() > 1 { ((b1 - b0).max(BIN_MIN) * (t1 - t0).max(BIN_MIN) / inf.len() as f64).sqrt() } else { w };
+    // each slice's run of `member` pulses (contiguous in impact) about the one nearest `c`: its half-width, and
+    // where both its sides are passes (a side with no pulse beyond it is sky: half a spacing out) half their gap
+    let mut order: Vec<usize> = (0..n).collect();
+    let slice = |i: usize| ((g.recs[i].s - t0) / step).floor() as i64;
+    order.sort_unstable_by(|&i, &j| slice(i).cmp(&slice(j)).then(bp[i].total_cmp(&bp[j])));
+    let runs = |member: &[bool], c: f64| {
+        let (mut lo_s, mut hi_s) = (Vec::new(), Vec::new());
+        for sl in order.chunk_by(|&i, &j| slice(i) == slice(j)) {
+            let Some(j0) = (0..sl.len()).filter(|&j| member[sl[j]] && (bp[sl[j]] - c).abs() < r_claim + w).min_by(|&x, &y| (bp[sl[x]] - c).abs().total_cmp(&(bp[sl[y]] - c).abs())) else { continue };
+            let (mut a, mut z) = (j0, j0);
+            while a > 0 && member[sl[a - 1]] {
+                a -= 1;
+            }
+            while z + 1 < sl.len() && member[sl[z + 1]] {
+                z += 1;
+            }
+            lo_s.push(0.5 * (bp[sl[z]] - bp[sl[a]]));
+            let left = if a == 0 { Some(bp[sl[a]] - 0.5 * step) } else { (fates[sl[a - 1]] == Fate::Pass).then(|| bp[sl[a - 1]]) };
+            let right = if z + 1 == sl.len() { Some(bp[sl[z]] + 0.5 * step) } else { (fates[sl[z + 1]] == Fate::Pass).then(|| bp[sl[z + 1]]) };
+            if let (Some(l), Some(r)) = (left, right) {
+                hi_s.push(0.5 * (r - l));
+            }
+        }
+        (lo_s, hi_s)
+    };
+    let centre = |member: &[bool]| {
+        let mut v: Vec<f64> = (0..n).filter(|&i| member[i] && g.recs[i].b.abs() < 1.5 * r_claim + 0.01).map(|i| bp[i]).collect();
+        if v.is_empty() { 0.0 } else { median(&mut v) }
+    };
+    let (mut lo_s, mut hi_s) = runs(&woody, centre(&woody));
+    let mut bounds = Vec::new();
+    let cap = 0.5 * p.tau * w;
+    let sd = p.edge * w / std::f64::consts::SQRT_2;
+    if lo_s.len() >= 3 {
+        let lo_r = median(&mut lo_s) - app;
+        if lo_r > cap {
+            bounds.push(Bound { eta: lo_r.ln(), sd: sd / lo_r, upper: false });
+        }
+    }
+    if hi_s.len() >= 3 {
+        let hi_r = (median(&mut hi_s) - app).max(cap);
+        bounds.push(Bound { eta: hi_r.ln(), sd: (sd * sd + step * step / 12.0).sqrt() / hi_r, upper: true });
+    }
+    // existence, over the oversampling: the core's stops by their echo character, and its pulses by opacity, which
+    // only counts for wood (research 93 §11.1: opaque from one scan is reliable, leaky is no proof of foliage: the
+    // core may be misplaced). The core is found from the runs of any stop, blind to echo character (a core of
+    // woody runs would hold woody echoes by construction), else it is the claim's middle half.
+    let hit: Vec<bool> = fates.iter().map(|&f| f == Fate::Hit).collect();
+    let ch = centre(&hit);
+    let (mut lo_e, _) = runs(&hit, ch);
+    let (core, half) = if lo_e.is_empty() { (0.0, 0.5 * r_claim) } else { (ch, median(&mut lo_e).max(0.25 * w)) };
+    let (on, off) = ((STOP_WOOD / STOP_LEAF).ln(), ((1.0 - STOP_WOOD) / (1.0 - STOP_LEAF)).ln());
+    let (mut echo, mut opacity) = (0.0, 0.0);
+    for i in (0..n).filter(|&i| (bp[i] - core).abs() <= half) {
+        match fates[i] {
+            Fate::Hit => (echo, opacity) = (echo + llr(&g.recs[i], r_claim, p), opacity + on),
+            Fate::Pass => opacity += off,
+            Fate::Blocked => {}
+        }
+    }
+    // a scan's verdict on a piece counts at most as one sure echo: beyond the beam's oversampling, foliage is
+    // dispersed at 10-40 cm (research 93 §15.6), the piece's scale, so its pulses there are one observation
+    let m = (w / step).powi(2).max(1.0);
+    let lam = ((echo + opacity.max(0.0)) / m).clamp(-LLR_CLIP, LLR_CLIP);
+    (bounds, lam, if near.is_empty() { 0.0 } else { w })
 }
 
-fn summarise_piece(scans: &[&ScanIndex], a: &Point, b: &Point, frame: Frame, r_claim: f64, p: &JointParams) -> PieceSummary {
+/// What one piece's pulses say: its circle (from its second pass), flags, runs, scans and pairs, its front's
+/// stops' misfit about the circle, and its bounds and existence evidence.
+fn summarise_piece(scans: &[&ScanIndex], a: &Point, b: &Point, frame: Frame, r_claim: f64, p: &JointParams) -> Summary {
     let tube = window(r_claim) + LEAN_TUBE * frame.3;
     let gs = groups(scans, a, b, frame, tube, p);
     let n_pairs = gs.iter().map(|g| g.recs.len()).sum::<usize>() as u32;
-    let mut out = PieceSummary { st: None, flags: 0, n_runs: 0, n_scans: 0, n_pairs, front: (0.0, 0.0) };
+    let mut out = Summary { circle: None, chi2_front: f64::NAN, flags: 0, n_runs: 0, n_scans: 0, n_pairs, bounds: Vec::new(), log_odds: 0.0 };
+    let mut cap = 0.0f64;
+    for g in &gs {
+        let (bs, lam, w) = censored(g, r_claim, p);
+        out.bounds.extend(bs);
+        out.log_odds += lam;
+        cap = cap.max(w);
+    }
+    if cap > 0.0 {
+        out.bounds.push(Bound { eta: (0.5 * p.tau * cap).ln(), sd: CAP_SD, upper: false });
+    }
     // the first pass: each stop by its echo
     let first: Vec<GroupOut> = gs.iter().map(|g| {
         let f: Vec<Fate> = g.recs.iter().map(|r| fate(r, g.n, g.v, None)).collect();
@@ -780,7 +955,10 @@ fn summarise_piece(scans: &[&ScanIndex], a: &Point, b: &Point, frame: Frame, r_c
         out.flags |= flag::POROUS;
         return out;
     }
-    let Some(c1) = solve_row(&Stats::of(&first.iter().flat_map(|o| o.meas.clone()).collect::<Vec<_>>()), r_claim) else { return out };
+    let Some(c1) = solve_row(&Stats::of(&first.iter().flat_map(|o| o.meas.clone()).collect::<Vec<_>>()), r_claim) else {
+        out.flags |= flag::BOUNDS;
+        return out;
+    };
     // the second: each stop gated by the first's circle
     let x = c1.x;
     let mut meas = Vec::new();
@@ -793,17 +971,19 @@ fn summarise_piece(scans: &[&ScanIndex], a: &Point, b: &Point, frame: Frame, r_c
         meas.extend(o.meas);
         fates2.push((f, w));
     }
-    let st = Stats::of(&meas);
-    out.st = Some(st);
-    let Some(c2) = solve_row(&st, r_claim) else { return out };
+    let Some(c2) = solve_row(&Stats::of(&meas), r_claim) else {
+        out.flags |= flag::BOUNDS;
+        return out;
+    };
     let y = c2.x;
     let rr = y[4];
     // the stems beside it and the run's width, its stops gated by its depth band
-    out.n_runs = gs.iter().map(|g| runs_of(g, &y, r_claim, p).0 as u32).max().unwrap_or(0);
+    let runs: Vec<(usize, bool)> = gs.iter().map(|g| runs_of(g, &y, r_claim, p)).collect();
+    out.n_runs = runs.iter().map(|q| q.0 as u32).max().unwrap_or(0);
     if out.n_runs >= 2 {
         out.flags |= flag::RUNS;
     }
-    if gs.iter().any(|g| runs_of(g, &y, r_claim, p).1) {
+    if runs.iter().any(|q| q.1) {
         out.flags |= flag::HULL;
     }
     // the hull: of the stops (any echo, before any gate) aimed at the circle's core that reached its front, the
@@ -838,49 +1018,48 @@ fn summarise_piece(scans: &[&ScanIndex], a: &Point, b: &Point, frame: Frame, r_c
     if on > 0 && behind as f64 > HULL_SHARE * on as f64 {
         out.flags |= flag::HULL;
     }
-    out.front = (ss, nw - ng as f64);
+    if nw - ng as f64 > 0.0 {
+        out.chi2_front = ss / (nw - ng as f64);
+    }
+    if c2.chi2 > HULL_CHI2 || out.chi2_front > HULL_CHI2 {
+        out.flags |= flag::HULL;
+    }
+    out.circle = Some(c2);
     out
 }
 
-/// One row's summary: its pieces' (one, or more where it is longer than [`PIECE_LEN`]), their measurements moved
-/// to the row's middle and solved together, then the flags.
-fn summarise_row(scans: &[&ScanIndex], a: &Point, b: &Point, frame: Frame, r_claim: f64, p: &JointParams) -> RowSummary {
-    let (u, e1, e2, len) = frame;
-    let m = (len / PIECE_LEN).ceil().max(1.0) as usize;
-    let pl = len / m as f64;
-    let mut out = RowSummary { circle: None, chi2_front: f64::NAN, flags: 0, n_runs: 0, n_scans: 0, n_pairs: 0 };
-    let mut st: Option<Stats> = None;
-    let mut front = (0.0, 0.0);
-    for j in 0..m {
-        let at = |x: f64| -> Point { std::array::from_fn(|i| a[i] + x * u[i]) };
-        let (pa, pb) = if m == 1 { (*a, *b) } else { (at(j as f64 * pl), at((j + 1) as f64 * pl)) };
-        let ps = summarise_piece(scans, &pa, &pb, (u, e1, e2, pl), r_claim, p);
-        out.flags |= ps.flags;
-        out.n_runs = out.n_runs.max(ps.n_runs);
-        out.n_scans = out.n_scans.max(ps.n_scans);
-        out.n_pairs += ps.n_pairs;
-        front = (front.0 + ps.front.0, front.1 + ps.front.1);
-        if let Some(s) = ps.st {
-            let s = s.moved((j as f64 + 0.5) * pl - 0.5 * len);
-            match st.as_mut() {
-                Some(t) => t.add(&s),
-                None => st = Some(s),
+/// The tree's nodes, the rows' pieces: each row cut into `ceil(len / PIECE_LEN)` equal pieces, in order, a row's
+/// first piece's parent the last of its parent row's and each later piece's the one before it.
+struct Nodes {
+    row: Vec<usize>,
+    /// Each row's first piece, and one past the last row's last.
+    first: Vec<usize>,
+    parent: Vec<Option<usize>>,
+    frame: Vec<Frame>,
+    a: Vec<Point>,
+}
+
+impl Nodes {
+    fn of(rows: &Rows, fr: &[Frame]) -> Self {
+        let mut nd = Nodes { row: Vec::new(), first: Vec::new(), parent: Vec::new(), frame: Vec::new(), a: Vec::new() };
+        for (k, &(u, e1, e2, len)) in fr.iter().enumerate() {
+            let m = (len / PIECE_LEN - 1e-9).ceil().max(1.0) as usize;
+            let pl = len / m as f64;
+            nd.first.push(nd.row.len());
+            for j in 0..m {
+                nd.parent.push(match (j, rows.parent[k]) {
+                    (0, q) if q >= 0 => Some(nd.first[q as usize + 1] - 1),
+                    (0, _) => None,
+                    _ => Some(nd.row.len() - 1),
+                });
+                nd.row.push(k);
+                nd.frame.push((u, e1, e2, pl));
+                nd.a.push(std::array::from_fn(|i| rows.a[k][i] + j as f64 * pl * u[i]));
             }
         }
+        nd.first.push(nd.row.len());
+        nd
     }
-    if front.1 > 0.0 {
-        out.chi2_front = front.0 / front.1;
-    }
-    if out.flags & flag::POROUS != 0 {
-        return out;
-    }
-    out.circle = st.and_then(|s| solve_row(&s, r_claim));
-    match &out.circle {
-        None => out.flags |= flag::FEW,
-        Some(c) if c.chi2 > HULL_CHI2 || out.chi2_front > HULL_CHI2 => out.flags |= flag::HULL,
-        _ => {}
-    }
-    out
 }
 
 /// Fits one tree from its rows' support summaries: `rows` (with `r_max` ignored) against `scans`, the prior's
@@ -889,56 +1068,170 @@ fn summarise_row(scans: &[&ScanIndex], a: &Point, b: &Point, frame: Frame, r_cla
 pub fn support_tree(scans: &[&ScanIndex], rows: &Rows, like: &JointParams, prior: &PriorParams, threads: usize) -> Result<SupportTree> {
     let fr = rows.check("support tree")?;
     prior.check()?;
-    let n = rows.a.len();
-    let sums: Vec<RowSummary> = pool(threads)?.install(|| {
-        (0..n).into_par_iter().map(|k| summarise_row(scans, &rows.a[k], &rows.b[k], fr[k], rows.r_prior[k], like)).collect()
+    let nd = Nodes::of(rows, &fr);
+    let sums: Vec<Summary> = pool(threads)?.install(|| {
+        (0..nd.row.len()).into_par_iter().map(|k| {
+            let (u, _, _, pl) = nd.frame[k];
+            let b: Point = std::array::from_fn(|i| nd.a[k][i] + pl * u[i]);
+            summarise_piece(scans, &nd.a[k], &b, nd.frame[k], rows.r_prior[nd.row[k]], like)
+        }).collect()
     });
-    let (x, cov) = tree_solve(rows, &fr, &sums, prior)?;
+    let sol = tree_solve(rows, &fr, &nd, &sums, prior)?;
+    let p_wood = existence(&nd.parent, &sums.iter().map(|s| s.log_odds).collect::<Vec<_>>());
 
-    let mut out = SupportTree {
-        a: Vec::new(), b: Vec::new(), r: Vec::new(), sd_log_r: Vec::new(), centre: Vec::new(), sd_centre: Vec::new(), lean: Vec::new(), sd_lean: Vec::new(),
-        e1: Vec::new(), e2: Vec::new(), r_row: Vec::new(), sd_r_row: Vec::new(), chi2: Vec::new(), chi2_front: Vec::new(), flags: Vec::new(),
-        n_runs: Vec::new(), n_scans: Vec::new(), n_pairs: Vec::new(),
+    let mut out = SupportTree { rows: Fit::default(), pieces: Fit::default(), piece_row: nd.row.iter().map(|&k| k as u32).collect() };
+    let bound = |s: &Summary, upper: bool| {
+        let it = s.censored().iter().filter(|b| b.upper == upper).map(|b| b.eta);
+        let e = if upper { it.fold(f64::INFINITY, f64::min) } else { it.fold(f64::NEG_INFINITY, f64::max) };
+        if e.is_finite() { e.exp() } else { f64::NAN }
     };
-    for k in 0..n {
-        let (_, e1, e2, len) = fr[k];
-        let xk = x[k];
-        let at = |s: f64| -> Point { std::array::from_fn(|i| (xk[0] + s * xk[2]) * e1[i] + (xk[1] + s * xk[3]) * e2[i]) };
-        let (oa, ob) = (at(-0.5 * len), at(0.5 * len));
-        out.a.push(std::array::from_fn(|i| rows.a[k][i] + oa[i]));
-        out.b.push(std::array::from_fn(|i| rows.b[k][i] + ob[i]));
-        out.r.push(xk[4].exp());
-        let sd = |i: usize| cov[k][(i, i)].max(0.0).sqrt();
-        out.sd_log_r.push(sd(4));
-        out.centre.push([xk[0], xk[1]]);
-        out.sd_centre.push([sd(0), sd(1)]);
-        out.lean.push([xk[2], xk[3]]);
-        out.sd_lean.push([sd(2), sd(3)]);
-        out.e1.push(e1);
-        out.e2.push(e2);
-        let s = &sums[k];
-        out.r_row.push(s.used().map_or(f64::NAN, |c| c.x[4]));
-        out.sd_r_row.push(s.used().map_or(f64::NAN, |c| c.cov[(4, 4)].max(0.0).sqrt()));
-        out.chi2.push(s.circle.map_or(f64::NAN, |c| c.chi2));
-        out.chi2_front.push(s.chi2_front);
-        out.flags.push(s.flags);
-        out.n_runs.push(s.n_runs);
-        out.n_scans.push(s.n_scans);
-        out.n_pairs.push(s.n_pairs);
+    for (k, s) in sums.iter().enumerate() {
+        let own = Own {
+            r_row: s.used().map_or(f64::NAN, |c| c.x[4]),
+            sd_r_row: s.used().map_or(f64::NAN, |c| c.cov[(4, 4)].max(0.0).sqrt()),
+            chi2: s.circle.map_or(f64::NAN, |c| c.chi2),
+            chi2_front: s.chi2_front,
+            r_lo: bound(s, false),
+            r_hi: bound(s, true),
+            log_odds: s.log_odds,
+            p_wood: p_wood[k],
+            flags: s.flags,
+            n_runs: s.n_runs,
+            n_scans: s.n_scans,
+            n_pairs: s.n_pairs,
+        };
+        out.pieces.push(&sol.x[k], &sol.cov[k], nd.frame[k], nd.a[k], own);
+    }
+    for k in 0..rows.a.len() {
+        let (k0, k1) = (nd.first[k], nd.first[k + 1]);
+        let (x, cov) = row_line(&sol, k0, k1, fr[k].3, nd.frame[k0].3);
+        let p = &out.pieces;
+        let fold = |v: &[f64], f: fn(f64, f64) -> f64| v[k0..k1].iter().copied().filter(|x| x.is_finite()).reduce(f).unwrap_or(f64::NAN);
+        // the measured pieces' own radii, independent: the geometric mean and its sd
+        let used: Vec<(f64, f64)> = (k0..k1).filter(|&j| p.r_row[j].is_finite()).map(|j| (p.r_row[j].ln(), p.sd_r_row[j] / p.r_row[j])).collect();
+        let nu = used.len() as f64;
+        let eta = used.iter().map(|q| q.0).sum::<f64>() / nu;
+        let sd = used.iter().map(|q| q.1 * q.1).sum::<f64>().sqrt() / nu;
+        let own = Own {
+            r_row: eta.exp(),
+            sd_r_row: eta.exp() * sd,
+            chi2: fold(&p.chi2, f64::max),
+            chi2_front: fold(&p.chi2_front, f64::max),
+            r_lo: fold(&p.r_lo, f64::min),
+            r_hi: fold(&p.r_hi, f64::max),
+            log_odds: p.log_odds[k0..k1].iter().sum(),
+            p_wood: p.p_wood[k0..k1].iter().sum::<f64>() / (k1 - k0) as f64,
+            flags: p.flags[k0..k1].iter().fold(0, |a, &f| a | f),
+            n_runs: p.n_runs[k0..k1].iter().copied().max().unwrap_or(0),
+            n_scans: p.n_scans[k0..k1].iter().copied().max().unwrap_or(0),
+            n_pairs: p.n_pairs[k0..k1].iter().sum(),
+        };
+        out.rows.push(&x, &cov, fr[k], rows.a[k], own);
     }
     Ok(out)
 }
 
-/// The tree's MAP state `[c1, c2, t1, t2, log R]` per row and each row's marginal covariance (see the module
-/// documentation): factors on a row and its parent, eliminated leaves first.
-#[allow(clippy::type_complexity)]
-fn tree_solve(rows: &Rows, fr: &[Frame], sums: &[RowSummary], p: &PriorParams) -> Result<(Vec<Vector5<f64>>, Vec<Matrix5<f64>>)> {
-    let n = rows.a.len();
-    let (parent, h0, c0, g0) = prior_system(rows, fr, p);
-    // the measurements, linearised in log R, three times
-    let mut lin: Vec<f64> = (0..n).map(|k| sums[k].used().map_or(rows.r_prior[k].ln(), |c| c.x[4].ln())).collect();
-    let mut sol = (vec![Vector5::zeros(); n], vec![Matrix5::zeros(); n]);
-    for _ in 0..3 {
+/// A piece's or row's own outputs (see [`Fit`]).
+struct Own {
+    r_row: f64,
+    sd_r_row: f64,
+    chi2: f64,
+    chi2_front: f64,
+    r_lo: f64,
+    r_hi: f64,
+    log_odds: f64,
+    p_wood: f64,
+    flags: u8,
+    n_runs: u32,
+    n_scans: u32,
+    n_pairs: u32,
+}
+
+impl Fit {
+    /// Appends a piece or row: its state `[c1, c2, t1, t2, log R]` and covariance, frame and claimed start `a0`.
+    fn push(&mut self, x: &Vector5<f64>, cov: &Matrix5<f64>, (u, e1, e2, len): Frame, a0: Point, own: Own) {
+        let at = |s: f64| -> Point { std::array::from_fn(|i| a0[i] + (s + 0.5 * len) * u[i] + (x[0] + s * x[2]) * e1[i] + (x[1] + s * x[3]) * e2[i]) };
+        self.a.push(at(-0.5 * len));
+        self.b.push(at(0.5 * len));
+        self.r.push(x[4].exp());
+        let sd = |i: usize| cov[(i, i)].max(0.0).sqrt();
+        self.sd_log_r.push(sd(4));
+        self.centre.push([x[0], x[1]]);
+        self.sd_centre.push([sd(0), sd(1)]);
+        self.lean.push([x[2], x[3]]);
+        self.sd_lean.push([sd(2), sd(3)]);
+        self.e1.push(e1);
+        self.e2.push(e2);
+        self.r_row.push(own.r_row);
+        self.sd_r_row.push(own.sd_r_row);
+        self.chi2.push(own.chi2);
+        self.chi2_front.push(own.chi2_front);
+        self.r_lo.push(own.r_lo);
+        self.r_hi.push(own.r_hi);
+        self.log_odds.push(own.log_odds);
+        self.p_wood.push(own.p_wood);
+        self.flags.push(own.flags);
+        self.n_runs.push(own.n_runs);
+        self.n_scans.push(own.n_scans);
+        self.n_pairs.push(own.n_pairs);
+    }
+}
+
+/// A row's state from its pieces `k0..k1` (a chain, each `pl` long, the row `len`): the line from the first's start
+/// to the last's end as the centre at the row's middle and the lean, and the mean of their log R; with its
+/// covariance from the chain's joint covariance (`Cov(x_j, x_i) = -Y_j Cov(x_{j-1}, x_i)` below the diagonal).
+fn row_line(sol: &Solved, k0: usize, k1: usize, len: f64, pl: f64) -> (Vector5<f64>, Matrix5<f64>) {
+    let m = k1 - k0;
+    let mut a = vec![Matrix5::<f64>::zeros(); m];
+    for i in 0..2 {
+        // start = c_0 - pl/2 t_0, end = c_last + pl/2 t_last
+        a[0][(i, i)] += 0.5;
+        a[0][(i, 2 + i)] -= 0.25 * pl;
+        a[m - 1][(i, i)] += 0.5;
+        a[m - 1][(i, 2 + i)] += 0.25 * pl;
+        a[0][(2 + i, i)] -= 1.0 / len;
+        a[0][(2 + i, 2 + i)] += 0.5 * pl / len;
+        a[m - 1][(2 + i, i)] += 1.0 / len;
+        a[m - 1][(2 + i, 2 + i)] += 0.5 * pl / len;
+    }
+    for aj in a.iter_mut() {
+        aj[(4, 4)] = 1.0 / m as f64;
+    }
+    let x = (0..m).map(|j| a[j] * sol.x[k0 + j]).sum();
+    let mut c: Vec<Vec<Matrix5<f64>>> = vec![Vec::with_capacity(m); m];
+    let mut cov = Matrix5::zeros();
+    for j in 0..m {
+        for i in 0..j {
+            let cji = -(sol.y[k0 + j] * c[j - 1][i]);
+            let t = a[j] * cji * a[i].transpose();
+            cov += t + t.transpose();
+            c[j].push(cji);
+        }
+        c[j].push(sol.cov[k0 + j]);
+        cov += a[j] * sol.cov[k0 + j] * a[j].transpose();
+    }
+    (x, cov)
+}
+
+/// The tree's solution: each piece's state `[c1, c2, t1, t2, log R]`, marginal covariance, and its elimination
+/// into its parent (`x_k = ... - Y_k x_parent`).
+struct Solved {
+    x: Vec<Vector5<f64>>,
+    cov: Vec<Matrix5<f64>>,
+    y: Vec<Matrix5<f64>>,
+}
+
+/// The tree's posterior (see the module documentation): the prior, the used pieces' summaries linearised in log R,
+/// and the censored pieces' bounds as expectation-propagation sites on log R, all re-solved until nothing moves.
+fn tree_solve(rows: &Rows, fr: &[Frame], nd: &Nodes, sums: &[Summary], p: &PriorParams) -> Result<Solved> {
+    let n = nd.row.len();
+    let (h0, c0, g0) = prior_system(rows, fr, nd, p);
+    let mut lin: Vec<f64> = (0..n).map(|k| sums[k].used().map_or(rows.r_prior[nd.row[k]].ln(), |c| c.x[4].ln())).collect();
+    let terms: Vec<(usize, &[Bound])> = (0..n).map(|k| (k, sums[k].censored())).filter(|t| !t.1.is_empty()).collect();
+    // each piece's site: precision and precision times mean, on its log R
+    let mut site = vec![(0.0, 0.0); terms.len()];
+    let mut round = 0;
+    loop {
         let (mut h, mut g) = (h0.clone(), g0.clone());
         for k in 0..n {
             let Some(c) = sums[k].used() else { continue };
@@ -952,56 +1245,153 @@ fn tree_solve(rows: &Rows, fr: &[Frame], sums: &[RowSummary], p: &PriorParams) -
             h[k] += jac.transpose() * info * jac;
             g[k] += jac.transpose() * (hh - info * off);
         }
-        sol = eliminate(&parent, h, &c0, g)?;
-        for k in 0..n {
-            lin[k] = sol.0[k][4];
+        for (&(k, _), &(tau, nu)) in terms.iter().zip(&site) {
+            h[k][(4, 4)] += tau;
+            g[k][4] += nu;
+        }
+        let sol = eliminate(&nd.parent, h, &c0, g)?;
+        let mut moved = 0.0f64;
+        for k in (0..n).filter(|&k| sums[k].used().is_some()) {
+            moved = moved.max((sol.x[k][4] - lin[k]).abs() / sol.cov[k][(4, 4)].sqrt());
+            lin[k] = sol.x[k][4];
+        }
+        for (t, &(k, bs)) in terms.iter().enumerate() {
+            let (v, mu) = (sol.cov[k][(4, 4)], sol.x[k][4]);
+            let (tau, nu) = site[t];
+            // the cavity (the marginal without this site), the tilted moments, the site that matches them
+            let pc = 1.0 / v - tau;
+            if !(pc > 0.0) {
+                continue;
+            }
+            let mc = (mu / v - nu) / pc;
+            let Some((mh, vh)) = tilted(mc, 1.0 / pc, (mu, v.sqrt()), bs) else { continue };
+            let (tau_new, nu_new) = ((1.0 / vh - pc).max(0.0), mh / vh - mc * pc);
+            let next = (tau + EP_DAMP * (tau_new - tau), nu + EP_DAMP * (nu_new - nu));
+            moved = moved.max((next.0 - tau).abs() * v).max((next.1 - nu).abs() * v.sqrt());
+            site[t] = next;
+        }
+        round += 1;
+        if (round >= 3 && moved < EP_TOL) || round >= EP_ROUNDS {
+            return Ok(sol);
         }
     }
-    Ok(sol)
 }
 
-/// The prior's normal equations on the rows: each row's block, its coupling to its parent's row, and the
-/// right-hand side (the prior is Gaussian in `[c1, c2, t1, t2, log R]`).
+/// The mean and variance of `N(mu, v)` times a piece's probit terms `bs`, by the trapezoid rule on [`EP_NODES`]
+/// points across `at.0 ± 6 at.1` (the piece's marginal, which the tilted distribution approaches); None where the
+/// grid holds no mass. One site per piece makes the expectation propagation exact for a piece alone (a site per
+/// term would not: two bounds on one piece leave its sd ~10 % wide).
+fn tilted(mu: f64, v: f64, at: (f64, f64), bs: &[Bound]) -> Option<(f64, f64)> {
+    let h = 12.0 * at.1 / (EP_NODES - 1) as f64;
+    let e: Vec<f64> = (0..EP_NODES).map(|i| at.0 - 6.0 * at.1 + i as f64 * h).collect();
+    let lf: Vec<f64> = e.iter().map(|&x| {
+        -0.5 * (x - mu).powi(2) / v + bs.iter().map(|b| ln_ncdf(if b.upper { b.eta - x } else { x - b.eta } / b.sd)).sum::<f64>()
+    }).collect();
+    let top = lf.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+    if !top.is_finite() {
+        return None;
+    }
+    let (mut z, mut m1, mut m2) = (0.0, 0.0, 0.0);
+    for (i, (&x, &l)) in e.iter().zip(&lf).enumerate() {
+        let w = (l - top).exp() * if i == 0 || i + 1 == EP_NODES { 0.5 } else { 1.0 };
+        (z, m1, m2) = (z + w, m1 + w * x, m2 + w * x * x);
+    }
+    let m = m1 / z;
+    Some((m, (m2 / z - m * m).max(1e-6 * at.1 * at.1)))
+}
+
+/// `log Phi(z)`, by its asymptote where `Phi` underflows.
+fn ln_ncdf(z: f64) -> f64 {
+    if z < -30.0 { -0.5 * z * z - (-z).ln() - 0.5 * (2.0 * std::f64::consts::PI).ln() } else { ncdf(z).ln() }
+}
+
+/// Each piece's chance of being wood: its evidence (`log_odds`) under a chain along the branches (a base piece is
+/// wood with [`EXIST`], a piece after wood with [`EXIST_ON`], one after none with [`EXIST_OFF`]), exactly by
+/// sum-product, leaves up then root down.
+fn existence(parent: &[Option<usize>], log_odds: &[f64]) -> Vec<f64> {
+    let n = parent.len();
+    let trans = |ep: usize, ek: usize| {
+        let on = if ep == 1 { EXIST_ON } else { EXIST_OFF };
+        if ek == 1 { on } else { 1.0 - on }
+    };
+    let norm = |v: [f64; 2]| {
+        let s = v[0] + v[1];
+        [v[0] / s, v[1] / s]
+    };
+    // up: the evidence of a piece's subtree given its state; msg: what it tells its parent
+    let mut up: Vec<[f64; 2]> = log_odds.iter().map(|&l| {
+        let pw = 1.0 / (1.0 + (-l).exp());
+        [1.0 - pw, pw]
+    }).collect();
+    let mut msg = vec![[1.0; 2]; n];
+    for k in (0..n).rev() {
+        up[k] = norm(up[k]);
+        if let Some(q) = parent[k] {
+            msg[k] = norm(std::array::from_fn(|ep| trans(ep, 0) * up[k][0] + trans(ep, 1) * up[k][1]));
+            up[q] = [up[q][0] * msg[k][0], up[q][1] * msg[k][1]];
+        }
+    }
+    let mut bel = vec![[0.0; 2]; n];
+    for k in 0..n {
+        let down = match parent[k] {
+            None => [1.0 - EXIST, EXIST],
+            Some(q) => {
+                let pq = [bel[q][0] / msg[k][0], bel[q][1] / msg[k][1]];
+                std::array::from_fn(|ek| trans(0, ek) * pq[0] + trans(1, ek) * pq[1])
+            }
+        };
+        bel[k] = norm([up[k][0] * down[0], up[k][1] * down[1]]);
+    }
+    bel.iter().map(|b| b[1]).collect()
+}
+
+/// The prior's normal equations on the pieces: each piece's block, its coupling to its parent's, and the
+/// right-hand side (the prior is Gaussian in `[c1, c2, t1, t2, log R]`). A row's first piece takes the row's taper
+/// step or fork share; its later pieces continue it, with no step.
 #[allow(clippy::type_complexity)]
-fn prior_system(rows: &Rows, fr: &[Frame], p: &PriorParams) -> (Vec<Option<usize>>, Vec<Matrix5<f64>>, Vec<Matrix5<f64>>, Vec<Vector5<f64>>) {
-    let n = rows.a.len();
-    let parent: Vec<Option<usize>> = rows.parent.iter().map(|&q| (q >= 0).then_some(q as usize)).collect();
+fn prior_system(rows: &Rows, fr: &[Frame], nd: &Nodes, p: &PriorParams) -> (Vec<Matrix5<f64>>, Vec<Matrix5<f64>>, Vec<Vector5<f64>>) {
+    let n = nd.row.len();
     let share = rows.fork_share(&fr.iter().map(|f| f.3).collect::<Vec<_>>(), ForkShare::WoodLength);
-    let eta0: Vec<f64> = rows.r_prior.iter().map(|r| r.ln()).collect();
-    // a factor: sum of coefficients times (row, unknown), its mean and sd
+    let eta0: Vec<f64> = nd.row.iter().map(|&k| rows.r_prior[k].ln()).collect();
+    // a factor: sum of coefficients times (piece, unknown), its mean and sd
     type Factor = (Vec<(usize, usize, f64)>, f64, f64);
     let mut factors: Vec<Factor> = Vec::new();
     for k in 0..n {
-        let sc = p.centre_rel * rows.r_prior[k] + p.centre_abs;
+        let row = nd.row[k];
+        let sc = p.centre_rel * rows.r_prior[row] + p.centre_abs;
         factors.push((vec![(k, 0, 1.0)], 0.0, sc));
         factors.push((vec![(k, 1, 1.0)], 0.0, sc));
         factors.push((vec![(k, 2, 1.0)], 0.0, LEAN_SD));
         factors.push((vec![(k, 3, 1.0)], 0.0, LEAN_SD));
-        let Some(q) = parent[k] else {
+        let Some(q) = nd.parent[k] else {
             factors.push((vec![(k, 4, 1.0)], eta0[k], p.sig_root));
             continue;
         };
-        let len = fr[k].3;
+        let len = nd.frame[k].3;
         let ls = len.max(0.01).sqrt();
-        if share[k].is_nan() {
-            factors.push((vec![(k, 4, 1.0), (q, 4, -1.0)], eta0[k] - eta0[q], p.sig_eta * ls));
-            // the child's start (its centre less half its length's lean) at the parent's end, in the child's frame
-            let (ek, eq) = ([fr[k].1, fr[k].2], [fr[q].1, fr[q].2]);
-            let lq = fr[q].3;
-            for j in 0..2 {
-                let tr = [dot(&ek[j], &eq[0]), dot(&ek[j], &eq[1])];
-                factors.push((vec![(k, j, 1.0), (k, 2 + j, -0.5 * len), (q, 0, -tr[0]), (q, 1, -tr[1]), (q, 2, -0.5 * lq * tr[0]), (q, 3, -0.5 * lq * tr[1])], 0.0, p.sig_delta * ls));
+        if nd.first[row] == k && share[row].is_finite() {
+            factors.push((vec![(k, 4, 1.0), (q, 4, -1.0)], 0.5 * (p.mu_fork + share[row].ln()), p.sig_fork));
+            continue;
+        }
+        factors.push((vec![(k, 4, 1.0), (q, 4, -1.0)], eta0[k] - eta0[q], p.sig_eta * ls));
+        // the child's start (its centre less half its length's lean) at the parent's end, in the child's frame
+        let (ek, eq) = ([nd.frame[k].1, nd.frame[k].2], [nd.frame[q].1, nd.frame[q].2]);
+        let lq = nd.frame[q].3;
+        for j in 0..2 {
+            let tr = [dot(&ek[j], &eq[0]), dot(&ek[j], &eq[1])];
+            factors.push((vec![(k, j, 1.0), (k, 2 + j, -0.5 * len), (q, 0, -tr[0]), (q, 1, -tr[1]), (q, 2, -0.5 * lq * tr[0]), (q, 3, -0.5 * lq * tr[1])], 0.0, p.sig_delta * ls));
+            // within a row (one frame), the lean bends by a random walk
+            if nd.row[q] == row {
+                factors.push((vec![(k, 2 + j, 1.0), (q, 2 + j, -1.0)], 0.0, LEAN_BEND * ls));
             }
-        } else {
-            factors.push((vec![(k, 4, 1.0), (q, 4, -1.0)], 0.5 * (p.mu_fork + share[k].ln()), p.sig_fork));
         }
     }
-    // the prior's precision (fixed), as row blocks and child-parent couplings
+    // the prior's precision (fixed), as piece blocks and child-parent couplings
     let (mut h0, mut c0) = (vec![Matrix5::<f64>::zeros(); n], vec![Matrix5::<f64>::zeros(); n]);
     let mut g0 = vec![Vector5::<f64>::zeros(); n];
     for (vars, mean, sd) in &factors {
         let w = 1.0 / (sd * sd);
-        let k = vars[0].0; // the factor's own row: a child's, where it links to its parent
+        let k = vars[0].0; // the factor's own piece: a child's, where it links to its parent
         for &(ri, i, ci) in vars {
             g0[ri][i] += w * mean * ci;
             for &(rj, j, cj) in vars {
@@ -1013,20 +1403,19 @@ fn prior_system(rows: &Rows, fr: &[Frame], p: &PriorParams) -> (Vec<Option<usize
             }
         }
     }
-    (parent, h0, c0, g0)
+    (h0, c0, g0)
 }
 
-/// Solves `H x = g` on a tree of 5x5 row blocks (`c[k]`: row k's coupling to its parent's row), leaves first,
-/// with each row's marginal covariance top-down (`Sigma_k = H_k^-1 + Y Sigma_q Y^T`). The prior's anchors make
-/// every block positive definite: one that isn't is an error.
-#[allow(clippy::type_complexity)]
-fn eliminate(parent: &[Option<usize>], mut h: Vec<Matrix5<f64>>, c: &[Matrix5<f64>], mut g: Vec<Vector5<f64>>) -> Result<(Vec<Vector5<f64>>, Vec<Matrix5<f64>>)> {
+/// Solves `H x = g` on a tree of 5x5 blocks (`c[k]`: block k's coupling to its parent's), leaves first, with each
+/// block's marginal covariance top-down (`Sigma_k = H_k^-1 + Y Sigma_q Y^T`). The prior's anchors make every block
+/// positive definite: one that isn't is an error.
+fn eliminate(parent: &[Option<usize>], mut h: Vec<Matrix5<f64>>, c: &[Matrix5<f64>], mut g: Vec<Vector5<f64>>) -> Result<Solved> {
     let n = h.len();
     let mut inv = vec![Matrix5::<f64>::zeros(); n];
     let mut y = vec![Matrix5::<f64>::zeros(); n];
     let mut yv = vec![Vector5::<f64>::zeros(); n];
     for k in (0..n).rev() {
-        inv[k] = h[k].cholesky().ok_or_else(|| Error::invalid(format!("support tree: row {k}'s block is not positive definite")))?.inverse();
+        inv[k] = h[k].cholesky().ok_or_else(|| Error::invalid(format!("support tree: piece {k}'s block is not positive definite")))?.inverse();
         yv[k] = inv[k] * g[k];
         if let Some(q) = parent[k] {
             y[k] = inv[k] * c[k];
@@ -1034,20 +1423,20 @@ fn eliminate(parent: &[Option<usize>], mut h: Vec<Matrix5<f64>>, c: &[Matrix5<f6
             g[q] -= c[k].transpose() * yv[k];
         }
     }
-    let (mut x, mut sig) = (vec![Vector5::<f64>::zeros(); n], vec![Matrix5::<f64>::zeros(); n]);
+    let (mut x, mut cov) = (vec![Vector5::<f64>::zeros(); n], vec![Matrix5::<f64>::zeros(); n]);
     for k in 0..n {
         match parent[k] {
             Some(q) => {
                 x[k] = yv[k] - y[k] * x[q];
-                sig[k] = inv[k] + y[k] * sig[q] * y[k].transpose();
+                cov[k] = inv[k] + y[k] * cov[q] * y[k].transpose();
             }
             None => {
                 x[k] = yv[k];
-                sig[k] = inv[k];
+                cov[k] = inv[k];
             }
         }
     }
-    Ok((x, sig))
+    Ok(Solved { x, cov, y })
 }
 
 #[cfg(test)]
@@ -1066,13 +1455,30 @@ mod tests {
         let (scan, a, b) = crate::qsm::evidence::tests::scene(0.05, true);
         let (a1, b1) = ([a[0] + 0.01, a[1], a[2]], [b[0] + 0.01, b[1], b[2]]);
         let rows = Rows { a: &[a1], b: &[b1], r_prior: &[0.08], r_max: &[], parent: &[-1] };
-        let f = support_tree(&[&scan], &rows, &like(), &PriorParams::default(), 2).unwrap();
-        assert_eq!(f.flags[0], 0, "flags {}", f.flags[0]);
-        assert!(f.n_scans[0] == 1 && f.n_runs[0] == 1, "scans {} runs {}", f.n_scans[0], f.n_runs[0]);
-        assert!((f.r[0] - 0.05).abs() < 0.0025, "R {}", f.r[0]);
-        // (measured in seven pieces of the 2 m row: the middle is the claim moved back by 1 cm, the lean within its sd)
+        let t = support_tree(&[&scan], &rows, &like(), &PriorParams::default(), 2).unwrap();
+        let (f, q) = (&t.rows, &t.pieces);
+        // the 2 m row is seven pieces of the tree; the fan sees the middle three, and they are measured
+        assert_eq!(t.piece_row, vec![0; 7]);
+        let seen: Vec<usize> = (0..7).filter(|&j| q.n_pairs[j] > 0).collect();
+        assert_eq!(seen, vec![2, 3, 4], "pairs {:?}", q.n_pairs);
+        assert!(seen.iter().all(|&j| q.flags[j] == 0 && (q.r_row[j] - 0.05).abs() < 0.0025 && q.n_runs[j] == 1 && q.n_scans[j] == 1), "flags {:?} r {:?}", q.flags, q.r_row);
+        // the others are the prior's along the chain, with nothing to bound them; the row says so
+        assert!((0..7).filter(|j| !seen.contains(j)).all(|j| q.flags[j] == flag::BOUNDS && q.r_lo[j].is_nan() && q.r_hi[j].is_nan()));
+        assert_eq!(f.flags[0], flag::BOUNDS);
+        assert!((f.r_row[0] - 0.05).abs() < 0.0025 && (f.r[0] - 0.05).abs() < 0.0025, "R {} {}", f.r_row[0], f.r[0]);
+        // the row runs from its first piece's start to its last's end
+        assert!((0..3).all(|i| (f.a[0][i] - q.a[0][i]).abs() < 1e-9 && (f.b[0][i] - q.b[6][i]).abs() < 1e-9));
+        // an opaque bark-free stem is wood, and so are the unseen pieces it carries on from
+        assert!(seen.iter().all(|&j| q.log_odds[j] > LLR_CLIP - 1e-9) && q.p_wood.iter().all(|&p| p > 0.9), "log odds {:?} p_wood {:?}", q.log_odds, q.p_wood);
+
+        // the part the fan sees, 48 cm in two pieces: measured, the claim moved back by 1 cm, upright
+        let (a2, b2) = ([a1[0], a1[1], -0.24], [b1[0], b1[1], 0.24]);
+        let rows = Rows { a: &[a2], b: &[b2], r_prior: &[0.08], r_max: &[], parent: &[-1] };
+        let t = support_tree(&[&scan], &rows, &like(), &PriorParams::default(), 2).unwrap();
+        let (f, q) = (&t.rows, &t.pieces);
+        assert!(t.piece_row == vec![0, 0] && f.flags[0] == 0 && q.flags == vec![0, 0], "flags {:?}", q.flags);
+        assert!((f.r[0] - 0.05).abs() < 0.0025 && (f.r_row[0] - f.r[0]).abs() < 0.002 && f.sd_log_r[0] < 0.1, "R {} {}", f.r[0], f.r_row[0]);
         assert!((0.5 * (f.a[0][0] + f.b[0][0])).abs() < 0.002 && f.lean[0][1].abs() < 2.0 * f.sd_lean[0][1], "x {} {} lean {:?}", f.a[0][0], f.b[0][0], f.lean[0]);
-        assert!(f.sd_log_r[0] < 0.1 && (f.r_row[0] - f.r[0]).abs() < 0.002);
         // one scan: the front's stops still give a misfit
         assert!(f.chi2_front[0].is_finite() && f.chi2_front[0] < HULL_CHI2, "chi2_front {}", f.chi2_front[0]);
     }
@@ -1082,76 +1488,148 @@ mod tests {
         Circle { st: Stats { info, h: info * x, yy: x.dot(&(info * x)), n: 5 }, x, cov: Matrix5::identity() * sd * sd, chi2: f64::NAN }
     }
 
+    fn summary(circle: Option<Circle>, flags: u8, bounds: Vec<Bound>) -> Summary {
+        Summary { circle, chi2_front: f64::NAN, flags, n_runs: 1, n_scans: 1, n_pairs: 100, bounds, log_odds: 0.0 }
+    }
+
     #[test]
-    fn the_tree_solve_is_exact_and_the_prior_carries_unmeasured_rows() {
-        // three rows in a chain and a fork; the middle row measured: the elimination equals the dense solve
-        let rows_a = [[0.0, 0.0, 0.0], [0.0, 0.0, 0.5], [0.0, 0.0, 1.0], [0.0, 0.0, 1.0]];
-        let rows_b = [[0.0, 0.0, 0.5], [0.0, 0.0, 1.0], [0.3, 0.0, 1.5], [-0.3, 0.0, 1.5]];
+    fn the_tree_solve_is_exact_and_the_prior_carries_unmeasured_pieces() {
+        // a 0.6 m base (two pieces), a 0.3 m row, and a fork of two; the 0.3 m row measured
+        let rows_a = [[0.0, 0.0, 0.0], [0.0, 0.0, 0.6], [0.0, 0.0, 0.9], [0.0, 0.0, 0.9]];
+        let rows_b = [[0.0, 0.0, 0.6], [0.0, 0.0, 0.9], [0.2, 0.0, 1.1], [-0.2, 0.0, 1.1]];
         let rp = [0.1, 0.08, 0.05, 0.04];
         let rows = Rows { a: &rows_a, b: &rows_b, r_prior: &rp, r_max: &[], parent: &[-1, 0, 1, 1] };
         let fr = frames(&rows_a, &rows_b);
+        let nd = Nodes::of(&rows, &fr);
+        assert_eq!((nd.row.clone(), nd.first.clone()), (vec![0, 0, 1, 2, 3], vec![0, 2, 3, 4, 5]));
+        assert_eq!(nd.parent, vec![None, Some(0), Some(1), Some(2), Some(2)]);
         let c = circle(Vector5::new(0.01, -0.005, 0.02, 0.0, 0.06), 1e-3);
-        let none = || RowSummary { circle: None, chi2_front: f64::NAN, flags: flag::FEW, n_runs: 0, n_scans: 0, n_pairs: 0 };
-        // a flagged row's circle stays out of the tree
-        let flagged = RowSummary { circle: Some(circle(Vector5::new(0.0, 0.0, 0.0, 0.0, 0.2), 1e-3)), chi2_front: f64::NAN, flags: flag::RUNS, n_runs: 2, n_scans: 1, n_pairs: 100 };
-        let sums = vec![none(), RowSummary { circle: Some(c), chi2_front: f64::NAN, flags: 0, n_runs: 1, n_scans: 1, n_pairs: 100 }, flagged, none()];
-        let (x, sig) = tree_solve(&rows, &fr, &sums, &PriorParams::default()).unwrap();
-        // the measured row follows its measurement; its neighbours follow the taper from it
-        assert!((x[1][4].exp() - 0.06).abs() < 0.001 && (x[1][0] - 0.01).abs() < 0.001, "{:?}", x[1]);
-        // (the base between the taper's step from it, 7.5 cm, and its own anchor on the claim, 10 cm)
-        assert!(x[0][4].exp() > 0.075 && x[0][4].exp() < 0.09, "{}", x[0][4].exp());
-        assert!(sig[1][(4, 4)] < sig[0][(4, 4)] && sig[1][(4, 4)] < sig[2][(4, 4)]);
-        // the prior alone leaves a flagged row's radius loose: the fork's spread, not a measurement's
+        // a routed piece's circle stays out of the tree
+        let routed = summary(Some(circle(Vector5::new(0.0, 0.0, 0.0, 0.0, 0.2), 1e-3)), flag::RUNS, Vec::new());
+        let sums = vec![summary(None, flag::BOUNDS, Vec::new()), summary(None, flag::BOUNDS, Vec::new()), summary(Some(c), 0, Vec::new()), routed, summary(None, flag::BOUNDS, Vec::new())];
         let pp = PriorParams::default();
-        assert!(sig[2][(4, 4)].sqrt() > pp.sig_fork * 0.9, "sd {}", sig[2][(4, 4)].sqrt());
-        // the forks' children split the parent's area by wood length (equal here), with mu_fork
-        assert!((x[2][4] - x[3][4]).abs() < 1e-9);
+        let sol = tree_solve(&rows, &fr, &nd, &sums, &pp).unwrap();
+        let (x, sig) = (&sol.x, &sol.cov);
+        // the measured piece follows its measurement; its neighbours follow the taper from it (the base's upper
+        // piece between the taper's step from it, 7.5 cm, and the base's anchor on the claim, 10 cm)
+        assert!((x[2][4].exp() - 0.06).abs() < 0.001 && (x[2][0] - 0.01).abs() < 0.001, "{:?}", x[2]);
+        assert!(x[1][4].exp() > 0.075 && x[1][4].exp() < 0.1, "{}", x[1][4].exp());
+        assert!(sig[2][(4, 4)] < sig[1][(4, 4)] && sig[2][(4, 4)] < sig[3][(4, 4)]);
+        // the prior alone leaves an unmeasured piece's radius loose: the fork's spread, not a measurement's; the
+        // fork's children split the parent's area by wood length (equal here), with mu_fork
+        assert!(sig[3][(4, 4)].sqrt() > pp.sig_fork * 0.9, "sd {}", sig[3][(4, 4)].sqrt());
+        assert!((x[3][4] - x[4][4]).abs() < 1e-9);
         // the elimination is the dense solve of the same system, mean and marginal covariances
-        let (parent, h, c, g) = prior_system(&rows, &fr, &PriorParams::default());
-        let mut hd = nalgebra::DMatrix::<f64>::zeros(20, 20);
-        let mut gd = nalgebra::DVector::<f64>::zeros(20);
-        for k in 0..4 {
+        let (h, c, g) = prior_system(&rows, &fr, &nd, &pp);
+        let n = nd.row.len();
+        let mut hd = nalgebra::DMatrix::<f64>::zeros(5 * n, 5 * n);
+        let mut gd = nalgebra::DVector::<f64>::zeros(5 * n);
+        for k in 0..n {
             hd.view_mut((5 * k, 5 * k), (5, 5)).copy_from(&h[k]);
             gd.rows_mut(5 * k, 5).copy_from(&g[k]);
-            if let Some(q) = parent[k] {
+            if let Some(q) = nd.parent[k] {
                 hd.view_mut((5 * k, 5 * q), (5, 5)).copy_from(&c[k]);
                 hd.view_mut((5 * q, 5 * k), (5, 5)).copy_from(&c[k].transpose());
             }
         }
         let inv = hd.try_inverse().unwrap();
         let xd = &inv * &gd;
-        let (xe, se) = eliminate(&parent, h, &c, g).unwrap();
-        for k in 0..4 {
+        let se = eliminate(&nd.parent, h, &c, g).unwrap();
+        for k in 0..n {
             for i in 0..5 {
-                assert!((xe[k][i] - xd[5 * k + i]).abs() < 1e-9, "x[{k}][{i}]");
+                assert!((se.x[k][i] - xd[5 * k + i]).abs() < 1e-9, "x[{k}][{i}]");
                 for j in 0..5 {
-                    assert!((se[k][(i, j)] - inv[(5 * k + i, 5 * k + j)]).abs() < 1e-9 * (1.0 + inv[(5 * k + i, 5 * k + j)].abs()), "cov[{k}]");
+                    assert!((se.cov[k][(i, j)] - inv[(5 * k + i, 5 * k + j)]).abs() < 1e-9 * (1.0 + inv[(5 * k + i, 5 * k + j)].abs()), "cov[{k}]");
                 }
             }
         }
+        // the base row from its two pieces: its mean log R and lean along e1, against the dense covariance
+        let (xr, cr) = row_line(&se, 0, 2, 0.6, 0.3);
+        let mut a = nalgebra::DVector::<f64>::zeros(5 * n);
+        (a[4], a[9]) = (0.5, 0.5);
+        assert!((xr[4] - (0.5 * (xd[4] + xd[9]))).abs() < 1e-12 && (cr[(4, 4)] - (a.transpose() * &inv * &a)[0]).abs() < 1e-12);
+        let mut l = nalgebra::DVector::<f64>::zeros(5 * n);
+        (l[0], l[2], l[5], l[7]) = (-1.0 / 0.6, 0.25, 1.0 / 0.6, 0.25);
+        assert!((cr[(2, 2)] - (l.transpose() * &inv * &l)[0]).abs() < 1e-12, "{} {}", cr[(2, 2)], (l.transpose() * &inv * &l)[0]);
         // a block that isn't positive definite is an error, not a silent zero
         let bad = vec![Matrix5::<f64>::zeros()];
         assert!(eliminate(&[None], bad, &[Matrix5::zeros()], vec![Vector5::zeros()]).is_err());
     }
 
     #[test]
-    fn pieces_combine_exactly_and_misfit_counts_on_the_rank() {
-        // two pieces of a 0.6 m row, each measuring a circle at its own middle: together the row's centre and lean
-        let (c0, t, r) = ([0.01, -0.02], [0.05, 0.0], 0.03);
-        let mut st: Option<Stats> = None;
-        for s in [-0.15, 0.15] {
-            let x = Vector5::new(c0[0] + s * t[0], c0[1] + s * t[1], t[0], t[1], r);
-            let m = circle(x, 1e-3).st.moved(s);
-            match st.as_mut() {
-                Some(a) => a.add(&m),
-                None => st = Some(m),
+    fn bounds_cut_the_prior_to_the_moments_of_its_truncation() {
+        // one base piece, its log R a priori N(log 1 cm, sig_root): an upper bound at 6 mm, then also a lower at 3 mm
+        let rows = Rows { a: &[[0.0, 0.0, 0.0]], b: &[[0.0, 0.0, 0.2]], r_prior: &[0.01], r_max: &[], parent: &[-1] };
+        let fr = rows.check("test").unwrap();
+        let nd = Nodes::of(&rows, &fr);
+        let pp = PriorParams::default();
+        let up = Bound { eta: 0.006f64.ln(), sd: 0.1, upper: true };
+        let lo = Bound { eta: 0.003f64.ln(), sd: 0.1, upper: false };
+        // the posterior's mean and sd by quadrature
+        let truth = |bs: &[Bound]| {
+            let (mut z, mut m1, mut m2) = (0.0, 0.0, 0.0);
+            for i in 0..200_000 {
+                let e = 0.01f64.ln() - 4.0 + 8.0 * i as f64 / 200_000.0;
+                let mut w = (-0.5 * ((e - 0.01f64.ln()) / pp.sig_root).powi(2)).exp();
+                for b in bs {
+                    w *= ncdf(if b.upper { b.eta - e } else { e - b.eta } / b.sd);
+                }
+                (z, m1, m2) = (z + w, m1 + w * e, m2 + w * e * e);
+            }
+            (m1 / z, (m2 / z - (m1 / z).powi(2)).sqrt())
+        };
+        for bs in [vec![up], vec![up, lo]] {
+            let sol = tree_solve(&rows, &fr, &nd, &[summary(None, flag::BOUNDS, bs.clone())], &pp).unwrap();
+            let (m, s) = truth(&bs);
+            let (me, se) = (sol.x[0][4], sol.cov[0][(4, 4)].sqrt());
+            // one piece: its site is exact (up to the quadrature)
+            assert!((me - m).abs() < 0.01 * s && (se - s).abs() < 0.01 * s, "{} bounds: {me} {se} against {m} {s}", bs.len());
+            assert!(se < pp.sig_root && me < 0.006f64.ln() + 0.1);
+        }
+        // a routed piece's bounds stay out
+        let sol = tree_solve(&rows, &fr, &nd, &[summary(None, flag::BOUNDS | flag::HULL, vec![up])], &pp).unwrap();
+        assert!((sol.x[0][4] - 0.01f64.ln()).abs() < 1e-9);
+    }
+
+    #[test]
+    fn existence_is_exact_on_the_branches() {
+        // a base, its child, and a fork of two, by enumeration of the 16 states
+        let parent = [None, Some(0), Some(1), Some(1)];
+        let lo = [2.0, -1.0, 0.5, -3.0];
+        let p = existence(&parent, &lo);
+        let mut marg = [0.0; 4];
+        let mut z = 0.0;
+        for st in 0..16usize {
+            let e = |k: usize| (st >> k) & 1;
+            let mut w = 1.0;
+            for k in 0..4 {
+                w *= if e(k) == 1 { lo[k].exp() } else { 1.0 };
+                let pk = match parent[k] {
+                    None => EXIST,
+                    Some(q) => if e(q) == 1 { EXIST_ON } else { EXIST_OFF },
+                };
+                w *= if e(k) == 1 { pk } else { 1.0 - pk };
+            }
+            z += w;
+            for k in 0..4 {
+                marg[k] += w * e(k) as f64;
             }
         }
-        let c = solve_row(&st.unwrap(), 0.05).unwrap();
-        let want = Vector5::new(c0[0], c0[1], t[0], t[1], r);
-        assert!((c.x - want).norm() < 1e-4, "{:?}", c.x);
-        assert!(c.chi2 < 1e-3, "chi2 {}", c.chi2);
-        // a measurement set of rank 2 (two edges): no redundancy, no misfit
+        for k in 0..4 {
+            assert!((p[k] - marg[k] / z).abs() < 1e-12, "{k}: {} {}", p[k], marg[k] / z);
+        }
+        // wood doesn't restart: a child's wood is evidence of its parent's
+        let p = existence(&[None, Some(0)], &[-6.0, 4.0]);
+        let alone = existence(&[None], &[-6.0])[0];
+        assert!(p[0] > 10.0 * alone && p[1] > p[0], "{p:?} {alone}");
+        // and with no evidence, every piece keeps the prior however far out
+        let p = existence(&(0..50usize).map(|k| k.checked_sub(1)).collect::<Vec<_>>(), &[0.0; 50]);
+        assert!(p.iter().all(|&x| (x - EXIST).abs() < 1e-9), "{p:?}");
+    }
+
+    #[test]
+    fn misfit_counts_on_the_rank() {
+        // a measurement set of rank 2 (two edges): no redundancy, no misfit; a third edge is redundant
         let n = [1.0, 0.0];
         let edges: Vec<Meas> = vec![([n[0], n[1], 0.0, 0.0, 1.0], 0.05, 1e-6), ([n[0], n[1], 0.0, 0.0, -1.0], -0.03, 1e-6), ([n[0], n[1], 0.0, 0.0, 1.0], 0.052, 1e-6)];
         let st = Stats::of(&edges);
@@ -1165,10 +1643,11 @@ mod tests {
     fn echo_character_weighs_stops() {
         let p = JointParams::default();
         let rec = |refl: f64, single: bool| Rec { b: 0.0, s: 0.0, depth: 0.0, w: 0.01, refl, single, blocked: false };
-        // bark-bright is wood, leaf-dark is leaf, unknown is wood; a multi-return echo is judged darker
+        // bark-bright is wood, leaf-dark is leaf, unknown is wood (and no evidence); a multi-return echo is judged darker
         assert!(p_wood(&rec(-15.5, true), 0.05, &p) > 0.9);
         assert!(p_wood(&rec(-21.0, true), 0.05, &p) < 0.1);
         assert_eq!(p_wood(&rec(f64::NAN, true), 0.05, &p), 1.0);
+        assert_eq!(llr(&rec(f64::NAN, true), 0.05, &p), 0.0);
         assert!(p_wood(&rec(-18.5, false), 0.05, &p) > 0.5 && p_wood(&rec(-18.5, true), 0.05, &p) < 0.5);
         // wood narrower than the footprint reads darker: a dark stop is likelier wood on a 1 mm twig
         assert!(p_wood(&rec(-19.0, true), 0.003, &p) > p_wood(&rec(-19.0, true), 0.05, &p));

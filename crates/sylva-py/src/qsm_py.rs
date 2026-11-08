@@ -710,7 +710,31 @@ fn qsm_joint_tree<'py>(py: Python<'py>, scans: Vec<Bound<'py, PyScanIndex>>, a: 
 #[pyfunction]
 fn qsm_support_flags() -> Vec<(&'static str, u8)> {
     use support_tree::flag::*;
-    vec![("RUNS", RUNS), ("HULL", HULL), ("FEW", FEW), ("POROUS", POROUS)]
+    vec![("RUNS", RUNS), ("HULL", HULL), ("BOUNDS", BOUNDS), ("POROUS", POROUS)]
+}
+
+/// A support fit's rows or pieces as a dict of arrays.
+fn support_fit<'py>(py: Python<'py>, f: support_tree::Fit) -> PyResult<Bound<'py, PyDict>> {
+    let n = f.r.len();
+    let d = PyDict::new(py);
+    let xyz = |v: &[[f64; 3]]| v.concat().into_pyarray(py).reshape([n, 3]);
+    let two = |v: &[[f64; 2]]| v.concat().into_pyarray(py).reshape([n, 2]);
+    d.set_item("a", xyz(&f.a)?)?;
+    d.set_item("b", xyz(&f.b)?)?;
+    d.set_item("e1", xyz(&f.e1)?)?;
+    d.set_item("e2", xyz(&f.e2)?)?;
+    d.set_item("centre", two(&f.centre)?)?;
+    d.set_item("sd_centre", two(&f.sd_centre)?)?;
+    d.set_item("lean", two(&f.lean)?)?;
+    d.set_item("sd_lean", two(&f.sd_lean)?)?;
+    for (k, v) in [("r", f.r), ("sd_log_r", f.sd_log_r), ("r_row", f.r_row), ("sd_r_row", f.sd_r_row), ("chi2", f.chi2), ("chi2_front", f.chi2_front), ("r_lo", f.r_lo), ("r_hi", f.r_hi), ("log_odds", f.log_odds), ("p_wood", f.p_wood)] {
+        d.set_item(k, v.into_pyarray(py))?;
+    }
+    d.set_item("flags", f.flags.into_pyarray(py))?;
+    d.set_item("n_runs", f.n_runs.into_pyarray(py))?;
+    d.set_item("n_scans", f.n_scans.into_pyarray(py))?;
+    d.set_item("n_pairs", f.n_pairs.into_pyarray(py))?;
+    Ok(d)
 }
 
 /// Fits one tree from its rows' support summaries (see `sylva.qsm.support_tree`); `params` as `qsm_joint_tree`'s.
@@ -726,25 +750,10 @@ fn qsm_support_tree<'py>(py: Python<'py>, scans: Vec<Bound<'py, PyScanIndex>>, a
         let rows = Rows { a: &a, b: &b, r_prior: &r_prior, r_max: &[], parent: &parent };
         support_tree::support_tree(&refs, &rows, &p.like, &p.prior, threads)
     }).map_err(err)?;
-    let n = f.r.len();
-    let d = PyDict::new(py);
-    let xyz = |v: &[[f64; 3]]| v.concat().into_pyarray(py).reshape([n, 3]);
-    let two = |v: &[[f64; 2]]| v.concat().into_pyarray(py).reshape([n, 2]);
-    d.set_item("a", xyz(&f.a)?)?;
-    d.set_item("b", xyz(&f.b)?)?;
-    d.set_item("e1", xyz(&f.e1)?)?;
-    d.set_item("e2", xyz(&f.e2)?)?;
-    d.set_item("centre", two(&f.centre)?)?;
-    d.set_item("sd_centre", two(&f.sd_centre)?)?;
-    d.set_item("lean", two(&f.lean)?)?;
-    d.set_item("sd_lean", two(&f.sd_lean)?)?;
-    for (k, v) in [("r", f.r), ("sd_log_r", f.sd_log_r), ("r_row", f.r_row), ("sd_r_row", f.sd_r_row), ("chi2", f.chi2), ("chi2_front", f.chi2_front)] {
-        d.set_item(k, v.into_pyarray(py))?;
-    }
-    d.set_item("flags", f.flags.into_pyarray(py))?;
-    d.set_item("n_runs", f.n_runs.into_pyarray(py))?;
-    d.set_item("n_scans", f.n_scans.into_pyarray(py))?;
-    d.set_item("n_pairs", f.n_pairs.into_pyarray(py))?;
+    let d = support_fit(py, f.rows)?;
+    let pieces = support_fit(py, f.pieces)?;
+    pieces.set_item("row", f.piece_row.into_pyarray(py))?;
+    d.set_item("pieces", pieces)?;
     Ok(d)
 }
 
