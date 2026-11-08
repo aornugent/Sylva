@@ -6,7 +6,7 @@ import pytest
 from sylva import PointCloud
 from sylva.qsm import JointParams, ScanIndex, SupportFlag, support_tree
 
-# the synthetic VZ-400i beam's detection share, calibrated on its vertical stems (3dtrees research 87 §10)
+# the synthetic VZ-400i beam's detection share, calibrated on its vertical stems (3dtrees research 93 §10)
 PARAMS = JointParams(tau=0.094)
 
 

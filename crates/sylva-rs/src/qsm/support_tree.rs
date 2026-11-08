@@ -4,7 +4,7 @@
 // see the LICENSE file. There is no warranty, to the extent permitted by law.
 //! One tree's wood from the support function of each row's cross-section, as
 //! each scan measures it, and one linear solve over the tree (3dtrees
-//! research 87 §10, §16): the fast path of the joint model, with flags that
+//! research 93 §10, §16): the fast path of the joint model, with flags that
 //! send the rows it can't summarise to [`crate::qsm::joint_tree`].
 //!
 //! Within one (row, scan) group the pulses are nearly parallel, so they
@@ -22,7 +22,7 @@
 //!   fate there: a stop (its first echo in the tube, with its depth), a pass,
 //!   or blocked (its last echo is before the tube: it says nothing about
 //!   it). A stop whose echo looks like leaf (reflectance by return position,
-//!   research 87 §11.2) didn't reach the wood: blocked.
+//!   research 93 §11.2) didn't reach the wood: blocked.
 //! - **Per group, twice.** The lean across the beam (a line through the hits'
 //!   centre against `s`) is removed; the profile is binned no finer than the
 //!   impacts' spacing; runs of mostly-hit bins are cut where the hits' depth
@@ -87,7 +87,7 @@ const MIN_PULSES: usize = 30;
 /// The tube's widening for the lean, a share of the row's length (a lean of up to about 27°).
 const LEAN_TUBE: f64 = 0.25;
 /// The lean's anchor (m per m), and the floor on each measurement's sd (m): non-round sections, a ~4 mm offset
-/// between scans that no sway explains (research 87 §15.6; at 2 mm Alice Mulga's clean rows misfit by a reduced
+/// between scans that no sway explains (research 93 §15.6; at 2 mm Alice Mulga's clean rows misfit by a reduced
 /// chi-square of 4-9).
 const LEAN_SD: f64 = 0.5;
 const MODEL_SD: f64 = 0.004;
@@ -101,7 +101,7 @@ const DEPTH_TOL: f64 = 0.02;
 const HULL_BEHIND: f64 = 0.01;
 const HULL_SHARE: f64 = 0.25;
 const HULL_CHI2: f64 = 9.0;
-/// The reflectance (dB) of wood and of leaf, mean and sd, for a single return and for one of several (research 87
+/// The reflectance (dB) of wood and of leaf, mean and sd, for a single return and for one of several (research 93
 /// §11.2: Alice Mulga's RIEGL VZ-400i exports). A stop is leaf-like where leaf is the likelier.
 const WOOD_REFL: [(f64, f64); 2] = [(-15.45, 1.0), (-18.5, 1.5)];
 const LEAF_REFL: [(f64, f64); 2] = [(-19.7, 1.4), (-22.7, 1.9)];
