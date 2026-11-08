@@ -4,7 +4,7 @@ import numpy as np
 import pytest
 
 from sylva import PointCloud
-from sylva.qsm import EchoPath, JointParams, ScanIndex, SupportFlag, support_tree
+from sylva.qsm import EchoPath, JointParams, ScanIndex, SupportDiag, SupportFlag, support_tree
 
 # the synthetic VZ-400i beam's detection share, calibrated on its vertical stems (3dtrees research 93 §10), and its
 # echo character: wood reflects 0.5 (-3 dB) and these scenes hold no leaf
@@ -57,6 +57,9 @@ def test_separated_stems_upright_and_leaning_are_measured(tmp_path):
         t = f["lean"][k] @ np.c_[f["e1"][k], f["e2"][k]].T
         assert np.allclose(t[:2], lean[k], atol=0.01), (k, t, lean[k])
     assert (f["sd_log_r"] < 0.2).all() and (np.isnan(f["chi2"]) | (f["chi2"] < 9)).all() and (f["chi2_front"] < 9).all()
+    # seen from three sides, every edge: no diagnostic, and the rows' own data say most of their radii
+    assert (f["diag"] & (SupportDiag.ONE_SIDED | SupportDiag.SHADOWED | SupportDiag.TUBE_EDGE)).sum() == 0, f["diag"]
+    assert (f["data_share"] > 0.5).all() and (f["data_share"] <= 1).all() and (f["deleted"] == 0).all(), f["data_share"]
 
 
 def test_a_bent_stem_is_a_chain_of_straight_pieces(tmp_path):

@@ -213,6 +213,21 @@ SupportFlag = IntFlag("SupportFlag", _core.qsm_support_flags())
 #: message says nothing of its radius).
 SupportRefusal = IntFlag("SupportRefusal", _core.qsm_support_refusals())
 
+#: What a reviewer or the screen should know of a node's fit that no other output says (bits of :func:`support_tree`'s
+#: ``diag``; a row's: its pieces'). Each threshold is a constant of ``support_tree.rs`` (module ``diag``), with its
+#: reason, and isn't restated here:
+#:
+#: - ``ONE_SIDED``: one scan supplies almost all its informative pulses, or every pair of the views that carry a share
+#:   of them looks from nearly one direction: no other view checks it (3dtrees research 93 §10, §11.1);
+#: - ``SHADOWED``: an exact stem a side of whose silhouette is unseen (no pulse reaches the circle's neighbourhood
+#:   there from a scan that would decide R, as a crossing branch's shadow), so the sides seen leave its radius trading
+#:   against its centre: its message says nothing along what they leave free, and its own bounds (the span of its
+#:   front arc's stops, the capacity floor) enter the tree beside it. A side past the fit's table isn't judged;
+#: - ``SUB_FOOTPRINT``: R below about half the footprint at its range;
+#: - ``TUBE_EDGE``: its own fitted circle reaches the edge of the tube its pulses were taken in: evidence cut off;
+#: - ``CONTESTED``: most of its stops are claimed by context or a neighbouring node (``contested``).
+SupportDiag = IntFlag("SupportDiag", _core.qsm_support_diags())
+
 #: How a classified echo (``echoes`` of :func:`support_tree` and :func:`joint_tree`) got its ``p_wood``:
 #: ``MEASURED``, ``BOUNDED``, ``POROUS`` and ``ROUTED`` (a routed piece with no exact fit accepted) by whether it lies
 #: on its piece's circle's front arc (the piece's own, or the tree's) times its echo character's weight, off the arc
@@ -263,7 +278,10 @@ def support_tree(scans, a, b, r_prior, parent, params: JointParams = JointParams
     node beside it (its parent's child by a fork term on its share of the stems' area). A fit is refused
     (:class:`SupportRefusal`, ``refused``) where there is no seed or no pulse left, Newton didn't converge, a stem
     isn't finite or its message says nothing of its radius, or its one stem is narrower than the piece's detection
-    bound; the piece is then the prior cut by its upper bound and capacity floor.
+    bound; the piece is then the prior cut by its upper bound and capacity floor. An accepted stem whose sides, as
+    its scans see them (the pulses that reach each edge's neighbourhood and its front, against those that echo
+    further in front), leave its radius trading against its centre (``SHADOWED``, 3dtrees research 93 §20) says
+    nothing along that ridge, and its own bounds enter with it: its radius is the prior's cut by them.
 
     Every stop is classified (``echoes``): by whether it lies on its piece's circle's front arc (its own, or the
     tree's) times its echo character's weight, or on a routed piece with an exact fit by the exact likelihood's wood
@@ -316,6 +334,12 @@ def support_tree(scans, a, b, r_prior, parent, params: JointParams = JointParams
       (its routed pulses) and ``evals_value``, ``evals_deriv`` (its pair evaluations, of the value alone and with
       derivatives: per routed pulse, its passes), and ``refused`` (:class:`SupportRefusal` bits: why its fit wasn't
       used, 0 where it was or the piece isn't routed);
+    - ``diag`` (:class:`SupportDiag` bits; a row's: its pieces') and three numbers: ``data_share``, the share of log
+      R's posterior precision its own data give (its measurement's information on R with its centre and lean unknown,
+      and its bounds' EP site), 0-1, NaN where that site's precision came out negative; ``contested``, the share of
+      its stops claimed by context or another node (NaN with none); ``deleted``, the share of its pulses with echoes
+      the export deleted (an exact stem's: its piece's; NaN with none). A row's: its pieces' means. The misfit is
+      ``chi2`` and ``chi2_front``, a refusal ``refused``, a thinned fit ``n_exact`` over the budget;
 
     and per tree ``converged``, whether the censored solve settled; and ``echoes``, one record per stop of the tree
     (of an echo several pieces saw, the one whose surface it lies nearest), keyed as the tile sidecars are: ``scan``

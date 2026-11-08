@@ -357,6 +357,11 @@ impl ScanIndex {
         self.src[pulse as usize]
     }
 
+    /// `pulse`'s echo ranges (m), nearest first.
+    pub fn ranges(&self, pulse: u32) -> &[f32] {
+        &self.range[self.echo_start[pulse as usize] as usize..self.echo_start[pulse as usize + 1] as usize]
+    }
+
     /// `pulse`'s unit direction.
     pub fn direction(&self, pulse: u32) -> Point {
         self.dir[pulse as usize].map(|x| x as f64)
@@ -885,6 +890,11 @@ pub(crate) mod tests {
     /// pulses over and under the wall are kept, without echoes; otherwise
     /// the wall's top and bottom are lost too.
     fn shots(r: f64, misses: bool) -> Shots {
+        screened(r, misses, None)
+    }
+
+    /// [`shots`], with a screen at y = 4 stopping every pulse whose line crosses y = 5 within `screen` (x, m).
+    fn screened(r: f64, misses: bool, screen: Option<(f64, f64)>) -> Shots {
         let (cx, cy) = (0.0, 5.0);
         let mut shots = Shots::default();
         let step = 0.0005f64; // rad
@@ -902,7 +912,10 @@ pub(crate) mod tests {
                 let d2 = cx * cx + cy * cy - tca * tca;
                 let hit = d2 <= r * r && (-1.0..=1.0).contains(&(d[2] * (tca / h)));
                 shots.echo_start.push(shots.echo_range.len());
-                if hit {
+                if screen.is_some_and(|(x0, x1)| (x0..=x1).contains(&(5.0 * dx / dy))) && d[2].abs() * 4.0 / dy <= 1.0 {
+                    shots.echo_range.push(4.0 / dy);
+                    shots.echo_count.push(1);
+                } else if hit {
                     shots.echo_range.push((tca - (r * r - d2).sqrt()) / h);
                     shots.echo_count.push(1);
                 } else if el.abs() < 0.04 || (misses && el.abs() < 0.045) {
@@ -933,6 +946,11 @@ pub(crate) mod tests {
 
     pub(crate) fn scene(r: f64, misses: bool) -> (ScanIndex, Point, Point) {
         (index(&shots(r, misses), ShotsWriteOptions::default().row_group_size), [0.0, 5.0, -1.0], [0.0, 5.0, 1.0])
+    }
+
+    /// [`scene`] (with misses) behind a screen at y = 4 that stops the pulses crossing y = 5 within `screen` (x, m).
+    pub(crate) fn scene_screened(r: f64, screen: (f64, f64)) -> (ScanIndex, Point, Point) {
+        (index(&screened(r, true, Some(screen)), ShotsWriteOptions::default().row_group_size), [0.0, 5.0, -1.0], [0.0, 5.0, 1.0])
     }
 
     #[test]
