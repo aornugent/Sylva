@@ -79,12 +79,13 @@ def test_a_bent_stem_is_a_chain_of_straight_pieces(tmp_path):
     for k in range(len(p["r"])):
         mid = 0.5 * (p["a"][k] + p["b"][k])
         assert abs(mid[0] - (rho - np.sqrt(rho ** 2 - mid[2] ** 2))) < 0.003, (k, mid)
-    assert (p["p_wood"] > 0.99).all() and (f["p_wood"] > 0.99).all()
+    assert (p["p_wood"] > 0.9).all() and (f["p_wood"] > 0.9).all()
 
 
 def test_thin_stems_far_away_are_bounded_around_their_truth(tmp_path):
     # stems of 2 to 8 mm seen from two scans 20 m away (a footprint of ~14 mm): where no circle is determined the
-    # radius is the prior cut by the bounds, and both the bounds and the posterior contain the truth
+    # radius is the prior cut by the bounds, and both the bounds and the posterior contain the truth; a stem too
+    # thin for its hits' span to say more than the capacity floor has no detection bound
     radii = np.array([0.002, 0.003, 0.005, 0.008])
     xs = np.arange(4) * 0.3 - 0.45
     scans = scanned(tmp_path, np.c_[xs, np.zeros(4), np.zeros(4)], np.c_[xs, np.zeros(4), np.full(4, 1.8)], radii,
@@ -94,9 +95,12 @@ def test_thin_stems_far_away_are_bounded_around_their_truth(tmp_path):
     bounded = (f["flags"] & (SupportFlag.BOUNDS | SupportFlag.POROUS)) > 0
     assert bounded.sum() >= 2 and not (f["flags"] & (SupportFlag.RUNS | SupportFlag.HULL)).any()
     assert np.isnan(f["r_row"][bounded]).all() and np.isfinite(f["r_hi"][bounded]).all()
-    assert ((f["r_lo"][bounded] <= radii[bounded]) & (radii[bounded] <= f["r_hi"][bounded])).all(), (f["r_lo"], f["r_hi"])
+    lo_ok = np.isnan(f["r_lo"]) | (f["r_lo"] <= radii)
+    held = (lo_ok & (f["r_floor"] <= radii) & (radii <= f["r_hi"]))[bounded]
+    assert held.all() and f["converged"], (f["r_lo"], f["r_floor"], f["r_hi"])
     lo, hi = f["r"] * np.exp(-1.96 * f["sd_log_r"]), f["r"] * np.exp(1.96 * f["sd_log_r"])
-    assert ((lo <= radii) & (radii <= hi)).all() and (f["p_wood"] > 0.9).all()
+    # two scans that each see opaque wood: as sure as two scans can make it (exist_scale)
+    assert ((lo <= radii) & (radii <= hi)).all() and (f["p_wood"] > 0.8).all()
 
 
 def test_a_clump_of_stems_is_flagged_as_runs(tmp_path):

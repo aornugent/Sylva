@@ -34,7 +34,17 @@ The parameters are a :class:`JointParams`, whose fields are:
   (the reflectance, dB, of a single return from bark that fills the footprint
   and from leaf, mean and sd), ``refl_multi`` and ``refl_multi_sd`` (a return
   that shares its pulse is ``refl_multi`` dB brighter, negative, with
-  ``refl_multi_sd`` more spread in quadrature);
+  ``refl_multi_sd`` more spread in quadrature), ``refl_thin`` (thin wood's
+  shift, dB, in full at R <= 1 cm and none from 3 cm);
+- the support path's own (read by :func:`support_tree` only): ``stop_wood``
+  and ``stop_leaf`` (the share of the pulses aimed at a core that stop there,
+  on wood and on foliage), ``exist_scale`` (the weight of a scan's existence
+  log odds: its pulses are correlated beyond the beam's oversampling),
+  ``model_sd`` (the floor on a support measurement's
+  sd, m), ``lean_sd`` (the lean's anchor, m per m), ``lean_bend`` (its random
+  walk between a row's pieces, per sqrt(m)), ``exist`` and ``exist_off``
+  (existence along a branch: a base piece is wood with ``exist``, one after a
+  piece that isn't with ``exist_off``);
 - the prior: ``lam_prior`` and ``lam_sd`` (foliage's median, 1/m, and log
   sd), ``sig_ell`` (its random walk), ``sig_eta`` (the taper's random walk per
   sqrt(m)), ``mu_fork`` and ``sig_fork`` (soft Leonardo's log area ratio and
@@ -84,6 +94,11 @@ class JointParams:
     refl_leaf_sd: float = _DEFAULTS["refl_leaf_sd"]
     refl_multi: float = _DEFAULTS["refl_multi"]
     refl_multi_sd: float = _DEFAULTS["refl_multi_sd"]
+    refl_thin: float = _DEFAULTS["refl_thin"]
+    stop_wood: float = _DEFAULTS["stop_wood"]
+    stop_leaf: float = _DEFAULTS["stop_leaf"]
+    exist_scale: float = _DEFAULTS["exist_scale"]
+    model_sd: float = _DEFAULTS["model_sd"]
     lam_prior: float = _DEFAULTS["lam_prior"]
     lam_sd: float = _DEFAULTS["lam_sd"]
     sig_ell: float = _DEFAULTS["sig_ell"]
@@ -98,6 +113,10 @@ class JointParams:
     centre_abs: float = _DEFAULTS["centre_abs"]
     scan_abs: float = _DEFAULTS["scan_abs"]
     scan_rel: float = _DEFAULTS["scan_rel"]
+    lean_sd: float = _DEFAULTS["lean_sd"]
+    lean_bend: float = _DEFAULTS["lean_bend"]
+    exist: float = _DEFAULTS["exist"]
+    exist_off: float = _DEFAULTS["exist_off"]
     #: Newton iterations per continuation stage at most, and the stopping tolerance.
     iters: int = _DEFAULTS["iters"]
     tol: float = _DEFAULTS["tol"]
@@ -181,7 +200,7 @@ def joint_tree(scans, a, b, r_prior, parent, context=None, params: JointParams =
 #: ``RUNS`` (a scan's profile shows two or more stems within the claim) and ``HULL`` (the support is wider than one
 #: circle explains within the piece: several stems or a non-round section) are for :func:`joint_tree`. ``BOUNDS``
 #: (the circle isn't determined: the radius is the prior cut by bounds) and ``POROUS`` (pulses, but no opaque run:
-#: existence, and the radius the prior cut by any bounds) are resolved there.
+#: existence, and the radius the prior cut by any bounds) are resolved by :func:`support_tree` itself.
 SupportFlag = IntFlag("SupportFlag", _core.qsm_support_flags())
 
 
@@ -199,15 +218,18 @@ def support_tree(scans, a, b, r_prior, parent, params: JointParams = JointParams
     character (``refl_*``: the chance of wood against leaf by its reflectance and return position, wood narrower
     than the footprint reading darker). Per piece, weighted least squares over its scans gives the centre at its
     middle, the lean and the radius with their covariance; a stop is a hit only on the first such circle's front
-    arc (the second pass). Where no circle is determined, each scan still bounds R: its woody stops' span is no
-    wider than the silhouette, the nearest passes either side of them no narrower, and wood that was hit fills at
-    least ``tau`` of the footprint. Each piece also has an existence log odds from its core's stops and passes
-    (echo character and opacity, over the beam's oversampling), and a chain along the branches (wood doesn't stop
-    and restart) gives ``p_wood``. The tree is one solve: the unflagged pieces' summaries as Gaussian
+    arc (the second pass). Where no circle is determined, each scan still bounds R, slice by slice along the piece:
+    its woody stops' span is no wider than the silhouette, the nearest passes either side of them (or, in a slice
+    with no woody stop, either side of the woody centre) no narrower, and wood that was hit fills at least ``tau``
+    of the footprint; a side with nothing recorded gives no bound. Each piece also has an existence log odds from
+    its core's stops and passes (echo character, and opacity: a stop for wood, a pass against it), over the beam's
+    oversampling and weighted by ``exist_scale``, and a chain along the branches (wood doesn't stop and restart:
+    ``exist``, ``exist_off``) gives ``p_wood``. The tree is one solve: the unflagged pieces' summaries as Gaussian
     measurements, the bounds as censored ones on log R (expectation propagation, one site per piece by
     quadrature), and a prior after :func:`joint_tree`'s (the base's level, the taper's steps, at a fork the child's
-    share of the subtree wood length rather than of the prior area, the centre's continuity along a branch and the
-    lean's between a row's pieces, the centre's anchor and a weak anchor of the lean; no tip anchor). A ``RUNS`` or
+    share of the subtree wood length rather than of the prior area as a heavy-tailed Student-t term, so a small
+    shoot measured fat can't inflate its parent, the centre's continuity along a branch and the lean's random walk
+    between a row's pieces, the centre's anchor and a weak anchor of the lean; no tip anchor). A ``RUNS`` or
     ``HULL`` piece's radius is the prior's given the others: it is for :func:`joint_tree`.
 
     Parameters
@@ -219,7 +241,9 @@ def support_tree(scans, a, b, r_prior, parent, params: JointParams = JointParams
         base).
     params
         :class:`JointParams`: the likelihood's footprint, ``tau``, ``edge``, ``sigma_r``, ``rough`` and ``refl_*``,
-        and the prior's ``sig_eta``, ``mu_fork``, ``sig_fork``, ``sig_root``, ``sig_delta``, ``centre_rel`` and
+        ``stop_wood``, ``stop_leaf``, ``exist_scale``, ``refl_thin`` and ``model_sd``, and the prior's ``sig_eta``,
+        ``mu_fork``, ``sig_fork``, ``sig_root``, ``sig_delta``, ``lean_sd``, ``lean_bend``, ``exist``, ``exist_off``,
+        ``centre_rel`` and
         ``centre_abs``; the rest are unused.
     threads
         Threads to use (0: one per core).
@@ -238,13 +262,17 @@ def support_tree(scans, a, b, r_prior, parent, params: JointParams = JointParams
     - ``chi2``, ``chi2_front``: the misfits (reduced chi-square), of the measurements to the circle (on their rank)
       and of the front's stops about it against the range noise, roughness and a 4 mm floor; NaN where there is
       none (a row's: its pieces' largest);
-    - ``r_lo``, ``r_hi``: the tightest lower and upper bound on R where they entered the tree, else NaN (a row's:
+    - ``r_lo``, ``r_hi``, ``r_floor``: the tightest lower bound on R from detection, upper bound from passes, and
+      the capacity floor ``tau w / 2`` (which says only that something was hit), where they entered the tree,
+      else NaN (a row's:
       its pieces' widest);
     - ``log_odds``, ``p_wood``: the existence evidence (log odds of wood against foliage) and the chance of wood
       under the branches' chain (a row's: the sum, and the mean: the share of it that is wood);
     - ``flags`` (:class:`SupportFlag` bits; 0: its summary entered the tree; a row's: its pieces');
     - ``n_runs`` (the most stems within the claim a scan's profile shows), ``n_scans`` (the scans that measured
-      it), ``n_pairs`` (its pulses).
+      it), ``n_pairs`` (its pulses);
+
+    and per tree ``converged``, whether the censored solve settled.
     """
     if not all(isinstance(s, ScanIndex) for s in scans):
         raise TypeError("support_tree: scans must be ScanIndex")

@@ -66,6 +66,14 @@ pub struct PriorParams {
     /// The per-scan nuisance, `scan_abs + scan_rel r` (both 0: none).
     pub scan_abs: f64,
     pub scan_rel: f64,
+    /// The lean's anchor (m per m) and its random walk between a row's pieces (per sqrt(m); 3dtrees research 93
+    /// §13.1: rows of 67-98 cm whose centres drift 8-24 cm). Read by [`crate::qsm::support_tree`] only.
+    pub lean_sd: f64,
+    pub lean_bend: f64,
+    /// Existence along a branch: a base piece is wood with `exist`, one after a piece that isn't with `exist_off`
+    /// (wood doesn't stop and restart). Read by [`crate::qsm::support_tree`] only.
+    pub exist: f64,
+    pub exist_off: f64,
 }
 
 impl Default for PriorParams {
@@ -73,15 +81,18 @@ impl Default for PriorParams {
     /// than a synthetic bench's, and RCT's taper is no guide to the rays' radii there (§21: rows fitted alone
     /// disagree with its steps by ~1 in log R, which `sig_eta` 0.05 priced at ~10^6 log units).
     fn default() -> Self {
-        PriorParams { lam_prior: 1.0, lam_sd: 2.0, sig_ell: 1.0, sig_eta: 0.5, mu_fork: 0.10, sig_fork: 0.17, sig_root: 0.5, r_tip: 0.0, sig_tip: 0.3, sig_delta: 0.02, centre_rel: 1.0, centre_abs: 0.003, scan_abs: 0.002, scan_rel: 0.3 }
+        PriorParams { lam_prior: 1.0, lam_sd: 2.0, sig_ell: 1.0, sig_eta: 0.5, mu_fork: 0.10, sig_fork: 0.17, sig_root: 0.5, r_tip: 0.0, sig_tip: 0.3, sig_delta: 0.02, centre_rel: 1.0, centre_abs: 0.003, scan_abs: 0.002, scan_rel: 0.3, lean_sd: 0.5, lean_bend: 0.3, exist: 0.65, exist_off: 0.5 }
     }
 }
 
 impl PriorParams {
     pub(crate) fn check(&self) -> Result<()> {
-        let sds = [("lam_prior", self.lam_prior), ("lam_sd", self.lam_sd), ("sig_ell", self.sig_ell), ("sig_eta", self.sig_eta), ("sig_fork", self.sig_fork), ("sig_root", self.sig_root), ("sig_delta", self.sig_delta)];
+        let sds = [("lam_prior", self.lam_prior), ("lam_sd", self.lam_sd), ("sig_ell", self.sig_ell), ("sig_eta", self.sig_eta), ("sig_fork", self.sig_fork), ("sig_root", self.sig_root), ("sig_delta", self.sig_delta), ("lean_sd", self.lean_sd), ("lean_bend", self.lean_bend)];
         if let Some((k, _)) = sds.iter().find(|(_, v)| !(v.is_finite() && *v > 0.0)) {
             return Err(Error::invalid(format!("joint fit: {k} must be positive")));
+        }
+        if let Some((k, _)) = [("exist", self.exist), ("exist_off", self.exist_off)].iter().find(|(_, v)| !(*v > 0.0 && *v < 1.0)) {
+            return Err(Error::invalid(format!("joint fit: {k} must be a probability in (0, 1)")));
         }
         let shares = [("mu_fork", self.mu_fork), ("centre_rel", self.centre_rel), ("centre_abs", self.centre_abs), ("scan_abs", self.scan_abs), ("scan_rel", self.scan_rel), ("r_tip", self.r_tip)];
         if let Some((k, _)) = shares.iter().find(|(k, v)| !v.is_finite() || (*k != "mu_fork" && *v < 0.0)) {
@@ -844,7 +855,7 @@ mod tests {
     use crate::qsm::joint::joint_table;
 
     fn prior() -> PriorParams {
-        PriorParams { lam_prior: 1.0, lam_sd: 2.0, sig_ell: 1.0, sig_eta: 0.05, mu_fork: 0.0, sig_fork: 0.17, sig_root: 0.5, r_tip: 0.0, sig_tip: 0.3, sig_delta: 0.02, centre_rel: 0.3, centre_abs: 0.003, scan_abs: 0.002, scan_rel: 0.05 }
+        PriorParams { lam_prior: 1.0, lam_sd: 2.0, sig_ell: 1.0, sig_eta: 0.05, mu_fork: 0.0, sig_fork: 0.17, sig_root: 0.5, r_tip: 0.0, sig_tip: 0.3, sig_delta: 0.02, centre_rel: 0.3, centre_abs: 0.003, scan_abs: 0.002, scan_rel: 0.05, ..PriorParams::default() }
     }
 
     fn like() -> JointParams {
