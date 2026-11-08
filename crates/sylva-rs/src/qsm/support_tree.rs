@@ -85,8 +85,7 @@
 //!   bounds), [`flag::POROUS`] (pulses but no opaque run: existence and
 //!   bounds). RUNS and HULL pieces are fitted by the exact likelihood here.
 //! - **Routed pieces, exactly** (research 93 §18; [`routed`]): seeds from the
-//!   runs of a tube [`SEED_WIDEN`] wider than the piece's (§19), each a circle
-//!   with its own lean, measured slice by slice;
+//!   piece's runs, each a circle with its own lean, measured slice by slice;
 //!   its pulses taken once about the claim's axis, each stem seeing them from
 //!   its own leaning axis, the stops the tree's measured and bounded pieces (a
 //!   first solve without the routed ones) explain better left to them; then
@@ -141,9 +140,6 @@ use crate::transform::{cross, dot, sub};
 use crate::Point;
 
 mod routed;
-mod site;
-
-pub use site::{site_prior, SitePrior, REACH_MIN};
 
 /// Why a piece's own summary is not used (bits of [`Fit::flags`]): [`RUNS`] and [`HULL`] pieces are fitted by the
 /// exact likelihood ([`routed`]), [`BOUNDS`] and [`POROUS`] ones are bounded.
@@ -181,8 +177,6 @@ const MIN_PULSES: f64 = 30.0;
 const RUN_HITS: f64 = 10.0;
 /// The tube's widening for the lean, a share of the piece's length (a lean of up to about 27°).
 const LEAN_TUBE: f64 = 0.25;
-/// How much wider than its own tube a routed piece's seeds are sought (m).
-const SEED_WIDEN: f64 = 0.15;
 /// Rows longer than this (m) are cut into pieces of at most this length.
 pub const PIECE_LEN: f64 = 0.3;
 /// The narrowest bin (m), the depth jump that separates two stems in a run (m), and how far a stop may sit from
@@ -207,14 +201,17 @@ const FORK_DF: f64 = 2.0;
 const THIN_FULL: f64 = 0.01;
 const THIN_NONE: f64 = 0.03;
 /// The censored solve: at most `EP_ROUNDS` rounds, each site moved `EP_DAMP` of the way (halved, down to
-/// `EP_DAMP_MIN`, each time its step turns back; a fork weight likewise from a full step), until no site or
-/// linearisation moves by more than `EP_TOL` (in units of its piece's sd) and no fork weight by more than that (tree 849
+/// `EP_DAMP_MIN`, each time its step turns back, and grown back by `EP_REGROW` while it doesn't; a fork weight likewise
+/// from a full step), until no linearisation moves, and no site or fork weight would move undamped, by more than
+/// `EP_TOL` (in units of its piece's sd; a fork weight by more than that itself) (tree 849
 /// takes ~200 rounds at 1e-4 and fewer at 1e-3, with the same radii to the bench's precision; a round is one
 /// elimination, ~3 us per piece; 3dtrees research 93 §19).
 const EP_ROUNDS: usize = 300;
 const EP_DAMP: f64 = 0.5;
-/// The least damping of a site whose steps keep turning back.
+/// The least damping of a site whose steps keep turning back, and how fast it grows back (up to `EP_DAMP`, a fork
+/// weight's to a full step) while its steps keep their sign.
 const EP_DAMP_MIN: f64 = 0.02;
+const EP_REGROW: f64 = 1.5;
 const EP_TOL: f64 = 1e-3;
 const EP_NODES: usize = 64;
 /// The rounds of the first solve, which only places the routed pieces' context and parents' ends: its bounds'
@@ -1132,9 +1129,7 @@ fn summarise_piece(scans: &[&ScanIndex], a: &Point, b: &Point, frame: Frame, r_c
         }
     }
     if let Outcome::Routed { .. } = out.outcome {
-        // its seeds from a tube SEED_WIDEN wider than the piece's: a stem leaning out of a hull's claim crosses its
-        // edge (3dtrees research 93 §19: tree 849 row 4's stem A, 23-30 cm off the axis)
-        out.seeds = routed::seeds(&groups(scans, a, b, frame, tube + SEED_WIDEN, p), r_claim, p, lean_sd);
+        out.seeds = routed::seeds(&gs, r_claim, p, lean_sd);
     }
     // the stops, for the classification once the tree is solved (a routed piece's come from its exact fit, where it
     // has one)
@@ -1235,8 +1230,6 @@ struct Nodes {
     frame: Vec<Frame>,
     a: Vec<Point>,
     further: Vec<Option<Further>>,
-    /// The reach at each node's middle: the path to the furthest tip beyond it (m, at least [`REACH_MIN`]).
-    reach: Vec<f64>,
 }
 
 impl Nodes {
@@ -1246,7 +1239,6 @@ impl Nodes {
         self.parent.push(from.or(self.parent[k]));
         self.frame.push(self.frame[k]);
         self.a.push(self.a[k]);
-        self.reach.push(self.reach[k]);
         self.further.push(Some(Further { piece: k, stem, share: from.is_none().then_some(share) }));
     }
 
@@ -1256,8 +1248,7 @@ impl Nodes {
     }
 
     fn of(rows: &Rows, fr: &[Frame]) -> Self {
-        let mut nd = Nodes { row: Vec::new(), first: Vec::new(), parent: Vec::new(), frame: Vec::new(), a: Vec::new(), further: Vec::new(), reach: Vec::new() };
-        let end = site::reach_ends(rows.parent, &fr.iter().map(|f| f.3).collect::<Vec<_>>());
+        let mut nd = Nodes { row: Vec::new(), first: Vec::new(), parent: Vec::new(), frame: Vec::new(), a: Vec::new(), further: Vec::new() };
         for (k, &(u, e1, e2, len)) in fr.iter().enumerate() {
             let m = (len / PIECE_LEN - 1e-9).ceil().max(1.0) as usize;
             let pl = len / m as f64;
@@ -1269,7 +1260,6 @@ impl Nodes {
                     _ => Some(nd.row.len() - 1),
                 });
                 nd.further.push(None);
-                nd.reach.push((end[k] + len - (j as f64 + 0.5) * pl).max(REACH_MIN));
                 nd.row.push(k);
                 nd.frame.push((u, e1, e2, pl));
                 nd.a.push(std::array::from_fn(|i| rows.a[k][i] + j as f64 * pl * u[i]));
@@ -1683,13 +1673,11 @@ fn tree_solve(rows: &Rows, fr: &[Frame], nd: &Nodes, sums: &[Summary], p: &Prior
             let cross = -(sol.y[k] * sol.cov[q])[(4, 4)];
             let e2 = (sol.x[k][4] - sol.x[q][4] - m).powi(2) + sol.cov[k][(4, 4)] + sol.cov[q][(4, 4)] - 2.0 * cross;
             let step = (FORK_DF + 1.0) / (FORK_DF + e2 / (p.sig_fork * p.sig_fork)) - fork_w[k];
-            if step * fork_last[k] < 0.0 {
-                fork_damp[k] = (0.5 * fork_damp[k]).max(EP_DAMP_MIN);
-            }
+            fork_damp[k] = if step * fork_last[k] < 0.0 { (0.5 * fork_damp[k]).max(EP_DAMP_MIN) } else { (EP_REGROW * fork_damp[k]).min(1.0) };
             fork_last[k] = step;
-            let w = fork_w[k] + fork_damp[k] * step;
-            moved = moved.max((w - fork_w[k]).abs());
-            fork_w[k] = w;
+            // converged on the step it would take undamped: a damped step is small however far it has to go
+            moved = moved.max(step.abs());
+            fork_w[k] += fork_damp[k] * step;
         }
         for (t, (k, bs)) in terms.iter().enumerate() {
             let k = *k;
@@ -1704,13 +1692,10 @@ fn tree_solve(rows: &Rows, fr: &[Frame], nd: &Nodes, sums: &[Summary], p: &Prior
             let Some((mh, vh)) = tilted(mc, 1.0 / pc, (mu, v.sqrt()), bs) else { continue };
             let (tau_new, nu_new) = ((1.0 / vh - pc).max(0.0), mh / vh - mc * pc);
             let step = (tau_new - tau, nu_new - nu);
-            if step.0 * last[t].0 < 0.0 || step.1 * last[t].1 < 0.0 {
-                damp[t] = (0.5 * damp[t]).max(EP_DAMP_MIN);
-            }
+            damp[t] = if step.0 * last[t].0 < 0.0 || step.1 * last[t].1 < 0.0 { (0.5 * damp[t]).max(EP_DAMP_MIN) } else { (EP_REGROW * damp[t]).min(1.0) };
             last[t] = step;
-            let next = (tau + damp[t] * step.0, nu + damp[t] * step.1);
-            moved = moved.max((next.0 - tau).abs() * v).max((next.1 - nu).abs() * v.sqrt());
-            site[t] = next;
+            moved = moved.max(step.0.abs() * v).max(step.1.abs() * v.sqrt());
+            site[t] = (tau + damp[t] * step.0, nu + damp[t] * step.1);
         }
         round += 1;
         if (round >= 3 && moved < EP_TOL) || round >= rounds.max(3) {
@@ -1846,9 +1831,7 @@ fn prior_system(rows: &Rows, nd: &Nodes, p: &PriorParams, forks: &[Option<f64>],
             factors.push((vec![(k, 4, 1.0), (q, 4, -1.0)], m, p.sig_fork / fork_w[k].sqrt()));
             continue;
         }
-        // the taper's step: the site's rate on the reach where it has one, else RCT's
-        let step = if p.taper.is_nan() { eta0[k] - eta0[q] } else { p.taper * (nd.reach[k].ln() - nd.reach[q].ln()) };
-        factors.push((vec![(k, 4, 1.0), (q, 4, -1.0)], step, p.sig_eta * ls));
+        factors.push((vec![(k, 4, 1.0), (q, 4, -1.0)], eta0[k] - eta0[q], p.sig_eta * ls));
         // the child's start (its centre less half its length's lean) at the parent's end, in the child's frame
         let (ek, eq) = ([nd.frame[k].1, nd.frame[k].2], [nd.frame[q].1, nd.frame[q].2]);
         let lq = nd.frame[q].3;
@@ -1966,23 +1949,6 @@ mod tests {
 
     fn summary(outcome: Outcome, bounds: Vec<Bound>) -> Summary {
         Summary { outcome, chi2_front: f64::NAN, n_runs: 1, n_scans: 1, n_pairs: 100, bounds, log_odds: 0.0, seeds: Vec::new(), exact: None, stops: Vec::new() }
-    }
-
-    #[test]
-    fn a_site_taper_steps_by_the_reach_and_rct_steps_by_its_own() {
-        // a chain of three upright 30 cm rows, nothing measured: the reach at their middles is 0.75, 0.45 and 0.15 m
-        let rows_a = [[0.0, 0.0, 0.0], [0.0, 0.0, 0.3], [0.0, 0.0, 0.6]];
-        let rows_b = [[0.0, 0.0, 0.3], [0.0, 0.0, 0.6], [0.0, 0.0, 0.9]];
-        let rows = Rows { a: &rows_a, b: &rows_b, r_prior: &[0.05, 0.05, 0.04], r_max: &[], parent: &[-1, 0, 1] };
-        let fr = frames(&rows_a, &rows_b);
-        let nd = Nodes::of(&rows, &fr);
-        assert!(nd.reach.iter().zip([0.75, 0.45, 0.15]).all(|(a, b)| (a - b).abs() < 1e-12), "{:?}", nd.reach);
-        let sums = vec![summary(Outcome::Bounded, Vec::new()), summary(Outcome::Bounded, Vec::new()), summary(Outcome::Bounded, Vec::new())];
-        let solve = |p: &PriorParams| tree_solve(&rows, &fr, &nd, &sums, p, EP_ROUNDS).unwrap().0.x;
-        let x = solve(&PriorParams { taper: 0.5, ..PriorParams::default() });
-        assert!((x[1][4] - x[0][4] - 0.5 * (0.45f64 / 0.75).ln()).abs() < 1e-9 && (x[2][4] - x[1][4] - 0.5 * (0.15f64 / 0.45).ln()).abs() < 1e-9);
-        let x = solve(&PriorParams::default());
-        assert!((x[1][4] - x[0][4]).abs() < 1e-9 && (x[2][4] - x[1][4] - 0.8f64.ln()).abs() < 1e-9);
     }
 
     #[test]

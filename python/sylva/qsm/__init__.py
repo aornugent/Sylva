@@ -32,7 +32,7 @@ from .plot import (  # noqa: F401
     build_plot,
 )
 from .evidence import EvidenceParams, Reason, ScanIndex, contradicted, evidence, pairs  # noqa: F401
-from .joint import EchoPath, JointParams, JointReason, SupportFlag, SupportRefusal, joint_fit, joint_table, joint_tree, site_prior, support_tree  # noqa: F401
+from .joint import EchoPath, JointParams, JointReason, SupportFlag, SupportRefusal, joint_fit, joint_table, joint_tree, support_tree  # noqa: F401
 from .support import surface_distance, surface_support  # noqa: F401
 from .wood import (  # noqa: F401
     wood_points,

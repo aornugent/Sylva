@@ -46,8 +46,8 @@
 //!   seed (no fallback: no seed, no fit), no pulse left, Newton unconverged, a
 //!   stem not finite, one stem narrower than the piece's detection bound, or
 //!   one stem saying nothing of its radius ([`UNINFORMED_SD`]). Of several
-//!   stems, one that says nothing of its radius refutes its rung of the
-//!   ladder: the fit of one stem fewer stands.
+//!   stems, one that isn't finite or says nothing of its radius refutes its
+//!   rung of the ladder: the fit of one stem fewer stands.
 //! - TODO: passes through a context cylinder aren't removed (context is the
 //!   stops it explains); nor are other trees' cylinders context.
 
@@ -469,16 +469,18 @@ fn exact_thinned(scans: &[&ScanIndex], a0: &Point, frame: Frame, seeds: &[Seed],
         let h5 = info * y;
         Circle { st: Stats { info, h: h5, yy: y.dot(&h5), n: 5 }, x: y, cov, chi2: f64::NAN }
     }).collect() };
-    // the most stems whose messages all say something of their radius: a stem that says nothing of it refutes its
-    // rung, and the fit of one stem fewer stands (only one stem's fit can be unconverged: it is refused)
-    let mut chosen = None;
+    // the most stems whose messages are all finite and all say something of their radius: a stem that doesn't
+    // refutes its rung, and the fit of one stem fewer stands (only one stem's fit can be unconverged: it is refused;
+    // where no rung stands, the piece is refused for the last one's fault)
+    let (mut chosen, mut why) = (None, refusal::UNINFORMED);
     while let Some((bic, st, sf)) = ladder.pop() {
         if !sf.fit.converged {
             return refused(refusal::UNCONVERGED);
         }
         let stems = messages(&st, &sf);
         if !stems.iter().all(|c| c.x.iter().chain(c.st.info.iter()).chain(c.cov.iter()).all(|v| v.is_finite())) {
-            return refused(refusal::NON_FINITE);
+            why = refusal::NON_FINITE;
+            continue;
         }
         // one stem as narrow as the run it was seen in can't be (several may span it together)
         if st.len() == 1 && stems[0].x[4].ln() < lower {
@@ -488,8 +490,9 @@ fn exact_thinned(scans: &[&ScanIndex], a0: &Point, frame: Frame, seeds: &[Seed],
             chosen = Some((bic, st, sf, stems));
             break;
         }
+        why = refusal::UNINFORMED;
     }
-    let Some((bic, st, sf, stems)) = chosen else { return refused(refusal::UNINFORMED) };
+    let Some((bic, st, sf, stems)) = chosen else { return refused(why) };
     let k = st.len();
     // the classification: every kept stop (fitted or not) by the softmax of its wood and leaf terms at the fit of
     // the stem it meets first

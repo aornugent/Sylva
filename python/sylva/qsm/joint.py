@@ -44,10 +44,7 @@ The parameters are a :class:`JointParams`, whose fields are:
   sd, m), ``lean_sd`` (the lean's anchor, m per m), ``lean_bend`` (its random
   walk between a row's pieces, per sqrt(m)), ``exist`` and ``exist_off``
   (existence along a branch: a base piece is wood with ``exist``, one after a
-  piece that isn't with ``exist_off``), ``taper`` (the taper between forks as a
-  site's rate: each step's mean in log R is ``taper`` times its step in the log
-  of the reach to the furthest tip; NaN, the default, takes RCT's steps; learned
-  with ``sig_eta``, ``mu_fork`` and ``sig_fork`` by :func:`site_prior`);
+  piece that isn't with ``exist_off``);
 - the prior: ``lam_prior`` and ``lam_sd`` (foliage's median, 1/m, and log
   sd), ``sig_ell`` (its random walk), ``sig_eta`` (the taper's random walk per
   sqrt(m)), ``mu_fork`` and ``sig_fork`` (soft Leonardo's log area ratio and
@@ -120,7 +117,6 @@ class JointParams:
     lean_bend: float = _DEFAULTS["lean_bend"]
     exist: float = _DEFAULTS["exist"]
     exist_off: float = _DEFAULTS["exist_off"]
-    taper: float = _DEFAULTS["taper"]
     #: Newton iterations per continuation stage at most, and the stopping tolerance.
     iters: int = _DEFAULTS["iters"]
     tol: float = _DEFAULTS["tol"]
@@ -335,26 +331,6 @@ def support_tree(scans, a, b, r_prior, parent, params: JointParams = JointParams
     return _core.qsm_support_tree([s._core for s in scans], f64(a).reshape(-1, 3), f64(b).reshape(-1, 3),
                                   f64(r_prior), np.ascontiguousarray(parent, np.int64), dataclasses.asdict(params),
                                   int(threads))
-
-
-def site_prior(trees) -> dict:
-    """A site's priors learned from its own measured wood (empirical Bayes; 3dtrees research 93 §19): the
-    :class:`JointParams` values ``mu_fork`` and ``sig_fork`` (a fork's child's step in log R, ``(mu_fork + log
-    share) / 2`` by subtree wood length, as a Student-t's location and scale, net of the radii's own noise),
-    ``taper`` and ``sig_eta`` (between forks, each step's mean is ``taper`` times its step in the log of the reach to
-    the furthest tip, its variance ``sig_eta^2`` per m), with ``noise`` (the measured radii's own sd in log R) and
-    ``n_forks``, ``n_steps`` (the measured forks and steps behind them). Pass the result's four values to
-    :class:`JointParams` for :func:`support_tree`.
-
-    Parameters
-    ----------
-    trees
-        Per tree, ``(a, b, r_prior, parent, r)``: its rows as :func:`support_tree` takes them, and each row's measured
-        radius (m; NaN where none). Hold out any tree that will be scored under the priors.
-    """
-    f64 = lambda x: np.ascontiguousarray(x, np.float64)  # noqa: E731
-    return _core.qsm_site_prior([(f64(a).reshape(-1, 3), f64(b).reshape(-1, 3), f64(rp), np.ascontiguousarray(par, np.int64), f64(r))
-                                 for a, b, rp, par, r in trees])
 
 
 def joint_table(scans, a, b, window, threads: int = 0) -> dict[str, np.ndarray]:

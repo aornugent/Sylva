@@ -74,12 +74,6 @@ pub struct PriorParams {
     /// (wood doesn't stop and restart). Read by [`crate::qsm::support_tree`] only.
     pub exist: f64,
     pub exist_off: f64,
-    /// The taper along a branch between forks, as a site's rate: each step's mean in log R is `taper` times its
-    /// step in the log of the reach (the path to the furthest tip beyond it), in place of RCT's own step (NaN: RCT's,
-    /// the default). Learned with `sig_eta`, `mu_fork` and `sig_fork` from a plot's measured wood by
-    /// [`crate::qsm::support_tree::site_prior`] (3dtrees research 93 §19). Read by [`crate::qsm::support_tree`]
-    /// only.
-    pub taper: f64,
 }
 
 impl Default for PriorParams {
@@ -87,7 +81,7 @@ impl Default for PriorParams {
     /// than a synthetic bench's, and RCT's taper is no guide to the rays' radii there (§21: rows fitted alone
     /// disagree with its steps by ~1 in log R, which `sig_eta` 0.05 priced at ~10^6 log units).
     fn default() -> Self {
-        PriorParams { lam_prior: 1.0, lam_sd: 2.0, sig_ell: 1.0, sig_eta: 0.5, mu_fork: 0.10, sig_fork: 0.17, sig_root: 0.5, r_tip: 0.0, sig_tip: 0.3, sig_delta: 0.02, centre_rel: 1.0, centre_abs: 0.003, scan_abs: 0.002, scan_rel: 0.3, lean_sd: 0.5, lean_bend: 0.3, exist: 0.65, exist_off: 0.5, taper: f64::NAN }
+        PriorParams { lam_prior: 1.0, lam_sd: 2.0, sig_ell: 1.0, sig_eta: 0.5, mu_fork: 0.10, sig_fork: 0.17, sig_root: 0.5, r_tip: 0.0, sig_tip: 0.3, sig_delta: 0.02, centre_rel: 1.0, centre_abs: 0.003, scan_abs: 0.002, scan_rel: 0.3, lean_sd: 0.5, lean_bend: 0.3, exist: 0.65, exist_off: 0.5 }
     }
 }
 
@@ -109,9 +103,6 @@ impl PriorParams {
         }
         if self.r_tip > 0.0 && !(self.sig_tip.is_finite() && self.sig_tip > 0.0) {
             return Err(Error::invalid("joint fit: a tip anchor needs a positive sig_tip"));
-        }
-        if self.taper.is_infinite() {
-            return Err(Error::invalid("joint fit: taper must be finite (or NaN: RCT's steps)"));
         }
         Ok(())
     }

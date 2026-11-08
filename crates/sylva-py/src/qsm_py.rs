@@ -623,7 +623,7 @@ fn qsm_joint_fit<'py>(py: Python<'py>, table: Bound<'py, PyDict>, a: PyReadonlyA
 }
 
 const JOINT_LIKE: [&str; 21] = ["exit", "divergence", "sigma_r", "rough", "tau", "edge", "eps", "eps_min", "mp_len", "hide", "refl_wood", "refl_wood_sd", "refl_leaf", "refl_leaf_sd", "refl_multi", "refl_multi_sd", "refl_thin", "stop_wood", "stop_leaf", "exist_scale", "model_sd"];
-const JOINT_PRIOR: [&str; 19] = ["lam_prior", "lam_sd", "sig_ell", "sig_eta", "mu_fork", "sig_fork", "sig_root", "r_tip", "sig_tip", "sig_delta", "centre_rel", "centre_abs", "scan_abs", "scan_rel", "lean_sd", "lean_bend", "exist", "exist_off", "taper"];
+const JOINT_PRIOR: [&str; 18] = ["lam_prior", "lam_sd", "sig_ell", "sig_eta", "mu_fork", "sig_fork", "sig_root", "r_tip", "sig_tip", "sig_delta", "centre_rel", "centre_abs", "scan_abs", "scan_rel", "lean_sd", "lean_bend", "exist", "exist_off"];
 const JOINT_TREE: [&str; 9] = ["version", "thin_seed", "iters", "tol", "sweeps", "split_min_r", "split_through", "split_min_votes", "drop"];
 
 /// The default settings of `qsm_joint_tree`, flat.
@@ -635,7 +635,7 @@ fn qsm_joint_defaults(py: Python<'_>) -> PyResult<Bound<'_, PyDict>> {
     for (k, v) in JOINT_LIKE.iter().zip([l.exit, l.divergence, l.sigma_r, l.rough, l.tau, l.edge, l.eps, l.eps_min, l.mp_len, l.hide, l.refl_wood, l.refl_wood_sd, l.refl_leaf, l.refl_leaf_sd, l.refl_multi, l.refl_multi_sd, l.refl_thin, l.stop_wood, l.stop_leaf, l.exist_scale, l.model_sd]) {
         d.set_item(k, v)?;
     }
-    for (k, v) in JOINT_PRIOR.iter().zip([p.lam_prior, p.lam_sd, p.sig_ell, p.sig_eta, p.mu_fork, p.sig_fork, p.sig_root, p.r_tip, p.sig_tip, p.sig_delta, p.centre_rel, p.centre_abs, p.scan_abs, p.scan_rel, p.lean_sd, p.lean_bend, p.exist, p.exist_off, p.taper]) {
+    for (k, v) in JOINT_PRIOR.iter().zip([p.lam_prior, p.lam_sd, p.sig_ell, p.sig_eta, p.mu_fork, p.sig_fork, p.sig_root, p.r_tip, p.sig_tip, p.sig_delta, p.centre_rel, p.centre_abs, p.scan_abs, p.scan_rel, p.lean_sd, p.lean_bend, p.exist, p.exist_off]) {
         d.set_item(k, v)?;
     }
     d.set_item("version", TreeParams::VERSION)?;
@@ -668,7 +668,7 @@ fn tree_params(d: &Bound<'_, PyDict>) -> PyResult<TreeParams> {
         return Err(PyValueError::new_err("joint params: unexpected fields"));
     }
     let prior = PriorParams { lam_prior: f("lam_prior")?, lam_sd: f("lam_sd")?, sig_ell: f("sig_ell")?, sig_eta: f("sig_eta")?, mu_fork: f("mu_fork")?, sig_fork: f("sig_fork")?, sig_root: f("sig_root")?, r_tip: f("r_tip")?, sig_tip: f("sig_tip")?, sig_delta: f("sig_delta")?, centre_rel: f("centre_rel")?, centre_abs: f("centre_abs")?, scan_abs: f("scan_abs")?, scan_rel: f("scan_rel")?,
-        lean_sd: f("lean_sd")?, lean_bend: f("lean_bend")?, exist: f("exist")?, exist_off: f("exist_off")?, taper: f("taper")? };
+        lean_sd: f("lean_sd")?, lean_bend: f("lean_bend")?, exist: f("exist")?, exist_off: f("exist_off")? };
     Ok(TreeParams { like: joint_params(d)?, prior, iters: u("iters")?, tol: f("tol")?, sweeps: u("sweeps")?, split_min_r: f("split_min_r")?, split_through: f("split_through")?, split_min_votes: u("split_min_votes")?, drop: f("drop")? })
 }
 
@@ -800,33 +800,11 @@ fn qsm_support_tree<'py>(py: Python<'py>, scans: Vec<Bound<'py, PyScanIndex>>, a
     Ok(d)
 }
 
-/// A site's priors from its trees' rows and measured radii (see `sylva.qsm.site_prior`).
-#[pyfunction]
-#[allow(clippy::type_complexity)]
-fn qsm_site_prior<'py>(py: Python<'py>, trees: Vec<(PyReadonlyArray2<f64>, PyReadonlyArray2<f64>, PyReadonlyArray1<f64>, PyReadonlyArray1<i64>, PyReadonlyArray1<f64>)>) -> PyResult<Bound<'py, PyDict>> {
-    let mut owned = Vec::with_capacity(trees.len());
-    for (a, b, rp, par, r) in &trees {
-        owned.push((xyz_from_py(a.clone())?, xyz_from_py(b.clone())?, rp.as_array().to_vec(), par.as_array().to_vec(), r.as_array().to_vec()));
-    }
-    let sp = py.detach(|| {
-        let t: Vec<(Rows, &[f64])> = owned.iter().map(|(a, b, rp, par, r)| (Rows { a, b, r_prior: rp, r_max: &[], parent: par }, r.as_slice())).collect();
-        support_tree::site_prior(&t)
-    }).map_err(err)?;
-    let d = PyDict::new(py);
-    for (k, v) in [("mu_fork", sp.mu_fork), ("sig_fork", sp.sig_fork), ("taper", sp.taper), ("sig_eta", sp.sig_eta), ("noise", sp.noise)] {
-        d.set_item(k, v)?;
-    }
-    d.set_item("n_forks", sp.n_forks)?;
-    d.set_item("n_steps", sp.n_steps)?;
-    Ok(d)
-}
-
 pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(qsm_support_flags, m)?)?;
     m.add_function(wrap_pyfunction!(qsm_support_refusals, m)?)?;
     m.add_function(wrap_pyfunction!(qsm_echo_paths, m)?)?;
     m.add_function(wrap_pyfunction!(qsm_support_tree, m)?)?;
-    m.add_function(wrap_pyfunction!(qsm_site_prior, m)?)?;
     m.add_function(wrap_pyfunction!(qsm_joint_defaults, m)?)?;
     m.add_function(wrap_pyfunction!(qsm_joint_reasons, m)?)?;
     m.add_function(wrap_pyfunction!(qsm_joint_tree, m)?)?;
