@@ -18,6 +18,11 @@
 //!
 //! Memory is bounded by one row group per file being read and one tile
 //! being thinned; the binned echoes wait on disk.
+//!
+//! Beside each cloud, sidecars name every ray's echo exactly, in cloud order:
+//! `scan.u16` (the file), `pulse.u32` (the pulse's row in that file) and
+//! `echo.u8` (the echo's place in its pulse, from 0). So anything `rayextract`
+//! writes per ray (`_labels.bin`) joins to the echo's character and its pulse.
 
 use std::collections::{BTreeMap, HashSet};
 use std::fs::{self, File};
@@ -58,7 +63,10 @@ pub struct TileInfo {
     pub rays: usize,
 }
 
-const REC: usize = 26; // x, y, z f64 + file index u16
+const REC: usize = 31; // x, y, z f64 + file index u16 + pulse row u32 + echo in pulse u8
+
+/// Which echo a binned point is: its pulse's row in the file and its place in that pulse.
+type EchoId = (u32, u8);
 
 fn tile_name(kx: i64, ky: i64) -> String {
     format!("{kx}_{ky}")
@@ -84,8 +92,12 @@ fn bin_file(path: &Path, file_idx: u16, bins: &Path, opts: &TileOptions) -> Resu
     let mut hit = Vec::with_capacity(4);
     let mut rec = [0u8; REC];
     rec[24..26].copy_from_slice(&file_idx.to_le_bytes());
+    let mut row0: usize = 0; // pulses in the groups before this one
     for g in 0..f.n_groups() {
         let shots = f.read_group(g)?;
+        if row0 + shots.n_shots() > u32::MAX as usize {
+            return Err(Error::File { path: path.into(), msg: "ray tiles: more than 2^32 pulses in one file".into() });
+        }
         for s in 0..shots.n_shots() {
             let o = shots.origin[s];
             match origin {
@@ -97,7 +109,9 @@ fn bin_file(path: &Path, file_idx: u16, bins: &Path, opts: &TileOptions) -> Resu
             }
             let d = shots.direction[s];
             let e0 = shots.echo_start[s];
+            rec[26..30].copy_from_slice(&((row0 + s) as u32).to_le_bytes());
             for e in e0..e0 + shots.echo_count[s] as usize {
+                rec[30] = u8::try_from(e - e0).map_err(|_| Error::File { path: path.into(), msg: "ray tiles: more than 255 echoes in a pulse".into() })?;
                 let r = shots.echo_range[e];
                 let p = [o[0] + d[0] * r, o[1] + d[1] * r, o[2] + d[2] * r];
                 if let Some([x0, y0, x1, y1]) = opts.extent {
@@ -122,6 +136,7 @@ fn bin_file(path: &Path, file_idx: u16, bins: &Path, opts: &TileOptions) -> Resu
                 }
             }
         }
+        row0 += shots.n_shots();
     }
     for (_, mut w) in writers {
         w.flush()?;
@@ -170,28 +185,30 @@ pub fn write_rct_ray_cloud(path: &Path, pts: &[(Point, u16)], keep: &[usize], or
     Ok(())
 }
 
-fn read_bins(dir: &Path) -> Result<Vec<(Point, u16)>> {
+/// A tile's binned echoes, and which echo each is (parallel arrays).
+fn read_bins(dir: &Path) -> Result<(Vec<(Point, u16)>, Vec<EchoId>)> {
     let mut parts: Vec<PathBuf> = fs::read_dir(dir)?.map(|e| e.map(|e| e.path())).collect::<std::io::Result<_>>()?;
     parts.sort(); // file order, so thinning keeps the same echo every run
-    let mut out = Vec::new();
+    let (mut out, mut ids) = (Vec::new(), Vec::new());
     let mut buf = Vec::new();
     for p in parts {
         buf.clear();
         BufReader::new(File::open(&p)?).read_to_end(&mut buf)?;
-        out.extend(buf.chunks_exact(REC).map(|r| {
+        for r in buf.chunks_exact(REC) {
             let f = |k: usize| f64::from_le_bytes(r[k * 8..k * 8 + 8].try_into().unwrap());
-            ([f(0), f(1), f(2)], u16::from_le_bytes([r[24], r[25]]))
-        }));
+            out.push(([f(0), f(1), f(2)], u16::from_le_bytes([r[24], r[25]])));
+            ids.push((u32::from_le_bytes(r[26..30].try_into().unwrap()), r[30]));
+        }
     }
-    Ok(out)
+    Ok((out, ids))
 }
 
-/// Thin one tile and write `tiles/<kx>_<ky>/cloud.ply` and `scan.u16` (each ray's file index);
+/// Thin one tile and write `tiles/<kx>_<ky>/cloud.ply` and its sidecars `scan.u16`, `pulse.u32`, `echo.u8`;
 /// return its info and its terrain points (its own cell, at `terrain_voxel`).
 fn finish_tile(bin_dir: &Path, out: &Path, origins: &[Point], opts: &TileOptions) -> Result<(TileInfo, Vec<(Point, u16)>)> {
     let name = bin_dir.file_name().unwrap().to_string_lossy().to_string();
     let (kx, ky) = name.split_once('_').and_then(|(a, b)| Some((a.parse().ok()?, b.parse().ok()?))).ok_or_else(|| Error::invalid(format!("bad tile dir {name}")))?;
-    let pts = read_bins(bin_dir)?;
+    let (pts, ids) = read_bins(bin_dir)?;
     fs::remove_dir_all(bin_dir)?;
     let keep = thin(&pts, opts.voxel);
     let info = TileInfo { kx, ky, raw: pts.len(), rays: keep.len() };
@@ -202,10 +219,16 @@ fn finish_tile(bin_dir: &Path, out: &Path, origins: &[Point], opts: &TileOptions
     fs::create_dir_all(&dir)?;
     write_rct_ray_cloud(&dir.join("cloud.ply"), &pts, &keep, origins)?;
     let mut scan = BufWriter::new(File::create(dir.join("scan.u16"))?);
+    let mut pulse = BufWriter::new(File::create(dir.join("pulse.u32"))?);
+    let mut echo = BufWriter::new(File::create(dir.join("echo.u8"))?);
     for &i in &keep {
         scan.write_all(&pts[i].1.to_le_bytes())?;
+        pulse.write_all(&ids[i].0.to_le_bytes())?;
+        echo.write_all(&[ids[i].1])?;
     }
     scan.flush()?;
+    pulse.flush()?;
+    echo.flush()?;
     let (w, cx, cy) = (opts.width, kx as f64 * opts.width, ky as f64 * opts.width);
     let cell: Vec<(Point, u16)> = keep
         .iter()
@@ -217,7 +240,7 @@ fn finish_tile(bin_dir: &Path, out: &Path, origins: &[Point], opts: &TileOptions
 }
 
 /// Cut `files` (one scan position each) into ray-cloud tiles under `out`:
-/// `tiles/<kx>_<ky>/{cloud.ply, scan.u16}` and `terrain.ply`. Returns every
+/// `tiles/<kx>_<ky>/{cloud.ply, scan.u16, pulse.u32, echo.u8}` and `terrain.ply`. Returns every
 /// tile binned, written or not (`rays < min_rays` are skipped), in name order.
 /// `threads` bounds how many tiles are thinned at once (each holds its echoes in memory).
 pub fn tile_ray_clouds(files: &[PathBuf], out: &Path, opts: &TileOptions, threads: usize) -> Result<(Vec<TileInfo>, usize)> {
