@@ -164,6 +164,68 @@ pub struct Rows<'a> {
     pub parent: &'a [i64],
 }
 
+/// A row's frame: its unit axis, the two directions across it, and its length (see [`frames`]).
+pub type Frame = (Point, Point, Point, f64);
+
+/// What a fork's child's share of its parent's area is proportional to.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum ForkShare {
+    /// Its prior radius squared ([`joint_fit`]).
+    Area,
+    /// Its subtree's wood length (3dtrees research 93 §11.8: [`crate::qsm::support_tree`]).
+    WoodLength,
+}
+
+impl Rows<'_> {
+    /// Checks the rows (`r_max`, where given, one per row and positive) and returns their frames; `who` names the
+    /// caller in the errors.
+    pub fn check(&self, who: &str) -> Result<Vec<Frame>> {
+        let n = self.a.len();
+        if [self.b.len(), self.r_prior.len(), self.parent.len()].iter().any(|&l| l != n) || !(self.r_max.is_empty() || self.r_max.len() == n) {
+            return Err(Error::invalid(format!("{who}: a, b, r_prior, r_max and parent must have one entry per row")));
+        }
+        if self.parent.iter().enumerate().any(|(k, &q)| q >= k as i64 || q < -1) {
+            return Err(Error::invalid(format!("{who}: each parent must come before its child (-1 at a base)")));
+        }
+        if !self.r_prior.iter().all(|r| r.is_finite() && *r > 0.0) || !self.r_max.iter().all(|r| *r > 0.0) {
+            return Err(Error::invalid(format!("{who}: prior radii must be positive, and largest radii positive or infinite")));
+        }
+        let fr = frames(self.a, self.b);
+        if !fr.iter().all(|f| f.3.is_finite() && f.3 > 0.0) {
+            return Err(Error::invalid(format!("{who}: every row needs a length")));
+        }
+        Ok(fr)
+    }
+
+    /// Each row's share of its parent's area where the parent forks (NaN elsewhere), by `by`; `len` the rows'
+    /// lengths. Both priors' fork rule, in one place.
+    pub fn fork_share(&self, len: &[f64], by: ForkShare) -> Vec<f64> {
+        let n = self.a.len();
+        let mut weight: Vec<f64> = match by {
+            ForkShare::Area => self.r_prior.iter().map(|r| r.powi(2)).collect(),
+            ForkShare::WoodLength => len.to_vec(),
+        };
+        if by == ForkShare::WoodLength {
+            for k in (0..n).rev() {
+                if self.parent[k] >= 0 {
+                    weight[self.parent[k] as usize] += weight[k];
+                }
+            }
+        }
+        let (mut kids, mut total) = (vec![0usize; n], vec![0.0; n]);
+        for k in 0..n {
+            if self.parent[k] >= 0 {
+                kids[self.parent[k] as usize] += 1;
+                total[self.parent[k] as usize] += weight[k];
+            }
+        }
+        (0..n).map(|k| match self.parent[k] {
+            q if q >= 0 && kids[q as usize] > 1 => weight[k] / total[q as usize],
+            _ => f64::NAN,
+        }).collect()
+    }
+}
+
 struct Factor {
     vars: Vec<(usize, f64)>,
     mean: f64,
@@ -212,24 +274,15 @@ impl<'a> Problem<'a> {
     fn new(pulses: &'a [Pulse], row: &[u32], scan: &[u32], rows: &Rows, n_scans: usize, p: &PriorParams, threads: usize) -> Result<Self> {
         p.check()?;
         let n = rows.a.len();
-        if [rows.b.len(), rows.r_prior.len(), rows.r_max.len(), rows.parent.len()].iter().any(|&l| l != n) {
-            return Err(Error::invalid("joint fit: a, b, r_prior, r_max and parent must have one entry per row"));
-        }
-        if rows.parent.iter().enumerate().any(|(k, &q)| q >= k as i64 || q < -1) {
-            return Err(Error::invalid("joint fit: each parent must come before its child (-1 at a base)"));
-        }
-        if !rows.r_prior.iter().all(|r| r.is_finite() && *r > 0.0) || !rows.r_max.iter().all(|r| *r > 0.0) {
-            return Err(Error::invalid("joint fit: prior radii must be positive, and largest radii positive or infinite"));
+        let fr = rows.check("joint fit")?;
+        if rows.r_max.len() != n {
+            return Err(Error::invalid("joint fit: r_max must have one entry per row"));
         }
         if row.len() != pulses.len() || scan.len() != pulses.len() || row.iter().any(|&k| k as usize >= n) || scan.iter().any(|&s| s as usize >= n_scans) {
             return Err(Error::invalid("joint fit: each pair needs a row and a scan in range"));
         }
         if n.saturating_mul(n_scans) > u32::MAX as usize {
             return Err(Error::invalid("joint fit: too many rows times scans"));
-        }
-        let fr = frames(rows.a, rows.b);
-        if !fr.iter().all(|f| f.3.is_finite() && f.3 > 0.0) {
-            return Err(Error::invalid("joint fit: every row needs a length"));
         }
         let parent: Vec<Option<usize>> = rows.parent.iter().map(|&q| (q >= 0).then_some(q as usize)).collect();
         let mut kids = vec![Vec::new(); n];
@@ -260,6 +313,7 @@ impl<'a> Problem<'a> {
             bl.dim = 4 * bl.rows.len() + if use_nu { 2 * n_scans } else { 0 };
         }
         let eta0: Vec<f64> = rows.r_prior.iter().map(|r| r.ln()).collect();
+        let share = rows.fork_share(&fr.iter().map(|f| f.3).collect::<Vec<_>>(), ForkShare::Area);
         let mut factors = Vec::new();
         let mut add = |vars: Vec<(usize, f64)>, mean: f64, sd: f64| factors.push(Factor { vars, mean, w: 1.0 / (sd * sd) });
         for k in 0..n {
@@ -284,8 +338,7 @@ impl<'a> Problem<'a> {
                     add(vec![(4 * k + j, 1.0), (4 * q, -t[0]), (4 * q + 1, -t[1])], 0.0, p.sig_delta * ls);
                 }
             } else {
-                let total: f64 = kids[q].iter().map(|&c| rows.r_prior[c].powi(2)).sum();
-                let share = rows.r_prior[k].powi(2) / total;
+                let share = share[k];
                 add(vec![(4 * k + 2, 1.0), (4 * q + 2, -1.0)], 0.5 * (p.mu_fork + share.ln()), p.sig_fork);
             }
             add(vec![(4 * k + 3, 1.0), (4 * q + 3, -1.0)], 0.0, p.sig_ell);
@@ -795,7 +848,7 @@ mod tests {
     }
 
     fn like() -> JointParams {
-        JointParams { exit: 0.007, divergence: 0.35e-3, sigma_r: 0.005, rough: 0.03, tau: 0.17, edge: 0.25, eps: 0.1, eps_min: 0.01, mp_len: 0.5, hide: 0.0 }
+        JointParams { exit: 0.007, divergence: 0.35e-3, sigma_r: 0.005, rough: 0.03, tau: 0.17, edge: 0.25, eps: 0.1, eps_min: 0.01, mp_len: 0.5, hide: 0.0, ..JointParams::default() }
     }
 
     fn opts() -> FitOptions {

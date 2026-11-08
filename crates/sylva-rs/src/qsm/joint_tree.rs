@@ -65,8 +65,8 @@ pub struct TreeParams {
 }
 
 impl TreeParams {
-    /// Bumped whenever the fit changes for the same settings.
-    pub const VERSION: u32 = 3;
+    /// Bumped whenever the fit (`joint_tree`'s or `support_tree`'s) changes for the same settings.
+    pub const VERSION: u32 = 4;
 }
 
 impl Default for TreeParams {
@@ -289,7 +289,7 @@ pub fn joint_tree(scans: &[&ScanIndex], rows: &Rows, ctx_a: &[Point], ctx_b: &[P
     let mut widths: Vec<Vec<f64>> = vec![Vec::new(); m];
     for (pu, &r) in mine.pulses.iter().zip(&mine.row) {
         n_pairs[r as usize] += 1;
-        widths[r as usize].push(p.exit + p.divergence * pu.t);
+        widths[r as usize].push(p.footprint(pu.t));
     }
     // each row's typical footprint: wood thinner than it can give an echo needs can't be wood, however much better a
     // thin line among its stops explains them (clumped foliage, which the Poisson foliage term can't; research 74 §20)
@@ -358,7 +358,7 @@ fn shifted(pu: &Pulse, d: [f64; 2]) -> Pulse {
 /// reaches first; if none, the one whose silhouette it passes nearest. Solid
 /// stems don't overlap, so a pulse's fate in the disc is the first one's.
 fn first_circle(pu: &Pulse, circles: &[(f64, f64, f64)], p: &JointParams) -> usize {
-    let w = p.exit + p.divergence * pu.t;
+    let w = p.footprint(pu.t);
     let mut best = (false, f64::INFINITY, 0);
     for (i, &(cx, cy, r)) in circles.iter().enumerate() {
         let s = shifted(pu, [cx, cy]);

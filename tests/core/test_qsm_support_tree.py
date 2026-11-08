@@ -6,8 +6,9 @@ import pytest
 from sylva import PointCloud
 from sylva.qsm import JointParams, ScanIndex, SupportFlag, support_tree
 
-# the synthetic VZ-400i beam's detection share, calibrated on its vertical stems (3dtrees research 93 §10)
-PARAMS = JointParams(tau=0.094)
+# the synthetic VZ-400i beam's detection share, calibrated on its vertical stems (3dtrees research 93 §10), and its
+# echo character: wood reflects 0.5 (-3 dB) and these scenes hold no leaf
+PARAMS = JointParams(tau=0.094, refl_wood=-3.0, refl_leaf=-60.0)
 
 
 def scanned(tmp_path, a, b, r, scanners, zenith=(80.0, 100.0)):
@@ -47,7 +48,7 @@ def test_separated_stems_upright_and_leaning_are_measured(tmp_path):
             lean.append(u[:2])
     ra, rb = np.array(ra), np.array(rb)
     f = support_tree(scans, ra, rb, rr, np.full(len(ra), -1), params=PARAMS, threads=2)
-    assert (f["flags"] == 0).all() and f["measured"].all() and (f["n_runs"] == 1).all() and (f["n_scans"] == 3).all()
+    assert (f["flags"] == 0).all() and (f["n_runs"] == 1).all() and (f["n_scans"] == 3).all()
     for k, (p, r) in enumerate(truth):
         mid = 0.5 * (f["a"][k] + f["b"][k])
         assert abs(np.log(f["r"][k] / r)) < 0.05, (k, f["r"][k], r)
@@ -55,7 +56,7 @@ def test_separated_stems_upright_and_leaning_are_measured(tmp_path):
         # the lean, along the row's frame, against the truth's
         t = f["lean"][k] @ np.c_[f["e1"][k], f["e2"][k]].T
         assert np.allclose(t[:2], lean[k], atol=0.01), (k, t, lean[k])
-    assert (f["sd_log_r"] < 0.2).all() and (np.isnan(f["chi2"]) | (f["chi2"] < 9)).all()
+    assert (f["sd_log_r"] < 0.2).all() and (np.isnan(f["chi2"]) | (f["chi2"] < 9)).all() and (f["chi2_front"] < 9).all()
 
 
 def test_a_clump_of_stems_is_flagged_as_runs(tmp_path):
@@ -66,8 +67,9 @@ def test_a_clump_of_stems_is_flagged_as_runs(tmp_path):
     centre = stems[:, :2].mean(0)
     a, b = np.array([[*centre, 0.5], [*centre, 0.8]]), np.array([[*centre, 0.8], [*centre, 1.1]])
     f = support_tree(scans, a, b, [0.093, 0.093], [-1, 0], params=PARAMS)
-    assert ((f["flags"] & SupportFlag.RUNS) > 0).all() and (f["n_runs"] >= 2).all() and not f["measured"].any()
-    assert list(f["src"]) == [0, 1] and list(f["parent"]) == [-1, 0] and f["a"].shape == (2, 3)
+    assert ((f["flags"] & SupportFlag.RUNS) > 0).all() and (f["n_runs"] >= 2).all() and f["a"].shape == (2, 3)
+    # a flagged row has no summary of its own, and its radius is the prior's: loose
+    assert np.isnan(f["r_row"]).all() and np.isnan(f["sd_r_row"]).all() and (f["sd_log_r"] > 0.1).all()
     with pytest.raises(ValueError, match="version"):
         support_tree(scans, a, b, [0.093, 0.093], [-1, 0], params=dataclasses.replace(PARAMS, version=0))
     with pytest.raises(ValueError, match="parent"):

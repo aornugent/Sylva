@@ -331,12 +331,36 @@ pub struct JointParams {
     /// lost an echo where it could lie (research 74 §19; 0: a recorded pass is
     /// a pass).
     pub hide: f64,
+    /// Echo character (3dtrees research 93 §11.2): the reflectance (dB) of a single return from bark that fills
+    /// the footprint and from leaf, mean and sd; a return that shares its pulse is `refl_multi` dB brighter (it
+    /// is negative) with `refl_multi_sd` more spread, in quadrature. Read by [`crate::qsm::support_tree`] only.
+    pub refl_wood: f64,
+    pub refl_wood_sd: f64,
+    pub refl_leaf: f64,
+    pub refl_leaf_sd: f64,
+    pub refl_multi: f64,
+    pub refl_multi_sd: f64,
 }
 
 impl Default for JointParams {
-    /// The calibration for TERN's RIEGL VZ-400i exports (3dtrees research 74 §§13-19: Alice Mulga).
+    /// The calibration for TERN's RIEGL VZ-400i exports (3dtrees research 74 §§13-19 and 93 §11.2: Alice Mulga).
     fn default() -> Self {
-        JointParams { exit: 0.007, divergence: 0.35e-3, sigma_r: 0.005, rough: 0.03, tau: 0.11, edge: 0.5, eps: 0.1, eps_min: 0.01, mp_len: 0.5, hide: 0.09 }
+        JointParams {
+            exit: 0.007, divergence: 0.35e-3, sigma_r: 0.005, rough: 0.03, tau: 0.11, edge: 0.5, eps: 0.1, eps_min: 0.01, mp_len: 0.5, hide: 0.09,
+            refl_wood: -15.45, refl_wood_sd: 1.0, refl_leaf: -19.7, refl_leaf_sd: 1.4, refl_multi: -3.0, refl_multi_sd: 1.2,
+        }
+    }
+}
+
+impl JointParams {
+    /// The footprint's width (m) at range `t`.
+    pub fn footprint(&self, t: f64) -> f64 {
+        self.exit + self.divergence * t
+    }
+
+    /// How far a silhouette's apparent edge lies beyond the wood's for a footprint `w` wide: `w (1/2 - tau)`.
+    pub fn app(&self, w: f64) -> f64 {
+        w * (0.5 - self.tau)
     }
 }
 
@@ -407,7 +431,7 @@ fn pair<N: Num>(pu: &Pulse, s: [N; 4], p: &JointParams) -> N {
     let lam = ell.exp();
     let bp = N::c(pu.b) - (d1 * pu.jb[0] + d2 * pu.jb[1]);
     let tp = N::c(pu.t) + (d1 * pu.jt[0] + d2 * pu.jt[1]);
-    let w = p.exit + p.divergence * pu.t;
+    let w = p.footprint(pu.t);
     // the footprint on the circle: its share f, and the surface's centroid depth hbar. A sliver's centroid
     // goes as the root of its width, an infinite slope at the silhouette that traps Newton (research 74 §18):
     // slivers narrower than SLIVER w are averaged over a width that doesn't vanish
@@ -420,7 +444,7 @@ fn pair<N: Num>(pu: &Pulse, s: [N; 4], p: &JointParams) -> N {
     // detected: the footprint's share on the wood reaches tau (a soft edge at the silhouette), and the wood is wide
     // enough to give that share at all (2 R / w >= tau: a twig thinner than that can't make an echo, however it
     // sits); P(miss) = (1 - p1) + p1 (1 - p2)
-    let z1 = (r + w * (0.5 - p.tau) - bp.abs()) * (1.0 / (p.edge * w));
+    let z1 = (r + p.app(w) - bp.abs()) * (1.0 / (p.edge * w));
     let z2 = (r * (2.0 / w) + (-p.tau)) * (1.0 / CAPACITY_SD);
     let (lp1, lq1, lp2, lq2) = (z1.log_ndtr(), (-z1).log_ndtr(), z2.log_ndtr(), (-z2).log_ndtr());
     let (lp, lq) = (lp1 + lp2, logaddexp(lq1, lp1 + lq2));
@@ -469,7 +493,7 @@ pub(crate) fn surface_residual(pu: &Pulse, s: [f64; 4], p: &JointParams) -> f64 
     let r = eta.exp();
     let bp = pu.b - (d1 * pu.jb[0] + d2 * pu.jb[1]);
     let tp = pu.t + (d1 * pu.jt[0] + d2 * pu.jt[1]);
-    let w = p.exit + p.divergence * pu.t;
+    let w = p.footprint(pu.t);
     if bp.abs() >= r + w / 2.0 {
         return f64::INFINITY;
     }
@@ -707,7 +731,7 @@ mod tests {
     use super::*;
 
     fn params() -> JointParams {
-        JointParams { exit: 0.007, divergence: 0.35e-3, sigma_r: 0.005, rough: 0.03, tau: 0.17, edge: 0.25, eps: 0.1, eps_min: 0.01, mp_len: 0.5, hide: 0.1 }
+        JointParams { exit: 0.007, divergence: 0.35e-3, sigma_r: 0.005, rough: 0.03, tau: 0.17, edge: 0.25, eps: 0.1, eps_min: 0.01, mp_len: 0.5, hide: 0.1, ..JointParams::default() }
     }
 
     /// A few pulses past a 5 cm stem at 8 m: on the surface, inside it, passing, and a leaf in front.

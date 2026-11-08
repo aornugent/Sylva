@@ -28,6 +28,12 @@ The parameters are a :class:`JointParams`, whose fields are:
   their share ``eps_min + eps (1 - f)`` and how far behind the surface, m),
   ``hide`` (the share of stops whose echo the export deleted, among pulses
   that lost an echo where it could lie: such a recorded pass may be one);
+- echo character (3dtrees research 93 §11.2, read by :func:`support_tree`
+  only): ``refl_wood``, ``refl_wood_sd``, ``refl_leaf`` and ``refl_leaf_sd``
+  (the reflectance, dB, of a single return from bark that fills the footprint
+  and from leaf, mean and sd), ``refl_multi`` and ``refl_multi_sd`` (a return
+  that shares its pulse is ``refl_multi`` dB brighter, negative, with
+  ``refl_multi_sd`` more spread in quadrature);
 - the prior: ``lam_prior`` and ``lam_sd`` (foliage's median, 1/m, and log
   sd), ``sig_ell`` (its random walk), ``sig_eta`` (the taper's random walk per
   sqrt(m)), ``mu_fork`` and ``sig_fork`` (soft Leonardo's log area ratio and
@@ -71,6 +77,12 @@ class JointParams:
     eps_min: float = _DEFAULTS["eps_min"]
     mp_len: float = _DEFAULTS["mp_len"]
     hide: float = _DEFAULTS["hide"]
+    refl_wood: float = _DEFAULTS["refl_wood"]
+    refl_wood_sd: float = _DEFAULTS["refl_wood_sd"]
+    refl_leaf: float = _DEFAULTS["refl_leaf"]
+    refl_leaf_sd: float = _DEFAULTS["refl_leaf_sd"]
+    refl_multi: float = _DEFAULTS["refl_multi"]
+    refl_multi_sd: float = _DEFAULTS["refl_multi_sd"]
     lam_prior: float = _DEFAULTS["lam_prior"]
     lam_sd: float = _DEFAULTS["lam_sd"]
     sig_ell: float = _DEFAULTS["sig_ell"]
@@ -177,14 +189,19 @@ def support_tree(scans, a, b, r_prior, parent, params: JointParams = JointParams
     Per (row, scan), the pulses in a tube around the row (wide enough for it to lean) reduce to a profile across
     it: where they stopped, at what depth, and where they passed. Opaque wood's profile measures its section's
     support function, linear in a circle's centre and radius: the silhouette's edges (each by maximum likelihood on
-    its hit/pass transition, the footprint and ``tau``/``edge`` of ``params``; an edge with no passes beyond it is
-    censored and left out), the front's depth, and the lean along the row. Per row, weighted least squares over its
-    scans gives the centre at its middle, the lean and the radius with their covariance; a stop is a hit only on
-    the first such circle's front arc (the second pass). A row is flagged (:class:`SupportFlag`) where one circle
-    can't summarise it, and its summary then stays out. The tree is one linear solve: the unflagged rows' summaries
-    and the prior of ``params`` (the base's level, the taper's steps, at a fork the child's share of the subtree
-    wood length, the centre's continuity along a branch and its anchor, a weak anchor of the lean), with three
-    Gauss-Newton steps for log R. Flagged rows rest on the prior: they are for :func:`joint_tree`.
+    its hit/pass transition, the footprint and ``tau``/``edge`` of ``params``; an edge with stops beyond it is
+    censored and left out, and one with nothing recorded beyond it was seen against the sky and ends half a pulse
+    spacing past its outermost hit), the front's depth, and the lean along the row. A stop counts as wood by its
+    echo character (``refl_*``: the chance of wood against leaf by its reflectance and return position, wood
+    narrower than the footprint reading darker). A row longer than 30 cm is measured in pieces at most that long
+    and their summaries combined into its line. Per row, weighted least squares over its scans gives the centre at
+    its middle, the lean and the radius with their covariance; a stop is a hit only on the first such circle's
+    front arc (the second pass). A row is flagged (:class:`SupportFlag`) where one circle can't summarise it, and
+    its summary then stays out. The tree is one linear solve: the unflagged rows' summaries and a prior after
+    :func:`joint_tree`'s (the base's level, the taper's steps, at a fork the child's share of the subtree wood
+    length rather than of the prior area, the centre's and lean's continuity along a branch, the centre's anchor
+    and a weak anchor of the lean; no tip anchor), with three Gauss-Newton steps for log R. A flagged row's radius
+    (``flags != 0``) is the prior's given the other rows: it is for :func:`joint_tree`.
 
     Parameters
     ----------
@@ -194,8 +211,8 @@ def support_tree(scans, a, b, r_prior, parent, params: JointParams = JointParams
         The tree's rows: ``(n, 3)`` axes, ``(n,)`` prior radii and parents (int; each before its child, -1 at a
         base).
     params
-        :class:`JointParams`: the likelihood's footprint, ``tau``, ``edge``, ``sigma_r`` and ``rough``, and the
-        prior's ``sig_eta``, ``mu_fork``, ``sig_fork``, ``sig_root``, ``sig_delta``, ``centre_rel`` and
+        :class:`JointParams`: the likelihood's footprint, ``tau``, ``edge``, ``sigma_r``, ``rough`` and ``refl_*``,
+        and the prior's ``sig_eta``, ``mu_fork``, ``sig_fork``, ``sig_root``, ``sig_delta``, ``centre_rel`` and
         ``centre_abs``; the rest are unused.
     threads
         Threads to use (0: one per core).
@@ -204,14 +221,15 @@ def support_tree(scans, a, b, r_prior, parent, params: JointParams = JointParams
     -------
     dict, per row (``(n,)`` unless noted):
 
-    - ``src`` (the row) and ``parent``, as :func:`joint_tree`'s;
     - ``a``, ``b`` ``(n, 3)``: the fitted axis, world coordinates (the claim moved by the centre and turned by the
-      lean); ``r``, ``sd_log_r``: the radius and its posterior sd in log;
+      lean); ``r``, ``sd_log_r``: the radius and its posterior sd in log (the prior's where ``flags != 0``);
     - ``centre``, ``sd_centre``, ``lean``, ``sd_lean`` ``(n, 2)``: the centre at the row's middle (m) and the lean
       (m per m of axis) along ``e1``, ``e2`` ``(n, 3)``, with their posterior sds;
-    - ``r_row``, ``sd_r_row``, ``chi2``: the row's own summary's radius, its sd, and its misfit (reduced
-      chi-square), NaN where it has none;
-    - ``flags`` (:class:`SupportFlag` bits) and ``measured`` (its summary entered the tree);
+    - ``r_row``, ``sd_r_row``: the row's own summary's radius and its sd, NaN where it is flagged or has none;
+    - ``chi2``, ``chi2_front``: its misfits (reduced chi-square), of its measurements to its circle (on their
+      rank) and of its front's stops about the circle against the range noise, roughness and a 4 mm floor; NaN
+      where there is none;
+    - ``flags`` (:class:`SupportFlag` bits; 0: its summary entered the tree);
     - ``n_runs`` (the most stems within the claim a scan's profile shows), ``n_scans`` (the scans that measured
       it), ``n_pairs`` (its pulses).
     """
