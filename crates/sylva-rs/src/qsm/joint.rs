@@ -441,6 +441,13 @@ pub(crate) const CAPACITY_SD: f64 = 0.02;
 /// One pair's log likelihood at state `[offset1, offset2, eta, ell]`, in
 /// whatever [`Num`] the state is given in.
 fn pair<N: Num>(pu: &Pulse, s: [N; 4], p: &JointParams) -> N {
+    pair_terms(pu, s, p).0
+}
+
+/// [`pair`], and for a stop its wood and leaf terms (`l_wood`, `l_leaf`: its echo the wood's or foliage's, before
+/// selection), whose softmax is the stop's chance of being the wood's echo.
+#[inline(always)]
+fn pair_terms<N: Num>(pu: &Pulse, s: [N; 4], p: &JointParams) -> (N, Option<(N, N)>) {
     let [d1, d2, eta, ell] = s;
     let r = eta.exp();
     let lam = ell.exp();
@@ -473,6 +480,7 @@ fn pair<N: Num>(pu: &Pulse, s: [N; 4], p: &JointParams) -> N {
     let q = pu.q;
     let p_pass = l_pass.min(N::c(0.0)).exp();
     let sel = if pu.early { N::c(0.0) } else { (p_pass * (-(1.0 - q))).log1p() };
+    let mut terms = None;
     let l = if pu.stop {
         // a stop: the wood's echo or foliage's (only a stop needs these terms)
         let sig = (r.sq() * (p.rough * p.rough) + p.sigma_r * p.sigma_r).sqrt();
@@ -484,6 +492,7 @@ fn pair<N: Num>(pu: &Pulse, s: [N; 4], p: &JointParams) -> N {
         let l_tail = (eps + 1e-300).ln() + (-p.mp_len.ln()) + u.log_ndtr() + ((xw + p.mp_len - x) / sig).log_ndtr();
         let l_wood = lp - lam * zw + logaddexp(l_gauss, l_tail);
         let l_leaf = ell - lam * z + logaddexp(lq, lp + (-u).log_ndtr());
+        terms = Some((l_wood, l_leaf));
         logaddexp(l_wood, l_leaf)
     } else if pu.deleted && p.hide > 0.0 {
         // a recorded pass where a deleted echo could lie: a pass, or a stop whose echo the export deleted
@@ -491,7 +500,7 @@ fn pair<N: Num>(pu: &Pulse, s: [N; 4], p: &JointParams) -> N {
     } else {
         l_pass + q.ln()
     };
-    l - sel
+    (l - sel, terms)
 }
 
 /// How far a stop lies from the wood surface the row's state `s` predicts for
@@ -555,6 +564,17 @@ pub fn joint_loglik(pulses: &[Pulse], owners: &[Owner], theta: &[[f64; 4]], nu: 
     pool(threads)?.install(|| Ok(pulses.par_iter().zip(owners).map(|(pu, o)| pair(pu, state(o, theta, nu), p)).collect()))
 }
 
+/// Each pair's chance that its stop is the wood's echo rather than foliage's, at row states `theta` and nuisances
+/// `nu`: the softmax of the stop's wood and leaf terms (3dtrees research 93 §18: the classification on the exact
+/// likelihood's path); NaN for a pass.
+pub fn joint_wood_share(pulses: &[Pulse], owners: &[Owner], theta: &[[f64; 4]], nu: &[[f64; 2]], p: &JointParams, threads: usize) -> Result<Vec<f64>> {
+    check(pulses, owners, theta, nu)?;
+    pool(threads)?.install(|| Ok(pulses.par_iter().zip(owners).map(|(pu, o)| match pair_terms(pu, state(o, theta, nu), p).1 {
+        Some((w, l)) => 1.0 / (1.0 + (l - w).exp()),
+        None => f64::NAN,
+    }).collect()))
+}
+
 /// Sums by group of the pairs' log likelihood, gradient and Hessian in their
 /// own four state variables: `(value (n,), gradient (n, 4), Hessian (n, 4,
 /// 4))`, group `group[i]` of `n_groups`.
@@ -608,8 +628,8 @@ pub fn joint_blocks(pulses: &[Pulse], owners: &[Owner], group: &[u32], n_groups:
 }
 
 /// A tree's pulse-cylinder pairs as the likelihood reads them, with where each
-/// came from: its row (cylinder), scan and pulse, and how many echoes the
-/// pulse recorded (0: a miss).
+/// came from: its row (cylinder), scan and pulse, how many echoes the
+/// pulse recorded (0: a miss), and a stop's place among them (`u8::MAX`: a pass).
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct JointPairs {
     pub pulses: Vec<Pulse>,
@@ -617,6 +637,74 @@ pub struct JointPairs {
     pub scan: Vec<u32>,
     pub pulse: Vec<u32>,
     pub n_echo: Vec<u32>,
+    pub echo: Vec<u8>,
+}
+
+/// Which path classified an echo (see [`Echoes`]).
+pub mod path {
+    /// A measured piece's: on its fitted circle's front arc, times the echo's character.
+    pub const MEASURED: u8 = 0;
+    /// A bounded piece's: on its posterior circle's front arc, times the echo's character.
+    pub const BOUNDED: u8 = 1;
+    /// A porous piece's: its existence, times the echo's character.
+    pub const POROUS: u8 = 2;
+    /// The exact likelihood's: the softmax of the stop's wood and leaf terms ([`super::joint_wood_share`]).
+    pub const EXACT: u8 = 3;
+}
+
+/// A tree's echoes classified (3dtrees research 93 §18), one record per echo, keyed as the tile sidecars are
+/// (research 94, win 1): the scan (an index into the fit's scans), the pulse's row in its Shots file and the echo's
+/// place in its pulse. Each with the chance it is wood's echo, the node it belongs to, the [`path`] that said so
+/// and how far it lies from that node's fitted surface (m), sorted by key.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Echoes {
+    pub scan: Vec<u32>,
+    pub pulse: Vec<u32>,
+    pub echo: Vec<u8>,
+    pub node: Vec<u32>,
+    pub path: Vec<u8>,
+    pub p_wood: Vec<f64>,
+    pub dist: Vec<f64>,
+}
+
+impl Echoes {
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn push(&mut self, scan: u32, pulse: u32, echo: u8, node: u32, path: u8, p_wood: f64, dist: f64) {
+        self.scan.push(scan);
+        self.pulse.push(pulse);
+        self.echo.push(echo);
+        self.node.push(node);
+        self.path.push(path);
+        self.p_wood.push(p_wood);
+        self.dist.push(dist);
+    }
+
+    pub fn len(&self) -> usize {
+        self.scan.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.scan.is_empty()
+    }
+
+    /// One record per echo: of an echo several nodes saw (their tubes overlap), the one whose surface it lies
+    /// nearest; sorted by key.
+    pub(crate) fn dedup(self) -> Echoes {
+        let mut order: Vec<usize> = (0..self.len()).collect();
+        order.sort_unstable_by(|&i, &j| (self.scan[i], self.pulse[i], self.echo[i]).cmp(&(self.scan[j], self.pulse[j], self.echo[j]))
+            .then(self.dist[i].total_cmp(&self.dist[j])).then(self.node[i].cmp(&self.node[j])));
+        let mut out = Echoes::default();
+        let mut last = None;
+        for i in order {
+            let key = (self.scan[i], self.pulse[i], self.echo[i]);
+            if last == Some(key) {
+                continue;
+            }
+            last = Some(key);
+            out.push(key.0, key.1, key.2, self.node[i], self.path[i], self.p_wood[i], self.dist[i]);
+        }
+        out
+    }
 }
 
 /// The radius of a row's tube, from its prior radius: wide enough for the
@@ -677,7 +765,8 @@ pub fn joint_table(scans: &[&crate::qsm::evidence::ScanIndex], a: &[Point], b: &
             let half = (window[c] * window[c] - bimp * bimp).max(0.0).sqrt() / sin;
             let (c0, c1) = (t - half, t + half);
             let echoes = &pp.range[pp.echo_start[i] as usize..pp.echo_start[i + 1] as usize];
-            let first_inside = echoes.iter().map(|&e| e as f64).find(|&e| e >= c0 && e <= c1);
+            let first_at = echoes.iter().position(|&e| (e as f64) >= c0 && (e as f64) <= c1);
+            let first_inside = first_at.map(|i| echoes[i] as f64);
             let numbers = &pp.return_number[pp.echo_start[i] as usize..pp.echo_start[i + 1] as usize];
             let limit = first_inside.unwrap_or(c1);
             let hidden = deleted(echoes, numbers, pp.returns[i]).into_iter().any(|(lo, hi)| lo < limit && hi > c0);
@@ -699,6 +788,7 @@ pub fn joint_table(scans: &[&crate::qsm::evidence::ScanIndex], a: &[Point], b: &
             out.scan.push(pp.scan[i]);
             out.pulse.push(pp.pulse[i]);
             out.n_echo.push(echoes.len() as u32);
+            out.echo.push(first_at.map_or(u8::MAX, |i| i.min(254) as u8));
         }
     }
     Ok(out)

@@ -217,7 +217,7 @@ fn pool(threads: usize) -> Result<rayon::ThreadPool> {
 }
 
 /// One scan's pulses, indexed by direction: what [`evidence`] reads. About
-/// 16 bytes per pulse (17 with the number of returns) and 4 per echo (8 with
+/// 20 bytes per pulse (21 with the number of returns; 4 of them its row in the file) and 4 per echo (8 with
 /// reflectance and deviation, 1 more with return numbers), plus a 6.5 MB cell
 /// table.
 ///
@@ -242,6 +242,8 @@ pub struct ScanIndex {
     /// Each echo's return number (`las_return_number`, 1 the nearest the scanner counted), in `range` order;
     /// empty where the store has none. A number missing below the pulse's returns is a deleted echo's.
     return_no: Vec<u8>,
+    /// Each pulse's row in its Shots file (the tile sidecars' `pulse.u32`), in pulse order.
+    src: Vec<u32>,
     cell_start: Vec<u32>,
 }
 
@@ -321,7 +323,7 @@ impl ScanIndex {
         let deviation = echoes(dev).into_iter().map(|x| x.round() as u16).collect();
         let returns = if nr.is_empty() { Vec::new() } else { src.iter().map(|&p| if rays.echo_count[p as usize] > 0 { nr[from[p as usize] as usize].round() as u8 } else { 0 }).collect() };
         let return_no = echoes(rn).into_iter().map(|x| x.round() as u8).collect();
-        Ok(ScanIndex { origin, misses, dir, echo_start, range, reflectance, deviation, returns, return_no, cell_start })
+        Ok(ScanIndex { origin, misses, dir, echo_start, range, reflectance, deviation, returns, return_no, src, cell_start })
     }
 
     /// The reflectance (dB) and deviation of echo `k` of `pulse`, NaN where
@@ -349,6 +351,17 @@ impl ScanIndex {
         self.return_no.get(self.echo_start[pulse as usize] as usize + k as usize).copied().unwrap_or(0)
     }
 
+    /// `pulse`'s row in its Shots file: with an echo's place in the pulse, the key the tile sidecars carry
+    /// (`pulse.u32`, `echo.u8`; 3dtrees research 94, win 1).
+    pub fn file_row(&self, pulse: u32) -> u32 {
+        self.src[pulse as usize]
+    }
+
+    /// `pulse`'s unit direction.
+    pub fn direction(&self, pulse: u32) -> Point {
+        self.dir[pulse as usize].map(|x| x as f64)
+    }
+
     /// The scanner position.
     pub fn origin(&self) -> Point {
         self.origin
@@ -367,7 +380,7 @@ impl ScanIndex {
 
     /// The bytes the index holds.
     pub fn nbytes(&self) -> usize {
-        size_of_val(&self.dir[..]) + size_of_val(&self.echo_start[..]) + size_of_val(&self.range[..]) + size_of_val(&self.reflectance[..]) + size_of_val(&self.deviation[..]) + size_of_val(&self.returns[..]) + size_of_val(&self.return_no[..]) + size_of_val(&self.cell_start[..])
+        size_of_val(&self.dir[..]) + size_of_val(&self.echo_start[..]) + size_of_val(&self.range[..]) + size_of_val(&self.reflectance[..]) + size_of_val(&self.deviation[..]) + size_of_val(&self.returns[..]) + size_of_val(&self.return_no[..]) + size_of_val(&self.src[..]) + size_of_val(&self.cell_start[..])
     }
 
     /// Calls `f(pulse, direction, echo ranges)` for every pulse whose line

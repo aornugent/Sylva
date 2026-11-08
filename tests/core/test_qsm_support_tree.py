@@ -4,7 +4,7 @@ import numpy as np
 import pytest
 
 from sylva import PointCloud
-from sylva.qsm import JointParams, ScanIndex, SupportFlag, support_tree
+from sylva.qsm import EchoPath, JointParams, ScanIndex, SupportFlag, support_tree
 
 # the synthetic VZ-400i beam's detection share, calibrated on its vertical stems (3dtrees research 93 §10), and its
 # echo character: wood reflects 0.5 (-3 dB) and these scenes hold no leaf
@@ -112,8 +112,28 @@ def test_a_clump_of_stems_is_flagged_as_runs(tmp_path):
     a, b = np.array([[*centre, 0.5], [*centre, 0.8]]), np.array([[*centre, 0.8], [*centre, 1.1]])
     f = support_tree(scans, a, b, [0.093, 0.093], [-1, 0], params=PARAMS)
     assert ((f["flags"] & SupportFlag.RUNS) > 0).all() and (f["n_runs"] >= 2).all() and f["a"].shape == (2, 3)
-    # a flagged row has no summary of its own, and its radius is the prior's: loose
-    assert np.isnan(f["r_row"]).all() and np.isnan(f["sd_r_row"]).all() and (f["sd_log_r"] > 0.1).all()
+    # routed, each piece is fitted exactly from its runs' seeds: its stems are nodes (the piece's own, then the
+    # further ones beside it), each within a centimetre of a stem and its radius within a quarter
+    p = f["pieces"]
+    assert (p["k_stems"][:2] >= 2).all() and (p["split_gain"][:2] > 0).all() and len(p["r"]) == 2 + (p["k_stems"][:2] - 1).sum()
+    assert (p["src"][2:] < 2).all() and (p["stem"][2:] > 0).all() and (p["stem"][:2] == 0).all()
+    mid = 0.5 * (p["a"] + p["b"])[:, :2]
+    for s in stems:
+        d = np.hypot(*(mid - s[:2]).T)
+        j = np.argmin(d)
+        assert d[j] < 0.012 and abs(np.log(p["r"][j] / s[2])) < 0.25, (s, d[j], p["r"][j])
+    # within the budget of passes per pair (research 93 §18: <= 60)
+    assert ((p["evals_value"] + p["evals_deriv"])[:2] <= 60 * p["n_exact"][:2]).all()
+    # every stop classified once, by the exact likelihood here, and the stems' echoes are wood
+    e = f["echoes"]
+    key = np.c_[e["scan"], e["pulse"], e["echo"]]
+    assert len(np.unique(key, axis=0)) == len(key) and (e["path"] == EchoPath.EXACT).all()
+    # keyed by the pulse's row in its Shots file: the index holds each row once
+    n = scans[0].n_pulses
+    assert (np.sort(scans[0].file_row(np.arange(n))) == np.arange(n)).all() and (e["pulse"] < max(s.n_pulses for s in scans)).all()
+    with pytest.raises(ValueError):
+        scans[0].file_row([n])
+    assert np.median(e["p_wood"][e["dist"] < 0.01]) > 0.9
     with pytest.raises(ValueError, match="version"):
         support_tree(scans, a, b, [0.093, 0.093], [-1, 0], params=dataclasses.replace(PARAMS, version=0))
     with pytest.raises(ValueError, match="parent"):

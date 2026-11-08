@@ -38,8 +38,8 @@ use std::collections::HashMap;
 
 use crate::error::{Error, Result};
 use crate::qsm::evidence::ScanIndex;
-use crate::qsm::joint::{capacity, frames, joint_loglik, joint_table, surface_residual, window, JointPairs, JointParams, Owner, Pulse};
-use crate::qsm::joint_fit::{joint_fit, profile_grid, FitOptions, PriorParams, Rows};
+use crate::qsm::joint::{capacity, frames, joint_loglik, joint_table, joint_wood_share, path, surface_residual, window, Echoes, JointPairs, JointParams, Owner, Pulse};
+use crate::qsm::joint_fit::{joint_fit, profile_grid, Fit, FitOptions, PriorParams, Rows};
 use crate::Point;
 
 /// The settings of [`joint_tree`]: the likelihood's, the prior's, the fit's,
@@ -125,6 +125,9 @@ pub struct TreeFit {
     pub u: f64,
     pub objective: f64,
     pub converged: bool,
+    /// The rows' stops classified: each the softmax of its wood and leaf terms at its row's fit
+    /// ([`crate::qsm::joint::joint_wood_share`]), `node` its row here.
+    pub echoes: Echoes,
 }
 
 /// The rows of a tree: cylinders `a -> b`, prior radii, parents (before
@@ -216,6 +219,8 @@ pub fn joint_tree(scans: &[&ScanIndex], rows: &Rows, ctx_a: &[Point], ctx_b: &[P
             mine.pulses.push(t.pulses[i]);
             mine.row.push(t.row[i]);
             mine.scan.push(t.scan[i]);
+            mine.pulse.push(t.pulse[i]);
+            mine.echo.push(t.echo[i]);
         }
         if sweep == 0 {
             // each row's mode: the row alone on its own pairs (ownership held, no tree prior) through the
@@ -224,7 +229,7 @@ pub fn joint_tree(scans: &[&ScanIndex], rows: &Rows, ctx_a: &[Point], ctx_b: &[P
             // each row's continuation is short and its own
             let alone_parent = vec![-1i64; m];
             let alone = Rows { parent: &alone_parent, ..fit_rows };
-            let o = FitOptions { schedule: SCHEDULE.to_vec(), iters: params.iters, tol: params.tol, threads, local: true };
+            let o = FitOptions { schedule: SCHEDULE.to_vec(), iters: params.iters, tol: params.tol, threads, local: true, profile: true };
             let f = joint_fit(&mine.pulses, &mine.row, &mine.scan, &alone, scans.len(), p, &params.prior, &o, Some(&theta))?;
             converged &= f.converged;
             theta = f.theta;
@@ -234,7 +239,7 @@ pub fn joint_tree(scans: &[&ScanIndex], rows: &Rows, ctx_a: &[Point], ctx_b: &[P
                 continue;
             }
         }
-        let opts = FitOptions { schedule: Vec::new(), iters: params.iters, tol: params.tol, threads, local: true };
+        let opts = FitOptions { schedule: Vec::new(), iters: params.iters, tol: params.tol, threads, local: true, profile: true };
         let f = joint_fit(&mine.pulses, &mine.row, &mine.scan, &fit_rows, scans.len(), p, &params.prior, &opts, Some(&theta))?;
         theta = f.theta.clone();
         converged &= f.converged;
@@ -302,7 +307,7 @@ pub fn joint_tree(scans: &[&ScanIndex], rows: &Rows, ctx_a: &[Point], ctx_b: &[P
     // the outputs
     let fr = frames(&stems.a, &stems.b);
     let grid = profile_grid();
-    let mut out = TreeFit { src: stems.src.clone(), parent: stems.parent.clone(), a: Vec::new(), b: Vec::new(), r: Vec::new(), sd_log_r: Vec::new(), lo: Vec::new(), hi: Vec::new(), flat: Vec::new(), lam: Vec::new(), log_odds: Vec::new(), p_wood: Vec::new(), reason: Vec::new(), rho_local: fit.rho_local.clone(), rho_pooled: fit.rho_pooled.clone(), n_pairs: n_pairs.clone(), grad: fit.grad.clone(), hess: fit.hess.clone(), e1: Vec::new(), e2: Vec::new(), split_gain, u: 0.0, objective: fit.objective, converged };
+    let mut out = TreeFit { src: stems.src.clone(), parent: stems.parent.clone(), a: Vec::new(), b: Vec::new(), r: Vec::new(), sd_log_r: Vec::new(), lo: Vec::new(), hi: Vec::new(), flat: Vec::new(), lam: Vec::new(), log_odds: Vec::new(), p_wood: Vec::new(), reason: Vec::new(), rho_local: fit.rho_local.clone(), rho_pooled: fit.rho_pooled.clone(), n_pairs: n_pairs.clone(), grad: fit.grad.clone(), hess: fit.hess.clone(), e1: Vec::new(), e2: Vec::new(), split_gain, u: 0.0, objective: fit.objective, converged, echoes: Echoes::default() };
     let (mut v_all, mut v_open) = (0.0, 0.0);
     for k in 0..m {
         let (_, e1, e2, len) = fr[k];
@@ -336,7 +341,22 @@ pub fn joint_tree(scans: &[&ScanIndex], rows: &Rows, ctx_a: &[Point], ctx_b: &[P
         v_open += v * (1.0 - fit.rho_local[k]);
     }
     out.u = if v_all > 0.0 { v_open / v_all } else { 1.0 };
+    // the classification: each owned stop at its row's fit (as the existence's `with`, the scans' offsets aside)
+    let share = joint_wood_share(&mine.pulses, &owners_plain, &theta, &[], p, threads)?;
+    let mut echoes = Echoes::default();
+    for (i, pu) in mine.pulses.iter().enumerate().filter(|(_, pu)| pu.stop) {
+        let k = mine.row[i] as usize;
+        let s = mine.scan[i];
+        echoes.push(s, scans[s as usize].file_row(mine.pulse[i]), mine.echo[i], k as u32, path::EXACT, share[i], surface_dist(pu, theta[k]));
+    }
+    out.echoes = echoes.dedup();
     Ok(out)
+}
+
+/// How far a stop lies from the circle of state `s` (offsets and log R in its row's frame) in the cross-section (m).
+pub(crate) fn surface_dist(pu: &Pulse, s: [f64; 4]) -> f64 {
+    let (y, _) = cross_section(pu);
+    ((y[0] - s[0]).hypot(y[1] - s[1]) - s[2].exp()).abs()
 }
 
 /// The pair table of `stems` then the context's cylinders, each in its [`window`].
@@ -384,35 +404,57 @@ fn first_circle(pu: &Pulse, circles: &[(f64, f64, f64)], p: &JointParams) -> usi
 /// one trunk's arcs leave the pulses aimed between them unexplained.
 #[allow(clippy::too_many_arguments)]
 fn split_gain(pulses: &[Pulse], scan: &[u32], n_scans: usize, a: Point, b: Point, r: f64, circles: &[(f64, f64, f64)], params: &TreeParams, threads: usize) -> Result<f64> {
-    let p = &params.like;
-    let opts = FitOptions { schedule: SCHEDULE.to_vec(), iters: params.iters, tol: params.tol, threads, local: false };
-    let (_, e1, e2, _) = frames(&[a], &[b])[0];
-    // the log likelihood of the pulses as the stems `cs` (offsets and radii in the row's frame), at their fit
-    let stems = |cs: &[(f64, f64, f64)]| -> Result<f64> {
-        let at = |c: &(f64, f64, f64), x: Point| -> Point { std::array::from_fn(|i| x[i] + c.0 * e1[i] + c.1 * e2[i]) };
-        let (sa, sb): (Vec<Point>, Vec<Point>) = cs.iter().map(|c| (at(c, a), at(c, b))).unzip();
-        let sr: Vec<f64> = cs.iter().map(|c| c.2).collect();
-        let sw: Vec<f64> = sr.iter().map(|&r| window(r)).collect();
-        let parent = vec![-1i64; cs.len()];
-        let assign = |cs: &[(f64, f64, f64)]| -> (Vec<Pulse>, Vec<Owner>) {
-            pulses.iter().map(|pu| {
-                let i = first_circle(pu, cs, p);
-                (shifted(pu, [cs[i].0, cs[i].1]), Owner { row: i as u32, nu: u32::MAX })
-            }).unzip()
-        };
-        let (sp, own) = assign(cs);
-        let row: Vec<u32> = own.iter().map(|o| o.row).collect();
-        let rows = Rows { a: &sa, b: &sb, r_prior: &sr, r_max: &sw, parent: &parent };
-        let f = joint_fit(&sp, &row, scan, &rows, n_scans, p, &params.prior, &opts, None)?;
-        // each pair again from the fitted stem it meets first (a stem's frame is the row's: they are parallel)
-        let fitted: Vec<(f64, f64, f64)> = cs.iter().zip(&f.theta).map(|(c, t)| (c.0 + t[0], c.1 + t[1], t[2].exp())).collect();
-        let (sp, own) = assign(&fitted);
-        let theta: Vec<[f64; 4]> = f.theta.iter().map(|t| [0.0, 0.0, t[2], t[3]]).collect();
-        Ok(joint_loglik(&sp, &own, &theta, &[], p, threads)?.iter().sum())
-    };
+    let opts = FitOptions { schedule: SCHEDULE.to_vec(), iters: params.iters, tol: params.tol, threads, local: false, profile: true };
+    let stems = |cs: &[(f64, f64, f64)]| fit_stems(pulses, scan, n_scans, a, b, cs, &params.like, &params.prior, &opts, threads).map(|s| s.ll);
     let l_whole = stems(&[(0.0, 0.0, r)])?.max(stems(&circles[..1])?);
     let l_split = stems(circles)?;
     Ok(l_split - l_whole - 2.0 * (circles.len() as f64 - 1.0) * (pulses.len().max(1) as f64).ln())
+}
+
+/// Stems parallel to a row fitted to its pairs (see [`fit_stems`]).
+pub(crate) struct StemFit {
+    /// The pairs' log likelihood at the fit, each seen from the fitted stem it meets first.
+    pub ll: f64,
+    pub fit: Fit,
+    /// The fitted stems' offsets and radii in the row's frame, and the stem each pair meets first.
+    pub stems: Vec<(f64, f64, f64)>,
+    pub owner: Vec<u32>,
+    /// Each pair seen from the fitted stem it meets first, and the state it was scored at.
+    pub pulses: Vec<Pulse>,
+    pub theta: Vec<[f64; 4]>,
+}
+
+/// The stems `cs` (offsets and radii in the frame of the row `a -> b`), parallel to it, fitted to the row's own
+/// pairs (`pulses`, measured from its axis, with their `scan`): each pair is seen from the stem it meets first
+/// ([`first_circle`]), each stem a row of its own with its own foliage, fitted by [`joint_fit`] with `opts` from
+/// the circles; then each pair is seen again from the fitted stem it meets first, and scored there. [`split_gain`]'s
+/// stems, and the seeded exact fit of [`crate::qsm::support_tree`]'s routed pieces (3dtrees research 93 §18). The
+/// fit's `evals` count that last pass too.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn fit_stems(pulses: &[Pulse], scan: &[u32], n_scans: usize, a: Point, b: Point, cs: &[(f64, f64, f64)], p: &JointParams, prior: &PriorParams, opts: &FitOptions, threads: usize) -> Result<StemFit> {
+    let (_, e1, e2, _) = frames(&[a], &[b])[0];
+    let at = |c: &(f64, f64, f64), x: Point| -> Point { std::array::from_fn(|i| x[i] + c.0 * e1[i] + c.1 * e2[i]) };
+    let (sa, sb): (Vec<Point>, Vec<Point>) = cs.iter().map(|c| (at(c, a), at(c, b))).unzip();
+    let sr: Vec<f64> = cs.iter().map(|c| c.2).collect();
+    let sw: Vec<f64> = sr.iter().map(|&r| window(r)).collect();
+    let parent = vec![-1i64; cs.len()];
+    let assign = |cs: &[(f64, f64, f64)]| -> (Vec<Pulse>, Vec<Owner>) {
+        pulses.iter().map(|pu| {
+            let i = first_circle(pu, cs, p);
+            (shifted(pu, [cs[i].0, cs[i].1]), Owner { row: i as u32, nu: u32::MAX })
+        }).unzip()
+    };
+    let (sp, own) = assign(cs);
+    let row: Vec<u32> = own.iter().map(|o| o.row).collect();
+    let rows = Rows { a: &sa, b: &sb, r_prior: &sr, r_max: &sw, parent: &parent };
+    let mut f = joint_fit(&sp, &row, scan, &rows, n_scans, p, prior, opts, None)?;
+    // each pair again from the fitted stem it meets first (a stem's frame is the row's: they are parallel)
+    let fitted: Vec<(f64, f64, f64)> = cs.iter().zip(&f.theta).map(|(c, t)| (c.0 + t[0], c.1 + t[1], t[2].exp())).collect();
+    let (sp, own) = assign(&fitted);
+    let theta: Vec<[f64; 4]> = f.theta.iter().map(|t| [0.0, 0.0, t[2], t[3]]).collect();
+    let ll = joint_loglik(&sp, &own, &theta, &[], p, threads)?.iter().sum();
+    f.evals[0] += sp.len() as u64;
+    Ok(StemFit { ll, fit: f, stems: fitted, owner: own.iter().map(|o| o.row).collect(), pulses: sp, theta })
 }
 
 /// Which pairs each row keeps: a stop seen by several rows stays with the one

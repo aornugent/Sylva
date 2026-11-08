@@ -181,7 +181,8 @@ def joint_tree(scans, a, b, r_prior, parent, context=None, params: JointParams =
 
     per input row ``split_gain`` ``(n,)``: the log evidence for its solid stems over it whole, less the price (NaN
     where none was weighed; near 0 is contested); and per tree ``u`` (the volume share the rays don't determine),
-    ``objective`` and ``converged``.
+    ``objective``, ``converged`` and ``echoes``: the rows' owned stops classified by the softmax of their wood and
+    leaf terms at their row's fit, keyed and laid out as :func:`support_tree`'s (``node`` a child row).
     """
     if not all(isinstance(s, ScanIndex) for s in scans):
         raise TypeError("joint_tree: scans must be ScanIndex")
@@ -202,6 +203,12 @@ def joint_tree(scans, a, b, r_prior, parent, context=None, params: JointParams =
 #: (the circle isn't determined: the radius is the prior cut by bounds) and ``POROUS`` (pulses, but no opaque run:
 #: existence, and the radius the prior cut by any bounds) are resolved by :func:`support_tree` itself.
 SupportFlag = IntFlag("SupportFlag", _core.qsm_support_flags())
+
+#: How a classified echo (``echoes`` of :func:`support_tree` and :func:`joint_tree`) got its ``p_wood``: ``MEASURED``
+#: and ``BOUNDED`` (on its piece's circle's front arc, the piece's own or the tree's, times its echo character's
+#: weight; off the arc 0), ``POROUS`` (its piece's ``p_wood`` times that weight) and ``EXACT`` (the exact
+#: likelihood's wood and leaf terms at its stem's fit: a routed piece's, or every one of :func:`joint_tree`'s).
+EchoPath = IntEnum("EchoPath", _core.qsm_echo_paths())
 
 
 def support_tree(scans, a, b, r_prior, parent, params: JointParams = JointParams(), threads: int = 0) -> dict:
@@ -229,8 +236,22 @@ def support_tree(scans, a, b, r_prior, parent, params: JointParams = JointParams
     quadrature), and a prior after :func:`joint_tree`'s (the base's level, the taper's steps, at a fork the child's
     share of the subtree wood length rather than of the prior area as a heavy-tailed Student-t term, so a small
     shoot measured fat can't inflate its parent, the centre's continuity along a branch and the lean's random walk
-    between a row's pieces, the centre's anchor and a weak anchor of the lean; no tip anchor). A ``RUNS`` or
-    ``HULL`` piece's radius is the prior's given the others: it is for :func:`joint_tree`.
+    between a row's pieces, the centre's anchor and a weak anchor of the lean; no tip anchor).
+
+    A ``RUNS`` or ``HULL`` piece is fitted by the exact likelihood, seeded from its runs (3dtrees research 93 §18):
+    its scans' runs placed as circles in its cross-section (merged across scans, strongest first, at most 4), its
+    pulses taken once about its circle's axis (the measured and bounded pieces of a first solve own the stops they
+    explain better), and 1, 2, ... stems parallel to that axis, each from a seed, fitted by :func:`joint_tree`'s
+    split weighing (each pulse seen from the stem it meets first, each stem its own foliage) by Newton with no
+    continuation or restarts, while BIC on the same pulses rises. Each stem's likelihood message (foliage integrated
+    out) measures the piece's centre and R in the tree: the stem nearest its parent's end continues the piece, and
+    the others become nodes of their own beside it (their parent's children by a fork term on their share of the
+    stems' area). A piece whose exact fit has nothing to fit stays the prior's.
+
+    Every stop is classified (``echoes``): on a measured or bounded piece by whether it lies on the piece's circle's
+    front arc (its own, or the tree's) times its echo character's weight, on a porous piece by the piece's
+    ``p_wood`` times that weight, on a routed one by the exact likelihood's wood and leaf terms at its stem's fit
+    (:class:`EchoPath`).
 
     Parameters
     ----------
@@ -250,15 +271,17 @@ def support_tree(scans, a, b, r_prior, parent, params: JointParams = JointParams
 
     Returns
     -------
-    dict, per row (``(n,)`` unless noted), with the same per piece under ``pieces`` (and its ``row``):
+    dict, per row (``(n,)`` unless noted), with the same per node under ``pieces``: the pieces, then the routed
+    pieces' further stems, with each node's ``row``, the piece it came from (``src``: itself for a piece) and its stem
+    there (``stem``: 0 for a piece's own):
 
     - ``a``, ``b`` ``(n, 3)``: the fitted axis, world coordinates (the claim moved by the centre and turned by the
       lean; a row's runs from its first piece's start to its last's end); ``r``, ``sd_log_r``: the radius and its
       posterior sd in log (a row's: the mean of its pieces' log R);
     - ``centre``, ``sd_centre``, ``lean``, ``sd_lean`` ``(n, 2)``: the centre at the middle (m) and the lean (m per
       m of axis) along ``e1``, ``e2`` ``(n, 3)``, with their posterior sds;
-    - ``r_row``, ``sd_r_row``: the own summary's radius and its sd, NaN where it is flagged or has none (a row's:
-      the geometric mean of its measured pieces');
+    - ``r_row``, ``sd_r_row``: the own summary's radius and its sd (a routed piece's: its exact fit's), NaN where it
+      has none (a row's: the geometric mean of its pieces');
     - ``chi2``, ``chi2_front``: the misfits (reduced chi-square), of the measurements to the circle (on their rank)
       and of the front's stops about it against the range noise, roughness and a 4 mm floor; NaN where there is
       none (a row's: its pieces' largest);
@@ -271,8 +294,15 @@ def support_tree(scans, a, b, r_prior, parent, params: JointParams = JointParams
     - ``flags`` (:class:`SupportFlag` bits; 0: its summary entered the tree; a row's: its pieces');
     - ``n_runs`` (the most stems within the claim a scan's profile shows), ``n_scans`` (the scans that measured
       it), ``n_pairs`` (its pulses);
+    - a routed piece's exact fit (a row's: the most stems and the sums): ``k_stems`` (0: none), ``split_gain`` (the
+      BIC of those stems over one, NaN for one), ``n_exact`` (its pulses) and ``evals_value``, ``evals_deriv`` (its
+      pair evaluations, of the value alone and with derivatives: per pulse, its passes);
 
-    and per tree ``converged``, whether the censored solve settled.
+    and per tree ``converged``, whether the censored solve settled, and ``echoes``, one record per stop of the tree
+    (of an echo several pieces saw, the one whose surface it lies nearest), keyed as the tile sidecars are: ``scan``
+    (an index into ``scans``), ``pulse`` (the pulse's row in its Shots file), ``echo`` (its place in the pulse);
+    with ``p_wood`` (the chance it is wood's echo), ``node`` (its piece or stem, in ``pieces``), ``path``
+    (:class:`EchoPath`) and ``dist`` (m from that node's surface).
     """
     if not all(isinstance(s, ScanIndex) for s in scans):
         raise TypeError("support_tree: scans must be ScanIndex")

@@ -78,7 +78,7 @@ class ScanIndex:
     """One scan's pulses, read from a single-position Shots file and indexed by direction.
 
     Built once per scan and reused by every :func:`evidence`, :func:`pairs` and
-    :func:`~sylva.qsm.joint_table` call (about 16 bytes per pulse, 17 where the
+    :func:`~sylva.qsm.joint_table` call (about 20 bytes per pulse, 21 where the
     store has ``las_number_of_returns``, and 4 per echo, 8 where it has
     reflectance and deviation and 1 more with ``las_return_number``, held on
     the Rust side). Only the angles, the echo ranges and those four attributes
@@ -118,6 +118,12 @@ class ScanIndex:
     def origin(self) -> np.ndarray:
         """The scanner position, ``(3,)``."""
         return np.asarray(self._core.origin, np.float64)
+
+    def file_row(self, pulse) -> np.ndarray:
+        """Each pulse's row in its Shots file, for pulses as this index numbers them (``pairs``' ``pulse``).
+
+        With an echo's place in its pulse it is the key the tile sidecars carry (``pulse.u32``, ``echo.u8``)."""
+        return self._core.file_row(np.ascontiguousarray(pulse, np.uint32))
 
 
 def pairs(scans, a, b, window, threads: int = 0) -> dict[str, np.ndarray]:
