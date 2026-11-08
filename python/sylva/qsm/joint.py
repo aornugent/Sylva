@@ -213,6 +213,26 @@ SupportFlag = IntFlag("SupportFlag", _core.qsm_support_flags())
 #: message says nothing of its radius).
 SupportRefusal = IntFlag("SupportRefusal", _core.qsm_support_refusals())
 
+#: What a reviewer or the screen should know of a node's fit (bits of :func:`support_tree`'s ``diag``; a row's: its
+#: pieces'), each threshold a constant of ``support_tree.rs`` with its reason:
+#:
+#: - ``ONE_SIDED``: one scan supplies at least 90 % of its informative pulses, or the scans with a tenth of them look
+#:   from within 20 degrees of each other: no other view checks it (3dtrees research 93 §10, §11.1);
+#: - ``SHADOWED``: a side of its silhouette is unseen (no pulse reaches the circle's neighbourhood there from a scan
+#:   that would decide R, as a crossing branch's shadow), so the sides seen leave its radius trading against its
+#:   centre: not determined by its own data. An exact stem's message then says nothing along what its sides leave
+#:   free and its own bounds (the span of its front arc's stops, the capacity floor) enter the tree beside it; a
+#:   measured piece's measurements already leave the unseen edge out, so the tree's prior fills it (flagged only);
+#: - ``SUB_FOOTPRINT``: R below half the footprint at its range;
+#: - ``TUBE_EDGE``: its fitted stem reaches within 1 cm of the tube its pulses were taken in: evidence cut off;
+#: - ``THINNED``: its exact fit used a share of its pulses (over the 8,000-pair budget): k may depend on which;
+#: - ``DELETED``: at least half its pulses have echoes the export deleted;
+#: - ``CONTESTED``: at least half its stops are claimed by context or a neighbouring node;
+#: - ``MISFIT``: its misfit (reduced chi-square within or between scans: non-round, sway or registration) above 4;
+#: - ``REFUSED``: its exact fit was refused (``refused`` says why);
+#: - ``UNSETTLED``: the tree's censored solve didn't settle (``converged`` false).
+SupportDiag = IntFlag("SupportDiag", _core.qsm_support_diags())
+
 #: How a classified echo (``echoes`` of :func:`support_tree` and :func:`joint_tree`) got its ``p_wood``:
 #: ``MEASURED``, ``BOUNDED``, ``POROUS`` and ``ROUTED`` (a routed piece with no exact fit accepted) by whether it lies
 #: on its piece's circle's front arc (the piece's own, or the tree's) times its echo character's weight, off the arc
@@ -263,7 +283,10 @@ def support_tree(scans, a, b, r_prior, parent, params: JointParams = JointParams
     node beside it (its parent's child by a fork term on its share of the stems' area). A fit is refused
     (:class:`SupportRefusal`, ``refused``) where there is no seed or no pulse left, Newton didn't converge, a stem
     isn't finite or its message says nothing of its radius, or its one stem is narrower than the piece's detection
-    bound; the piece is then the prior cut by its upper bound and capacity floor.
+    bound; the piece is then the prior cut by its upper bound and capacity floor. An accepted stem whose sides, as
+    its scans see them (the pulses that reach each edge's neighbourhood and its front, against those that echo
+    further in front), leave its radius trading against its centre (``SHADOWED``, 3dtrees research 93 §20) says
+    nothing along that ridge, and its own bounds enter with it: its radius is the prior's cut by them.
 
     Every stop is classified (``echoes``): by whether it lies on its piece's circle's front arc (its own, or the
     tree's) times its echo character's weight, or on a routed piece with an exact fit by the exact likelihood's wood
@@ -316,6 +339,12 @@ def support_tree(scans, a, b, r_prior, parent, params: JointParams = JointParams
       (its routed pulses) and ``evals_value``, ``evals_deriv`` (its pair evaluations, of the value alone and with
       derivatives: per routed pulse, its passes), and ``refused`` (:class:`SupportRefusal` bits: why its fit wasn't
       used, 0 where it was or the piece isn't routed);
+    - ``diag`` (:class:`SupportDiag` bits; a row's: its pieces') and three numbers: ``data_share``, the share of log
+      R's posterior precision its own data give (its measurement's information on R with its centre and lean unknown,
+      and its bounds' site), 0-1; ``misfit``, the larger reduced chi-square of the measurements to the circle and of
+      the front's stops about it (NaN where there is none, as an exact stem); ``contested``, the share of its stops
+      claimed by context or another node (NaN with none). A row's: the mean share, the largest misfit and the mean
+      contested share of its pieces;
 
     and per tree ``converged``, whether the censored solve settled; and ``echoes``, one record per stop of the tree
     (of an echo several pieces saw, the one whose surface it lies nearest), keyed as the tile sidecars are: ``scan``

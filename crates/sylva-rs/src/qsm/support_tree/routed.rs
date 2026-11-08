@@ -53,10 +53,10 @@
 
 use nalgebra::{Matrix2, Matrix3, Matrix4, Matrix5, SymmetricEigen, Vector5};
 
-use super::{fate, measure, median, p_wood, profile_runs, refusal, solve_row, spacing, weights, Circle, Fate, Group, Stats, DEPTH_TOL, HULL_BEHIND, HULL_SHARE, RUN_HITS};
+use super::{fate, marginalise, measure, median, p_wood, profile_runs, refusal, solve_row, spacing, unseen, weights, Bound, Circle, Fate, Group, Side, Sight, Stats, CAP_SD, DEPTH_TOL, HULL_BEHIND, HULL_SHARE, RUN_HITS, SEEN_MIN};
 use crate::error::Result;
 use crate::qsm::evidence::ScanIndex;
-use crate::qsm::joint::{frames, joint_table, joint_wood_share, path, window, Echoes, JointParams, Owner, Pulse};
+use crate::qsm::joint::{frames, joint_table, joint_wood_share, path, window, Echoes, JointPairs, JointParams, Owner, Pulse};
 use crate::qsm::joint_fit::{FitOptions, Frame, PriorParams};
 use crate::qsm::joint_tree::{fit_stems, shifted, surface_dist};
 use crate::transform::{cross, dot, norm, sub};
@@ -82,10 +82,14 @@ const EXACT_TOL: f64 = 3e-4;
 /// Every pulse is fitted on a piece of at most [`FIT_PAIRS`] pairs, and one in `ceil(n / FIT_PAIRS)` (by [`kept`]) on
 /// a larger one, so that at most about that many are (a trunk near a scanner is the most oversampled).
 const THIN: u32 = 1;
-const FIT_PAIRS: usize = 8000;
+pub(super) const FIT_PAIRS: usize = 8000;
 /// A stem whose message's sd of log R exceeds this says nothing of its radius (a factor of e either way): the fit is
 /// refused, as no measurement of the stem (tree 849 row 81's had 4e4).
 const UNINFORMED_SD: f64 = 1.0;
+
+/// How far from a shadowed stem's fitted surface its stops may lie and bound it from below (m, plus `0.3 R`): the range
+/// noise's scale (a reach of `DEPTH_TOL` takes in a face beside a thin stem).
+const ARC_TOL: f64 = 0.005;
 
 /// A seed: a stem's centre at the piece's middle and lean (along the piece's `e1, e2`, the lean per m), its radius,
 /// and its lean's variance.
@@ -267,6 +271,88 @@ pub(super) struct Exact {
     pub n_pairs: u32,
     pub evals: [u64; 2],
     pub echoes: Echoes,
+    /// Each stem: whether the sides its scans see leave its radius undetermined ([`look`]; its message then says
+    /// nothing along what they leave free), and its own bounds where so.
+    pub shadowed: Vec<bool>,
+    pub bounds: Vec<Vec<Bound>>,
+    /// The tube its pulses were taken in (m, about the claim's axis), whether they were thinned, and the stops the
+    /// context owned.
+    pub tube: f64,
+    pub thinned: bool,
+    pub n_ctx: u32,
+}
+
+/// How each scan sees a fitted stem (`r`, on `axis` with frame `fr`, moved by `d`), from every pulse of the table `t`
+/// and its echoes' depths about the stem (research 93 §20): a side (the neighbourhood of an edge, `R` to `R + W`
+/// beyond the axis across the beam, `W` half the radius within 1-3 cm, or the front's middle) is seen where at
+/// least [`SEEN_MIN`] pulses reached it (an echo at or behind it, or none recorded), and weighs the pulses that did
+/// per m across the beam; one whose pulses all echoed further in front (a crossing branch's shadow, tree 849 row 4's
+/// stem A) is not seen. The directions are the piece's
+/// (`piece`: its axis and `e1, e2`). And the stem's bounds: below, half the span of the stops on its front arc
+/// (5-95 %) less the footprint's widening, from the scan that says most; the capacity floor.
+#[allow(clippy::too_many_arguments)]
+fn look(t: &JointPairs, scans: &[&ScanIndex], axis: &Point, fr: (Point, Point, Point), d: [f64; 2], r: f64, piece: (Point, Point, Point), like: &JointParams) -> (Vec<Sight>, Vec<Bound>) {
+    let (_, e1, e2) = piece;
+    let us = fr.0;
+    let band = (0.5 * r).clamp(0.01, 0.03);
+    let tol = DEPTH_TOL + 0.3 * r;
+    // each side's weight is its pulses per m across the beam (the front's band is R wide, an edge's `band`)
+    let width = [band, band, r];
+    let ns = scans.len();
+    let (mut nsum, mut vsum) = (vec![[0.0f64; 2]; ns], vec![[0.0f64; 2]; ns]);
+    let mut reached = vec![[0usize; 3]; ns];
+    let mut arc: Vec<Vec<(f64, f64)>> = vec![Vec::new(); ns];
+    for (i, pu) in t.pulses.iter().enumerate() {
+        let s = t.scan[i] as usize;
+        let sc = scans[s];
+        let ray = (sc.origin(), sc.direction(t.pulse[i]));
+        let v = shifted(&remeasure(pu, ray, axis, fr), d);
+        let (bb, at) = (v.b, |range: f64| (range - v.t) * v.sin);
+        if pu.stop {
+            let dx = at(pu.x);
+            // on its surface within the range noise's scale (the reach `tol` would take in a face beside a thin stem)
+            if dx <= 0.0 && (bb.hypot(dx) - r).abs() < ARC_TOL + 0.3 * r {
+                arc[s].push((bb, like.footprint(v.t)));
+            }
+        }
+        let side = if bb.abs() < 0.5 * r { 2 } else if bb > r && bb <= r + band { 0 } else if bb < -r && bb >= -r - band { 1 } else { continue };
+        let front = if side == 2 { -(r * r - bb * bb).max(0.0).sqrt() } else { 0.0 };
+        let echoes = sc.ranges(t.pulse[i]);
+        if echoes.is_empty() || echoes.iter().any(|&e| at(e as f64) >= front - tol) {
+            reached[s][side] += 1;
+        }
+        let dir = ray.1;
+        let du = dot(&dir, &us);
+        let sin = (1.0 - du * du).max(1e-12).sqrt();
+        let n = cross(&us, &dir).map(|x| x / sin);
+        let vv: Point = std::array::from_fn(|k| (dir[k] - du * us[k]) / sin);
+        nsum[s] = [nsum[s][0] + dot(&n, &e1), nsum[s][1] + dot(&n, &e2)];
+        vsum[s] = [vsum[s][0] + dot(&vv, &e1), vsum[s][1] + dot(&vv, &e2)];
+    }
+    let unit = |q: [f64; 2]| {
+        let l = q[0].hypot(q[1]).max(1e-12);
+        [q[0] / l, q[1] / l]
+    };
+    let sights = (0..ns).filter(|&s| nsum[s] != [0.0; 2]).map(|s| Sight { n: unit(nsum[s]), v: unit(vsum[s]), w: std::array::from_fn(|k| if reached[s][k] >= SEEN_MIN { reached[s][k] as f64 / width[k] } else { 0.0 }) }).collect();
+    let mut bounds = Vec::new();
+    let mut lo = f64::NEG_INFINITY;
+    let mut ws: Vec<f64> = Vec::new();
+    for mut a in arc.into_iter().filter(|a| a.len() >= 10) {
+        a.sort_unstable_by(|x, y| x.0.total_cmp(&y.0));
+        let m = a.len();
+        let w = median(&mut a.iter().map(|q| q.1).collect::<Vec<_>>());
+        ws.push(w);
+        let half = 0.5 * (a[(19 * m) / 20 - 1].0 - a[m / 20].0) - like.app(w);
+        if half > 0.5 * like.tau * w && half.ln() > lo {
+            lo = half.ln();
+            bounds.retain(|b: &Bound| b.side != Side::Lower);
+            bounds.push(Bound { eta: lo, sd: like.edge * w / std::f64::consts::SQRT_2 / half, side: Side::Lower });
+        }
+    }
+    if let Some(w) = ws.into_iter().reduce(f64::max) {
+        bounds.push(Bound { eta: (0.5 * like.tau * w).ln(), sd: CAP_SD, side: Side::Floor });
+    }
+    (sights, bounds)
 }
 
 /// What became of a routed piece's exact fit: accepted, or refused (a [`refusal`] bit) with what it cost.
@@ -492,8 +578,19 @@ fn exact_thinned(scans: &[&ScanIndex], a0: &Point, frame: Frame, seeds: &[Seed],
         }
         why = refusal::UNINFORMED;
     }
-    let Some((bic, st, sf, stems)) = chosen else { return refused(why) };
+    let Some((bic, st, sf, mut stems)) = chosen else { return refused(why) };
     let k = st.len();
+    // each stem as its scans see it: where the sides they see leave its radius undetermined, its message says nothing
+    // along what they leave free, and its own bounds go with it (research 93 §20)
+    let (mut shadowed, mut bounds) = (vec![false; k], vec![Vec::new(); k]);
+    for (q, &(j, d, r)) in st.iter().enumerate() {
+        let (sights, b) = look(&t, scans, &axes[j].0, sfr[j], d, r, (u, e1, e2), like);
+        let free = unseen(&sights);
+        if !free.is_empty() {
+            stems[q] = marginalise(&stems[q], &free);
+            (shadowed[q], bounds[q]) = (true, b);
+        }
+    }
     // the classification: every kept stop (fitted or not) by the softmax of its wood and leaf terms at the fit of
     // the stem it meets first
     let echoes = {
@@ -514,7 +611,9 @@ fn exact_thinned(scans: &[&ScanIndex], a0: &Point, frame: Frame, seeds: &[Seed],
         }
         out
     };
-    Ok(Fitted::Accepted(Exact { stems, lam: sf.theta.iter().map(|t| t[3].exp()).collect(), gain: if k > 1 { bic - bic1 } else { f64::NAN }, n_pairs: n_all as u32, evals, echoes }))
+    let n_ctx = keep.iter().filter(|&&q| !q).count() as u32;
+    Ok(Fitted::Accepted(Exact { stems, lam: sf.theta.iter().map(|t| t[3].exp()).collect(), gain: if k > 1 { bic - bic1 } else { f64::NAN }, n_pairs: n_all as u32, evals, echoes,
+        shadowed, bounds, tube, thinned: thin > 1, n_ctx }))
 }
 
 #[cfg(test)]
@@ -539,6 +638,30 @@ mod tests {
         assert!((pm.b - sh.b).abs() < 1e-12 && (pm.t - sh.t).abs() < 1e-12, "{pm:?} {sh:?}");
         // the chord and the fate are the table's
         assert!(pm.c0 == base.c0 && pm.x == base.x && pm.stop);
+    }
+
+    #[test]
+    fn a_side_behind_a_screen_leaves_the_radius_undetermined() {
+        // the fan's 5 cm stem seen whole, and with a screen 1 m in front of its left edge (stopping the pulses that
+        // would cross the stem's plane 2-15 cm left of its axis): seen whole, both edges and the front decide R; behind
+        // the screen, one edge and the front leave it trading against the centre
+        let like = JointParams { tau: 0.17, edge: 0.25, hide: 0.0, ..JointParams::default() };
+        let (whole, a, b) = crate::qsm::evidence::tests::scene(0.05, true);
+        let (screened, _, _) = crate::qsm::evidence::tests::scene_screened(0.05, (-0.15, -0.02));
+        let (a0, b0) = ([a[0], a[1], -0.15], [b[0], b[1], 0.15]);
+        let (u, e1, e2, _) = frames(&[a0], &[b0])[0];
+        for (scan, shadowed) in [(&whole, false), (&screened, true)] {
+            let t = joint_table(&[scan], &[a0], &[b0], &[0.2], 1).unwrap();
+            let (sights, bounds) = look(&t, &[scan], &a0, (u, e1, e2), [0.0, 0.0], 0.05, (u, e1, e2), &like);
+            assert_eq!(sights.len(), 1);
+            let seen = sights[0].w.iter().filter(|&&w| w > 0.0).count();
+            assert_eq!((unseen(&sights).is_empty(), seen), (!shadowed, if shadowed { 2 } else { 3 }), "{sights:?}");
+            if shadowed {
+                // the stops on its seen arc bound it from below, no tighter than it is; and the capacity floor
+                assert!(bounds.iter().filter(|q| q.side == Side::Lower).all(|q| q.eta.exp() <= 0.053) && bounds.iter().any(|q| q.side == Side::Floor), "{bounds:?}");
+            }
+        }
+        let _ = b;
     }
 
     #[test]
