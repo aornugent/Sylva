@@ -78,7 +78,7 @@ class ScanIndex:
     """One scan's pulses, read from a single-position Shots file and indexed by direction.
 
     Built once per scan and reused by every :func:`evidence`, :func:`pairs` and
-    :func:`~sylva.qsm.joint_table` call (about 16 bytes per pulse, 17 where the
+    :func:`~sylva.qsm.joint_table` call (about 20 bytes per pulse, 21 where the
     store has ``las_number_of_returns``, and 4 per echo, 8 where it has
     reflectance and deviation and 1 more with ``las_return_number``, held on
     the Rust side). Only the angles, the echo ranges and those four attributes

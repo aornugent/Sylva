@@ -16,7 +16,7 @@ use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList};
 use sylva_rs::qsm::buttress::{Buttress, ButtressParams};
 use sylva_rs::qsm::evidence::{self, Beam, EvidenceParams, ScanIndex};
-use sylva_rs::qsm::joint::{self, JointParams, Owner, Pulse};
+use sylva_rs::qsm::joint::{self, Echoes, JointParams, Owner, Pulse};
 use sylva_rs::qsm::joint_fit::{self, FitOptions, PriorParams, Rows};
 use sylva_rs::qsm::joint_tree::{self, TreeParams};
 use sylva_rs::qsm::support_tree;
@@ -598,7 +598,7 @@ fn qsm_joint_fit<'py>(py: Python<'py>, table: Bound<'py, PyDict>, a: PyReadonlyA
     let (r_prior, r_max, parent) = (r_prior.as_array().to_vec(), r_max.as_array().to_vec(), parent.as_array().to_vec());
     let TreeParams { like, prior, .. } = tree_params(&params)?;
     let theta0 = theta0.map(|t| rows::<4>(t, "theta0")).transpose()?;
-    let opts = FitOptions { schedule, iters, tol, threads, local: false };
+    let opts = FitOptions { schedule, iters, tol, threads, local: false, profile: true };
     let fit = py.detach(|| {
         let rows = Rows { a: &a, b: &b, r_prior: &r_prior, r_max: &r_max, parent: &parent };
         joint_fit::joint_fit(&pulses, &row, &scan, &rows, n_scans, &like, &prior, &opts, theta0.as_deref())
@@ -705,7 +705,28 @@ fn qsm_joint_tree<'py>(py: Python<'py>, scans: Vec<Bound<'py, PyScanIndex>>, a: 
     d.set_item("u", f.u)?;
     d.set_item("objective", f.objective)?;
     d.set_item("converged", f.converged)?;
+    d.set_item("echoes", echoes_to_py(py, f.echoes)?)?;
     Ok(d)
+}
+
+/// A tree's classified echoes as a dict of `(m,)` arrays.
+fn echoes_to_py<'py>(py: Python<'py>, e: Echoes) -> PyResult<Bound<'py, PyDict>> {
+    let d = PyDict::new(py);
+    d.set_item("scan", e.scan.into_pyarray(py))?;
+    d.set_item("pulse", e.pulse.into_pyarray(py))?;
+    d.set_item("echo", e.echo.into_pyarray(py))?;
+    d.set_item("node", e.node.into_pyarray(py))?;
+    d.set_item("path", e.path.into_pyarray(py))?;
+    d.set_item("p_wood", e.p_wood.into_pyarray(py))?;
+    d.set_item("dist", e.dist.into_pyarray(py))?;
+    Ok(d)
+}
+
+/// The names of the `path` codes of the classified echoes.
+#[pyfunction]
+fn qsm_echo_paths() -> Vec<(&'static str, u8)> {
+    use joint::path::*;
+    vec![("MEASURED", MEASURED), ("BOUNDED", BOUNDED), ("POROUS", POROUS), ("EXACT", EXACT), ("ROUTED", ROUTED)]
 }
 
 /// The names of the `flags` bits of `qsm_support_tree`.
@@ -736,6 +757,11 @@ fn support_fit<'py>(py: Python<'py>, f: support_tree::Fit) -> PyResult<Bound<'py
     d.set_item("n_runs", f.n_runs.into_pyarray(py))?;
     d.set_item("n_scans", f.n_scans.into_pyarray(py))?;
     d.set_item("n_pairs", f.n_pairs.into_pyarray(py))?;
+    d.set_item("k_stems", f.k_stems.into_pyarray(py))?;
+    d.set_item("split_gain", f.split_gain.into_pyarray(py))?;
+    d.set_item("n_exact", f.n_exact.into_pyarray(py))?;
+    d.set_item("evals_value", f.evals_value.into_pyarray(py))?;
+    d.set_item("evals_deriv", f.evals_deriv.into_pyarray(py))?;
     Ok(d)
 }
 
@@ -755,13 +781,22 @@ fn qsm_support_tree<'py>(py: Python<'py>, scans: Vec<Bound<'py, PyScanIndex>>, a
     let d = support_fit(py, f.rows)?;
     let pieces = support_fit(py, f.pieces)?;
     pieces.set_item("row", f.piece_row.into_pyarray(py))?;
+    pieces.set_item("src", f.piece_src.into_pyarray(py))?;
+    pieces.set_item("stem", f.piece_stem.into_pyarray(py))?;
     d.set_item("pieces", pieces)?;
     d.set_item("converged", f.converged)?;
+    d.set_item("echoes", echoes_to_py(py, f.echoes)?)?;
+    let phases = PyDict::new(py);
+    for (k, v) in f.phases {
+        phases.set_item(k, v)?;
+    }
+    d.set_item("phases", phases)?;
     Ok(d)
 }
 
 pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(qsm_support_flags, m)?)?;
+    m.add_function(wrap_pyfunction!(qsm_echo_paths, m)?)?;
     m.add_function(wrap_pyfunction!(qsm_support_tree, m)?)?;
     m.add_function(wrap_pyfunction!(qsm_joint_defaults, m)?)?;
     m.add_function(wrap_pyfunction!(qsm_joint_reasons, m)?)?;

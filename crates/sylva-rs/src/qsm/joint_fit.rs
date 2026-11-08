@@ -128,6 +128,8 @@ pub struct FitOptions {
     /// the whole step then checked; else one scale and one line search for
     /// the whole step, which one stiff row throttles.
     pub local: bool,
+    /// Compute [`Fit::profile`] (21 passes over the pairs); else it is empty.
+    pub profile: bool,
 }
 
 /// The `eta - eta_hat` offsets of [`Fit::profile`].
@@ -152,7 +154,8 @@ pub struct Fit {
     pub grad: Vec<[f64; 4]>,
     pub hess: Vec<[[f64; 4]; 4]>,
     /// Each row's own pairs' log likelihood with eta moved by each
-    /// [`profile_grid`] offset, the rest of the state held at the MAP.
+    /// [`profile_grid`] offset, the rest of the state held at the MAP (empty
+    /// unless [`FitOptions::profile`]).
     pub profile: Vec<[f64; 21]>,
     pub objective: f64,
     /// Newton iterations per stage, and whether every stage converged.
@@ -161,6 +164,9 @@ pub struct Fit {
     /// The sds come from the true Hessian (else, where it isn't negative
     /// definite at the MAP, from the saddle-free one).
     pub exact: bool,
+    /// The pair evaluations the fit made: of the value alone, and with the
+    /// gradient and Hessian (each pass over the pairs counts each pair once).
+    pub evals: [u64; 2],
 }
 
 /// The rows: cylinders `a -> b` with their prior radii, the largest radius
@@ -267,6 +273,8 @@ struct Problem<'a> {
     eta_max: Vec<f64>,
     n_var: usize,
     threads: usize,
+    /// Pair evaluations so far: value, value with derivatives.
+    evals: std::cell::Cell<[u64; 2]>,
 }
 
 /// A Newton system on the branch tree: each block's matrix, its coupling to
@@ -381,7 +389,14 @@ impl<'a> Problem<'a> {
         let owners = row.iter().zip(scan).map(|(&k, &s)| Owner { row: k, nu: if use_nu { (s as usize * n + k as usize) as u32 } else { u32::MAX } }).collect();
         let group = row.iter().zip(scan).map(|(&k, &s)| (k as usize * n_scans + s as usize) as u32).collect();
         let eta_max = rows.r_max.iter().map(|r| r.ln()).collect();
-        Ok(Problem { pulses, owners, group, n, s: n_scans, use_nu, branch, rowpos, blocks, factors, nu_w, nu_t, cap, eta_max, n_var, threads })
+        Ok(Problem { pulses, owners, group, n, s: n_scans, use_nu, branch, rowpos, blocks, factors, nu_w, nu_t, cap, eta_max, n_var, threads, evals: std::cell::Cell::new([0; 2]) })
+    }
+
+    /// Counts `m` pair evaluations, with derivatives or not.
+    fn count(&self, m: usize, deriv: bool) {
+        let mut e = self.evals.get();
+        e[usize::from(deriv)] += m as u64;
+        self.evals.set(e);
     }
 
     /// Block and position of a global unknown.
@@ -434,6 +449,7 @@ impl<'a> Problem<'a> {
     /// Each row's own pairs' log likelihood at row states `theta`.
     fn row_loglik(&self, theta: &[[f64; 4]], nu: &[[f64; 2]], like: &JointParams) -> Result<Vec<f64>> {
         let ll = joint_loglik(self.pulses, &self.owners, theta, &self.row_nu(nu), like, self.threads)?;
+        self.count(ll.len(), false);
         let mut out = vec![0.0; self.n];
         for (o, l) in self.owners.iter().zip(ll) {
             out[o.row as usize] += l;
@@ -444,6 +460,7 @@ impl<'a> Problem<'a> {
     fn objective(&self, x: &[f64], like: &JointParams) -> Result<f64> {
         let (theta, nu) = self.split(x);
         let ll: f64 = joint_loglik(self.pulses, &self.owners, &theta, &self.row_nu(&nu), like, self.threads)?.iter().sum();
+        self.count(self.pulses.len(), false);
         let prior: f64 = self.factors.iter().map(|f| {
             let r = f.vars.iter().map(|&(v, c)| c * x[v]).sum::<f64>() - f.mean;
             -0.5 * f.w * r * r
@@ -469,6 +486,7 @@ impl<'a> Problem<'a> {
                 let sel: Vec<usize> = (0..self.pulses.len()).filter(|&i| only[self.branch[self.owners[i].row as usize]]).collect();
                 let pu: Vec<Pulse> = sel.iter().map(|&i| self.pulses[i]).collect();
                 let ow: Vec<Owner> = sel.iter().map(|&i| self.owners[i]).collect();
+                self.count(sel.len(), false);
                 for (o, l) in ow.iter().zip(joint_loglik(&pu, &ow, &theta, &self.row_nu(&nu), like, self.threads)?) {
                     out[self.branch[o.row as usize]] += l;
                 }
@@ -530,6 +548,7 @@ impl<'a> Problem<'a> {
     fn groups(&self, x: &[f64], like: &JointParams) -> Result<Groups> {
         let (theta, nu) = self.split(x);
         let (_, grad, hess) = joint_blocks(self.pulses, &self.owners, &self.group, self.n * self.s, &theta, &self.row_nu(&nu), like, self.threads)?;
+        self.count(self.pulses.len(), true);
         Ok((grad, hess))
     }
 
@@ -753,7 +772,7 @@ impl<'a> Problem<'a> {
 
 /// `V |Lambda| V^T` of a symmetric 4x4: the curvature saddle-free Newton uses
 /// for a log likelihood's Hessian (eigenvalues' magnitudes floored at 1e-6).
-fn abs_eig(h: &Matrix4<f64>) -> Matrix4<f64> {
+pub(crate) fn abs_eig(h: &Matrix4<f64>) -> Matrix4<f64> {
     let e = SymmetricEigen::new(*h);
     let d = Matrix4::from_diagonal(&e.eigenvalues.map(|l| l.abs().max(1e-6)));
     let out = e.eigenvectors * d * e.eigenvectors.transpose();
@@ -838,15 +857,18 @@ pub fn joint_fit(pulses: &[Pulse], row: &[u32], scan: &[u32], rows: &Rows, n_sca
         (tau * var[4 * k + 2]).clamp(0.0, 1.0)
     }).collect();
     let rho_pooled = (0..pr.n).map(|k| 1.0 - var[4 * k + 2] / pvar[4 * k + 2]).collect();
-    let mut profile = vec![[0.0; 21]; pr.n];
-    for (j, d) in profile_grid().into_iter().enumerate() {
-        let moved: Vec<[f64; 4]> = theta.iter().map(|t| [t[0], t[1], t[2] + d, t[3]]).collect();
-        for (k, l) in pr.row_loglik(&moved, &nu, like)?.into_iter().enumerate() {
-            profile[k][j] = l;
+    let mut profile = Vec::new();
+    if opts.profile {
+        profile = vec![[0.0; 21]; pr.n];
+        for (j, d) in profile_grid().into_iter().enumerate() {
+            let moved: Vec<[f64; 4]> = theta.iter().map(|t| [t[0], t[1], t[2] + d, t[3]]).collect();
+            for (k, l) in pr.row_loglik(&moved, &nu, like)?.into_iter().enumerate() {
+                profile[k][j] = l;
+            }
         }
     }
     let objective = pr.objective(&x, like)?;
-    Ok(Fit { theta, nu: if pr.use_nu { nu } else { Vec::new() }, sd, rho_local, rho_pooled, grad, hess, profile, objective, iterations, converged, exact })
+    Ok(Fit { theta, nu: if pr.use_nu { nu } else { Vec::new() }, sd, rho_local, rho_pooled, grad, hess, profile, objective, iterations, converged, exact, evals: pr.evals.get() })
 }
 
 #[cfg(test)]
@@ -863,7 +885,7 @@ mod tests {
     }
 
     fn opts() -> FitOptions {
-        FitOptions { schedule: vec![0.3, 0.15, 0.08], iters: 100, tol: 1e-10, threads: 2, local: false }
+        FitOptions { schedule: vec![0.3, 0.15, 0.08], iters: 100, tol: 1e-10, threads: 2, local: false, profile: true }
     }
 
     /// A small tree: a trunk of 3 rows forking into two branches of 2.

@@ -16,6 +16,7 @@ description = "Terrestrial and airborne laser scanning processing for forest eco
 nalgebra.workspace = true
 rayon.workspace = true
 libm.workspace = true
+libc.workspace = true
 kiddo.workspace = true
 las.workspace = true
 thiserror.workspace = true
