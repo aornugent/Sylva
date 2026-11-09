@@ -792,7 +792,7 @@ fn support_fit<'py>(py: Python<'py>, f: support_tree::Fit) -> PyResult<Bound<'py
     Ok(d)
 }
 
-/// Fits one tree from its rows' support summaries (see `sylva.qsm.support_tree`); `params` as `qsm_joint_tree`'s.
+/// Each of `trees`' context for `support_tree` (see `sylva.qsm.tree_context`).
 #[pyfunction]
 fn qsm_tree_context<'py>(py: Python<'py>, a: PyReadonlyArray2<f64>, b: PyReadonlyArray2<f64>, cyl_offsets: Vec<usize>, trees: Vec<usize>,
                          reach: f64) -> PyResult<(Bound<'py, PyArray1<usize>>, Bound<'py, PyArray1<usize>>)> {
@@ -805,6 +805,7 @@ fn qsm_tree_context<'py>(py: Python<'py>, a: PyReadonlyArray2<f64>, b: PyReadonl
     Ok((off.into_pyarray(py), idx.into_pyarray(py)))
 }
 
+/// Fits one tree from its rows' support summaries (see `sylva.qsm.support_tree`); `params` as `qsm_joint_tree`'s.
 #[pyfunction]
 #[pyo3(signature = (scans, a, b, r_prior, parent, ctx_a, ctx_b, ctx_r, params, threads=0))]
 #[allow(clippy::too_many_arguments)]

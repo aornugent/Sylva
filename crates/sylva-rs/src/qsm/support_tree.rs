@@ -1840,9 +1840,6 @@ fn enter(k: usize, e: &routed::Exact, nd: &mut Nodes, sums: &mut Vec<Summary>, e
     node
 }
 
-/// Fits one tree from its rows' support summaries: `rows` (with `r_max` ignored) against `scans`, the prior's
-/// widths from `prior` and the footprint, detection threshold, range noise and echo character from `like`. Runs on
-/// `threads` threads (0: one per core).
 /// Each of `trees`' [`support_tree`] context: of a plot's cylinders `a -> b`,
 /// tree `g` owning `cyl_offsets[g]..cyl_offsets[g + 1]`, the other trees'
 /// whose segments come within `reach` of one of `g`'s, as sorted indices
@@ -1904,6 +1901,9 @@ fn segment_distance(p1: &Point, q1: &Point, p2: &Point, q2: &Point) -> f64 {
     ((g[0] * g[0] + g[1] * g[1]) + g[2] * g[2]).sqrt()
 }
 
+/// Fits one tree from its rows' support summaries: `rows` (with `r_max` ignored) against `scans`, the prior's
+/// widths from `prior` and the footprint, detection threshold, range noise and echo character from `like`. Runs on
+/// `threads` threads (0: one per core).
 pub fn support_tree(scans: &[&ScanIndex], rows: &Rows, context: &[(Point, Point, f64)], like: &JointParams, prior: &PriorParams, threads: usize) -> Result<SupportTree> {
     let fr = rows.check("support tree")?;
     prior.check()?;

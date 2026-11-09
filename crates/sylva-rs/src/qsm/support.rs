@@ -160,10 +160,10 @@ pub fn contest(cloud: &KdTree, points: &[Point], labels: &[i32], a: &[Point], b:
             }
             near.sort_unstable();
             near.dedup();
-            let mut other: Vec<i32> = near.iter().map(|&p| labels[p]).filter(|&l| l >= 0 && l as usize != g).collect();
             if near.is_empty() {
                 return (0.0, -1);
             }
+            let mut other: Vec<i32> = near.iter().map(|&p| labels[p]).filter(|&l| l >= 0 && l as usize != g).collect();
             let share = other.len() as f64 / near.len() as f64;
             other.sort_unstable();
             let (mut owner, mut best, mut i) = (-1i64, 0usize, 0usize);
