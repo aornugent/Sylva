@@ -515,3 +515,26 @@ def joint_fit(table, a, b, r_prior, parent, n_scans: int, params, *, r_max=None,
         raise TypeError("joint_fit: params must be JointParams")
     return _core.qsm_joint_fit(table, a, b, r_prior, r_max, parent, int(n_scans), dataclasses.asdict(params), [float(s) for s in schedule],
                                int(iters), float(tol), theta0, int(threads))
+
+
+def base_columns(scans, centre, params: JointParams = JointParams(), z_lo: float = 0.1, z_hi: float = 1.5,
+                 dz: float = 0.1, reach: float = 0.6, link: float = 0.02, threads: int = 0) -> dict:
+    """The columns of wood standing in a plant's base, from every scan's pulses at once (3dtrees ticket 125, a
+    prototype on branch ``3dtrees/base-from-rays``): for a caller to build the base's rows from and measure with
+    :func:`support_tree`.
+
+    From ``z_lo`` to ``z_hi`` above the ground ``centre[2]``, slabs ``dz`` thick about ``centre``'s vertical axis,
+    each scan's pulses within ``reach`` of it; a slab's woody stops (echo character over a half) from every scan,
+    linked where within ``link`` of each other, are its sections, each with a circle (RANSAC and least squares, its
+    arc's covariance for its sd; a sliver one scan grazes is centred behind its stops) the ray veto audits. Sections
+    are linked upward into columns, each to the nearest column one or two slabs below (within half the wider radius
+    and 5 cm); where two claim one, the nearer continues it and the other forks from it. Columns of under three
+    sections without a fork are dropped; refuted sections and those at the tube's edge are left out.
+
+    Returns a dict of ``(m,)`` arrays per section: ``slab``, ``z`` (its middle, world), ``x``, ``y`` (its centre),
+    ``r``, ``sd_log_r`` (NaN where no circle was fitted: ``fitted``), ``arc`` (ten-degree bins its stops fill),
+    ``n_scans``, ``hits``, ``n_pass``, ``pass_share``, ``column`` (-1: none); and per column ``col_parent`` (the
+    column it forks from, -1 at the ground) and ``col_at`` (that column's section below its own first, -1).
+    """
+    return _core.qsm_base_columns([s._core for s in scans], [float(x) for x in centre], dataclasses.asdict(params),
+                                  z_lo, z_hi, dz, reach, link, int(threads))

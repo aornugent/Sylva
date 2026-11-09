@@ -179,6 +179,7 @@ use crate::transform::{cross, dot, sub};
 use crate::trees::{fit_circle_ransac, RansacCircleParams};
 use crate::Point;
 
+pub mod base;
 mod routed;
 
 /// Why a piece's own summary is not used (bits of [`Fit::flags`]): [`RUNS`] and [`HULL`] pieces are fitted by the
@@ -1510,10 +1511,46 @@ fn summarise_piece(scans: &[&ScanIndex], a: &Point, b: &Point, frame: Frame, r_c
     out
 }
 
+/// One-sided arcs (3dtrees ticket 125, a prototype on branch `3dtrees/base-from-rays`, on where the environment sets
+/// `SYLVA_ARC=1`): a point circle whose stops fill at least [`ARC_MIN`] of the 36 ten-degree bins (60 degrees: one
+/// scan's view of a trunk's front) but under [`PTS_ARC`] is a measurement too, with the sd its arc leaves: the
+/// geometric fit's covariance of `(c1, c2, R)` (the stops' rms about it, at least [`ARC_NOISE`], over the
+/// [`ARC_BIN`]-degree bins they fill, since a scan's stops in one such bin are one look at the surface), the
+/// circle's own noise ([`PTS_SD`] R) added. On a short arc R trades against the centre along its bisector, and the
+/// covariance says how far; a full ring keeps [`PTS_SD`] alone.
+const ARC_MIN: usize = 6;
+const ARC_NOISE: f64 = 0.003;
+const ARC_BIN: f64 = 2.0;
+/// With [`arc_on`], a point circle's upper bounds more than this many of its sds under it are dropped (the veto's
+/// audit of the circle itself has passed it).
+const ARC_CUT: f64 = 3.0;
+
+/// Whether one-sided arcs are measurements ([`ARC_MIN`]).
+pub(crate) fn arc_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("SYLVA_ARC").is_ok_and(|v| v == "1"))
+}
+
+/// A circle fitted to an arc's stops `on` (about its centre): the covariance of `(c1, c2, R)` the arc leaves
+/// ([`ARC_MIN`]), its own noise aside; None where the arc doesn't determine it.
+fn arc_cov(on: &[[f64; 2]], rmse: f64) -> Option<Matrix3<f64>> {
+    let mut jtj = Matrix3::zeros();
+    let mut bins = std::collections::HashSet::new();
+    for q in on {
+        let d = q[0].hypot(q[1]).max(1e-9);
+        let j = Vector3::new(-q[0] / d, -q[1] / d, -1.0);
+        jtj += j * j.transpose();
+        bins.insert((q[1].atan2(q[0]).to_degrees() / ARC_BIN).floor() as i64);
+    }
+    let s2 = rmse.max(ARC_NOISE).powi(2) * on.len() as f64 / bins.len().max(1) as f64;
+    jtj.try_inverse().map(|i| i * s2).filter(|c| c.iter().all(|x| x.is_finite()) && c[(2, 2)] > 0.0)
+}
+
 /// A row's point circle (3dtrees research 111: the refit's measurement, research 52 and 62), `[c1, c2, 0, 0, R]`: RANSAC
 /// on its stops' places across its axis `xy`, then least squares on the inliers, accepted on the tests of
-/// [`PTS_R_MIN`] and after for a row claimed `r0` wide whose circle may be at most `believe` wide (m; NaN: no cap).
-fn point_circle(xy: &[[f64; 2]], r0: f64, believe: f64) -> Option<Vector5<f64>> {
+/// [`PTS_R_MIN`] and after for a row claimed `r0` wide whose circle may be at most `believe` wide (m; NaN: no cap);
+/// with, for a one-sided arc ([`ARC_MIN`], where [`arc_on`]), the covariance its arc leaves.
+fn point_circle(xy: &[[f64; 2]], r0: f64, believe: f64) -> Option<(Vector5<f64>, Option<Matrix3<f64>>)> {
     if xy.len() < PTS_MIN {
         return None;
     }
@@ -1530,7 +1567,17 @@ fn point_circle(xy: &[[f64; 2]], r0: f64, believe: f64) -> Option<Vector5<f64>> 
         bins[(((q[1].atan2(q[0]).to_degrees() + 180.0) / 10.0) as usize).min(35)] = true;
     }
     let arc = bins.iter().filter(|&&b| b).count();
-    (cx.hypot(cy) <= r.max(r0) + PTS_SHIFT && rmse <= PTS_RMSE.0 * r + PTS_RMSE.1 && arc >= PTS_ARC).then(|| Vector5::new(cx, cy, 0.0, 0.0, r))
+    if !(cx.hypot(cy) <= r.max(r0) + PTS_SHIFT && rmse <= PTS_RMSE.0 * r + PTS_RMSE.1) {
+        return None;
+    }
+    let x = Vector5::new(cx, cy, 0.0, 0.0, r);
+    if arc >= PTS_ARC {
+        Some((x, None))
+    } else if arc_on() && arc >= ARC_MIN {
+        arc_cov(&on, rmse).map(|c| (x, Some(c)))
+    } else {
+        None
+    }
 }
 
 /// The stops in row `k`'s pieces' tubes (their places across its axis) that lie nearer its claimed axis than any
@@ -1566,10 +1613,26 @@ fn own_stops(k: usize, rows: &Rows, context: &[(Point, Point, f64)], nd: &Nodes,
 
 /// A point circle `x` as the measurement of one of a row's `pieces` pieces: its centre and R, each of sd [`PTS_SD`] R
 /// times the root of the pieces (one circle, shared by them); the lean unmeasured.
-fn point_measure(x: &Vector5<f64>, pieces: f64) -> Circle {
+fn point_measure(x: &Vector5<f64>, pieces: f64, arc: Option<&Matrix3<f64>>) -> Circle {
     let var = (PTS_SD * x[4]).powi(2) * pieces;
-    let meas: [Meas; 3] = [([1.0, 0.0, 0.0, 0.0, 0.0], x[0], var), ([0.0, 1.0, 0.0, 0.0, 0.0], x[1], var), ([0.0, 0.0, 0.0, 0.0, 1.0], x[4], var)];
-    Circle { st: Stats::of(&meas), x: *x, cov: Matrix5::from_diagonal(&Vector5::new(var, var, UNSEEN_VAR, UNSEEN_VAR, var)), chi2: f64::NAN }
+    let Some(arc) = arc else {
+        let meas: [Meas; 3] = [([1.0, 0.0, 0.0, 0.0, 0.0], x[0], var), ([0.0, 1.0, 0.0, 0.0, 0.0], x[1], var), ([0.0, 0.0, 0.0, 0.0, 1.0], x[4], var)];
+        return Circle { st: Stats::of(&meas), x: *x, cov: Matrix5::from_diagonal(&Vector5::new(var, var, UNSEEN_VAR, UNSEEN_VAR, var)), chi2: f64::NAN };
+    };
+    // a one-sided arc ([`ARC_MIN`]): its fit's covariance of (c1, c2, R), shared by the pieces, beside the circle's
+    // own noise
+    let c3 = arc * pieces + Matrix3::from_diagonal_element(var);
+    let i3 = c3.try_inverse().unwrap_or_else(Matrix3::zeros);
+    let at = [0usize, 1, 4];
+    let (mut info, mut cov) = (Matrix5::zeros(), Matrix5::from_diagonal(&Vector5::new(0.0, 0.0, UNSEEN_VAR, UNSEEN_VAR, 0.0)));
+    for (i, &p) in at.iter().enumerate() {
+        for (j, &q) in at.iter().enumerate() {
+            info[(p, q)] = i3[(i, j)];
+            cov[(p, q)] = c3[(i, j)];
+        }
+    }
+    let h = info * x;
+    Circle { st: Stats { info, h, yy: x.dot(&h), n: 3 }, x: *x, cov, chi2: f64::NAN }
 }
 
 /// The ray veto's tally of a circle `x` (`[c1, c2, t1, t2, R]`, in the piece's frame) against a piece's groups: the
@@ -1914,18 +1977,22 @@ pub fn support_tree(scans: &[&ScanIndex], rows: &Rows, context: &[(Point, Point,
             continue;
         }
         let xy = own_stops(k, rows, context, &nd, &sums);
-        let Some(x) = point_circle(&xy, rows.r_prior[k], PTS_BELIEVE * caps[k0].exp()) else { continue };
+        let Some((x, arc)) = point_circle(&xy, rows.r_prior[k], PTS_BELIEVE * caps[k0].exp()) else { continue };
         // a circle at its pieces' tubes' edge is the captor a piece's own circle there was refused for (TUBE_EDGE)
         if (k0..k1).any(|j| reaches_edge(&x, 0.0, sums[j].diag.tube)) {
             continue;
         }
         r_points[k0..k1].fill(x[4]);
         if !refuted((k0..k1).map(|j| tally(&sums[j].seen, &x)).fold((0, 0), |a, q| (a.0 + q.0, a.1 + q.1))) {
-            let c = point_measure(&x, (k1 - k0) as f64);
+            let c = point_measure(&x, (k1 - k0) as f64, arc.as_ref());
+            // (3dtrees ticket 125, with [`arc_on`]) an upper bound more than [`ARC_CUT`] sds under the circle is about
+            // another centre than the circle's (the passes either side of a woody centre the circle isn't on), which
+            // the veto's audit of the circle itself has just contradicted: it is dropped, not left to pin the circle
+            let floor = x[4].ln() - ARC_CUT * c.cov[(4, 4)].max(0.0).sqrt() / x[4];
             for s in &mut sums[k0..k1] {
                 s.points = Some(c);
                 // the bounds its stops gave (the woody run's span, the capacity floor) are the circle's own data
-                s.bounds.retain(|b| b.side == Side::Upper);
+                s.bounds.retain(|b| b.side == Side::Upper && (!arc_on() || b.eta >= floor));
             }
         }
     }
@@ -3429,7 +3496,7 @@ mod tests {
         // a 5 cm stem 1 cm off the axis, seen over 200 degrees with 2 mm of roughness, and a few leaves about it
         let mut xy = arc_stops([0.01, 0.0], 0.05, (-100.0, 100.0), 60, 0.002);
         xy.extend([[0.12, 0.05], [-0.1, 0.11], [0.0, -0.13], [0.09, -0.1]]);
-        let x = point_circle(&xy, 0.06, f64::NAN).unwrap();
+        let x = point_circle(&xy, 0.06, f64::NAN).unwrap().0;
         assert!((x[4] - 0.05).abs() < 0.002 && (x[0] - 0.01).abs() < 0.002 && x[1].abs() < 0.002 && x[2] == 0.0 && x[3] == 0.0, "{x:?}");
         // the site's cap, through `believe`: a circle wider than it is none
         assert!(point_circle(&xy, 0.06, 0.04).is_none());
@@ -3440,7 +3507,7 @@ mod tests {
         assert!(point_circle(&arc_stops([0.0, 0.0], 0.05, (0.0, 90.0), 40, 0.001), 0.06, f64::NAN).is_none());
         // three thin stems about a vase: no stem through them all
         let vase: Vec<[f64; 2]> = (0..3).flat_map(|k| arc_stops(std::array::from_fn(|i| 0.06 * (k as f64 * 2.1 + i as f64 * 1.57).cos()), 0.008, (0.0, 360.0), 15, 0.0)).collect();
-        assert!(point_circle(&vase, 0.08, f64::NAN).is_none_or(|x| x[4] < 0.02), "{:?}", point_circle(&vase, 0.08, f64::NAN));
+        assert!(point_circle(&vase, 0.08, f64::NAN).is_none_or(|x| x.0[4] < 0.02), "{:?}", point_circle(&vase, 0.08, f64::NAN));
         // most stops off any circle: leaves
         let mut leafy = arc_stops([0.0, 0.0], 0.03, (-90.0, 90.0), 20, 0.0);
         leafy.extend((0..60).map(|i| [0.3 * ((i * 37 % 61) as f64 / 61.0 - 0.5), 0.3 * ((i * 53 % 59) as f64 / 59.0 - 0.5)]));
@@ -3514,7 +3581,7 @@ mod tests {
         let fr = frames(&rows_a, &rows_b);
         let nd = Nodes::of(&rows, &fr);
         let x = Vector5::new(0.003, 0.0, 0.0, 0.0, 0.05);
-        let c = point_measure(&x, 2.0);
+        let c = point_measure(&x, 2.0, None);
         assert!((c.cov[(4, 4)].sqrt() / 0.05 - PTS_SD * 2f64.sqrt()).abs() < 1e-12);
         let base = circle(Vector5::new(0.0, 0.0, 0.0, 0.0, 0.09), 1e-3);
         let upper = Bound { eta: 0.08f64.ln(), sd: 0.1, side: Side::Upper };

@@ -832,6 +832,31 @@ fn qsm_support_tree<'py>(py: Python<'py>, scans: Vec<Bound<'py, PyScanIndex>>, a
     Ok(d)
 }
 
+/// The columns of wood in a plant's base (see `sylva.qsm.base_columns`; 3dtrees ticket 125, a prototype).
+#[pyfunction]
+#[pyo3(signature = (scans, centre, params, z_lo=0.1, z_hi=1.5, dz=0.1, reach=0.6, link=0.02, threads=0))]
+#[allow(clippy::too_many_arguments)]
+fn qsm_base_columns<'py>(py: Python<'py>, scans: Vec<Bound<'py, PyScanIndex>>, centre: [f64; 3], params: Bound<'py, PyDict>, z_lo: f64, z_hi: f64, dz: f64, reach: f64, link: f64, threads: usize) -> PyResult<Bound<'py, PyDict>> {
+    let p = tree_params(&params)?;
+    let bp = support_tree::base::BaseParams { z_lo, z_hi, dz, reach, link };
+    let refs: Vec<&ScanIndex> = scans.iter().map(|s| &s.get().inner).collect();
+    let (secs, cols) = py.detach(|| support_tree::base::base_columns(&refs, &centre, &bp, &p.like, threads)).map_err(err)?;
+    let d = PyDict::new(py);
+    let f = |g: fn(&support_tree::base::Section) -> f64| secs.iter().map(g).collect::<Vec<f64>>();
+    for (k, v) in [("z", f(|s| s.z)), ("x", f(|s| s.c[0])), ("y", f(|s| s.c[1])), ("r", f(|s| s.r)), ("sd_log_r", f(|s| s.sd_log_r)), ("hits", f(|s| s.hits)), ("pass_share", f(|s| s.pass_share))] {
+        d.set_item(k, v.into_pyarray(py))?;
+    }
+    let u = |g: fn(&support_tree::base::Section) -> u32| secs.iter().map(g).collect::<Vec<u32>>();
+    for (k, v) in [("slab", u(|s| s.slab)), ("arc", u(|s| s.arc)), ("n_scans", u(|s| s.n_scans)), ("n_pass", u(|s| s.n_pass))] {
+        d.set_item(k, v.into_pyarray(py))?;
+    }
+    d.set_item("fitted", secs.iter().map(|s| s.fitted).collect::<Vec<bool>>().into_pyarray(py))?;
+    d.set_item("column", secs.iter().map(|s| s.column).collect::<Vec<i32>>().into_pyarray(py))?;
+    d.set_item("col_parent", cols.iter().map(|c| c.parent).collect::<Vec<i32>>().into_pyarray(py))?;
+    d.set_item("col_at", cols.iter().map(|c| c.at).collect::<Vec<i32>>().into_pyarray(py))?;
+    Ok(d)
+}
+
 pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(qsm_support_flags, m)?)?;
     m.add_function(wrap_pyfunction!(qsm_support_refusals, m)?)?;
@@ -839,6 +864,7 @@ pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(qsm_support_bases, m)?)?;
     m.add_function(wrap_pyfunction!(qsm_echo_paths, m)?)?;
     m.add_function(wrap_pyfunction!(qsm_support_tree, m)?)?;
+    m.add_function(wrap_pyfunction!(qsm_base_columns, m)?)?;
     m.add_function(wrap_pyfunction!(qsm_joint_defaults, m)?)?;
     m.add_function(wrap_pyfunction!(qsm_joint_reasons, m)?)?;
     m.add_function(wrap_pyfunction!(qsm_joint_tree, m)?)?;
