@@ -44,7 +44,9 @@
 //!   its sections' evidence is positive and those chains hold under [`BaseParams::keep`] of it in the same slabs,
 //!   and under [`MEASURED`] of them are measured (by their own circle, unrefuted, as the joint fit would serve it): a skeleton
 //!   already on its wood keeps it; one beside it, inside a trunk wider than its claim, or a fan's axes through air,
-//!   don't; a column of thin stems the rays see between loses to their own rows.
+//!   don't; a column of thin stems the rays see between loses to their own rows. A column another member's rows
+//!   already stand on (on [`CTX_SHARE`] of its sections) isn't given to members other than it; nor is one that, in
+//!   some slab, reads thinner than the rows it would replace while the rays support those rows more.
 //! - **Ownership.** A column's rows go to the member whose taken entries carry the most of the skeleton's volume
 //!   above their cuts (of its own and its forks' entries), from the ground under it, or from its owner's own base
 //!   where the owner keeps one (a stem the columns missed stands there too); a fork owned by another member starts that member's base
@@ -638,6 +640,21 @@ fn join(rows: &Rows, member: &[i64], centre: &Point, p: &BaseParams, secs: &[Sec
         (i, v)
     }).collect();
     let reaches: Vec<bool> = (0..n).map(|i| subtree(i).iter().any(|&j| hi(j) > z_h)).collect();
+    // each column's holders: the members with a row on CTX_SHARE of its sections (the axis within its circle and
+    // IN_COL at the section's height): their drawing stands on that wood already
+    let holders: Vec<BTreeSet<i64>> = (0..nc).map(|k| {
+        let on = |m: i64| cols[k].sections.iter().filter(|&&q| {
+            let (c, z, rr) = (secs[q].c, secs[q].z, secs[q].r + IN_COL);
+            (0..n).any(|j| member[j] == m && {
+                let dz = b[j][2] - a[j][2];
+                dz.abs() > 1e-9 && {
+                    let f = (z - a[j][2]) / dz;
+                    (0.0..1.0).contains(&f) && (a[j][0] + f * (b[j][0] - a[j][0]) - c[0]).hypot(a[j][1] + f * (b[j][1] - a[j][1]) - c[1]) <= rr
+                }
+            })
+        }).count() as f64 >= CTX_SHARE * cols[k].sections.len() as f64;
+        member.iter().copied().collect::<BTreeSet<i64>>().into_iter().filter(|&m| on(m)).collect()
+    }).collect();
     // the plant's rows given each column's owner (-1: not chosen) and each entry's fate: the chosen columns' rows, by
     // owner; then the skeleton's kept rows, entries cut at their column's top; with the counts of rows dropped and
     // hung
@@ -759,12 +776,31 @@ fn join(rows: &Rows, member: &[i64], centre: &Point, p: &BaseParams, secs: &[Sec
                 ev[i].iter().enumerate().filter(|(k, _)| *k as u32 <= last && slabs.contains(&(*k as u32))).filter_map(|q| *q.1).sum()
             };
             let e_rct: f64 = replaced.iter().map(|&j| row_e(j, Some(&slabs))).sum::<f64>() + taken.iter().map(|&i| under(i)).sum::<f64>();
+            // slab by slab, where the column reads thinner than the skeleton's rows it replaces and the rays support
+            // those rows more than the column's circle there, the skeleton's base stands (research 125's F21)
+            let rows_in = |q: u32| -> Vec<usize> {
+                replaced.iter().copied().chain(taken.iter().copied().filter(|&i| {
+                    let c = col_of(fate[&i]).unwrap();
+                    q <= secs[*sec_of(c).last().unwrap()].slab
+                })).filter(|&j| ev[j][q as usize].is_some()).collect()
+            };
+            let thinner_and_worse = slabs.iter().any(|&q| {
+                let here: Vec<usize> = ss.iter().copied().filter(|&i| secs[i].slab == q).collect();
+                let js = rows_in(q);
+                let (ec, er) = (here.iter().map(|&i| secs[i].evidence).sum::<f64>(), js.iter().filter_map(|&j| ev[j][q as usize]).sum::<f64>());
+                let rc = here.iter().map(|&i| secs[i].r).fold(0.0, f64::max);
+                let rr = js.iter().map(|&j| r[j]).fold(0.0, f64::max);
+                !js.is_empty() && rc < rr && er > ec
+            });
             let (lm, lt) = replaced.iter().map(|&j| {
                 let l = norm3(&sub(&b[j], &a[j])) * f64::from(ev[j].iter().enumerate().any(|(k, e)| e.is_some() && slabs.contains(&(k as u32))) as u8);
                 (l * measured[j], l)
             }).fold((0.0, 0.0), |x, y| (x.0 + y.0, x.1 + y.1));
             let ms = if lt > 0.0 { lm / lt } else { 0.0 };
-            let pick = !taken.is_empty() && e_col > 0.0 && e_rct < p.keep * e_col && ms < MEASURED;
+            // a column whose wood another member's kept drawing stands on is that member's: it isn't given to others
+            let takers: BTreeSet<i64> = taken.iter().map(|&i| member[i]).collect();
+            let held = sub_cols.iter().any(|&c| holders[c].iter().any(|m| !takers.contains(m)));
+            let pick = !taken.is_empty() && !held && !thinner_and_worse && e_col > 0.0 && e_rct < p.keep * e_col && ms < MEASURED;
             for &c in &sub_cols {
                 (out[c].e_col, out[c].e_rct, out[c].measured) = (e_col, e_rct, ms);
                 chosen[c] = pick;
@@ -981,6 +1017,17 @@ mod tests {
         // unmeasured: re-sectioned
         let f = join(&rows, &m, &[0.0, 0.0, 0.0], &BaseParams::default(), &column(0.0, 0.0, 0.1, 100.0, 0), cols, &[], 0.5, &ev, &vec![0.0; a.len()], &vec![false; a.len()]);
         assert!(f.out[0].chosen, "{:?}", f.out);
+    }
+
+    #[test]
+    fn a_column_another_member_already_stands_on_is_not_given_to_a_fan() {
+        // RCT tree 1 drawn on the column's wood up to 1 m (its rows supported), then leaning away; tree 0 a fan's axis
+        // through air onto the column's top: the column is tree 1's wood, so the fan doesn't take it (research 125's
+        // shadows: a column drawn along a stem a neighbour already stands on)
+        let fan: &[Point] = &[[0.4, -0.3, 0.0], [0.25, -0.2, 0.8], [0.02, 0.0, 1.6], [0.0, 0.0, 2.5]];
+        let stem: &[Point] = &[[0.0, 0.0, 0.0], [0.0, 0.0, 0.5], [0.0, 0.0, 1.0], [0.6, 0.0, 2.0]];
+        let f = joined(&plant(&[(fan, 0.05), (stem, 0.05)]), &column(0.0, 0.0, 0.08, 100.0, 0), |i| if i < 3 { -20.0 } else { 20.0 });
+        assert!(!f.out[0].chosen, "{:?} {:?}", f.out, f.counts);
     }
 
     #[test]

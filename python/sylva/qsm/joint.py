@@ -575,7 +575,9 @@ def rebase(scans, a, b, r_prior, parent, member, centre, context=None, params: J
     within 30 cm; it is cut there. A column and its forks replace the chains of the rows they take only where their
     evidence is positive, those chains hold under ``keep`` of it in the same slabs, and under half of them are
     measured (by an own circle the veto doesn't refute, as :func:`support_tree` would serve it): a skeleton already
-    on its wood keeps it. A column's rows go to the member whose taken rows carry most of the skeleton above their cuts; another
+    on its wood keeps it. Nor is a column given to one member where another's rows already stand on half its
+    sections, nor where, in some slab, it reads thinner than the rows it would replace and the rays support those
+    rows more. A column's rows go to the member whose taken rows carry most of the skeleton above their cuts; another
     member's row it takes starts that member's base at its cut (a fork, at the fork). A member that would stand on two
     bases keeps its rows as they were. Of a member re-sectioned, other rows under the chosen columns' top whose
     middle lies in a chosen column's circle, or that the veto refutes at a quarter of their radius, are dropped; a
