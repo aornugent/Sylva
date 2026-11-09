@@ -350,8 +350,8 @@ def support_tree(scans, a, b, r_prior, parent, context=None, params: JointParams
 
     - ``a``, ``b`` ``(n, 3)``: the fitted axis, world coordinates (the claim moved by the centre and turned by the
       lean; a row's runs from its first piece's start to its last's end); ``r``, ``sd_log_r``: the radius, held inside
-      its own bounds, and its posterior sd in log, the solve's widened by its basis's factor (a row's: the mean of its
-      pieces' log R);
+      its own bounds, and its posterior sd in log, the solve's widened by its basis's factor (a row's: its pieces' root
+      mean square R, so its volume is theirs);
     - ``centre``, ``sd_centre``, ``lean``, ``sd_lean`` ``(n, 2)``: the centre at the middle (m) and the lean (m per
       m of axis) along ``e1``, ``e2`` ``(n, 3)``, with their posterior sds;
     - ``r_row``, ``sd_r_row``: the own summary's radius and its sd (a routed piece's: its exact fit's stem's), NaN

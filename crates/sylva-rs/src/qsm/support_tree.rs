@@ -162,8 +162,8 @@
 //!   damped, until nothing moves (or [`EP_ROUNDS`] pass: the tree's
 //!   `converged` says which). The posterior is then the prior cut by the
 //!   bounds, mean and sd. A row's output is its pieces': the line from the
-//!   first's start to the last's end and the mean of their log R, with the
-//!   covariance of the chain.
+//!   first's start to the last's end and their root mean square R (the row's
+//!   volume is theirs), with the covariance of the chain.
 
 use nalgebra::{Matrix3, Matrix4, Matrix5, SymmetricEigen, Vector3, Vector4, Vector5};
 use rayon::prelude::*;
@@ -304,12 +304,12 @@ const BOUNDED_SHARE: f64 = 0.1;
 /// The factor each basis's posterior sds of log R are widened by, in the reported `sd_log_r` and the volume's draws
 /// (by [`basis`], from MEASURED): the raw posterior is overconfident. Learned per basis as 3dtrees research 106
 /// `uncertain.md` §1 learned one (3dtrees ticket 109): the factor that puts 90 % of Alice Mulga's refit circles (their
-/// own noise, 0.136 in log R, added) inside the 90 % interval, on random halves of the trees, 89.9-90.0 % on the other
-/// halves; the circles on PINNED nodes left out (a circle past the rays' own bound: 86 % of them fatter, by a median
-/// 4.4x). MEASURED 2.1 [2.0-2.2], BOUNDED 2.9 [2.6-3.2], PRIOR 2.5 [2.4-2.7], CAPPED 2.1 [2.0-2.2]; POINTS 1, its sd
-/// being the point circles' own error against the truth already (its refit circle shares its stops, so the 1.1 it
-/// learns against it is no test).
-pub const WIDEN: [f64; 5] = [2.1, 1.0, 2.9, 2.5, 2.1];
+/// own noise, 0.136 in log R, added) inside the 90 % interval, on random halves of the trees, 90.0-90.4 % on the other
+/// halves; the circles on PINNED nodes left out (6.5 %: a circle past the rays' own bound, 86 % of them fatter, by a
+/// median 4.4x). MEASURED 2.1 [2.0-2.2], POINTS 1.2 [1.1-1.3], BOUNDED 3.6 [3.3-3.8], PRIOR 3.1 [2.9-3.2], CAPPED 2.3
+/// [2.1-2.4]. POINTS's is a floor: its refit circle shares its stops. One factor for all (2.0) left bounded and prior
+/// rows short.
+pub const WIDEN: [f64; 5] = [2.1, 1.2, 3.6, 3.1, 2.3];
 
 /// The factor a node of basis `b` is widened by ([`WIDEN`]).
 fn widen(b: u8) -> f64 {
@@ -2332,8 +2332,10 @@ impl Fit {
 }
 
 /// A row's state from its pieces `k0..k1` (a chain, each `pl` long, the row `len`): the line from the first's start
-/// to the last's end as the centre at the row's middle and the lean, and the mean of their log R; with its
-/// covariance from the chain's joint covariance (`Cov(x_j, x_i) = -Y_j Cov(x_{j-1}, x_i)` below the diagonal).
+/// to the last's end as the centre at the row's middle and the lean, and the log of their root mean square R, so the
+/// row's volume is its pieces' (3dtrees ticket 109: one volume per tree); with its covariance from the chain's joint
+/// covariance (`Cov(x_j, x_i) = -Y_j Cov(x_{j-1}, x_i)` below the diagonal), log R's linearised (each piece's weight
+/// its share of the row's area).
 fn row_line(sol: &Solved, k0: usize, k1: usize, len: f64, pl: f64) -> (Vector5<f64>, Matrix5<f64>) {
     let m = k1 - k0;
     let mut a = vec![Matrix5::<f64>::zeros(); m];
@@ -2348,10 +2350,13 @@ fn row_line(sol: &Solved, k0: usize, k1: usize, len: f64, pl: f64) -> (Vector5<f
         a[m - 1][(2 + i, i)] += 1.0 / len;
         a[m - 1][(2 + i, 2 + i)] += 0.5 * pl / len;
     }
-    for aj in a.iter_mut() {
-        aj[(4, 4)] = 1.0 / m as f64;
+    let area: Vec<f64> = (k0..k1).map(|k| (2.0 * sol.x[k][4]).exp()).collect();
+    let total: f64 = area.iter().sum();
+    for (aj, s) in a.iter_mut().zip(&area) {
+        aj[(4, 4)] = s / total;
     }
-    let x = (0..m).map(|j| a[j] * sol.x[k0 + j]).sum();
+    let mut x: Vector5<f64> = (0..m).map(|j| a[j] * sol.x[k0 + j]).sum();
+    x[4] = 0.5 * (total / m as f64).ln();
     let mut c: Vec<Vec<Matrix5<f64>>> = vec![Vec::with_capacity(m); m];
     let mut cov = Matrix5::zeros();
     for j in 0..m {
@@ -2717,6 +2722,9 @@ mod tests {
         assert!((f.r_row[0] - 0.05).abs() < 0.0025 && (f.r[0] - 0.05).abs() < 0.0025, "R {} {}", f.r_row[0], f.r[0]);
         // the row runs from its first piece's start to its last's end
         assert!((0..3).all(|i| (f.a[0][i] - q.a[0][i]).abs() < 1e-9 && (f.b[0][i] - q.b[6][i]).abs() < 1e-9));
+        // and its volume is its pieces'
+        let area: f64 = q.r.iter().map(|r| r * r).sum::<f64>() / 7.0;
+        assert!((f.r[0] * f.r[0] - area).abs() < 1e-12 * area, "{} against {}", f.r[0], area.sqrt());
         // an opaque bark-free stem is wood, at the most one scan can say, and lifts the unseen pieces it carries on from
         let pp = PriorParams::default();
         assert!(seen.iter().all(|&j| q.log_odds[j] > like().exist_scale * LLR_CLIP - 1e-9 && q.p_wood[j] > 0.75) && q.p_wood.iter().all(|&p| p > pp.exist), "log odds {:?} p_wood {:?}", q.log_odds, q.p_wood);
