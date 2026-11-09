@@ -56,7 +56,7 @@ def test_separated_stems_upright_and_leaning_are_measured(tmp_path):
         # the lean, along the row's frame, against the truth's
         t = f["lean"][k] @ np.c_[f["e1"][k], f["e2"][k]].T
         assert np.allclose(t[:2], lean[k], atol=0.01), (k, t, lean[k])
-    assert (f["sd_log_r"] < 0.2 * PARAMS.widen).all() and (np.isnan(f["chi2"]) | (f["chi2"] < 9)).all() and (f["chi2_front"] < 9).all()
+    assert (f["sd_log_r"] < 0.2 * 2.1).all() and (np.isnan(f["chi2"]) | (f["chi2"] < 9)).all() and (f["chi2_front"] < 9).all()
     # seen from three sides, every edge: no diagnostic, and the rows' own data say most of their radii
     assert (f["diag"] & (SupportDiag.ONE_SIDED | SupportDiag.SHADOWED | SupportDiag.TUBE_EDGE)).sum() == 0, f["diag"]
     assert (f["data_share"] > 0.5).all() and (f["data_share"] <= 1).all() and (f["deleted"] == 0).all(), f["data_share"]

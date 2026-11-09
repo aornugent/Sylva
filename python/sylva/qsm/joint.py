@@ -46,8 +46,7 @@ The parameters are a :class:`JointParams`, whose fields are:
   (existence along a branch: a base piece is wood with ``exist``, one after a
   piece that isn't with ``exist_off``), ``dh`` (the site's largest stem D/H:
   no radius the rays don't measure is wider than ``dh`` times its reach to the
-  tips over 2; 0 for no cap) and ``widen`` (the factor its posterior sds of
-  log R are widened by, calibrated against the refit's circles);
+  tips over 2; 0 for no cap);
 - the prior: ``lam_prior`` and ``lam_sd`` (foliage's median, 1/m, and log
   sd), ``sig_ell`` (its random walk), ``sig_eta`` (the taper's random walk per
   sqrt(m)), ``mu_fork`` and ``sig_fork`` (soft Leonardo's log area ratio and
@@ -121,7 +120,6 @@ class JointParams:
     exist: float = _DEFAULTS["exist"]
     exist_off: float = _DEFAULTS["exist_off"]
     dh: float = _DEFAULTS["dh"]
-    widen: float = _DEFAULTS["widen"]
     #: Newton iterations per continuation stage at most, and the stopping tolerance.
     iters: int = _DEFAULTS["iters"]
     tol: float = _DEFAULTS["tol"]
@@ -321,7 +319,9 @@ def support_tree(scans, a, b, r_prior, parent, context=None, params: JointParams
 
     The tree's volume is its pieces' (a routed piece's further stems aside): at their posterior R, split by how each is
     known (:class:`SupportBasis`), and as an interval from 1,000 draws of the tree's joint posterior (the solve's
-    exact covariance, its sds ``widen`` times wider, each draw held inside its piece's bounds; a fixed seed).
+    exact covariance, each node's sd widened by its basis's factor, each draw held inside its piece's bounds; a fixed
+    seed). The factors are Sylva's calibration (``WIDEN`` in ``support_tree.rs``, learned per basis against Alice
+    Mulga's refit circles), not a setting.
 
     Parameters
     ----------
@@ -337,7 +337,7 @@ def support_tree(scans, a, b, r_prior, parent, context=None, params: JointParams
         :class:`JointParams`: the likelihood's footprint, ``tau``, ``edge``, ``sigma_r``, ``rough`` and ``refl_*``,
         ``stop_wood``, ``stop_leaf``, ``exist_scale``, ``refl_thin`` and ``model_sd``, and the prior's ``sig_eta``,
         ``mu_fork``, ``sig_fork``, ``sig_root``, ``sig_delta``, ``lean_sd``, ``lean_bend``, ``exist``, ``exist_off``,
-        ``centre_rel``, ``centre_abs`` and ``dh``, and ``widen``; the rest are unused.
+        ``centre_rel``, ``centre_abs`` and ``dh``; the rest are unused.
     threads
         Threads to use (0: one per core).
 
@@ -349,8 +349,8 @@ def support_tree(scans, a, b, r_prior, parent, context=None, params: JointParams
 
     - ``a``, ``b`` ``(n, 3)``: the fitted axis, world coordinates (the claim moved by the centre and turned by the
       lean; a row's runs from its first piece's start to its last's end); ``r``, ``sd_log_r``: the radius, held inside
-      its own bounds, and its posterior sd in log, ``widen`` times the solve's (a row's: the mean of its pieces' log
-      R);
+      its own bounds, and its posterior sd in log, the solve's widened by its basis's factor (a row's: the mean of its
+      pieces' log R);
     - ``centre``, ``sd_centre``, ``lean``, ``sd_lean`` ``(n, 2)``: the centre at the middle (m) and the lean (m per
       m of axis) along ``e1``, ``e2`` ``(n, 3)``, with their posterior sds;
     - ``r_row``, ``sd_r_row``: the own summary's radius and its sd (a routed piece's: its exact fit's stem's), NaN
