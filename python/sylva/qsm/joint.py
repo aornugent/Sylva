@@ -228,7 +228,8 @@ SupportRefusal = IntFlag("SupportRefusal", _core.qsm_support_refusals())
 #:   front arc's stops, the capacity floor) enter the tree beside it. A side past the fit's table isn't judged;
 #: - ``SUB_FOOTPRINT``: R below about half the footprint at its range;
 #: - ``TUBE_EDGE``: its own fitted circle reaches the edge of the tube its pulses were taken in: evidence cut off, so
-#:   a piece's own circle there isn't used (a capture or a drift), nor its woody run's span as a lower bound;
+#:   a piece's own circle there isn't used (a capture or a drift), nor, as a lower bound, the span of a woody run the
+#:   circle spans (the captor's; another scan's run keeps its bound);
 #: - ``CONTESTED``: most of its stops are claimed by context or a neighbouring node (``contested``);
 #: - ``REFUTED``: the ray veto refutes its fitted circle: at least 10 pulses pass through it, and passes are at least a
 #:   quarter of its stops and passes (3dtrees research 106; a row's: of its pieces' counts summed);
@@ -294,7 +295,8 @@ def support_tree(scans, a, b, r_prior, parent, context=None, params: JointParams
     most twice the claim and twice the site's cap, and short of the edge of its pieces' tubes). Unless the ray veto
     refutes it (on a tangle it can be another tree's), it measures each of the row's n pieces' R and centre (each
     coordinate) with sd 0.136 R sqrt(n) (0.136 in log R, the refit circles' noise, shared by the n pieces), its
-    pieces' bounds beside it, and isn't capped (``POINTS``).
+    pieces' upper bounds beside it (the lower bound and capacity floor its own stops gave it replaces), and isn't
+    capped (``POINTS``).
 
     A ``RUNS`` or ``HULL`` piece is fitted by the exact likelihood, seeded from its runs (3dtrees research 93 §18):
     each scan's runs, found slice by slice along the piece, measured as circles with their own centre, lean and
@@ -353,7 +355,8 @@ def support_tree(scans, a, b, r_prior, parent, context=None, params: JointParams
     - ``a``, ``b`` ``(n, 3)``: the fitted axis, world coordinates (the claim moved by the centre and turned by the
       lean; a row's runs from its first piece's start to its last's end); ``r``, ``sd_log_r``: the radius, held inside
       its own bounds, and its posterior sd in log, the solve's widened by its basis's factor (a row's: its pieces' root
-      mean square R, so its volume is theirs);
+      mean square R, so its volume is theirs, and the sd of its log from the chain's joint covariance, each piece
+      widened by its own basis's factor);
     - ``centre``, ``sd_centre``, ``lean``, ``sd_lean`` ``(n, 2)``: the centre at the middle (m) and the lean (m per
       m of axis) along ``e1``, ``e2`` ``(n, 3)``, with their posterior sds;
     - ``r_row``, ``sd_r_row``: the own summary's radius and its sd (a routed piece's: its exact fit's stem's), NaN
