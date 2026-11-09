@@ -224,7 +224,9 @@ pub mod diag {
     /// R below about half the footprint at its range ([`super::SUB_W`]): the edges are the beam's, not the wood's.
     pub const SUB_FOOTPRINT: u16 = 4;
     /// Its own fitted circle reaches within [`super::TUBE_MARGIN`] of the tube its pulses were taken in: evidence
-    /// beyond it is cut off.
+    /// beyond it is cut off. A piece's own circle that does is not used (3dtrees ticket 109: a stem captured by a
+    /// neighbour's or the ground's mass, or drifted onto a leaf clump at the tube's edge): its bounds are; an exact
+    /// stem's is only reported.
     pub const TUBE_EDGE: u16 = 8;
     /// At least [`super::CONTESTED_SHARE`] of its stops are claimed by context or a neighbouring node (`contested`).
     pub const CONTESTED: u16 = 16;
@@ -765,6 +767,8 @@ struct DiagIn {
     one_sided: bool,
     deleted: f64,
     n_ctx: u32,
+    /// Its own circle reached its tube's edge, and wasn't used ([`diag::TUBE_EDGE`]).
+    edge: bool,
 }
 
 impl Summary {
@@ -1463,10 +1467,10 @@ fn summarise_piece(scans: &[&ScanIndex], a: &Point, b: &Point, frame: Frame, r_c
     let log_odds = profiles.iter().map(|q| q.log_odds(r_claim, p)).sum();
     let w = if n_pairs > 0 { median(&mut gs.iter().flat_map(|g| g.recs.iter().map(|r| r.w)).collect::<Vec<_>>()) } else { f64::NAN };
     let deleted = if n_pairs > 0 { gs.iter().map(|g| g.recs.iter().filter(|r| r.lost).count()).sum::<usize>() as f64 / f64::from(n_pairs) } else { f64::NAN };
-    let diag = DiagIn { tube, w, one_sided: one_sided(&gs), deleted, n_ctx: 0 };
+    let diag = DiagIn { tube, w, one_sided: one_sided(&gs), deleted, n_ctx: 0, edge: false };
     let mut out = Summary { outcome: Outcome::Bounded, chi2_front: f64::NAN, n_runs: 0, n_scans: 0, n_pairs, bounds: Vec::new(), log_odds, seeds: Vec::new(), exact: None, seen: Vec::new(),
         shadowed: false, points: None, diag };
-    out.outcome = outcome(&gs, r_claim, p, lean_sd, &mut out);
+    out.outcome = outcome(&gs, r_claim, p, lean_sd, 0.5 * frame.3, &mut out);
     if !matches!(out.outcome, Outcome::Measured(_)) {
         out.bounds = profiles.iter().flat_map(|q| q.bounds(r_claim, p)).collect();
         match profiles.iter().filter_map(|q| q.woody_w(r_claim)).reduce(f64::max) {
@@ -1474,6 +1478,10 @@ fn summarise_piece(scans: &[&ScanIndex], a: &Point, b: &Point, frame: Frame, r_c
             // no woody stop near the claim gives a centre for the passes to straddle: passes through the claim's
             // axis alone bound it (a veto about an axis off the wood would cut real wood: research 106, 103 §20)
             None => out.bounds.extend(veto(&gs, tube)),
+        }
+        if out.diag.edge {
+            // the woody run its refused circle spanned is the captor's: its span says nothing of this piece
+            out.bounds.retain(|b| b.side != Side::Lower);
         }
     }
     if let Outcome::Routed { .. } = out.outcome {
@@ -1506,6 +1514,37 @@ fn point_circle(xy: &[[f64; 2]], r0: f64, believe: f64) -> Option<Vector5<f64>> 
     }
     let arc = bins.iter().filter(|&&b| b).count();
     (cx.hypot(cy) <= r.max(r0) + PTS_SHIFT && rmse <= PTS_RMSE.0 * r + PTS_RMSE.1 && arc >= PTS_ARC).then(|| Vector5::new(cx, cy, 0.0, 0.0, r))
+}
+
+/// The stops in row `k`'s pieces' tubes (their places across its axis) that lie nearer its claimed axis than any
+/// other the tree or its context claims, as the refit took each of RCT's points to its nearest cylinder: a neighbour's
+/// stem or the tree's own next row doesn't lend the row its stops.
+fn own_stops(k: usize, rows: &Rows, context: &[(Point, Point, f64)], nd: &Nodes, sums: &[Summary]) -> Vec<[f64; 2]> {
+    let (k0, k1) = (nd.first[k], nd.first[k + 1]);
+    let reach = sums[k0..k1].iter().map(|s| s.diag.tube).fold(0.0, f64::max);
+    let (a, b) = (rows.a[k], rows.b[k]);
+    let lo: Point = std::array::from_fn(|i| a[i].min(b[i]) - reach);
+    let hi: Point = std::array::from_fn(|i| a[i].max(b[i]) + reach);
+    let others: Vec<(Point, Point)> = rows.a.iter().zip(rows.b).enumerate().filter(|&(j, _)| j != k).map(|(_, (p, q))| (*p, *q))
+        .chain(context.iter().map(|c| (c.0, c.1)))
+        .filter(|(p, q)| (0..3).all(|i| p[i].min(q[i]) <= hi[i] && p[i].max(q[i]) >= lo[i])).collect();
+    let to_axis = |x: &Point, (p, q): &(Point, Point)| {
+        let (pq, px) = (sub(q, p), sub(x, p));
+        let t = (dot(&px, &pq) / dot(&pq, &pq).max(1e-12)).clamp(0.0, 1.0);
+        crate::transform::norm(&sub(&px, &pq.map(|v| v * t)))
+    };
+    let mut out = Vec::new();
+    for j in k0..k1 {
+        let (u, e1, e2, pl) = nd.frame[j];
+        for r in sums[j].seen.iter().flat_map(|g| g.recs.iter()).filter(|r| r.is_stop()) {
+            let x: Point = std::array::from_fn(|i| nd.a[j][i] + (r.s + 0.5 * pl) * u[i] + r.xy[0] * e1[i] + r.xy[1] * e2[i]);
+            let own = to_axis(&x, &(a, b));
+            if others.iter().all(|o| to_axis(&x, o) >= own) {
+                out.push(r.xy);
+            }
+        }
+    }
+    out
 }
 
 /// A point circle `x` as the measurement of one of a row's `pieces` pieces: its centre and R, each of sd [`PTS_SD`] R
@@ -1575,9 +1614,10 @@ fn veto(gs: &[Group], tube: f64) -> Option<Bound> {
     Some(Bound { eta: VETO_MIN.ln() + step * first.saturating_sub(1) as f64, sd: VETO_SD, side: Side::Upper })
 }
 
-/// What becomes of a piece's own summary: porous (pulses, no opaque run), bounded (no circle determined), routed
-/// (several stems or a hull) or measured; recording its runs, scans and front misfit in `out`.
-fn outcome(gs: &[Group], r_claim: f64, p: &JointParams, lean_sd: f64, out: &mut Summary) -> Outcome {
+/// What becomes of a piece's own summary: porous (pulses, no opaque run), bounded (no circle determined, or one that
+/// reaches the edge of its tube, `out.diag.tube`, along its half-length `half`: [`diag::TUBE_EDGE`]), routed (several
+/// stems or a hull) or measured; recording its runs, scans and front misfit in `out`.
+fn outcome(gs: &[Group], r_claim: f64, p: &JointParams, lean_sd: f64, half: f64, out: &mut Summary) -> Outcome {
     // the first pass: each stop by its echo
     let first: Vec<GroupOut> = gs.iter().map(|g| {
         let f: Vec<Fate> = g.recs.iter().map(|r| fate(r, g, None)).collect();
@@ -1644,7 +1684,22 @@ fn outcome(gs: &[Group], r_claim: f64, p: &JointParams, lean_sd: f64, out: &mut 
     let runs = out.n_runs >= 2;
     // (a measured piece's measurements already leave an unseen edge out, so in the tree the prior's centre fills the
     // ridge it leaves; bounding it instead cost its circles, research 93 §20: 0.064 to 0.150 on the bench's 15)
-    if runs || hull { Outcome::Routed { circle: c2, runs, hull } } else { Outcome::Measured(c2) }
+    if runs || hull {
+        Outcome::Routed { circle: c2, runs, hull }
+    } else if reaches_edge(&y, half, out.diag.tube) {
+        // the evidence beyond the tube is cut off: a circle there is a capture or a drift, not a measurement
+        out.diag.edge = true;
+        Outcome::Bounded
+    } else {
+        Outcome::Measured(c2)
+    }
+}
+
+/// Whether the circle `x` (`[c1, c2, t1, t2, R]`) reaches within [`TUBE_MARGIN`] of the `tube` its pulses were taken
+/// in, anywhere along its half-length `half` ([`diag::TUBE_EDGE`]).
+fn reaches_edge(x: &Vector5<f64>, half: f64, tube: f64) -> bool {
+    let reach = [-half, half].iter().map(|&q| (x[0] + q * x[2]).hypot(x[1] + q * x[3])).fold(0.0, f64::max) + x[4];
+    reach > tube - TUBE_MARGIN
 }
 
 /// A routed piece's further stem (3dtrees research 93 §18): the piece it came from and its stem there; and its share
@@ -1845,7 +1900,7 @@ pub fn support_tree(scans: &[&ScanIndex], rows: &Rows, context: &[(Point, Point,
         if rows.r_prior[k] < PTS_R_MIN || (k0..k1).any(|j| sums[j].own().is_some()) {
             continue;
         }
-        let xy: Vec<[f64; 2]> = (k0..k1).flat_map(|j| sums[j].seen.iter().flat_map(|g| g.recs.iter().filter(|r| r.is_stop()).map(|r| r.xy))).collect();
+        let xy = own_stops(k, rows, context, &nd, &sums);
         let Some(x) = point_circle(&xy, rows.r_prior[k], PTS_BELIEVE * caps[k0].exp()) else { continue };
         r_points[k0..k1].fill(x[4]);
         if !refuted((k0..k1).map(|j| tally(&sums[j].seen, &x)).fold((0, 0), |a, q| (a.0 + q.0, a.1 + q.1))) {
@@ -2149,11 +2204,8 @@ fn diagnose(s: &Summary, r: f64, var_eta: f64, site_tau: f64, half: f64, (seen, 
     let own = s.used().map_or(0.0, |c| info_r(&(c.st.info / c.inflate())) * r * r);
     let data_share = if site_tau < 0.0 { f64::NAN } else { ((own + site_tau) * var_eta).clamp(0.0, 1.0) };
     // how far its own circle reaches from the claim's axis (over its length), against the tube its pulses came from
-    let tube_edge = s.used().is_some_and(|c| {
-        let x = &c.x;
-        let reach = [-half, half].iter().map(|&q| (x[0] + q * x[2]).hypot(x[1] + q * x[3])).fold(0.0, f64::max) + x[4];
-        reach > d.tube - TUBE_MARGIN
-    });
+    // (a piece's own circle that reached it wasn't used)
+    let tube_edge = d.edge || s.used().is_some_and(|c| reaches_edge(&c.x, half, d.tube));
     let bits = [
         (d.one_sided, diag::ONE_SIDED),
         (s.shadowed, diag::SHADOWED),
@@ -2699,7 +2751,7 @@ mod tests {
 
     fn summary(outcome: Outcome, bounds: Vec<Bound>) -> Summary {
         Summary { outcome, chi2_front: f64::NAN, n_runs: 1, n_scans: 1, n_pairs: 100, bounds, log_odds: 0.0, seeds: Vec::new(), exact: None, seen: Vec::new(), shadowed: false, points: None,
-            diag: DiagIn { tube: 0.1, w: 0.005, one_sided: false, deleted: 0.0, n_ctx: 0 } }
+            diag: DiagIn { tube: 0.1, w: 0.005, one_sided: false, deleted: 0.0, n_ctx: 0, edge: false } }
     }
 
     #[test]
@@ -3352,6 +3404,56 @@ mod tests {
         let mut leafy = arc_stops([0.0, 0.0], 0.03, (-90.0, 90.0), 20, 0.0);
         leafy.extend((0..60).map(|i| [0.3 * ((i * 37 % 61) as f64 / 61.0 - 0.5), 0.3 * ((i * 53 % 59) as f64 / 59.0 - 0.5)]));
         assert!(point_circle(&leafy, 0.05, f64::NAN).is_none());
+    }
+
+    #[test]
+    fn a_circle_at_the_tubes_edge_is_not_a_measurement() {
+        // the fan's 5 cm stem, claimed 1 cm off it as itself (the circle well inside its 15.5 cm tube) and as a 5 mm
+        // twig 10 cm long (the stem reaches past its 6.5 cm tube: a twig captured by a neighbouring mass, research 106)
+        let (scan, _, _) = crate::qsm::evidence::tests::scene(0.05, true);
+        let piece = |r: f64, len: f64| {
+            let rows = Rows { a: &[[0.01, 5.0, -0.5 * len]], b: &[[0.01, 5.0, 0.5 * len]], r_prior: &[r], r_max: &[], parent: &[-1] };
+            support_tree(&[&scan], &rows, &[], &like(), &PriorParams::default(), 2).unwrap()
+        };
+        let near = piece(0.05, 0.3);
+        assert!(near.pieces.flags[0] == 0 && near.pieces.diag[0] & diag::TUBE_EDGE == 0 && (near.pieces.r_row[0] - 0.05).abs() < 0.003, "{:?}", near.pieces);
+        let far = piece(0.005, 0.1);
+        let q = &far.pieces;
+        assert!(q.flags[0] == flag::BOUNDS && q.diag[0] & diag::TUBE_EDGE != 0 && q.r_row[0].is_nan() && q.basis[0] != basis::MEASURED,
+            "flags {} diag {} r_row {} basis {}", q.flags[0], q.diag[0], q.r_row[0], q.basis[0]);
+        // nor is the captor's span a lower bound on it
+        assert!(q.r_lo[0].is_nan() && q.r[0] < 0.02, "r_lo {} r {}", q.r_lo[0], q.r[0]);
+        assert!(reaches_edge(&Vector5::new(0.07, 0.0, 0.0, 0.0, 0.05), 0.15, 0.115) && !reaches_edge(&Vector5::new(0.01, 0.0, 0.0, 0.0, 0.05), 0.15, 0.115));
+        // a lean carries a circle to the edge at its ends
+        assert!(reaches_edge(&Vector5::new(0.0, 0.0, 0.3, 0.0, 0.05), 0.15, 0.1));
+    }
+
+    #[test]
+    fn a_rows_point_circle_takes_only_the_stops_nearest_its_own_axis() {
+        // two upright rows 8 cm apart; stops ring a 3 cm stem about the second's axis, inside the first's tube too:
+        // the first row's point circle takes none of them, nor those nearer a context cylinder
+        let ra = [[0.0, 0.0, 0.0], [0.08, 0.0, 0.0]];
+        let rb = [[0.0, 0.0, 0.3], [0.08, 0.0, 0.3]];
+        let rows = Rows { a: &ra, b: &rb, r_prior: &[0.03, 0.03], r_max: &[], parent: &[-1, -1] };
+        let fr = frames(&ra, &rb);
+        let nd = Nodes::of(&rows, &fr);
+        let (_, e1, e2, _) = fr[0];
+        let stop = |x: f64, y: f64| {
+            // a stop at world (x, y) and mid-height, as the first row's piece sees it
+            let xy = [x * e1[0] + y * e1[1], x * e2[0] + y * e2[1]];
+            Rec { b: 0.0, s: 0.0, depth: 0.0, xy, w: 0.005, refl: f64::NAN, single: true, blocked: false, lost: false, pulse: 0, echo: 0 }
+        };
+        let ring = |cx: f64, n: usize| (0..n).map(move |i| {
+            let t = i as f64 / n as f64 * std::f64::consts::TAU;
+            (cx + 0.03 * t.cos(), 0.03 * t.sin())
+        });
+        let recs: Vec<Rec> = ring(0.08, 24).chain(ring(0.0, 12)).map(|(x, y)| stop(x, y)).collect();
+        let mut sums = vec![summary(Outcome::Bounded, Vec::new()), summary(Outcome::Bounded, Vec::new())];
+        sums[0].seen = vec![Group { scan: 0, n: [1.0, 0.0], v: [0.0, 1.0], recs }];
+        assert_eq!(own_stops(0, &rows, &[], &nd, &sums).len(), 12);
+        // a context stem 3.1 cm beside the first row's axis takes the quarter of its ring nearer its own
+        let ctx = [([-0.031, 0.0, 0.0], [-0.031, 0.0, 0.3], 0.03)];
+        assert_eq!(own_stops(0, &rows, &ctx, &nd, &sums).len(), 9);
     }
 
     #[test]
