@@ -756,7 +756,7 @@ fn qsm_support_diags() -> Vec<(&'static str, u16)> {
 #[pyfunction]
 fn qsm_support_bases() -> Vec<(&'static str, u8)> {
     use support_tree::basis::*;
-    vec![("MEASURED", MEASURED), ("BOUNDED", BOUNDED), ("PRIOR", PRIOR), ("CAPPED", CAPPED)]
+    vec![("MEASURED", MEASURED), ("POINTS", POINTS), ("BOUNDED", BOUNDED), ("PRIOR", PRIOR), ("CAPPED", CAPPED)]
 }
 
 /// A support fit's rows or pieces as a dict of arrays.
@@ -773,7 +773,7 @@ fn support_fit<'py>(py: Python<'py>, f: support_tree::Fit) -> PyResult<Bound<'py
     d.set_item("sd_centre", two(&f.sd_centre)?)?;
     d.set_item("lean", two(&f.lean)?)?;
     d.set_item("sd_lean", two(&f.sd_lean)?)?;
-    for (k, v) in [("r", f.r), ("sd_log_r", f.sd_log_r), ("r_row", f.r_row), ("sd_r_row", f.sd_r_row), ("chi2", f.chi2), ("chi2_front", f.chi2_front), ("r_lo", f.r_lo), ("r_hi", f.r_hi), ("r_floor", f.r_floor), ("log_odds", f.log_odds), ("p_wood", f.p_wood), ("lam", f.lam), ("data_share", f.data_share), ("contested", f.contested), ("deleted", f.deleted), ("r_cap", f.r_cap), ("pass_share", f.pass_share)] {
+    for (k, v) in [("r", f.r), ("sd_log_r", f.sd_log_r), ("r_row", f.r_row), ("sd_r_row", f.sd_r_row), ("chi2", f.chi2), ("chi2_front", f.chi2_front), ("r_lo", f.r_lo), ("r_hi", f.r_hi), ("r_floor", f.r_floor), ("log_odds", f.log_odds), ("p_wood", f.p_wood), ("lam", f.lam), ("data_share", f.data_share), ("contested", f.contested), ("deleted", f.deleted), ("r_cap", f.r_cap), ("pass_share", f.pass_share), ("r_points", f.r_points)] {
         d.set_item(k, v.into_pyarray(py))?;
     }
     d.set_item("diag", f.diag.into_pyarray(py))?;
@@ -821,7 +821,7 @@ fn qsm_support_tree<'py>(py: Python<'py>, scans: Vec<Bound<'py, PyScanIndex>>, a
     d.set_item("echoes", echoes_to_py(py, f.echoes)?)?;
     let v = f.volume;
     let volume = PyDict::new(py);
-    for (k, x) in [("point", v.point), ("mean", v.mean), ("q05", v.q05), ("q95", v.q95), ("measured", v.measured), ("bounded", v.bounded), ("prior", v.prior), ("capped", v.capped)] {
+    for (k, x) in [("point", v.point), ("mean", v.mean), ("q05", v.q05), ("q95", v.q95), ("measured", v.measured), ("points", v.points), ("bounded", v.bounded), ("prior", v.prior), ("capped", v.capped)] {
         volume.set_item(k, x)?;
     }
     d.set_item("volume", volume)?;

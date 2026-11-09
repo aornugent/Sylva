@@ -239,7 +239,8 @@ SupportRefusal = IntFlag("SupportRefusal", _core.qsm_support_refusals())
 SupportDiag = IntFlag("SupportDiag", _core.qsm_support_diags())
 
 #: How a node's radius is known (:func:`support_tree`'s ``basis``; a row's: most of its pieces', the less known on a
-#: tie): ``MEASURED`` (its own circle, or an exact stem's message, not ``SHADOWED``), ``BOUNDED`` (its own bounds give
+#: tie): ``MEASURED`` (its own circle, or an exact stem's message, not ``SHADOWED``), ``POINTS`` (its row's point
+#: circle: the rays gave it no circle of its own), ``BOUNDED`` (its own bounds give
 #: at least 0.1 of its precision, ``data_share``, and it isn't pinned), ``PRIOR`` (the prior's, given the rest of the
 #: tree, or pinned to its own bound) and ``CAPPED`` (on the site's cap). Its tree's volume is split by them.
 SupportBasis = IntEnum("SupportBasis", _core.qsm_support_bases())
@@ -286,6 +287,13 @@ def support_tree(scans, a, b, r_prior, parent, context=None, params: JointParams
     between a row's pieces, the centre's anchor and a weak anchor of the lean; no tip anchor). A posterior is then held
     inside its own bounds (between the tightest lower and upper, the upper where they cross), and says where it sits
     on them (``PINNED``).
+
+    Point evidence (3dtrees ticket 109): a row none of whose pieces has a circle of its own gets one from the stops
+    in its pieces' tubes, placed across its axis, as the refit fitted RCT's points (RANSAC, least squares on its
+    inliers, and the refit's tests: at least 12 stops on a claim of at least 1 cm, half of them on it, filling 120
+    degrees of it, its centre near the axis, at most twice the claim and twice the site's cap). Unless the ray veto
+    refutes it (on a tangle it can be another tree's), it measures each of the row's pieces' centre and R with sd
+    0.136 in log R (times the root of the pieces), its pieces' bounds beside it, and isn't capped (``POINTS``).
 
     A ``RUNS`` or ``HULL`` piece is fitted by the exact likelihood, seeded from its runs (3dtrees research 93 §18):
     each scan's runs, found slice by slice along the piece, measured as circles with their own centre, lean and
@@ -354,7 +362,8 @@ def support_tree(scans, a, b, r_prior, parent, context=None, params: JointParams
       a woody run, or through the claim: the veto), and the capacity floor ``tau w / 2`` (which says only that
       something was hit), on a piece that isn't measured, else NaN (they enter the tree where no circle does, a
       routed piece's without its detection bound; a row's: its pieces' widest); ``r_cap``, the site's cap on it (NaN
-      without ``dh``, or where it is measured; a row's: its first piece's);
+      without ``dh``, or where a circle measures it; a row's: its first piece's); ``r_points``, its row's point
+      circle's radius, NaN where none passed its tests (it entered unless the veto refuted it: ``basis`` says so);
     - ``n_pass``, ``pass_share``: the ray veto's audit of its fitted circle, the pulses passing through it and their
       share of its stops and passes (NaN with none; a row's: its pieces' summed), ``REFUTED`` where they refute it;
     - ``basis`` (:class:`SupportBasis`): how its radius is known;
@@ -378,7 +387,7 @@ def support_tree(scans, a, b, r_prior, parent, context=None, params: JointParams
 
     and per tree ``converged``, whether the censored solve settled; ``volume``, a dict of m^3: ``point`` (at each
     piece's posterior R), ``mean``, ``q05`` and ``q95`` (of the draws), and the point by basis, ``measured``,
-    ``bounded``, ``prior`` and ``capped``; and ``echoes``, one record per stop of the tree
+    ``points``, ``bounded``, ``prior`` and ``capped``; and ``echoes``, one record per stop of the tree
     (of an echo several pieces saw, the one whose surface it lies nearest), keyed as the tile sidecars are: ``scan``
     (an index into ``scans``), ``pulse`` (the pulse's row in its Shots file), ``echo`` (its place in the pulse);
     with ``p_wood`` (the chance it is wood's echo), ``node`` (its piece or stem, in ``pieces``), ``path``

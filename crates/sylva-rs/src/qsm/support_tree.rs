@@ -110,10 +110,20 @@
 //!   [`VETO_PASSES`] passes through it, a share [`VETO_SHARE`] of its stops and
 //!   passes). Every node's fitted circle is audited the same way (`n_pass`,
 //!   `pass_share`, [`diag::REFUTED`]).
+//! - **Point evidence** (3dtrees ticket 109, research 111): a row none of
+//!   whose pieces has a circle of its own gets one from the stops in its
+//!   pieces' tubes, placed across its axis, as the refit fitted RCT's points
+//!   ([`point_circle`]: RANSAC, least squares on its inliers, and the refit's
+//!   tests of inliers, arc, misfit, shift and width, and at most
+//!   [`PTS_BELIEVE`] times the site's cap). Unless the ray veto refutes it (on
+//!   a tangle a circle can be another tree's), it measures each of the row's
+//!   pieces' centre and R with sd [`PTS_SD`] in log R (times the root of the
+//!   pieces: one circle, not one per piece), and the pieces' bounds enter
+//!   beside it ([`basis::POINTS`]).
 //! - **The site's cap** (`PriorParams::dh`, 3dtrees research 62, 106
-//!   `uncertain.md`): after the solve, every node whose own circle doesn't
-//!   enter has R at most `dh` times its reach to the tips over 2, applied to
-//!   that node alone (its point and its volume's draws), never in the solve:
+//!   `uncertain.md`): after the solve, every node into which no circle
+//!   enters (its own or its row's point circle) has R at most `dh` times its
+//!   reach to the tips over 2, applied to that node alone (its point and its volume's draws), never in the solve:
 //!   it is a stem-scale rule, no true bound on a short-reach twig, so it must
 //!   not carry down the tree's chain.
 //! - **Held inside its bounds:** a posterior that the soft terms leave outside
@@ -162,6 +172,7 @@ use crate::qsm::evidence::ScanIndex;
 use crate::qsm::joint::{log_ndtr_value, path, pool, window, Echoes, JointParams};
 use crate::qsm::joint_fit::{ForkShare, Frame, PriorParams, Rows};
 use crate::transform::{cross, dot, sub};
+use crate::trees::{fit_circle_ransac, RansacCircleParams};
 use crate::Point;
 
 mod routed;
@@ -234,12 +245,14 @@ pub mod diag {
 pub mod basis {
     /// Its own circle, or an exact stem's message, that isn't [`super::diag::SHADOWED`].
     pub const MEASURED: u8 = 1;
+    /// Its row's point circle ([`super::point_circle`]): the rays gave it no circle of its own.
+    pub const POINTS: u8 = 2;
     /// Its own bounds give at least [`super::BOUNDED_SHARE`] of its precision (`data_share`), and it isn't pinned.
-    pub const BOUNDED: u8 = 2;
+    pub const BOUNDED: u8 = 3;
     /// The prior's, given the rest of the tree: too little of its own data, or pinned to a bound of its own.
-    pub const PRIOR: u8 = 3;
+    pub const PRIOR: u8 = 4;
     /// The site's cap ([`super::diag::CAPPED`]).
-    pub const CAPPED: u8 = 4;
+    pub const CAPPED: u8 = 5;
 }
 
 /// [`diag::ONE_SIDED`]: one scan's share of a piece's informative pulses (90 %: the rest can't check it), or the
@@ -285,6 +298,27 @@ const VETO_STEP: f64 = 0.05;
 /// [`basis::BOUNDED`]: the least `data_share` of a node whose bounds say something (3dtrees research 106
 /// `uncertain.md`: the posterior's interval covers the refit's circles as well from there as on measured rows).
 const BOUNDED_SHARE: f64 = 0.1;
+/// Point evidence ([`point_circle`], 3dtrees research 111), with the refit's settings (3dtrees research 52, 62): a row
+/// claimed at least [`PTS_R_MIN`] (m) wide with at least [`PTS_MIN`] stops; RANSAC's inlier band `PTS_BAND_SHARE` of
+/// the claim, between [`PTS_BAND_MIN`] and [`PTS_BAND`] (m: a band growing with a fat claim lets a wide circle through
+/// a few scattered stems confirm it); at least [`PTS_INLIERS`] of the stops on it, filling [`PTS_ARC`] of the 36
+/// ten-degree bins about it (120 degrees: three thin stems about a vase aren't one circle), their rms distance from
+/// it at most `PTS_RMSE.0 R + PTS_RMSE.1`, its centre within the wider of R and the claim plus [`PTS_SHIFT`] of the
+/// axis, and R at most [`PTS_GROW`] times the claim and [`PTS_BELIEVE`] times the site's cap (a wide circle through
+/// a bush of thin stems passes every other test). Its noise, [`PTS_SD`] in log R, is the refit circles' (3dtrees
+/// research 93 §19).
+const PTS_R_MIN: f64 = 0.01;
+const PTS_MIN: usize = 12;
+const PTS_BAND_SHARE: f64 = 0.25;
+const PTS_BAND_MIN: f64 = 0.003;
+const PTS_BAND: f64 = 0.02;
+const PTS_INLIERS: f64 = 0.5;
+const PTS_ARC: usize = 12;
+const PTS_RMSE: (f64, f64) = (0.35, 0.002);
+const PTS_SHIFT: f64 = 0.02;
+const PTS_GROW: f64 = 2.0;
+const PTS_BELIEVE: f64 = 2.0;
+const PTS_SD: f64 = 0.136;
 /// The draws of a tree's volume from its joint posterior ([`Volume`]): its 5th and 95th percentiles to about a tenth
 /// of the interval's log width (one standard error), at ~25 ms for a tree of 300 pieces.
 const VOLUME_DRAWS: usize = 1000;
@@ -486,7 +520,7 @@ pub struct Fit {
     pub contested: Vec<f64>,
     pub deleted: Vec<f64>,
     /// The site's D/H cap on R (`PriorParams::dh` times the reach from its start to the tips over 2; NaN without a
-    /// cap, or where its own data measure it; a row's: its first piece's, the widest).
+    /// cap, or where a circle, its own or its row's point circle, measures it; a row's: its first piece's, the widest).
     pub r_cap: Vec<f64>,
     /// The ray veto's audit of its fitted circle: the pulses that pass through it, and their share of its stops and
     /// passes (NaN with none; a row's: its pieces' summed). [`diag::REFUTED`] says where they refute it.
@@ -494,6 +528,9 @@ pub struct Fit {
     pub pass_share: Vec<f64>,
     /// How its radius is known ([`basis`]).
     pub basis: Vec<u8>,
+    /// Its row's point circle's radius ([`point_circle`]), NaN where none passed its tests (it entered unless the veto
+    /// refuted it: [`basis::POINTS`] says so).
+    pub r_points: Vec<f64>,
 }
 
 /// A tree's volume (m^3), over its pieces (the served wood: a routed piece's further stems aside): the point, from
@@ -507,6 +544,7 @@ pub struct Volume {
     pub q05: f64,
     pub q95: f64,
     pub measured: f64,
+    pub points: f64,
     pub bounded: f64,
     pub prior: f64,
     pub capped: f64,
@@ -538,6 +576,8 @@ struct Rec {
     b: f64,
     s: f64,
     depth: f64,
+    /// Its stop's place across the axis (along `e1, e2`; NaN: no stop in the tube).
+    xy: [f64; 2],
     w: f64,
     refl: f64,
     single: bool,
@@ -692,6 +732,9 @@ struct Summary {
     /// An exact stem whose radius the sides its scans see leave undetermined (research 93 §20): its message says
     /// nothing along what they leave free, and its own bounds (in `bounds`) enter the tree with it.
     shadowed: bool,
+    /// Its row's point circle, where the rays gave none of its pieces a circle of their own and the veto doesn't
+    /// refute it ([`point_circle`]): it enters the tree with the piece's bounds beside it.
+    points: Option<Circle>,
     diag: DiagIn,
 }
 
@@ -709,12 +752,22 @@ struct DiagIn {
 }
 
 impl Summary {
-    /// The circle, where the piece's summary enters the tree: its own, or the exact fit's of a routed piece.
-    fn used(&self) -> Option<&Circle> {
+    /// The circle of its own pulses, where one enters the tree: its summary's, or the exact fit's of a routed piece.
+    fn own(&self) -> Option<&Circle> {
         match &self.outcome {
             Outcome::Measured(c) => Some(c),
             _ => self.exact.as_ref(),
         }
+    }
+
+    /// The circle that enters the tree: its own, or its row's point circle.
+    fn used(&self) -> Option<&Circle> {
+        self.own().or(self.points.as_ref())
+    }
+
+    /// Whether its bounds enter the tree: no circle of its own, or one that leaves its radius undetermined.
+    fn bounded(&self) -> bool {
+        self.own().is_none() || self.shadowed
     }
 }
 
@@ -805,10 +858,12 @@ fn groups(scans: &[&ScanIndex], a: &Point, b: &Point, frame: Frame, tube: f64, p
                 Some(i) => (((echoes[i] as f64) - t) * sin, sc.character(pulse, i as u32).0),
                 None => (f64::NAN, f64::NAN),
             };
-            ns.push([dot(&n, &e1), dot(&n, &e2)]);
-            vs.push([dot(&v, &e1), dot(&v, &e2)]);
+            let (nn, vv) = ([dot(&n, &e1), dot(&n, &e2)], [dot(&v, &e1), dot(&v, &e2)]);
+            ns.push(nn);
+            vs.push(vv);
             let echo = first.map_or(u8::MAX, |i| i.min(254) as u8);
-            recs.push(Rec { b: bimp, s: s_ax - 0.5 * len, depth, w: p.footprint(t), refl, single: echoes.len() == 1, blocked, lost: sc.lost_echoes(pulse), pulse, echo });
+            let xy = [bimp * nn[0] + depth * vv[0], bimp * nn[1] + depth * vv[1]];
+            recs.push(Rec { b: bimp, s: s_ax - 0.5 * len, depth, xy, w: p.footprint(t), refl, single: echoes.len() == 1, blocked, lost: sc.lost_echoes(pulse), pulse, echo });
         });
         if recs.is_empty() {
             continue;
@@ -1394,7 +1449,7 @@ fn summarise_piece(scans: &[&ScanIndex], a: &Point, b: &Point, frame: Frame, r_c
     let deleted = if n_pairs > 0 { gs.iter().map(|g| g.recs.iter().filter(|r| r.lost).count()).sum::<usize>() as f64 / f64::from(n_pairs) } else { f64::NAN };
     let diag = DiagIn { tube, w, one_sided: one_sided(&gs), deleted, n_ctx: 0 };
     let mut out = Summary { outcome: Outcome::Bounded, chi2_front: f64::NAN, n_runs: 0, n_scans: 0, n_pairs, bounds: Vec::new(), log_odds, seeds: Vec::new(), exact: None, seen: Vec::new(),
-        shadowed: false, diag };
+        shadowed: false, points: None, diag };
     out.outcome = outcome(&gs, r_claim, p, lean_sd, &mut out);
     if !matches!(out.outcome, Outcome::Measured(_)) {
         out.bounds = profiles.iter().flat_map(|q| q.bounds(r_claim, p)).collect();
@@ -1412,6 +1467,37 @@ fn summarise_piece(scans: &[&ScanIndex], a: &Point, b: &Point, frame: Frame, r_c
     // come from its exact fit, where it has one), and with the passes, for the veto's audit of the fitted circle
     out.seen = gs.into_iter().map(|g| Group { recs: g.recs.into_iter().filter(|r| !r.blocked).collect(), ..g }).collect();
     out
+}
+
+/// A row's point circle (3dtrees research 111: the refit's measurement, research 52 and 62), `[c1, c2, 0, 0, R]`: RANSAC
+/// on its stops' places across its axis `xy`, then least squares on the inliers, accepted on the tests of
+/// [`PTS_R_MIN`] and after for a row claimed `r0` wide whose circle may be at most `believe` wide (m; NaN: no cap).
+fn point_circle(xy: &[[f64; 2]], r0: f64, believe: f64) -> Option<Vector5<f64>> {
+    if xy.len() < PTS_MIN {
+        return None;
+    }
+    let band = (PTS_BAND_SHARE * r0).min(PTS_BAND).max(PTS_BAND_MIN);
+    let ransac = RansacCircleParams { threshold: band, iterations: 200, min_radius: 0.002, max_radius: 1.0, seed: 0 };
+    let (cx, cy, r, inl) = fit_circle_ransac(xy, &ransac).ok()?;
+    let on: Vec<[f64; 2]> = xy.iter().zip(&inl).filter(|q| *q.1).map(|(q, _)| [q[0] - cx, q[1] - cy]).collect();
+    if (on.len() as f64) < PTS_INLIERS * xy.len() as f64 || !(r.is_finite() && r > 0.0) || r > PTS_GROW * r0 || r > believe {
+        return None;
+    }
+    let rmse = (on.iter().map(|q| (q[0].hypot(q[1]) - r).powi(2)).sum::<f64>() / on.len() as f64).sqrt();
+    let mut bins = [false; 36];
+    for q in &on {
+        bins[(((q[1].atan2(q[0]).to_degrees() + 180.0) / 10.0) as usize).min(35)] = true;
+    }
+    let arc = bins.iter().filter(|&&b| b).count();
+    (cx.hypot(cy) <= r.max(r0) + PTS_SHIFT && rmse <= PTS_RMSE.0 * r + PTS_RMSE.1 && arc >= PTS_ARC).then(|| Vector5::new(cx, cy, 0.0, 0.0, r))
+}
+
+/// A point circle `x` as the measurement of one of a row's `pieces` pieces: its centre and R, each of sd [`PTS_SD`] R
+/// times the root of the pieces (one circle, shared by them); the lean unmeasured.
+fn point_measure(x: &Vector5<f64>, pieces: f64) -> Circle {
+    let var = (PTS_SD * x[4]).powi(2) * pieces;
+    let meas: [Meas; 3] = [([1.0, 0.0, 0.0, 0.0, 0.0], x[0], var), ([0.0, 1.0, 0.0, 0.0, 0.0], x[1], var), ([0.0, 0.0, 0.0, 0.0, 1.0], x[4], var)];
+    Circle { st: Stats::of(&meas), x: *x, cov: Matrix5::from_diagonal(&Vector5::new(var, var, UNSEEN_VAR, UNSEEN_VAR, var)), chi2: f64::NAN }
 }
 
 /// The ray veto's tally of a circle `x` (`[c1, c2, t1, t2, R]`, in the piece's frame) against a piece's groups: the
@@ -1664,7 +1750,7 @@ fn enter(k: usize, e: &routed::Exact, nd: &mut Nodes, sums: &mut Vec<Summary>, e
         nd.push_stem(k, s as u32 + 1, from, c.x[4] * c.x[4] / area);
         let p = &sums[k];
         sums.push(Summary { outcome: p.outcome, chi2_front: f64::NAN, n_runs: p.n_runs, n_scans: p.n_scans, n_pairs: 0, bounds: e.shadow[j].clone().unwrap_or_default(),
-            log_odds: p.log_odds, seeds: Vec::new(), exact: Some(*c), seen: Vec::new(), shadowed: e.shadow[j].is_some(), diag: DiagIn { n_ctx: e.n_ctx[j], ..p.diag } });
+            log_odds: p.log_odds, seeds: Vec::new(), exact: Some(*c), seen: Vec::new(), shadowed: e.shadow[j].is_some(), points: None, diag: DiagIn { n_ctx: e.n_ctx[j], ..p.diag } });
         ends.push((end(c), c.x[4]));
     }
     node
@@ -1731,9 +1817,38 @@ pub fn support_tree(scans: &[&ScanIndex], rows: &Rows, context: &[(Point, Point,
         }
     }
 
+    // the site's D/H cap (log R; NaN without one): the widest point circle's ceiling, and after the solve each
+    // unmeasured node's
+    let caps: Vec<f64> = if prior.dh > 0.0 {
+        reach(rows, &fr, &nd).iter().map(|l| (0.5 * prior.dh * l).ln()).collect()
+    } else {
+        vec![f64::NAN; nd.row.len()]
+    };
+    // point evidence: a row none of whose pieces has a circle of its own gets its stops' circle, unless the veto
+    // refutes it (3dtrees research 111: on tangles a circle can be another tree's)
+    let mut r_points = vec![f64::NAN; nd.row.len()];
+    for k in 0..rows.a.len() {
+        let (k0, k1) = (nd.first[k], nd.first[k + 1]);
+        if rows.r_prior[k] < PTS_R_MIN || (k0..k1).any(|j| sums[j].own().is_some()) {
+            continue;
+        }
+        let xy: Vec<[f64; 2]> = (k0..k1).flat_map(|j| sums[j].seen.iter().flat_map(|g| g.recs.iter().filter(|r| r.is_stop()).map(|r| r.xy))).collect();
+        let Some(x) = point_circle(&xy, rows.r_prior[k], PTS_BELIEVE * caps[k0].exp()) else { continue };
+        r_points[k0..k1].fill(x[4]);
+        if !refuted((k0..k1).map(|j| tally(&sums[j].seen, &x)).fold((0, 0), |a, q| (a.0 + q.0, a.1 + q.1))) {
+            let c = point_measure(&x, (k1 - k0) as f64);
+            for s in &mut sums[k0..k1] {
+                s.points = Some(c);
+            }
+        }
+    }
+
     let (mut sol, converged) = tree_solve(rows, &fr, &nd, &sums, prior, EP_ROUNDS)?;
     let (mut held, mut bits) = hold(&terms(&sums), nd.row.len(), &mut sol);
-    let unmeasured: Vec<bool> = sums.iter().map(|s| s.used().is_none() || s.shadowed).collect();
+    // the nodes with no circle of their own (a point circle's among them), and those with none at all, which the cap
+    // holds
+    let unmeasured: Vec<bool> = sums.iter().map(Summary::bounded).collect();
+    let free: Vec<bool> = sums.iter().map(|s| s.bounded() && s.points.is_none()).collect();
     // what the rays don't measure is held under the veto about its own posterior circle too: a woody run's bounds
     // straddle its run, not the circle served (research 106: 17 % of such rows' volume was refuted)
     for k in (0..nd.row.len()).filter(|&k| unmeasured[k]) {
@@ -1743,13 +1858,8 @@ pub fn support_tree(scans: &[&ScanIndex], rows: &Rows, context: &[(Point, Point,
             bits[k] |= diag::PINNED;
         }
     }
-    // the site's D/H cap (log R; NaN without one), after the solve, on each unmeasured node alone
-    let caps: Vec<f64> = if prior.dh > 0.0 {
-        reach(rows, &fr, &nd).iter().map(|l| (0.5 * prior.dh * l).ln()).collect()
-    } else {
-        vec![f64::NAN; nd.row.len()]
-    };
-    cap(&caps, &unmeasured, &mut sol, &mut held, &mut bits);
+    // the cap, after the solve, on each node with no circle at all, alone
+    cap(&caps, &free, &mut sol, &mut held, &mut bits);
     let p_wood = existence(&nd.parent, &sums.iter().map(|s| s.log_odds).collect::<Vec<_>>(), prior);
     // the classification on the support path: each stop by its piece's circle (its own, or the tree's) and its echo
     for (k, s) in sums.iter().enumerate().filter(|(_, s)| s.exact.is_none()) {
@@ -1793,7 +1903,7 @@ pub fn support_tree(scans: &[&ScanIndex], rows: &Rows, context: &[(Point, Point,
     for (k, s) in sums.iter().enumerate() {
         let (diag, data_share, contested) = diagnose(s, sol.x[k][4].exp(), sol.cov[k][(4, 4)], sol.site_tau[k], 0.5 * nd.frame[k].3, (seen_stops[k], kept_stops[k]));
         let diag = diag | bits[k] | if refuted(audit[k]) { diag::REFUTED } else { 0 };
-        let measured = s.used().is_some() && !s.shadowed;
+        let measured = !s.bounded();
         let own = Own {
             diag,
             data_share,
@@ -1806,7 +1916,7 @@ pub fn support_tree(scans: &[&ScanIndex], rows: &Rows, context: &[(Point, Point,
             r_lo: bound(s, Side::Lower),
             r_hi: bound(s, Side::Upper),
             r_floor: bound(s, Side::Floor),
-            r_cap: if unmeasured[k] { caps[k].exp() } else { f64::NAN },
+            r_cap: if free[k] { caps[k].exp() } else { f64::NAN },
             log_odds: s.log_odds,
             p_wood: p_wood[k],
             flags: s.outcome.flags(),
@@ -1816,8 +1926,11 @@ pub fn support_tree(scans: &[&ScanIndex], rows: &Rows, context: &[(Point, Point,
             exact: exact[k],
             lam: lam[k],
             audit: audit[k],
+            r_points: r_points[k],
             basis: if measured {
                 basis::MEASURED
+            } else if s.points.is_some() {
+                basis::POINTS
             } else if diag & diag::CAPPED != 0 {
                 basis::CAPPED
             } else if diag & diag::PINNED != 0 || !(data_share >= BOUNDED_SHARE) {
@@ -1873,6 +1986,7 @@ pub fn support_tree(scans: &[&ScanIndex], rows: &Rows, context: &[(Point, Point,
             },
             lam: mean(&p.lam),
             audit,
+            r_points: fold(&p.r_points, f64::max),
             basis,
         };
         out.rows.push(&x, &cov, fr[k], rows.a[k], like.widen, own);
@@ -1922,8 +2036,9 @@ fn hold(terms: &[(usize, Vec<Bound>)], n: usize, sol: &mut Solved) -> (Vec<(f64,
     (held, bits)
 }
 
-/// The site's D/H cap (3dtrees research 106 `uncertain.md`), after the solve and on each `free` node alone (one whose
-/// own circle doesn't enter), never below what its rays hold it above (its interval's lower end, `held`): its log R
+/// The site's D/H cap (3dtrees research 106 `uncertain.md`), after the solve and on each `free` node alone (one into
+/// which no circle enters, its own or its row's point circle), never below what its rays hold it above (its
+/// interval's lower end, `held`): its log R
 /// (`caps`, NaN for none) clipped there, its interval's upper end too (so are its volume's draws), and
 /// [`diag::CAPPED`] where its posterior median reached a cap above that lower end. A site rule never overrides the
 /// rays.
@@ -1953,6 +2068,7 @@ fn volume(nd: &Nodes, sol: &Solved, held: &[(f64, f64)], basis: &[u8], widen: f6
         v.point += x;
         match basis[k] {
             basis::MEASURED => v.measured += x,
+            basis::POINTS => v.points += x,
             basis::BOUNDED => v.bounded += x,
             basis::CAPPED => v.capped += x,
             _ => v.prior += x,
@@ -2057,6 +2173,7 @@ struct Own {
     lam: f64,
     /// The veto's stops and passes through its fitted circle.
     audit: (u32, u32),
+    r_points: f64,
     basis: u8,
 }
 
@@ -2143,6 +2260,7 @@ impl Fit {
         self.n_pass.push(pass);
         self.pass_share.push(if stop + pass > 0 { f64::from(pass) / f64::from(stop + pass) } else { f64::NAN });
         self.basis.push(own.basis);
+        self.r_points.push(own.r_points);
     }
 }
 
@@ -2304,7 +2422,7 @@ fn tree_solve(rows: &Rows, fr: &[Frame], nd: &Nodes, sums: &[Summary], p: &Prior
 /// own enters the tree, a routed piece's without its detection bound (its woody run can span several stems), and a
 /// shadowed exact stem's own beside its message.
 fn terms(sums: &[Summary]) -> Vec<(usize, Vec<Bound>)> {
-    (0..sums.len()).filter(|&k| sums[k].used().is_none() || sums[k].shadowed).map(|k| {
+    (0..sums.len()).filter(|&k| sums[k].bounded()).map(|k| {
         let routed = matches!(sums[k].outcome, Outcome::Routed { .. }) && !sums[k].shadowed;
         (k, sums[k].bounds.iter().copied().filter(|b| !(routed && b.side == Side::Lower)).collect::<Vec<_>>())
     }).filter(|t| !t.1.is_empty()).collect()
@@ -2565,7 +2683,7 @@ mod tests {
     }
 
     fn summary(outcome: Outcome, bounds: Vec<Bound>) -> Summary {
-        Summary { outcome, chi2_front: f64::NAN, n_runs: 1, n_scans: 1, n_pairs: 100, bounds, log_odds: 0.0, seeds: Vec::new(), exact: None, seen: Vec::new(), shadowed: false,
+        Summary { outcome, chi2_front: f64::NAN, n_runs: 1, n_scans: 1, n_pairs: 100, bounds, log_odds: 0.0, seeds: Vec::new(), exact: None, seen: Vec::new(), shadowed: false, points: None,
             diag: DiagIn { tube: 0.1, w: 0.005, one_sided: false, deleted: 0.0, n_ctx: 0 } }
     }
 
@@ -2786,7 +2904,7 @@ mod tests {
     fn a_profile_bounds_what_it_sees_and_no_more() {
         let p = JointParams { tau: 0.17, ..JointParams::default() };
         let w = 0.005;
-        let rec = |b: f64, s: f64, depth: f64| Rec { b, s, depth, w, refl: f64::NAN, single: true, blocked: false, lost: false, pulse: 0, echo: 0 };
+        let rec = |b: f64, s: f64, depth: f64| Rec { b, s, depth, xy: [f64::NAN; 2], w, refl: f64::NAN, single: true, blocked: false, lost: false, pulse: 0, echo: 0 };
         let group = |recs: Vec<Rec>| Group { scan: 0, n: [1.0, 0.0], v: [0.0, 1.0], recs };
         // a 2 cm stem across a grid of pulses 5 mm apart both ways: hit within its silhouette (R + w (1/2 - tau)),
         // passed beside it
@@ -2935,7 +3053,7 @@ mod tests {
     #[test]
     fn echo_character_weighs_stops() {
         let p = JointParams::default();
-        let rec = |refl: f64, single: bool| Rec { b: 0.0, s: 0.0, depth: 0.0, w: 0.01, refl, single, blocked: false, lost: false, pulse: 0, echo: 0 };
+        let rec = |refl: f64, single: bool| Rec { b: 0.0, s: 0.0, depth: 0.0, xy: [0.0; 2], w: 0.01, refl, single, blocked: false, lost: false, pulse: 0, echo: 0 };
         // bark-bright is wood, leaf-dark is leaf, unknown is wood (and no evidence); a multi-return echo is judged darker
         assert!(p_wood(&rec(-15.5, true), 0.05, &p) > 0.9);
         assert!(p_wood(&rec(-21.0, true), 0.05, &p) < 0.1);
@@ -3124,7 +3242,7 @@ mod tests {
         // the porous piece's too (its p_wood no longer scales it)
         let (scan, _, _) = crate::qsm::evidence::tests::scene(0.05, true);
         let p = like();
-        let rec = |b: f64, depth: f64, pulse: u32| Rec { b, s: 0.0, depth, w: 0.005, refl: f64::NAN, single: true, blocked: false, lost: false, pulse, echo: 0 };
+        let rec = |b: f64, depth: f64, pulse: u32| Rec { b, s: 0.0, depth, xy: [f64::NAN; 2], w: 0.005, refl: f64::NAN, single: true, blocked: false, lost: false, pulse, echo: 0 };
         let stops = vec![Group { scan: 0, n: [1.0, 0.0], v: [0.0, 1.0], recs: vec![rec(0.0, -0.05, 0), rec(0.0, 0.10, 1)] }];
         let x = Vector5::new(0.0, 0.0, 0.0, 0.0, 0.05f64.ln());
         let circle = circle(Vector5::new(0.0, 0.0, 0.0, 0.0, 0.05), 1e-3);
@@ -3188,10 +3306,74 @@ mod tests {
         assert!(sol.x[5][4] == lo && held[5] == (lo, lo) && bits[5] == 0, "{} {:?} {}", sol.x[5][4], held[5], bits[5]);
     }
 
+    /// Stops on an arc of a circle of radius `r` about `c`, from `a0` to `a1` degrees, `n` of them, `jitter` (m) off it
+    /// by a fixed pattern.
+    fn arc_stops(c: [f64; 2], r: f64, (a0, a1): (f64, f64), n: usize, jitter: f64) -> Vec<[f64; 2]> {
+        (0..n).map(|i| {
+            let t = (a0 + (a1 - a0) * i as f64 / (n - 1) as f64).to_radians();
+            let rr = r + jitter * ((i * 7 % 5) as f64 - 2.0) / 2.0;
+            [c[0] + rr * t.cos(), c[1] + rr * t.sin()]
+        }).collect()
+    }
+
+    #[test]
+    fn a_rows_stops_give_its_point_circle_on_the_refits_tests() {
+        // a 5 cm stem 1 cm off the axis, seen over 200 degrees with 2 mm of roughness, and a few leaves about it
+        let mut xy = arc_stops([0.01, 0.0], 0.05, (-100.0, 100.0), 60, 0.002);
+        xy.extend([[0.12, 0.05], [-0.1, 0.11], [0.0, -0.13], [0.09, -0.1]]);
+        let x = point_circle(&xy, 0.06, f64::NAN).unwrap();
+        assert!((x[4] - 0.05).abs() < 0.002 && (x[0] - 0.01).abs() < 0.002 && x[1].abs() < 0.002 && x[2] == 0.0 && x[3] == 0.0, "{x:?}");
+        // the site's cap, through `believe`: a circle wider than it is none
+        assert!(point_circle(&xy, 0.06, 0.04).is_none());
+        // a claim under half its width: a circle over twice the claim is a bush, not a stem
+        assert!(point_circle(&xy, 0.024, f64::NAN).is_none());
+        // too few stops, or an arc of 90 degrees
+        assert!(point_circle(&xy[..11], 0.06, f64::NAN).is_none());
+        assert!(point_circle(&arc_stops([0.0, 0.0], 0.05, (0.0, 90.0), 40, 0.001), 0.06, f64::NAN).is_none());
+        // three thin stems about a vase: no stem through them all
+        let vase: Vec<[f64; 2]> = (0..3).flat_map(|k| arc_stops(std::array::from_fn(|i| 0.06 * (k as f64 * 2.1 + i as f64 * 1.57).cos()), 0.008, (0.0, 360.0), 15, 0.0)).collect();
+        assert!(point_circle(&vase, 0.08, f64::NAN).is_none_or(|x| x[4] < 0.02), "{:?}", point_circle(&vase, 0.08, f64::NAN));
+        // most stops off any circle: leaves
+        let mut leafy = arc_stops([0.0, 0.0], 0.03, (-90.0, 90.0), 20, 0.0);
+        leafy.extend((0..60).map(|i| [0.3 * ((i * 37 % 61) as f64 / 61.0 - 0.5), 0.3 * ((i * 53 % 59) as f64 / 59.0 - 0.5)]));
+        assert!(point_circle(&leafy, 0.05, f64::NAN).is_none());
+    }
+
+    #[test]
+    fn a_point_circle_measures_its_pieces_with_their_bounds_beside_it() {
+        // a row of two pieces under a measured base: the point circle (5 cm) enters each piece at PTS_SD times the
+        // root of two in log R, and the pieces' bounds still enter beside it
+        let rows_a = [[0.0, 0.0, 0.0], [0.0, 0.0, 0.3]];
+        let rows_b = [[0.0, 0.0, 0.3], [0.0, 0.0, 0.9]];
+        let rows = Rows { a: &rows_a, b: &rows_b, r_prior: &[0.1, 0.09], r_max: &[], parent: &[-1, 0] };
+        let fr = frames(&rows_a, &rows_b);
+        let nd = Nodes::of(&rows, &fr);
+        let x = Vector5::new(0.003, 0.0, 0.0, 0.0, 0.05);
+        let c = point_measure(&x, 2.0);
+        assert!((c.cov[(4, 4)].sqrt() / 0.05 - PTS_SD * 2f64.sqrt()).abs() < 1e-12);
+        let base = circle(Vector5::new(0.0, 0.0, 0.0, 0.0, 0.09), 1e-3);
+        let upper = Bound { eta: 0.08f64.ln(), sd: 0.1, side: Side::Upper };
+        let mut sums = vec![summary(Outcome::Measured(base), Vec::new()), summary(Outcome::Bounded, vec![upper]), summary(Outcome::Bounded, vec![upper])];
+        let pp = PriorParams::default();
+        let (prior_only, _) = tree_solve(&rows, &fr, &nd, &sums, &pp, EP_ROUNDS).unwrap();
+        for s in &mut sums[1..] {
+            s.points = Some(c);
+        }
+        assert!(sums[1].bounded() && sums[1].used().is_some() && sums[1].own().is_none() && !sums[0].bounded());
+        assert_eq!(terms(&sums).iter().map(|t| t.0).collect::<Vec<_>>(), vec![1, 2]);
+        let (sol, converged) = tree_solve(&rows, &fr, &nd, &sums, &pp, EP_ROUNDS).unwrap();
+        assert!(converged);
+        // the pieces move from the taper's guess towards the circle, and are surer of it
+        for k in 1..3 {
+            assert!((sol.x[k][4] - 0.05f64.ln()).abs() < (prior_only.x[k][4] - 0.05f64.ln()).abs() && sol.cov[k][(4, 4)] < prior_only.cov[k][(4, 4)],
+                "{k}: {} against {}", sol.x[k][4].exp(), prior_only.x[k][4].exp());
+        }
+    }
+
     #[test]
     fn passes_through_a_circle_bound_it_and_audit_it() {
         let w = 0.005;
-        let rec = |b: f64, s: f64, depth: f64| Rec { b, s, depth, w, refl: f64::NAN, single: true, blocked: false, lost: false, pulse: 0, echo: 0 };
+        let rec = |b: f64, s: f64, depth: f64| Rec { b, s, depth, xy: [f64::NAN; 2], w, refl: f64::NAN, single: true, blocked: false, lost: false, pulse: 0, echo: 0 };
         let group = |recs: Vec<Rec>| Group { scan: 0, n: [1.0, 0.0], v: [0.0, 1.0], recs };
         let circle = |r: f64| Vector5::new(0.0, 0.0, 0.0, 0.0, r);
         // a phantom: RCT claims 5 cm where a grid of pulses 5 mm apart passes, but for a 2 mm twig on the axis that
