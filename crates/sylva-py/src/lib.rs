@@ -627,6 +627,19 @@ fn qsm_surface_distance<'py>(py: Python<'py>, points: PyReadonlyArray2<f64>, poi
     Ok(d.into_pyarray(py))
 }
 
+/// Each tree's contested points (see `sylva.qsm.contest`).
+#[pyfunction]
+#[allow(clippy::too_many_arguments)]
+fn qsm_contest<'py>(py: Python<'py>, points: PyReadonlyArray2<f64>, labels: PyReadonlyArray1<i32>, a: PyReadonlyArray2<f64>, b: PyReadonlyArray2<f64>,
+                    radius: PyReadonlyArray1<f64>, cyl_offsets: Vec<usize>, tol: f64) -> PyResult<(Bound<'py, PyArray1<f64>>, Bound<'py, PyArray1<i64>>)> {
+    let (points, labels, a, b, r) = (xyz_from_py(points)?, labels.as_slice()?, xyz_from_py(a)?, xyz_from_py(b)?, radius.as_slice()?);
+    if labels.len() != points.len() || r.len() != a.len() || b.len() != a.len() || cyl_offsets.last().is_some_and(|&n| n != a.len()) || cyl_offsets.windows(2).any(|w| w[0] > w[1]) {
+        return Err(PyValueError::new_err("one label per point, one radius per cylinder, and cyl_offsets rising to the cylinder count"));
+    }
+    let (share, owner) = py.detach(|| qsm::support::contest(&sylva_rs::util::spatial::KdTree::new(&points), &points, labels, &a, &b, r, &cyl_offsets, tol));
+    Ok((share.into_pyarray(py), owner.into_pyarray(py)))
+}
+
 #[pyfunction]
 #[pyo3(signature = (files, out, width, buffer, voxel, terrain_voxel, extent=None, min_rays=100_000, threads=4))]
 #[allow(clippy::too_many_arguments)]
@@ -1976,6 +1989,7 @@ fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
         wrap_pyfunction!(tile_ray_clouds, m)?,
         wrap_pyfunction!(qsm_surface_support, m)?,
         wrap_pyfunction!(qsm_surface_distance, m)?,
+        wrap_pyfunction!(qsm_contest, m)?,
         wrap_pyfunction!(shots_from_ray_cloud, m)?,
         wrap_pyfunction!(shots_to_pointcloud, m)?,
         wrap_pyfunction!(shots_transform, m)?,

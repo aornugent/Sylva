@@ -1902,6 +1902,67 @@ fn enter(k: usize, e: &routed::Exact, nd: &mut Nodes, sums: &mut Vec<Summary>, e
     node
 }
 
+/// Each of `trees`' [`support_tree`] context: of a plot's cylinders `a -> b`,
+/// tree `g` owning `cyl_offsets[g]..cyl_offsets[g + 1]`, the other trees'
+/// whose segments come within `reach` of one of `g`'s, as sorted indices
+/// (CSR: tree `trees[i]`'s are `idx[off[i]..off[i + 1]]`). A cylinder of
+/// zero length is never close. The distance is written as 3dtrees' numpy
+/// wrote it, so the two agree to the bit (the context keys its store).
+pub fn tree_context(a: &[Point], b: &[Point], cyl_offsets: &[usize], trees: &[usize], reach: f64) -> (Vec<usize>, Vec<usize>) {
+    // Indexed by pieces no longer than `reach` (a plot's cylinders run from millimetres to metres): segments within
+    // `reach` have pieces whose midpoints are within half of each plus `reach`, so a piece's query reaches no further
+    // than its own half, `reach / 2` and `reach`, however long the longest cylinder.
+    let len: Vec<f64> = (0..a.len()).map(|c| crate::transform::norm(&sub(&b[c], &a[c]))).collect();
+    let (mut mids, mut halves, mut of) = (Vec::new(), Vec::new(), Vec::new());
+    for c in (0..a.len()).filter(|&c| len[c] > 0.0) {
+        let k = if reach > 0.0 { (len[c] / reach).ceil().max(1.0) as usize } else { 1 };
+        for p in 0..k {
+            let f = (p as f64 + 0.5) / k as f64;
+            mids.push([a[c][0] + f * (b[c][0] - a[c][0]), a[c][1] + f * (b[c][1] - a[c][1]), a[c][2] + f * (b[c][2] - a[c][2])]);
+            halves.push(len[c] / k as f64 / 2.0);
+            of.push(c);
+        }
+    }
+    let kd = crate::util::spatial::KdTree::new(&mids);
+    let start: Vec<usize> = (0..=a.len()).map(|c| of.partition_point(|&x| x < c)).collect(); // cylinder c's pieces
+    let per: Vec<Vec<usize>> = trees
+        .par_iter()
+        .map(|&g| {
+            let (own, of) = (cyl_offsets[g]..cyl_offsets[g + 1], &of);
+            let mut cand: Vec<(usize, usize)> = (start[own.start]..start[own.end])
+                .flat_map(|p| {
+                    kd.within(&mids[p], (halves[p] + reach / 2.0 + reach) * (1.0 + 1e-9) + 1e-9)
+                        .into_iter()
+                        .map(move |(q, _)| (of[p], of[q]))
+                })
+                .filter(|&(_, j)| !own.contains(&j))
+                .collect();
+            cand.sort_unstable();
+            cand.dedup();
+            let mut near: Vec<usize> = cand.into_iter().filter(|&(c, j)| segment_distance(&a[c], &b[c], &a[j], &b[j]) <= reach).map(|(_, j)| j).collect();
+            near.sort_unstable();
+            near.dedup();
+            near
+        })
+        .collect();
+    let off = std::iter::once(0).chain(per.iter().scan(0, |n, p| { *n += p.len(); Some(*n) })).collect();
+    (off, per.concat())
+}
+
+/// Closest distance between segments p1-q1 and p2-q2 (3dtrees' `joint.segment_distance`, operation for operation).
+fn segment_distance(p1: &Point, q1: &Point, p2: &Point, q2: &Point) -> f64 {
+    let (d1, d2, w) = (sub(q1, p1), sub(q2, p2), sub(p1, p2));
+    let dot3 = |u: &Point, v: &Point| (u[0] * v[0] + u[1] * v[1]) + u[2] * v[2];
+    let (a, e, b, c, f) = (dot3(&d1, &d1).max(1e-12), dot3(&d2, &d2).max(1e-12), dot3(&d1, &d2), dot3(&d1, &w), dot3(&d2, &w));
+    let den = a * e - b * b;
+    let s = (if den > 1e-12 { (b * f - c * e) / den } else { -c / a }).clamp(0.0, 1.0);
+    let t = (b * s + f) / e;
+    let s = if t < 0.0 { (-c / a).clamp(0.0, 1.0) } else if t > 1.0 { ((b - c) / a).clamp(0.0, 1.0) } else { s };
+    let t = t.clamp(0.0, 1.0);
+    let g = [p1[0] + d1[0] * s - p2[0] - d2[0] * t, p1[1] + d1[1] * s - p2[1] - d2[1] * t, p1[2] + d1[2] * s - p2[2] - d2[2] * t];
+    ((g[0] * g[0] + g[1] * g[1]) + g[2] * g[2]).sqrt()
+}
+
 /// Fits one tree from its rows' support summaries: `rows` (with `r_max` ignored) against `scans`, the prior's
 /// widths from `prior` and the footprint, detection threshold, range noise and echo character from `like`. Runs on
 /// `threads` threads (0: one per core).
@@ -2816,6 +2877,19 @@ mod tests {
     use super::*;
     use crate::qsm::joint::frames;
     use crate::qsm::joint_fit::PriorParams;
+
+    #[test]
+    fn context_is_the_other_trees_cylinders_within_reach() {
+        // tree 0: a 2 m stem at the origin; tree 1: a stem 0.4 m away and one of zero length beside it; tree 2: 3 m away
+        let a = [[0.0, 0.0, 0.0], [0.0, 0.0, 1.0], [0.4, 0.0, 0.0], [0.1, 0.0, 0.5], [3.0, 0.0, 0.0]];
+        let b = [[0.0, 0.0, 1.0], [0.0, 0.0, 2.0], [0.4, 0.0, 2.0], [0.1, 0.0, 0.5], [3.0, 0.0, 2.0]];
+        let (off, idx) = tree_context(&a, &b, &[0, 2, 4, 5], &[0, 1, 2], 0.5);
+        assert_eq!(off, vec![0, 1, 3, 3]);
+        assert_eq!(idx, vec![2, 0, 1]); // tree 0's: 1's stem, not the zero-length one; tree 1's: 0's two; tree 2's: none
+        assert_eq!(segment_distance(&a[0], &b[0], &a[2], &b[2]), 0.4);
+        assert_eq!(tree_context(&a, &b, &[0, 2, 4, 5], &[0], 0.0), (vec![0, 0], vec![])); // no reach: nothing close
+        assert_eq!(segment_distance(&a[0], &b[0], &[1.0, 0.0, 3.0], &[1.0, 0.0, 4.0]), 5f64.sqrt()); // end to end
+    }
 
     fn like() -> JointParams {
         JointParams { tau: 0.17, edge: 0.25, hide: 0.0, ..JointParams::default() }

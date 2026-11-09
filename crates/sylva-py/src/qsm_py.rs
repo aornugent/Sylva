@@ -792,6 +792,19 @@ fn support_fit<'py>(py: Python<'py>, f: support_tree::Fit) -> PyResult<Bound<'py
     Ok(d)
 }
 
+/// Each of `trees`' context for `support_tree` (see `sylva.qsm.tree_context`).
+#[pyfunction]
+fn qsm_tree_context<'py>(py: Python<'py>, a: PyReadonlyArray2<f64>, b: PyReadonlyArray2<f64>, cyl_offsets: Vec<usize>, trees: Vec<usize>,
+                         reach: f64) -> PyResult<(Bound<'py, PyArray1<usize>>, Bound<'py, PyArray1<usize>>)> {
+    let (a, b) = (xyz_from_py(a)?, xyz_from_py(b)?);
+    if b.len() != a.len() || cyl_offsets.last() != Some(&a.len()) || cyl_offsets.windows(2).any(|w| w[0] > w[1])
+        || trees.iter().any(|&g| g + 1 >= cyl_offsets.len()) {
+        return Err(PyValueError::new_err("a and b one row per cylinder; cyl_offsets rising to the cylinder count; trees indices into them"));
+    }
+    let (off, idx) = py.detach(|| support_tree::tree_context(&a, &b, &cyl_offsets, &trees, reach));
+    Ok((off.into_pyarray(py), idx.into_pyarray(py)))
+}
+
 /// Fits one tree from its rows' support summaries (see `sylva.qsm.support_tree`); `params` as `qsm_joint_tree`'s.
 #[pyfunction]
 #[pyo3(signature = (scans, a, b, r_prior, parent, ctx_a, ctx_b, ctx_r, params, threads=0))]
@@ -839,6 +852,7 @@ pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(qsm_support_bases, m)?)?;
     m.add_function(wrap_pyfunction!(qsm_echo_paths, m)?)?;
     m.add_function(wrap_pyfunction!(qsm_support_tree, m)?)?;
+    m.add_function(wrap_pyfunction!(qsm_tree_context, m)?)?;
     m.add_function(wrap_pyfunction!(qsm_joint_defaults, m)?)?;
     m.add_function(wrap_pyfunction!(qsm_joint_reasons, m)?)?;
     m.add_function(wrap_pyfunction!(qsm_joint_tree, m)?)?;
