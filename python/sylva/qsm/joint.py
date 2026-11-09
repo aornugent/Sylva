@@ -318,8 +318,8 @@ def support_tree(scans, a, b, r_prior, parent, context=None, params: JointParams
     tree's) times its echo character's weight, or on a routed piece with an exact fit by the exact likelihood's wood
     and leaf terms at its stem's fit (:class:`EchoPath`).
 
-    The tree's volume is its pieces' (a routed piece's further stems aside): at their posterior R, split by how each is
-    known (:class:`SupportBasis`), and as an interval from 1,000 draws of the tree's joint posterior (the solve's
+    The tree's volume is its pieces' (a routed piece's further stems aside): at their posterior R (the drawing's), and
+    as the mean (the volume of record, split by how each piece is known, :class:`SupportBasis`) and an interval from 1,000 draws of the tree's joint posterior (the solve's
     exact covariance, each node's sd widened by its basis's factor, each draw held inside its piece's bounds; a fixed
     seed). The factors are Sylva's calibration (``WIDEN`` in ``support_tree.rs``, learned per basis against Alice
     Mulga's refit circles), not a setting.
@@ -387,7 +387,8 @@ def support_tree(scans, a, b, r_prior, parent, context=None, params: JointParams
       ``chi2`` and ``chi2_front``, a refusal ``refused``, a thinned fit ``n_exact`` over the budget;
 
     and per tree ``converged``, whether the censored solve settled; ``volume``, a dict of m^3: ``point`` (at each
-    piece's posterior R), ``mean``, ``q05`` and ``q95`` (of the draws), and the point by basis, ``measured``,
+    piece's posterior R: the drawn geometry's, per-piece medians), ``mean`` (the volume of record), ``q05`` and
+    ``q95`` (of the draws), and the mean by basis (each piece's draws' mean, adding to it), ``measured``,
     ``points``, ``bounded``, ``prior`` and ``capped``; and ``echoes``, one record per stop of the tree
     (of an echo several pieces saw, the one whose surface it lies nearest), keyed as the tile sidecars are: ``scan``
     (an index into ``scans``), ``pulse`` (the pulse's row in its Shots file), ``echo`` (its place in the pulse);

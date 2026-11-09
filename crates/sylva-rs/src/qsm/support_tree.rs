@@ -306,10 +306,11 @@ const BOUNDED_SHARE: f64 = 0.1;
 /// `uncertain.md` §1 learned one (3dtrees ticket 109): the factor that puts 90 % of Alice Mulga's refit circles (their
 /// own noise, 0.136 in log R, added) inside the 90 % interval, on random halves of the trees, 90.0-90.4 % on the other
 /// halves; the circles on PINNED nodes left out (6.5 %: a circle past the rays' own bound, 86 % of them fatter, by a
-/// median 4.4x). MEASURED 2.1 [2.0-2.2], POINTS 1.2 [1.1-1.3], BOUNDED 3.6 [3.3-3.8], PRIOR 3.1 [2.9-3.2], CAPPED 2.3
-/// [2.1-2.4]. POINTS's is a floor: its refit circle shares its stops. One factor for all (2.0) left bounded and prior
-/// rows short.
-pub const WIDEN: [f64; 5] = [2.1, 1.2, 3.6, 3.1, 2.3];
+/// median 4.4x). MEASURED 2.1 [2.0-2.2], BOUNDED 3.6 [3.3-3.8], PRIOR 3.1 [2.9-3.2], CAPPED 2.3 [2.1-2.4]. POINTS
+/// learns 1.2 [1.1-1.3], but that is a floor, not a calibration: its reference (the refit's circle) was fitted to the
+/// same stops, so their errors are shared and cancel; it takes MEASURED's 2.1, the factor of a circle checked against
+/// an independent one. One factor for all (2.0) left bounded and prior rows short.
+pub const WIDEN: [f64; 5] = [2.1, 2.1, 3.6, 3.1, 2.3];
 
 /// The factor a node of basis `b` is widened by ([`WIDEN`]).
 fn widen(b: u8) -> f64 {
@@ -552,9 +553,11 @@ pub struct Fit {
 }
 
 /// A tree's volume (m^3), over its pieces (the served wood: a routed piece's further stems aside): the point, from
-/// each piece's posterior R; the mean and the 5th and 95th percentiles of [`VOLUME_DRAWS`] draws from the tree's
-/// joint posterior (the solve's exact covariance, each node's sd widened by [`WIDEN`] for its basis, each draw held
-/// inside its piece's bounds); and the point split by each piece's [`basis`].
+/// each piece's posterior R (the drawn geometry's: per-piece medians); the mean and the 5th and 95th percentiles of
+/// [`VOLUME_DRAWS`] draws from the tree's joint posterior (the solve's exact covariance, each node's sd widened by
+/// [`WIDEN`] for its basis, each draw held inside its piece's bounds): the mean is the volume of record (3dtrees
+/// ticket 109: a sum of medians can lie under its own q05); and the mean split by each piece's [`basis`] (the
+/// draws' mean of its pieces' volume, so the parts add to the mean).
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub struct Volume {
     pub point: f64,
@@ -2131,18 +2134,10 @@ fn volume(nd: &Nodes, sol: &Solved, held: &[(f64, f64)], basis: &[u8], widen: &[
     let n = nd.row.len();
     let pieces: Vec<usize> = (0..n).filter(|&k| nd.further[k].is_none()).collect();
     let vol = |k: usize, eta: f64| std::f64::consts::PI * (2.0 * eta).exp() * nd.frame[k].3;
-    let mut v = Volume::default();
-    for &k in &pieces {
-        let x = vol(k, sol.x[k][4]);
-        v.point += x;
-        match basis[k] {
-            basis::MEASURED => v.measured += x,
-            basis::POINTS => v.points += x,
-            basis::BOUNDED => v.bounded += x,
-            basis::CAPPED => v.capped += x,
-            _ => v.prior += x,
-        }
-    }
+    let mut v = Volume { point: pieces.iter().map(|&k| vol(k, sol.x[k][4])).sum(), ..Volume::default() };
+    // each piece's basis's part of the mean (the codes beyond CAPPED, none, are prior's)
+    let mut parts = [0.0f64; 5];
+    let slot: Vec<usize> = basis.iter().map(|&b| usize::from(if (basis::MEASURED..=basis::CAPPED).contains(&b) { b } else { basis::PRIOR }) - 1).collect();
     let chol: Vec<Matrix5<f64>> = sol.inv.iter().map(|m| m.cholesky().map_or_else(|| Matrix5::from_diagonal(&m.diagonal().map(|d| d.max(0.0).sqrt())), |c| c.l())).collect();
     let mut rng = Normal::new(0x5EED_0F_7EE5);
     let k_of: Vec<f64> = basis.iter().map(|&b| widen[usize::from(b.clamp(basis::MEASURED, basis::CAPPED) - 1)]).collect();
@@ -2152,12 +2147,17 @@ fn volume(nd: &Nodes, sol: &Solved, held: &[(f64, f64)], basis: &[u8], widen: &[
             let z = Vector5::from_fn(|_, _| rng.next());
             d[k] = chol[k] * z - nd.parent[k].map_or(Vector5::zeros(), |q| sol.y[k] * d[q]);
         }
-        pieces.iter().map(|&k| vol(k, (sol.x[k][4] + k_of[k] * d[k][4]).max(held[k].0).min(held[k].1))).sum()
+        pieces.iter().map(|&k| {
+            let x = vol(k, (sol.x[k][4] + k_of[k] * d[k][4]).max(held[k].0).min(held[k].1));
+            parts[slot[k]] += x;
+            x
+        }).sum()
     }).collect();
     draws.sort_unstable_by(f64::total_cmp);
     let q = |p: f64| draws[(p * (VOLUME_DRAWS - 1) as f64).round() as usize];
     v.mean = draws.iter().sum::<f64>() / VOLUME_DRAWS as f64;
     (v.q05, v.q95) = (q(0.05), q(0.95));
+    [v.measured, v.points, v.bounded, v.prior, v.capped] = parts.map(|x| x / VOLUME_DRAWS as f64);
     v
 }
 
@@ -3608,9 +3608,9 @@ mod tests {
             let se = (0.05f64 * 0.95 / VOLUME_DRAWS as f64).sqrt() / npdf(1.645) * (q95 / q05).ln() / 3.29;
             assert!((v.q05 / q05).ln().abs() < 3.0 * se && (v.q95 / q95).ln().abs() < 3.0 * se && (v.mean / mean).ln().abs() < 3.0 * se,
                 "widen {widen:?}: {v:?} against q05 {q05} q95 {q95} mean {mean} (se {se})");
-            // the point is the posterior's, all of it prior here
+            // the point is the posterior's; the mean is split by basis (the first row prior, the child bounded)
             let point: f64 = (0..n).map(|k| std::f64::consts::PI * (2.0 * sol.x[k][4]).exp() * nd.frame[k].3).sum();
-            assert!((v.point - point).abs() < 1e-12 && (v.prior + v.bounded - v.point).abs() < 1e-12 && v.q05 < v.point && v.point < v.q95);
+            assert!((v.point - point).abs() < 1e-12 && (v.prior + v.bounded - v.mean).abs() < 1e-9 * v.mean && v.prior > 0.0 && v.bounded > 0.0 && v.q05 < v.point && v.point < v.q95);
         }
         // a piece held in its interval holds every draw: none wider than its upper bound
         let mut held = free.clone();

@@ -165,7 +165,7 @@ def test_a_tree_reports_how_its_radii_are_known_and_its_volume_with_an_interval(
     assert not (f["diag"] & SupportDiag.REFUTED).any() and (np.isnan(f["pass_share"]) | (f["pass_share"] < 0.25)).all()
     v = f["volume"]
     parts = v["measured"] + v["points"] + v["bounded"] + v["prior"] + v["capped"]
-    assert np.isclose(parts, v["point"]) and v["q05"] < v["point"] < v["q95"] and v["capped"] == 0
+    assert np.isclose(parts, v["mean"]) and v["q05"] < v["point"] < v["q95"] and v["capped"] == 0
     capped = support_tree(scans, a, a + [0, 0, 0.3], 1.5 * radii, np.full(4, -1),
                           params=dataclasses.replace(PARAMS, dh=0.006), threads=2)
     held = capped["basis"] != SupportBasis.MEASURED
