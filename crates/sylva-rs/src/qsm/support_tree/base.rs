@@ -39,7 +39,8 @@
 //!   its chain (its evidence is negative: a fan's axis through air); else it stays. A row on another entry's chain is
 //!   that entry's.
 //! - **The choice, by likelihood.** A column (with its forks) replaces the chains of the entries it takes only where
-//!   its sections' evidence is positive and those chains hold under [`KEEP`] of it in the same slabs: a skeleton
+//!   its sections' evidence is positive and those chains hold under [`BaseParams::keep`] of it in the same slabs,
+//!   and under [`MEASURED`] of them are measured (by their own circle, unrefuted, as the joint fit would serve it): a skeleton
 //!   already on its wood keeps it; one beside it, inside a trunk wider than its claim, or a fan's axes through air,
 //!   don't; a column of thin stems the rays see between loses to their own rows.
 //! - **Ownership.** A column's rows go to the member whose taken entries carry the most of the skeleton's volume
@@ -47,12 +48,14 @@
 //!   where the owner keeps one (a stem the columns missed stands there too); a fork owned by another member starts that member's base
 //!   at the fork, and an entry whose column is another member's starts its member's base at its cut. A column no
 //!   entry takes is left out. A member that would stand on two bases keeps its rows as they were.
-//! - **What else under `H`,** of a member re-sectioned: the chains replaced are dropped, and so is any other row
-//!   under `H` whose middle lies in a chosen column's circle (the same wood twice) or whose evidence is negative (a
-//!   fan's row through air). A kept row whose parent was dropped hangs from its member's nearest row end within
-//!   [`HANG`]; else, if its subtree reaches above `H`, it is joined to its member's nearest row end within
-//!   [`CONNECT`] by a row of its dropped parent's radius (the stem RCT drew there, redrawn from the column), or
-//!   starts a base of its own (so its member keeps its rows); any other is dropped.
+//! - **What else under the cut** (the chosen columns' top), of a member re-sectioned: the chains replaced are
+//!   dropped, and so is any other row whose middle lies in a chosen column's circle (the same wood twice) or that
+//!   the veto refutes at a quarter of its radius in every slab it crosses (a fan's row through air); a thin stem
+//!   beside the column is neither. A kept row whose parent was dropped hangs from its member's nearest row end within
+//!   [`HANG`] no more than [`HANG_UP`] above its start (a branch leaves its stem at its height); else, if its subtree
+//!   reaches above `H`, it is joined to such an end within [`CONNECT`] by a row of its dropped parent's radius (the
+//!   stem RCT drew there, redrawn from the column), or starts a base of its own (so its member keeps its rows); any
+//!   other is dropped.
 use super::*;
 use crate::trees::fit_circle;
 
@@ -87,11 +90,12 @@ const CONNECT: f64 = 1.0;
 /// The share of a column's sections inside another plant's cylinder (within [`IN_COL`] of its radius) that makes
 /// it that plant's.
 const CTX_SHARE: f64 = 0.5;
-/// The share of a column's evidence the skeleton's rows it would replace must hold, in the same slabs, to keep the
-/// base: then they stand on its wood (the joint fit measures a base whose axis is on its wood; one beside it, or a
-/// fan's axes through air, it can't). A ratio, not a price per circle: a slab's pulses number thousands and are
-/// correlated far beyond what `exist_scale` discounts, so the evidence's scale says little, its share much.
-const KEEP: f64 = 0.8;
+/// The share of the skeleton's rows a column would replace (by length, in its slabs) whose pieces the rays measure (an
+/// own circle the veto doesn't refute, as `support_tree` would serve it) that keeps the base: a base already measured
+/// stays.
+const MEASURED: f64 = 0.5;
+/// How far above a row's start the end of the row it is hung from may lie (m): a branch leaves its stem at its height.
+const HANG_UP: f64 = 0.05;
 /// The radii a skeleton row is weighed at, as shares of its own: the best of them is its evidence in a slab.
 const NARROW: [f64; 3] = [1.0, 0.5, 0.25];
 /// The narrowest circle weighed (m): about the beam's footprint.
@@ -108,11 +112,16 @@ pub struct BaseParams {
     pub reach: f64,
     /// Stops within this of each other are one section (m).
     pub link: f64,
+    /// The share of a column's evidence the skeleton's rows it would replace must hold, in the same slabs, to keep the
+    /// base: then they stand on its wood (the joint fit measures a base whose axis is on its wood; one beside it, or a
+    /// fan's axes through air, it can't). A ratio, not a price per circle: a slab's pulses number thousands and are
+    /// correlated far beyond what `exist_scale` discounts, so the evidence's scale says little, its share much.
+    pub keep: f64,
 }
 
 impl Default for BaseParams {
     fn default() -> Self {
-        BaseParams { z_lo: 0.1, z_hi: 1.5, dz: 0.1, reach: 0.6, link: 0.02 }
+        BaseParams { z_lo: 0.1, z_hi: 1.5, dz: 0.1, reach: 0.6, link: 0.02, keep: 0.8 }
     }
 }
 
@@ -405,13 +414,14 @@ fn columns(slabs: Vec<Vec<Section>>) -> (Vec<Section>, Vec<Column>) {
     (secs, out)
 }
 
-/// What became of a column in [`rebase`]: its evidence and its replaced chains' in its slabs (both its root
-/// column's, with its forks), whether it was chosen and the member it went to (-1: none),
+/// What became of a column in [`rebase`]: its evidence and its replaced chains' in its slabs, and the share of those
+/// chains the rays measure (each its root column's, with its forks), whether it was chosen and the member it went to (-1: none),
 /// its median radius, whether it is believable as this plant's stem, and the entries it took (joined, grafted).
 #[derive(Debug, Clone, PartialEq)]
 pub struct ColumnOut {
     pub e_col: f64,
     pub e_rct: f64,
+    pub measured: f64,
     pub chosen: bool,
     pub owner: i64,
     pub r: f64,
@@ -457,7 +467,7 @@ fn row_support(gs: &[Group], a: &Point, b: &Point, r: f64, z: f64, centre: &Poin
 /// `member`, parents first and within a member), about `centre` (x, y and the ground's z) with the slabs `p`, the
 /// other plants' cylinders `context`, the site's D/H `dh` (NaN: no cap) and the likelihood `like`.
 #[allow(clippy::too_many_arguments)]
-pub fn rebase(scans: &[&ScanIndex], rows: &Rows, member: &[i64], centre: &Point, p: &BaseParams, context: &[(Point, Point, f64)], dh: f64, like: &JointParams, threads: usize) -> Result<Rebased> {
+pub fn rebase(scans: &[&ScanIndex], rows: &Rows, member: &[i64], centre: &Point, p: &BaseParams, context: &[(Point, Point, f64)], like: &JointParams, prior: &PriorParams, threads: usize) -> Result<Rebased> {
     let n = rows.a.len();
     if rows.b.len() != n || rows.r_prior.len() != n || rows.parent.len() != n || member.len() != n {
         return Err(Error::invalid("rebase: a, b, r_prior, parent and member must have one entry per row"));
@@ -472,14 +482,46 @@ pub fn rebase(scans: &[&ScanIndex], rows: &Rows, member: &[i64], centre: &Point,
             (0..mids.len()).map(|k| row_support(&gs[k], &rows.a[i], &rows.b[i], rows.r_prior[i], mids[k], centre, like)).collect()
         }).collect()
     });
+    // each row under the slabs' top: the share of its pieces the rays measure (an own circle the veto doesn't refute),
+    // and whether they refute it at the narrowest it is weighed at in every slab it crosses (through air)
+    let z_h = centre[2] + p.z_hi;
+    let (measured, air): (Vec<f64>, Vec<bool>) = pool(threads)?.install(|| {
+        (0..n).into_par_iter().map(|i| {
+            let (a, b) = (rows.a[i], rows.b[i]);
+            if a[2].min(b[2]) >= z_h {
+                return (0.0, false);
+            }
+            let len = norm3(&sub(&b, &a));
+            let k = (len / PIECE_LEN).ceil().max(1.0) as usize;
+            let at = |f: f64| -> Point { std::array::from_fn(|d| a[d] + f * (b[d] - a[d])) };
+            let own = (0..k).filter(|&j| {
+                let (pa, pb) = (at(j as f64 / k as f64), at((j + 1) as f64 / k as f64));
+                let s = summarise_piece(scans, &pa, &pb, crate::qsm::joint::frames(&[pa], &[pb])[0], rows.r_prior[i], like, prior.lean_sd);
+                matches!(s.outcome, Outcome::Measured(c) if !refuted(tally(&s.seen, &c.x)))
+            }).count();
+            let thin = |g: &[Group], z: f64| {
+                let dz = b[2] - a[2];
+                if !(a[2].min(b[2]) <= z && z < a[2].max(b[2])) || dz.abs() < 1e-6 {
+                    return None;
+                }
+                let f = (z - a[2]) / dz;
+                let x = Vector5::new(a[0] + f * (b[0] - a[0]) - centre[0], a[1] + f * (b[1] - a[1]) - centre[1], (b[0] - a[0]) / dz, (b[1] - a[1]) / dz,
+                    (NARROW[NARROW.len() - 1] * rows.r_prior[i]).max(NARROW_MIN));
+                Some(refuted(tally(g, &x)))
+            };
+            let seen: Vec<bool> = (0..mids.len()).filter_map(|s| thin(&gs[s], mids[s])).collect();
+            (own as f64 / k as f64, !seen.is_empty() && seen.iter().all(|&x| x))
+        }).unzip()
+    });
     let top = rows.a.iter().chain(rows.b).map(|q| q[2]).fold(centre[2], f64::max) - centre[2];
-    let cap = if dh.is_finite() && dh > 0.0 { PTS_BELIEVE * dh * top / 2.0 } else { f64::INFINITY };
-    Ok(join(rows, member, centre, p, &secs, cols, context, cap, &ev))
+    let cap = if prior.dh.is_finite() && prior.dh > 0.0 { PTS_BELIEVE * prior.dh * top / 2.0 } else { f64::INFINITY };
+    Ok(join(rows, member, centre, p, &secs, cols, context, cap, &ev, &measured, &air))
 }
 
-/// [`rebase`]'s join (module documentation), from the columns and each row's evidence per slab (`ev`).
+/// [`rebase`]'s join (module documentation), from the columns, each row's evidence per slab (`ev`), the share of it
+/// the rays measure and whether they refute it at its narrowest (`air`).
 #[allow(clippy::too_many_arguments)]
-fn join(rows: &Rows, member: &[i64], centre: &Point, p: &BaseParams, secs: &[Section], cols: Vec<Column>, context: &[(Point, Point, f64)], cap: f64, ev: &[Vec<Option<f64>>]) -> Rebased {
+fn join(rows: &Rows, member: &[i64], centre: &Point, p: &BaseParams, secs: &[Section], cols: Vec<Column>, context: &[(Point, Point, f64)], cap: f64, ev: &[Vec<Option<f64>>], measured: &[f64], air: &[bool]) -> Rebased {
     use std::collections::{BTreeSet, HashMap};
     let n = rows.a.len();
     let (a, b, r, parent) = (rows.a, rows.b, rows.r_prior, rows.parent);
@@ -599,11 +641,13 @@ fn join(rows: &Rows, member: &[i64], centre: &Point, p: &BaseParams, secs: &[Sec
         }
         let inside = |j: usize| {
             let m: Point = std::array::from_fn(|d| 0.5 * (a[j][d] + b[j][d]));
-            chosen_secs.iter().any(|&i| (secs[i].z - m[2]).abs() <= p.dz && (secs[i].c[0] - m[0]).hypot(secs[i].c[1] - m[1]) <= secs[i].r + IN_COL)
+            chosen_secs.iter().any(|&i| (secs[i].z - m[2]).abs() <= p.dz && (secs[i].c[0] - m[0]).hypot(secs[i].c[1] - m[1]) <= secs[i].r)
         };
+        // the rows a column replaces: under its top, never the drawing above it
+        let z_cut = chosen_secs.iter().map(|&i| secs[i].z + 0.5 * p.dz).fold(f64::NEG_INFINITY, f64::max).min(z_h);
         let drop: Vec<bool> = (0..n).map(|j| {
-            resected.contains(&member[j]) && hi(j) <= z_h && !fate.get(&j).is_some_and(|f| col_of(*f).is_some())
-                && (replaced[j] || inside(j) || ev[j].iter().any(|e| e.is_some()) && row_e(j, None) < 0.0)
+            resected.contains(&member[j]) && hi(j) <= z_cut && !fate.get(&j).is_some_and(|f| col_of(*f).is_some())
+                && (replaced[j] || inside(j) || air[j])
         }).collect();
         let mut reb = Rebased { sections: secs.to_vec(), columns: cols.clone(), ..Default::default() };
         let push = |reb: &mut Rebased, x: Point, y: Point, rr: f64, par: i64, m: i64, c: i32| {
@@ -655,7 +699,7 @@ fn join(rows: &Rows, member: &[i64], centre: &Point, p: &BaseParams, secs: &[Sec
                     // reaches above the slabs' top is joined by a row of its dropped parent's radius from its
                     // member's nearest row end within CONNECT (the stem RCT drew there, redrawn from the column),
                     // else starts a base of its own (and its member then keeps its rows); any other is dropped
-                    let near = |within: f64| (0..reb.a.len()).filter(|&k| reb.member[k] == member[i]).map(|k| (k, norm3(&sub(&reb.b[k], &a[i]))))
+                    let near = |within: f64| (0..reb.a.len()).filter(|&k| reb.member[k] == member[i] && reb.b[k][2] <= a[i][2] + HANG_UP).map(|k| (k, norm3(&sub(&reb.b[k], &a[i]))))
                         .filter(|q| q.1 <= within).min_by(|x, y| x.1.total_cmp(&y.1)).map(|q| q.0);
                     hung += 1;
                     match (near(HANG), reaches[i]) {
@@ -681,7 +725,7 @@ fn join(rows: &Rows, member: &[i64], centre: &Point, p: &BaseParams, secs: &[Sec
     };
     // the choice, ownership and the rows, again while a member would stand on two bases (it then keeps its rows)
     let mut reverted: BTreeSet<i64> = BTreeSet::new();
-    let mut out: Vec<ColumnOut> = (0..nc).map(|k| ColumnOut { e_col: f64::NAN, e_rct: f64::NAN, chosen: false, owner: -1, r: col_r[k], believable: ok[k], joined: 0, grafted: 0 }).collect();
+    let mut out: Vec<ColumnOut> = (0..nc).map(|k| ColumnOut { e_col: f64::NAN, e_rct: f64::NAN, measured: f64::NAN, chosen: false, owner: -1, r: col_r[k], believable: ok[k], joined: 0, grafted: 0 }).collect();
     loop {
         for (&i, f) in fate.iter_mut() {
             if reverted.contains(&member[i]) {
@@ -704,9 +748,14 @@ fn join(rows: &Rows, member: &[i64], centre: &Point, p: &BaseParams, secs: &[Sec
                 ev[i].iter().enumerate().filter(|(k, _)| *k as u32 <= last && slabs.contains(&(*k as u32))).filter_map(|q| *q.1).sum()
             };
             let e_rct: f64 = replaced.iter().map(|&j| row_e(j, Some(&slabs))).sum::<f64>() + taken.iter().map(|&i| under(i)).sum::<f64>();
-            let pick = !taken.is_empty() && e_col > 0.0 && e_rct < KEEP * e_col;
+            let (lm, lt) = replaced.iter().map(|&j| {
+                let l = norm3(&sub(&b[j], &a[j])) * f64::from(ev[j].iter().enumerate().any(|(k, e)| e.is_some() && slabs.contains(&(k as u32))) as u8);
+                (l * measured[j], l)
+            }).fold((0.0, 0.0), |x, y| (x.0 + y.0, x.1 + y.1));
+            let ms = if lt > 0.0 { lm / lt } else { 0.0 };
+            let pick = !taken.is_empty() && e_col > 0.0 && e_rct < p.keep * e_col && ms < MEASURED;
             for &c in &sub_cols {
-                (out[c].e_col, out[c].e_rct) = (e_col, e_rct);
+                (out[c].e_col, out[c].e_rct, out[c].measured) = (e_col, e_rct, ms);
                 chosen[c] = pick;
             }
         }
@@ -809,7 +858,7 @@ mod tests {
     fn joined((a, b, r, p, m): &Plant, secs: &[Section], e: impl Fn(usize) -> f64) -> Rebased {
         let cols = vec![Column { sections: (0..secs.len()).collect(), parent: -1, at: -1 }];
         let rows = Rows { a, b, r_prior: r, r_max: &[], parent: p };
-        join(&rows, m, &[0.0, 0.0, 0.0], &BaseParams::default(), secs, cols, &[], 0.5, &evidence(a, b, e))
+        join(&rows, m, &[0.0, 0.0, 0.0], &BaseParams::default(), secs, cols, &[], 0.5, &evidence(a, b, &e), &vec![0.0; a.len()], &(0..a.len()).map(|i| e(i) < 0.0).collect::<Vec<_>>())
     }
 
     /// Every member hangs from one base, parents first.
@@ -905,6 +954,22 @@ mod tests {
         // it was
         let f = forked([1.2, 0.0, 0.0], [1.2, 0.0, 1.0], [0.02, 0.0, 1.46]);
         assert!(!f.out[0].chosen && f.counts[6] == 1 && f.a.len() == 4 && f.a[0] == [1.2, 0.0, 0.0], "{:?} {:?}", f.out, f.counts);
+    }
+
+    #[test]
+    fn a_base_the_rays_measure_keeps_its_rows_however_strong_the_column() {
+        // the trunk drawn 15 cm beside a column, its rows holding none of its evidence, but measured by their own
+        // circles: kept (research 125's F20)
+        let trunk: Vec<Point> = (0..6).map(|k| [0.0, if k < 4 { 0.15 } else { 0.0 }, 0.5 * k as f64]).collect();
+        let (a, b, r, p, m) = plant(&[(&trunk, 0.06)]);
+        let rows = Rows { a: &a, b: &b, r_prior: &r, r_max: &[], parent: &p };
+        let cols = vec![Column { sections: (0..14).collect(), parent: -1, at: -1 }];
+        let ev = evidence(&a, &b, |_| 0.0);
+        let f = join(&rows, &m, &[0.0, 0.0, 0.0], &BaseParams::default(), &column(0.0, 0.0, 0.1, 100.0, 0), cols.clone(), &[], 0.5, &ev, &vec![1.0; a.len()], &vec![false; a.len()]);
+        assert!(!f.out[0].chosen && f.out[0].measured == 1.0 && f.a == a, "{:?}", f.out);
+        // unmeasured: re-sectioned
+        let f = join(&rows, &m, &[0.0, 0.0, 0.0], &BaseParams::default(), &column(0.0, 0.0, 0.1, 100.0, 0), cols, &[], 0.5, &ev, &vec![0.0; a.len()], &vec![false; a.len()]);
+        assert!(f.out[0].chosen, "{:?}", f.out);
     }
 
     #[test]

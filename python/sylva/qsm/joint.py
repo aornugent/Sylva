@@ -552,7 +552,7 @@ def joint_fit(table, a, b, r_prior, parent, n_scans: int, params, *, r_max=None,
 
 def rebase(scans, a, b, r_prior, parent, member, centre, context=None, params: JointParams = JointParams(),
            reach: float = 0.6, z_lo: float = 0.1, z_hi: float = 1.5, dz: float = 0.1, link: float = 0.02,
-           threads: int = 0) -> dict:
+           keep: float = 0.8, threads: int = 0) -> dict:
     """A plant's base re-sectioned from the rays (3dtrees ticket 125): its grounded members' rows ``a[i] -> b[i]``
     (``parent`` within the rows, -1 at a member's base, parents first; ``member`` each row's), joined to the columns
     of wood standing in its bottom ``z_hi`` above the ground, where the rays favour them, for :func:`support_tree` to
@@ -572,13 +572,15 @@ def rebase(scans, a, b, r_prior, parent, member, centre, context=None, params: J
     (its highest section) joins the column whose top lies nearest where it does, within 8 cm beyond the column's
     radius, or else, where the rays refute the row's chain under that height, is grafted to the nearest column top
     within 30 cm; it is cut there. A column and its forks replace the chains of the rows they take only where their
-    evidence is positive and those chains hold under half of it in the same slabs; a skeleton already on its wood
-    keeps it. A column's rows go to the member whose taken rows carry most of the skeleton above their cuts; another
+    evidence is positive, those chains hold under ``keep`` of it in the same slabs, and under half of them are
+    measured (by an own circle the veto doesn't refute, as :func:`support_tree` would serve it): a skeleton already
+    on its wood keeps it. A column's rows go to the member whose taken rows carry most of the skeleton above their cuts; another
     member's row it takes starts that member's base at its cut (a fork, at the fork). A member that would stand on two
-    bases keeps its rows as they were. Of a member re-sectioned, other rows under ``z_hi`` whose middle lies in a
-    chosen column's circle, or whose evidence is negative, are dropped; a kept row whose parent was dropped hangs
-    from its member's nearest row end within 30 cm; one whose subtree reaches above ``z_hi`` is else joined to it
-    within 1 m by a row of its dropped parent's radius (else its member keeps its rows); any other is dropped. A
+    bases keeps its rows as they were. Of a member re-sectioned, other rows under the chosen columns' top whose
+    middle lies in a chosen column's circle, or that the veto refutes at a quarter of their radius, are dropped; a
+    kept row whose parent was dropped hangs from its member's nearest row end within 30 cm, no more than 5 cm above
+    its start; one whose subtree reaches above ``z_hi`` is else joined to such an end within 1 m by a row of its
+    dropped parent's radius (else its member keeps its rows); any other is dropped. A
     column whose owner keeps a base of its own (a stem the columns missed) starts there.
     ``support_tree.rs``'s ``base`` module documentation says it in full.
 
@@ -602,14 +604,18 @@ def rebase(scans, a, b, r_prior, parent, member, centre, context=None, params: J
         The slabs, above the ground: the first's bottom, the last's top and their thickness (m).
     link
         Stops within this of each other are one section (m).
+    keep
+        The share of a column's evidence RCT's rows must hold in its slabs to keep their base.
     threads
-        Threads for the slabs (0: all).
+        Threads for the slabs and the rows (0: all).
 
     Returns a dict: the rows ``a``, ``b`` ``(m, 3)``, ``r_prior``, ``parent`` (a row of the same member, -1 at its
     base: every member's rows hang from one base, parents first), ``member`` and ``column`` (-1 for a skeleton row);
     ``sections``, per section ``slab``, ``z``, ``x``, ``y``, ``r``, ``sd_log_r``, ``fitted``, ``arc``, ``n_scans``,
     ``hits``, ``n_pass``, ``pass_share``, ``evidence``, ``n_through``, ``column`` (-1: none), and per column
-    ``col_parent``, ``col_at``; ``columns``, per column ``e_col`` and ``e_rct`` (its root column's, with its forks), ``chosen``, ``owner`` (-1: none), ``r`` (its median), ``believable``, ``joined``, ``grafted``; and
+    ``col_parent``, ``col_at``; ``columns``, per column ``e_col``, ``e_rct`` and ``measured`` (its root column's,
+    with its forks), ``chosen``, ``owner`` (-1: none), ``r`` (its median), ``believable``, ``joined``, ``grafted``;
+    and
     ``counts`` of the rows rising through a column's top near it (``entries``: ``joined``, ``grafted``, ``kept``),
     rows ``dropped`` and ``hung``, and members ``reverted`` to their rows.
     """
@@ -622,4 +628,5 @@ def rebase(scans, a, b, r_prior, parent, member, centre, context=None, params: J
     return _core.qsm_rebase([s._core for s in scans], f64(a).reshape(-1, 3), f64(b).reshape(-1, 3), f64(r_prior),
                             np.ascontiguousarray(parent, np.int64), np.ascontiguousarray(member, np.int64),
                             [float(x) for x in centre], f64(ca).reshape(-1, 3), f64(cb).reshape(-1, 3), f64(cr),
-                            dataclasses.asdict(params), z_lo, z_hi, dz, reach, link, int(threads))
+                            dataclasses.asdict(params), z_lo, z_hi, dz, reach, link, float(keep),
+                            int(threads))

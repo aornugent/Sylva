@@ -38,16 +38,22 @@ def rows_of(f, k):
 
 
 Z = np.linspace(0, 2.5, 6)
-BESIDE = np.c_[np.zeros(6), np.r_[np.full(4, 0.12), 0, 0], Z]  # the trunk drawn 12 cm beside its wood under 1.5 m
+BESIDE = np.c_[np.zeros(6), np.r_[np.full(4, 0.2), 0, 0], Z]  # the trunk drawn 20 cm beside its wood under 1.5 m
 
 
 def test_a_base_drawn_on_its_wood_is_kept_and_one_beside_it_is_re_sectioned(scans):
     on = plant([(np.c_[np.zeros(6), np.zeros(6), Z], 0.08)])
     f = rebase(scans, *on, [0, 0, 0], params=PARAMS, reach=0.7, threads=2)
     assert not f["columns"]["chosen"].any() and np.array_equal(f["a"], on[0]) and np.array_equal(f["b"], on[1])
+    # 12 cm beside it, its rows' own circles find the trunk in their tubes: measured, as the joint fit would serve it,
+    # so kept however little of the column's evidence they hold
+    near = np.c_[np.zeros(6), np.r_[np.full(4, 0.12), 0, 0], Z]
+    f = rebase(scans, *plant([(near, 0.06)]), [0, 0, 0], params=PARAMS, reach=0.7, threads=2)
+    c = f["columns"]
+    assert not c["chosen"].any() and c["measured"][np.argmax(c["r"])] == 1 and c["e_rct"][np.argmax(c["r"])] < 0
     f = rebase(scans, *plant([(BESIDE, 0.06)]), [0, 0, 0], params=PARAMS, reach=0.7, threads=2)
     c = f["columns"]
-    assert c["chosen"].sum() == 1 and c["owner"][c["chosen"]][0] == 0 and f["counts"]["joined"] == 1
+    assert c["chosen"].sum() == 1 and c["owner"][c["chosen"]][0] == 0 and f["counts"]["joined"] + f["counts"]["grafted"] == 1
     # its base is now the column: on the trunk, about its radius, from the ground
     col = f["column"] >= 0
     mid = (f["a"][col] + f["b"][col]) / 2
