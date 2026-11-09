@@ -58,8 +58,10 @@
 //!   nearest the axis, span no more than the silhouette (a lower bound, `R >=
 //!   span / 2 - w (1/2 - tau)`); the nearest passes either side of them, or
 //!   either side of the woody centre in a slice where no woody stop is, lie
-//!   outside it (an upper bound, `R <= gap / 2 - w (1/2 - tau)`; a side with
-//!   no recorded pulse, or a stop or blocked pulse next, gives none); and wood
+//!   outside it (an upper bound, `R <= gap / 2 - w (1/2 - tau)`, a pass
+//!   there a pulse that met nothing in the tube; a side with no recorded
+//!   pulse, or a stop anywhere in the tube or a blocked pulse next, gives
+//!   none); and wood
 //!   that was hit fills at least `tau` of the footprint (the capacity floor `R
 //!   >= tau w / 2`, reported apart as `r_floor`). Each is a probit term on log
 //!   R: the bounds of the edge's sd (and the impacts' quantisation), the floor
@@ -132,7 +134,16 @@
 //! - **Held inside its bounds:** a posterior that the soft terms leave outside
 //!   its own bounds is moved onto them (the upper where they cross), and every
 //!   node says how its radius is known ([`basis`]; [`diag::PINNED`],
-//!   [`diag::CAPPED`]).
+//!   [`diag::CAPPED`]). Then the site's cap, then the veto: a node with no
+//!   circle of its own whose posterior circle the veto refutes is narrowed
+//!   about its centre until it isn't (the cap first, as a narrower circle can be
+//!   one the rays refute), or where that would cut it below its lower bound,
+//!   moved onto the nearest unrefuted circle that wide within three of its radii
+//!   whose centre is its own claim's, not a neighbour's ([`recentre`],
+//!   [`diag::MOVED`]: its wood beside the claim's axis, 3dtrees research 127).
+//!   A point circle's piece has no lower bound and never moves; a refused
+//!   routed piece's lower bound is its capacity floor, so it may move within
+//!   three floor radii.
 //! - **The volume** ([`Volume`]): the tree's pieces' at their posterior R, by
 //!   basis, and an interval from draws of the joint posterior, each node's
 //!   sd [`WIDEN`] times the solve's for its basis (as the reported
@@ -244,6 +255,8 @@ pub mod diag {
     /// Its posterior median reached the site's D/H cap (`PriorParams::dh`), applied after the solve: it is served
     /// at the cap.
     pub const CAPPED: u16 = 128;
+    /// The veto moved its circle onto the wood its lower bound saw beside it ([`super::recentre`]), refuted or not.
+    pub const MOVED: u16 = 256;
 }
 
 /// How a node's radius is known ([`Fit::basis`]; a row's: most of its pieces', the less known on a tie), the classes
@@ -301,6 +314,11 @@ const VETO_MIN: f64 = 0.001;
 const VETO_SD: f64 = 0.1;
 /// The step (log R) by which an unmeasured node's posterior circle the veto refutes is narrowed until it doesn't.
 const VETO_STEP: f64 = 0.05;
+/// [`recentre`]'s grid of centres: rings and spacing of `RECENTRE_STEP` of the radius kept (at least `RECENTRE_MIN`
+/// m), out to `RECENTRE_REACH` radii (a ring beside the claim's axis, research 122 F14, not another stem).
+const RECENTRE_STEP: f64 = 0.5;
+const RECENTRE_MIN: f64 = 0.002;
+const RECENTRE_REACH: f64 = 3.0;
 /// [`basis::BOUNDED`]: the least `data_share` of a node whose bounds say something (3dtrees research 106
 /// `uncertain.md`: the posterior's interval covers the refit's circles as well from there as on measured rows).
 const BOUNDED_SHARE: f64 = 0.1;
@@ -501,9 +519,10 @@ pub struct Fit {
     /// and the floor.
     pub chi2: Vec<f64>,
     pub chi2_front: Vec<f64>,
-    /// The bounds on R of a piece that isn't measured, NaN where there are none (they enter the tree where no circle
-    /// does, a routed piece's without its detection bound, which can span several stems; a row's: its pieces'
-    /// widest): the
+    /// The bounds on R that entered the tree, NaN where none did: a piece's where no circle of its own does (a
+    /// routed piece's without its detection bound, which can span several stems; a point circle's piece's upper
+    /// alone), so its radius is held in them but where they cross or the veto narrows it ([`diag::PINNED`]); a row's,
+    /// its pieces' root mean square as its R is (a piece without a lower bound at 0, without an upper unbounded): the
     /// tightest lower bound from detection (a woody run's span) and upper (passes beside or through), and the
     /// capacity floor `tau w / 2`, kept apart because it says only that something was hit.
     pub r_lo: Vec<f64>,
@@ -1366,7 +1385,10 @@ impl<'a> Profile<'a> {
     /// ends, so nothing recorded there is no evidence of sky.
     fn runs(&self, member: &[bool], c: f64, r_claim: f64, through: bool) -> (Vec<f64>, Vec<f64>) {
         let bp = &self.bp;
-        let pass = |i: usize| self.fates[i] == Fate::Pass;
+        // a pass beside the run is a pulse that met nothing in the tube: one that stopped behind the claim's depth
+        // window may have stopped on this wood, off the claim's axis in depth (a thin claim in a fat stem, a point
+        // circle behind it), and read as a pass it bounded that wood at millimetres (3dtrees research 127)
+        let pass = |i: usize| self.fates[i] == Fate::Pass && !self.g.recs[i].depth.is_finite();
         let (mut lo_s, mut hi_s) = (Vec::new(), Vec::new());
         for sl in &self.slices {
             let j0 = (0..sl.len()).filter(|&j| member[sl[j]] && (bp[sl[j]] - c).abs() < r_claim + self.w).min_by(|&x, &y| (bp[sl[x]] - c).abs().total_cmp(&(bp[sl[y]] - c).abs()));
@@ -1538,7 +1560,23 @@ fn point_circle(xy: &[[f64; 2]], r0: f64, believe: f64) -> Option<Vector5<f64>> 
 /// stem or the tree's own next row doesn't lend the row its stops.
 fn own_stops(k: usize, rows: &Rows, context: &[(Point, Point, f64)], nd: &Nodes, sums: &[Summary]) -> Vec<[f64; 2]> {
     let (k0, k1) = (nd.first[k], nd.first[k + 1]);
-    let reach = sums[k0..k1].iter().map(|s| s.diag.tube).fold(0.0, f64::max);
+    let owns = owner(k, rows, context, sums[k0..k1].iter().map(|s| s.diag.tube).fold(0.0, f64::max));
+    let mut out = Vec::new();
+    for j in k0..k1 {
+        let (u, e1, e2, pl) = nd.frame[j];
+        for r in sums[j].seen.iter().flat_map(|g| g.recs.iter()).filter(|r| r.is_stop()) {
+            let x: Point = std::array::from_fn(|i| nd.a[j][i] + (r.s + 0.5 * pl) * u[i] + r.xy[0] * e1[i] + r.xy[1] * e2[i]);
+            if owns(&x) {
+                out.push(r.xy);
+            }
+        }
+    }
+    out
+}
+
+/// Whether a place (world) within `reach` of row `k`'s claimed axis lies nearer it than any other axis the tree or
+/// its `context` claims: what row `k` may take as its own (a point circle's stops, a moved circle's centre).
+fn owner(k: usize, rows: &Rows, context: &[(Point, Point, f64)], reach: f64) -> impl Fn(&Point) -> bool {
     let (a, b) = (rows.a[k], rows.b[k]);
     let lo: Point = std::array::from_fn(|i| a[i].min(b[i]) - reach);
     let hi: Point = std::array::from_fn(|i| a[i].max(b[i]) + reach);
@@ -1550,18 +1588,10 @@ fn own_stops(k: usize, rows: &Rows, context: &[(Point, Point, f64)], nd: &Nodes,
         let t = (dot(&px, &pq) / dot(&pq, &pq).max(1e-12)).clamp(0.0, 1.0);
         crate::transform::norm(&sub(&px, &pq.map(|v| v * t)))
     };
-    let mut out = Vec::new();
-    for j in k0..k1 {
-        let (u, e1, e2, pl) = nd.frame[j];
-        for r in sums[j].seen.iter().flat_map(|g| g.recs.iter()).filter(|r| r.is_stop()) {
-            let x: Point = std::array::from_fn(|i| nd.a[j][i] + (r.s + 0.5 * pl) * u[i] + r.xy[0] * e1[i] + r.xy[1] * e2[i]);
-            let own = to_axis(&x, &(a, b));
-            if others.iter().all(|o| to_axis(&x, o) >= own) {
-                out.push(r.xy);
-            }
-        }
+    move |x: &Point| {
+        let own = to_axis(x, &(a, b));
+        others.iter().all(|o| to_axis(x, o) >= own)
     }
-    out
 }
 
 /// A point circle `x` as the measurement of one of a row's `pieces` pieces: its centre and R, each of sd [`PTS_SD`] R
@@ -1619,6 +1649,38 @@ fn veto_at(gs: &[Group], x: &Vector5<f64>) -> Option<f64> {
         }
     }
     Some(eta.max(VETO_MIN.ln()))
+}
+
+/// Where a circle `x` (`[c1, c2, t1, t2, log R]`) the veto refutes can move to keep the radius `exp(eta)` (its lower
+/// bound): on rings about its centre, [`RECENTRE_STEP`] times that radius apart (at least [`RECENTRE_MIN`] m), out to
+/// [`RECENTRE_REACH`] radii, with the circle inside the `tube` its pulses were taken in and its centre one its node
+/// `owns` (nearer its own claimed axis than any other claim's: a neighbour's stem isn't taken), the nearest ring holding
+/// a circle with a stop on it that the veto doesn't refute, and on it the one with the most stops; None where there is
+/// none.
+fn recentre(gs: &[Group], x: &Vector5<f64>, eta: f64, tube: f64, owns: impl Fn(f64, f64) -> bool) -> Option<(f64, f64)> {
+    let r = eta.exp();
+    let step = (RECENTRE_STEP * r).max(RECENTRE_MIN);
+    let mut d = step;
+    while d <= RECENTRE_REACH * r {
+        let n = (std::f64::consts::TAU * d / step).ceil();
+        let mut best: Option<(u32, (f64, f64))> = None;
+        for i in 0..n as usize {
+            let a = std::f64::consts::TAU * i as f64 / n;
+            let c = (x[0] + d * a.cos(), x[1] + d * a.sin());
+            if c.0.hypot(c.1) + r > tube || !owns(c.0, c.1) {
+                continue;
+            }
+            let (stop, pass) = tally(gs, &Vector5::new(c.0, c.1, x[2], x[3], r));
+            if stop > 0 && !refuted((stop, pass)) && best.map_or(true, |b| stop > b.0) {
+                best = Some((stop, c));
+            }
+        }
+        if let Some(b) = best {
+            return Some(b.1);
+        }
+        d += step;
+    }
+    None
 }
 
 /// An unmeasured piece's upper bound from the ray veto (3dtrees research 106 `geometry.md`): the widest circle about
@@ -1931,22 +1993,44 @@ pub fn support_tree(scans: &[&ScanIndex], rows: &Rows, context: &[(Point, Point,
     }
 
     let (mut sol, converged) = tree_solve(rows, &fr, &nd, &sums, prior, EP_ROUNDS)?;
-    let (mut held, mut bits) = hold(&terms(&sums), nd.row.len(), &mut sol);
+    let entered = terms(&sums);
+    let (mut held, mut bits) = hold(&entered, nd.row.len(), &mut sol);
     // the nodes with no circle of their own (a point circle's among them), and those with none at all, which the cap
     // holds
     let unmeasured: Vec<bool> = sums.iter().map(Summary::bounded).collect();
     let free: Vec<bool> = sums.iter().map(|s| s.bounded() && s.points.is_none()).collect();
-    // what the rays don't measure is held under the veto about its own posterior circle too: a woody run's bounds
-    // straddle its run, not the circle served (research 106: 17 % of such rows' volume was refuted)
-    for k in (0..nd.row.len()).filter(|&k| unmeasured[k]) {
-        if let Some(eta) = veto_at(&sums[nd.src(k).0].seen, &sol.x[k]) {
-            sol.x[k][4] = eta;
-            held[k] = (held[k].0.min(eta), held[k].1.min(eta));
-            bits[k] |= diag::PINNED;
-        }
-    }
-    // the cap, after the solve, on each node with no circle at all, alone
+    // the cap, after the solve, on each node with no circle at all, alone; before the veto, since a narrower circle
+    // can be one the rays refute (its stops on the front arc fall away before its passes do: 3dtrees research 127)
     cap(&caps, &free, &mut sol, &mut held, &mut bits);
+    // what the rays don't measure is held under the veto about its own posterior circle too: a woody run's bounds
+    // straddle its run, not the circle served (research 106: 17 % of such rows' volume was refuted). Where that would
+    // narrow it below its own lower bound, the circle is beside the wood its bound saw: it moves onto it, where the
+    // rays allow a circle that wide (3dtrees research 127), else it narrows about its own centre
+    // (a point circle's piece has no lower bound in the tree, so it is never moved)
+    for k in (0..nd.row.len()).filter(|&k| unmeasured[k]) {
+        let gs = &sums[nd.src(k).0].seen;
+        let Some(eta) = veto_at(gs, &sol.x[k]) else { continue };
+        let moved = (eta < held[k].0).then(|| {
+            let owns = owner(nd.row[k], rows, context, sums[k].diag.tube);
+            let mid = |c1: f64, c2: f64| axis_point(&nd.a[k], nd.frame[k], &Vector5::new(c1, c2, 0.0, 0.0, 0.0), 0.0);
+            recentre(gs, &sol.x[k], held[k].0, sums[k].diag.tube, |c1, c2| owns(&mid(c1, c2)))
+        }).flatten();
+        let eta = match moved {
+            Some(c) => {
+                (sol.x[k][0], sol.x[k][1]) = c;
+                bits[k] |= diag::MOVED;
+                // the moved circle at its lower bound isn't refuted, so the veto narrows it no further
+                match veto_at(gs, &sol.x[k]) {
+                    Some(e) => e.max(held[k].0),
+                    None => continue,
+                }
+            }
+            None => eta,
+        };
+        sol.x[k][4] = eta;
+        held[k] = (held[k].0.min(eta), held[k].1.min(eta));
+        bits[k] |= diag::PINNED;
+    }
     let p_wood = existence(&nd.parent, &sums.iter().map(|s| s.log_odds).collect::<Vec<_>>(), prior);
     // the classification on the support path: each stop by its piece's circle (its own, or the tree's) and its echo
     for (k, s) in sums.iter().enumerate().filter(|(_, s)| s.exact.is_none()) {
@@ -1981,9 +2065,13 @@ pub fn support_tree(scans: &[&ScanIndex], rows: &Rows, context: &[(Point, Point,
         echoes,
         volume: Volume::default(),
     };
-    // the tightest bound of a side
-    let bound = |s: &Summary, side: Side| {
-        let it = s.bounds.iter().filter(|b| b.side == side).map(|b| b.eta);
+    // the tightest bound of a side, of those that entered the tree (so a node's radius is held in what it reports)
+    let mut bounds_of: Vec<&[Bound]> = vec![&[]; nd.row.len()];
+    for (k, bs) in &entered {
+        bounds_of[*k] = bs;
+    }
+    let bound = |k: usize, side: Side| {
+        let it = bounds_of[k].iter().filter(|b| b.side == side).map(|b| b.eta);
         let e = if side == Side::Upper { it.fold(f64::INFINITY, f64::min) } else { it.fold(f64::NEG_INFINITY, f64::max) };
         if e.is_finite() { e.exp() } else { f64::NAN }
     };
@@ -2010,9 +2098,9 @@ pub fn support_tree(scans: &[&ScanIndex], rows: &Rows, context: &[(Point, Point,
             sd_r_row: s.used().map_or(f64::NAN, |c| c.cov[(4, 4)].max(0.0).sqrt()),
             chi2: s.outcome.circle().map_or(f64::NAN, |c| c.chi2),
             chi2_front: s.chi2_front,
-            r_lo: bound(s, Side::Lower),
-            r_hi: bound(s, Side::Upper),
-            r_floor: bound(s, Side::Floor),
+            r_lo: bound(k, Side::Lower),
+            r_hi: bound(k, Side::Upper),
+            r_floor: bound(k, Side::Floor),
             r_cap: if free[k] { caps[k].exp() } else { f64::NAN },
             log_odds: s.log_odds,
             p_wood: p_wood[k],
@@ -2044,6 +2132,13 @@ pub fn support_tree(scans: &[&ScanIndex], rows: &Rows, context: &[(Point, Point,
             let v: Vec<f64> = v[k0..k1].iter().copied().filter(|x| x.is_finite()).collect();
             if v.is_empty() { f64::NAN } else { v.iter().sum::<f64>() / v.len() as f64 }
         };
+        // a row's bounds as its radius: its pieces' root mean square, a piece without a lower bound at 0 and one
+        // without an upper unbounded, so a row whose pieces lie inside their bounds lies inside its own
+        let rms = |v: &[f64], none: f64| {
+            let v = &v[k0..k1];
+            let ms = v.iter().map(|x| if x.is_finite() { x * x } else { none }).sum::<f64>() / v.len() as f64;
+            if v.iter().all(|x| x.is_nan()) || ms.is_infinite() { f64::NAN } else { ms.sqrt() }
+        };
         let audit = audit[k0..k1].iter().fold((0, 0), |a, q| (a.0 + q.0, a.1 + q.1));
         // most of its pieces' basis, the less known on a tie (max_by_key keeps the last of equal maxima)
         let basis = (1..=basis::CAPPED).max_by_key(|&b| p.basis[k0..k1].iter().filter(|&&x| x == b).count()).unwrap_or(basis::PRIOR);
@@ -2056,9 +2151,9 @@ pub fn support_tree(scans: &[&ScanIndex], rows: &Rows, context: &[(Point, Point,
             sd_r_row: eta.exp() * sd,
             chi2: fold(&p.chi2, f64::max),
             chi2_front: fold(&p.chi2_front, f64::max),
-            r_lo: fold(&p.r_lo, f64::min),
-            r_hi: fold(&p.r_hi, f64::max),
-            r_floor: fold(&p.r_floor, f64::min),
+            r_lo: rms(&p.r_lo, 0.0),
+            r_hi: rms(&p.r_hi, f64::INFINITY),
+            r_floor: rms(&p.r_floor, 0.0),
             r_cap: fold(&p.r_cap, f64::max),
             log_odds: p.log_odds[k0..k1].iter().sum(),
             p_wood: p.p_wood[k0..k1].iter().sum::<f64>() / (k1 - k0) as f64,
@@ -3570,12 +3665,48 @@ mod tests {
         }
         let stem = [group(v)];
         assert!(tally(&stem, &circle(0.02)).1 == 0 && veto_at(&stem, &Vector5::new(0.0, 0.0, 0.0, 0.0, 0.02f64.ln())).is_none());
+        // the same stem 3 cm beside the claim's axis (research 122 F14): a 2 cm circle about the axis is refuted and
+        // narrowing it about the axis leaves a thread, but moved onto the stem it keeps its 2 cm, and nothing moves
+        // where no circle that wide is left unrefuted (the phantom)
+        let beside = [group(stem[0].recs.iter().map(|r| Rec { b: r.b + 0.03, ..*r }).collect())];
+        let lo = 0.02f64.ln();
+        let x = Vector5::new(0.0, 0.0, 0.0, 0.0, lo);
+        assert!(veto_at(&beside, &x).unwrap() < 0.005f64.ln());
+        let (c1, c2) = recentre(&beside, &x, lo, 0.1, |_, _| true).unwrap();
+        assert!((c1 - 0.03).abs() < 0.006 && c2.abs() < 0.011, "{c1} {c2}");
+        assert!(veto_at(&beside, &Vector5::new(c1, c2, 0.0, 0.0, lo)).is_none());
+        assert!(recentre(&phantom, &Vector5::new(0.0, 0.0, 0.0, 0.0, lo), lo, 0.1, |_, _| true).is_none());
+        // where that stem is a neighbour's (its axis at 3 cm, nearer it than the claim's past 1.5 cm), it isn't taken
+        assert!(recentre(&beside, &x, lo, 0.1, |c1, _| c1 < 0.015).is_none());
         let b = veto(&stem, 0.1).unwrap();
         assert!(b.eta.exp() >= 0.02 && b.eta.exp() < 0.03, "{}", b.eta.exp());
         // a pulse blocked in front, or stopping before the circle, says nothing of it
         let front = [group((0..20).map(|j| rec(0.0, j as f64 * 0.005, -0.05)).collect())];
         assert_eq!(tally(&front, &circle(0.02)), (0, 0));
         assert!(veto(&front, 0.1).is_none());
+    }
+
+    #[test]
+    fn a_stem_off_the_claims_axis_in_depth_is_not_bounded_by_its_own_flanks() {
+        // a 2.25 cm stem 4.5 cm behind a 5 mm claim's axis: its flanks fall behind the claim's depth window, and read
+        // as passes either side of a 2 cm run they bounded it at 1.5 cm, pinning a point circle on it or a thin
+        // claim in a fat base (3dtrees research 127); a pass is a pulse that met nothing in the tube
+        let rec = |b: f64, s: f64, depth: f64| Rec { b, s, depth, xy: [f64::NAN; 2], w: 0.005, refl: f64::NAN, single: true, blocked: false, lost: false, pulse: 0, echo: 0 };
+        let mut v = Vec::new();
+        for j in 0..20 {
+            for i in -12..=12 {
+                let b = i as f64 * 0.005;
+                v.push(rec(b, j as f64 * 0.005, if b.abs() < 0.0225 { 0.045 - (0.0225f64.powi(2) - b * b).sqrt() } else { f64::NAN }));
+            }
+        }
+        let gs = [Group { scan: 0, n: [1.0, 0.0], v: [0.0, 1.0], recs: v }];
+        let p = like();
+        let upper = |bs: Vec<Bound>| bs.iter().filter(|b| b.side == Side::Upper).map(|b| b.eta.exp()).fold(f64::INFINITY, f64::min);
+        assert!(upper(Profile::of(&gs[0], 0.005, &p).bounds(0.005, &p, None)) >= 0.0225);
+        // the same stem on the claim's axis is bounded by the passes beside it
+        let on: Vec<Rec> = gs[0].recs.iter().map(|r| Rec { depth: r.depth - 0.045, ..*r }).collect();
+        let hi = upper(Profile::of(&Group { scan: 0, n: [1.0, 0.0], v: [0.0, 1.0], recs: on }, 0.02, &p).bounds(0.02, &p, None));
+        assert!((0.0225..0.03).contains(&hi), "{hi}");
     }
 
     #[test]

@@ -26,6 +26,21 @@ def scanned(tmp_path, a, b, r, scanners, zenith=(80.0, 100.0)):
     return scans
 
 
+def inside_own_bounds(f):
+    """Each row and node of a fit lies inside the bounds it reports (those that entered the tree), but where PINNED
+    says the rays contradict themselves; a node measured by its own circle reports none (3dtrees research 127)."""
+    for x in (f, f["pieces"]):
+        lo, hi = np.nan_to_num(x["r_lo"]), np.nan_to_num(x["r_hi"], nan=np.inf)
+        ok = (x["r"] >= lo * (1 - 1e-9)) & (x["r"] <= hi * (1 + 1e-9)) | ((x["diag"] & SupportDiag.PINNED) > 0)
+        assert ok.all(), (x["r"], x["r_lo"], x["r_hi"], x["diag"])
+    p = f["pieces"]
+    # a point circle's passes bound it about its own centre, so they don't pin it far under itself
+    pts = p["basis"] == SupportBasis.POINTS
+    assert (p["r"][pts] >= 0.5 * p["r_points"][pts]).all(), (p["r"][pts], p["r_points"][pts])
+    own = p["basis"] == SupportBasis.MEASURED
+    assert np.isnan(p["r_lo"][own]).all() and np.isnan(p["r_hi"][own]).all()
+
+
 def test_separated_stems_upright_and_leaning_are_measured(tmp_path):
     # stems of 1 to 8 cm 40 cm apart, the last leaning 10 degrees along x, from three sides; each claimed as RCT
     # errs: rows of 30 cm, upright, 1.5 r fat, 0.3 r off the axis
@@ -140,6 +155,8 @@ def test_a_clump_of_stems_is_flagged_as_runs(tmp_path):
     # each fitted stem reports its own foliage rate (NaN off the exact path), and the solve its rounds
     assert np.isfinite(p["lam"][p["k_stems"] > 0]).all() and (p["lam"][p["k_stems"] > 0] > 0).all() and 3 <= f["rounds"] <= 300
     assert len(set(zip(p["src"].tolist(), p["stem"].tolist()))) == len(p["src"])
+    # the runs' spans don't bound the stems measured in them, so they aren't reported as their bounds
+    inside_own_bounds(f)
     with pytest.raises(ValueError, match="version"):
         support_tree(scans, a, b, [0.093, 0.093], [-1, 0], params=dataclasses.replace(PARAMS, version=0))
     with pytest.raises(ValueError, match="parent"):
@@ -166,12 +183,16 @@ def test_a_tree_reports_how_its_radii_are_known_and_its_volume_with_an_interval(
     v = f["volume"]
     parts = v["measured"] + v["points"] + v["bounded"] + v["prior"] + v["capped"]
     assert np.isclose(parts, v["mean"]) and v["q05"] < v["point"] < v["q95"] and v["capped"] == 0
+    inside_own_bounds(f)
     capped = support_tree(scans, a, a + [0, 0, 0.3], 1.5 * radii, np.full(4, -1),
                           params=dataclasses.replace(PARAMS, dh=0.006), threads=2)
     held = capped["basis"] != SupportBasis.MEASURED
     assert held.any() and np.allclose(capped["r_cap"][held], 0.0009)
     assert (capped["r"][held] <= capped["r_cap"][held] * (1 + 1e-9)).all()
     assert (capped["basis"][held] == SupportBasis.CAPPED).all() and (capped["diag"][held] & SupportDiag.CAPPED).all()
+    inside_own_bounds(capped)
+    # the cap comes before the veto, so a capped circle is one the rays don't refute either
+    assert not (capped["diag"] & SupportDiag.REFUTED).any()
     assert capped["volume"]["capped"] > 0 and capped["volume"]["q95"] < v["q95"]
     # neighbours' cylinders are context: the call takes them, and a context far away changes nothing
     far = (np.array([[50.0, 0, 0]]), np.array([[50.0, 0, 1]]), np.array([0.1]))
