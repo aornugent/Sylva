@@ -227,7 +227,8 @@ SupportRefusal = IntFlag("SupportRefusal", _core.qsm_support_refusals())
 #:   against its centre: its message says nothing along what they leave free, and its own bounds (the span of its
 #:   front arc's stops, the capacity floor) enter the tree beside it. A side past the fit's table isn't judged;
 #: - ``SUB_FOOTPRINT``: R below about half the footprint at its range;
-#: - ``TUBE_EDGE``: its own fitted circle reaches the edge of the tube its pulses were taken in: evidence cut off;
+#: - ``TUBE_EDGE``: its own fitted circle reaches the edge of the tube its pulses were taken in: evidence cut off, so
+#:   a piece's own circle there isn't used (a capture or a drift), nor its woody run's span as a lower bound;
 #: - ``CONTESTED``: most of its stops are claimed by context or a neighbouring node (``contested``);
 #: - ``REFUTED``: the ray veto refutes its fitted circle: at least 10 pulses pass through it, and passes are at least a
 #:   quarter of its stops and passes (3dtrees research 106; a row's: of its pieces' counts summed);
@@ -287,7 +288,7 @@ def support_tree(scans, a, b, r_prior, parent, context=None, params: JointParams
     on them (``PINNED``).
 
     Point evidence (3dtrees ticket 109): a row none of whose pieces has a circle of its own gets one from the stops
-    in its pieces' tubes, placed across its axis, as the refit fitted RCT's points (RANSAC, least squares on its
+    in its pieces' tubes nearer its claimed axis than any other the tree or its context claims, placed across its axis, as the refit fitted RCT's points (RANSAC, least squares on its
     inliers, and the refit's tests: at least 12 stops on a claim of at least 1 cm, half of them on it, filling 120
     degrees of it, its centre near the axis, at most twice the claim and twice the site's cap). Unless the ray veto
     refutes it (on a tangle it can be another tree's), it measures each of the row's pieces' centre and R with sd
