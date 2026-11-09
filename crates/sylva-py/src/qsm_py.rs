@@ -749,7 +749,7 @@ fn qsm_support_refusals() -> Vec<(&'static str, u8)> {
 #[pyfunction]
 fn qsm_support_diags() -> Vec<(&'static str, u16)> {
     use support_tree::diag::*;
-    vec![("ONE_SIDED", ONE_SIDED), ("SHADOWED", SHADOWED), ("SUB_FOOTPRINT", SUB_FOOTPRINT), ("TUBE_EDGE", TUBE_EDGE), ("CONTESTED", CONTESTED), ("REFUTED", REFUTED), ("PINNED", PINNED), ("CAPPED", CAPPED)]
+    vec![("ONE_SIDED", ONE_SIDED), ("SHADOWED", SHADOWED), ("SUB_FOOTPRINT", SUB_FOOTPRINT), ("TUBE_EDGE", TUBE_EDGE), ("CONTESTED", CONTESTED), ("REFUTED", REFUTED), ("PINNED", PINNED), ("CAPPED", CAPPED), ("MOVED", MOVED)]
 }
 
 /// The names of the `basis` codes of `qsm_support_tree`.

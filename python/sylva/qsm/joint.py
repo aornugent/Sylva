@@ -235,7 +235,9 @@ SupportRefusal = IntFlag("SupportRefusal", _core.qsm_support_refusals())
 #:   quarter of its stops and passes (3dtrees research 106; a row's: of its pieces' counts summed);
 #: - ``PINNED``: its radius sits on its own bounds (the tree without them would put it past one, or the posterior did
 #:   and was held inside them): what its rays say is a bound, not a value;
-#: - ``CAPPED``: its posterior median reached the site's D/H cap (``dh``), applied after the solve: served at the cap.
+#: - ``CAPPED``: its posterior median reached the site's D/H cap (``dh``), applied after the solve: served at the cap;
+#: - ``MOVED``: the veto moved its circle onto its own wood beside the claim's axis, refuted or not (3dtrees research
+#:   127).
 SupportDiag = IntFlag("SupportDiag", _core.qsm_support_diags())
 
 #: How a node's radius is known (:func:`support_tree`'s ``basis``; a row's: most of its pieces', the less known on a
@@ -286,10 +288,9 @@ def support_tree(scans, a, b, r_prior, parent, context=None, params: JointParams
     shoot measured fat can't inflate its parent, the centre's continuity along a branch and the lean's random walk
     between a row's pieces, the centre's anchor and a weak anchor of the lean; no tip anchor). A posterior is then held
     inside its own bounds (between the tightest lower and upper, the upper where they cross), and says where it sits
-    on them (``PINNED``). A piece with no circle of its own whose posterior circle the veto refutes is then narrowed
-    about its own centre until it isn't (after the site's cap); where that would take it below its lower bound, it moves instead (up to
-    three of those radii) onto the unrefuted circle as wide as that bound with the most stops on it (3dtrees research
-    127: a stem beside the claim's axis), and only where there is none narrows past the bound.
+    on them (``PINNED``). Then the site's cap, then the veto: a piece with no circle of its own whose posterior
+    circle the veto refutes is narrowed until it isn't, or moved onto its own wood beside the claim's axis where
+    narrowing would cut it below its lower bound (``MOVED``; ``support_tree.rs``'s module documentation says how).
 
     Point evidence (3dtrees ticket 109): a row none of whose pieces has a circle of its own gets one from the stops
     in its pieces' tubes nearer its claimed axis than any other the tree or its context claims, placed across its
@@ -298,8 +299,8 @@ def support_tree(scans, a, b, r_prior, parent, context=None, params: JointParams
     most twice the claim and twice the site's cap, and short of the edge of its pieces' tubes). Unless the ray veto
     refutes it (on a tangle it can be another tree's), it measures each of the row's n pieces' R and centre (each
     coordinate) with sd 0.136 R sqrt(n) (0.136 in log R, the refit circles' noise, shared by the n pieces), its
-    pieces' upper bounds beside it (the lower bound and capacity floor its own stops gave it replaces), and isn't
-    capped (``POINTS``).
+    pieces' upper bounds beside it, read about the circle's own centre (the lower bound and capacity floor its own
+    stops gave it replaces), and isn't capped (``POINTS``).
 
     A ``RUNS`` or ``HULL`` piece is fitted by the exact likelihood, seeded from its runs (3dtrees research 93 §18):
     each scan's runs, found slice by slice along the piece, measured as circles with their own centre, lean and
@@ -373,9 +374,9 @@ def support_tree(scans, a, b, r_prior, parent, context=None, params: JointParams
       routed piece's without its detection bound, a point circle's piece's upper alone), so ``r`` lies inside them
       but where ``PINNED`` says the rays contradict themselves (bounds that cross, or a veto that refutes every
       circle as wide as the lower bound); a row's: its pieces' root mean square, as its ``r`` is (a piece without a
-      lower bound at 0, without an upper unbounded); ``r_cap``, the site's cap on it (NaN
-      without ``dh``, or where a circle measures it; a row's: its first piece's); ``r_points``, its row's point
-      circle's radius, NaN where none passed its tests (it entered unless the veto refuted it: ``basis`` says so);
+      lower bound at 0, without an upper unbounded); ``r_cap``, the site's cap on it (NaN without ``dh``, or where a
+      circle measures it; a row's: its first piece's); ``r_points``, its row's point circle's radius, NaN where none
+      passed its tests (it entered unless the veto refuted it: ``basis`` says so);
     - ``n_pass``, ``pass_share``: the ray veto's audit of its fitted circle, the pulses passing through it and their
       share of its stops and passes (NaN with none; a row's: its pieces' summed), ``REFUTED`` where they refute it;
     - ``basis`` (:class:`SupportBasis`): how its radius is known;

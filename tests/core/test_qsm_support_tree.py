@@ -34,6 +34,9 @@ def inside_own_bounds(f):
         ok = (x["r"] >= lo * (1 - 1e-9)) & (x["r"] <= hi * (1 + 1e-9)) | ((x["diag"] & SupportDiag.PINNED) > 0)
         assert ok.all(), (x["r"], x["r_lo"], x["r_hi"], x["diag"])
     p = f["pieces"]
+    # a point circle's passes bound it about its own centre, so they don't pin it far under itself
+    pts = p["basis"] == SupportBasis.POINTS
+    assert (p["r"][pts] >= 0.5 * p["r_points"][pts]).all(), (p["r"][pts], p["r_points"][pts])
     own = p["basis"] == SupportBasis.MEASURED
     assert np.isnan(p["r_lo"][own]).all() and np.isnan(p["r_hi"][own]).all()
 
