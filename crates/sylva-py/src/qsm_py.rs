@@ -821,8 +821,12 @@ fn qsm_support_tree<'py>(py: Python<'py>, scans: Vec<Bound<'py, PyScanIndex>>, a
     d.set_item("echoes", echoes_to_py(py, f.echoes)?)?;
     let v = f.volume;
     let volume = PyDict::new(py);
-    for (k, x) in [("point", v.point), ("mean", v.mean), ("q05", v.q05), ("q95", v.q95), ("measured", v.measured), ("points", v.points), ("bounded", v.bounded), ("prior", v.prior), ("capped", v.capped)] {
+    for (k, x) in [("point", v.point), ("mean", v.mean), ("q05", v.q05), ("q95", v.q95)] {
         volume.set_item(k, x)?;
+    }
+    // the mean by basis, each under its basis's name
+    for (name, b) in qsm_support_bases() {
+        volume.set_item(name.to_lowercase(), v.by_basis[usize::from(b) - 1])?;
     }
     d.set_item("volume", volume)?;
     Ok(d)
