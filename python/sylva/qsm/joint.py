@@ -235,7 +235,7 @@ SupportRefusal = IntFlag("SupportRefusal", _core.qsm_support_refusals())
 #:   quarter of its stops and passes (3dtrees research 106; a row's: of its pieces' counts summed);
 #: - ``PINNED``: its radius sits on its own bounds (the tree without them would put it past one, or the posterior did
 #:   and was held inside them): what its rays say is a bound, not a value;
-#: - ``CAPPED``: its radius sits on the site's D/H cap (``dh``), the tighter of its upper bounds.
+#: - ``CAPPED``: its posterior median reached the site's D/H cap (``dh``), applied after the solve: served at the cap.
 SupportDiag = IntFlag("SupportDiag", _core.qsm_support_diags())
 
 #: How a node's radius is known (:func:`support_tree`'s ``basis``; a row's: most of its pieces', the less known on a
@@ -272,8 +272,9 @@ def support_tree(scans, a, b, r_prior, parent, context=None, params: JointParams
     with no woody stop, either side of the woody centre) no narrower, and wood that was hit fills at least ``tau``
     of the footprint; a side with nothing recorded gives no bound. Passes alone bound it too, the ray veto (3dtrees
     research 106): its R is at most the widest circle about the claim's axis that fewer than 10 pulses, or under a
-    quarter of its stops and passes, pass through. With ``dh``, the site's largest stem D/H caps it: R is at most
-    ``dh`` times its reach to the tips (the longest path from its start) over 2, a bound of the prior's. Each piece also has an existence log odds from
+    quarter of its stops and passes, pass through. With ``dh``, the site's largest stem D/H caps it after the solve, on
+    that node alone (a stem-scale rule, so it doesn't carry down the tree): R is at most ``dh`` times its reach to the
+    tips (the longest path from its start) over 2, its point and its volume's draws clipped there. Each piece also has an existence log odds from
     its core's stops and passes (echo character, and opacity: a stop for wood, a pass against it), over the beam's
     oversampling and weighted by ``exist_scale``, and a chain along the branches (wood doesn't stop and restart:
     ``exist``, ``exist_off``) gives ``p_wood``. The tree is one solve: the unflagged pieces' summaries as Gaussian
@@ -283,7 +284,7 @@ def support_tree(scans, a, b, r_prior, parent, context=None, params: JointParams
     shoot measured fat can't inflate its parent, the centre's continuity along a branch and the lean's random walk
     between a row's pieces, the centre's anchor and a weak anchor of the lean; no tip anchor). A posterior is then held
     inside its own bounds (between the tightest lower and upper, the upper where they cross), and says where it sits
-    on them (``PINNED``, ``CAPPED``).
+    on them (``PINNED``).
 
     A ``RUNS`` or ``HULL`` piece is fitted by the exact likelihood, seeded from its runs (3dtrees research 93 §18):
     each scan's runs, found slice by slice along the piece, measured as circles with their own centre, lean and

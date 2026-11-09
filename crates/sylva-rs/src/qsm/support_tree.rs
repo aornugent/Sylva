@@ -110,10 +110,12 @@
 //!   [`VETO_PASSES`] passes through it, a share [`VETO_SHARE`] of its stops and
 //!   passes). Every node's fitted circle is audited the same way (`n_pass`,
 //!   `pass_share`, [`diag::REFUTED`]).
-//! - **The site's cap** (`PriorParams::dh`, 3dtrees research 62): every node
-//!   whose own circle doesn't enter has R at most `dh` times its reach to the
-//!   tips over 2, a censored term like its bounds but the prior's (it adds
-//!   nothing to `data_share`).
+//! - **The site's cap** (`PriorParams::dh`, 3dtrees research 62, 106
+//!   `uncertain.md`): after the solve, every node whose own circle doesn't
+//!   enter has R at most `dh` times its reach to the tips over 2, applied to
+//!   that node alone (its point and its volume's draws), never in the solve:
+//!   it is a stem-scale rule, no true bound on a short-reach twig, so it must
+//!   not carry down the tree's chain.
 //! - **Held inside its bounds:** a posterior that the soft terms leave outside
 //!   its own bounds is moved onto them (the upper where they cross), and every
 //!   node says how its radius is known ([`basis`]; [`diag::PINNED`],
@@ -222,8 +224,8 @@ pub mod diag {
     /// Its radius sits on its own bounds: the tree without them would put it past one (its cavity's mean lies beyond
     /// a bound), or the posterior did and was held inside them. What the rays say there is a bound, not a value.
     pub const PINNED: u16 = 64;
-    /// Its radius sits on the site's D/H cap (`PriorParams::dh`), the tighter of its upper bounds: the tree without
-    /// it would put it past the cap.
+    /// Its posterior median reached the site's D/H cap (`PriorParams::dh`), applied after the solve: it is served
+    /// at the cap.
     pub const CAPPED: u16 = 128;
 }
 
@@ -280,9 +282,6 @@ const VETO_MIN: f64 = 0.001;
 const VETO_SD: f64 = 0.1;
 /// The step (log R) by which an unmeasured node's posterior circle the veto refutes is narrowed until it doesn't.
 const VETO_STEP: f64 = 0.05;
-/// The site's D/H cap enters as an upper bound of this sd in log R (soft as the bounds are, and held hard by the
-/// posterior's projection into its bounds).
-const DH_SD: f64 = 0.1;
 /// [`basis::BOUNDED`]: the least `data_share` of a node whose bounds say something (3dtrees research 106
 /// `uncertain.md`: the posterior's interval covers the refit's circles as well from there as on measured rows).
 const BOUNDED_SHARE: f64 = 0.1;
@@ -622,8 +621,6 @@ enum Side {
     Upper,
     /// The capacity floor: wood that was hit fills at least `tau` of the footprint.
     Floor,
-    /// The site's D/H cap: a prior's bound, not the piece's data.
-    Cap,
 }
 
 /// A censored measurement of a piece's log R, `log R <= eta` (upper) or `>= eta`, softened by a Gaussian of sd
@@ -636,14 +633,9 @@ struct Bound {
 }
 
 impl Bound {
-    /// Whether it holds R from above.
-    fn upper(&self) -> bool {
-        matches!(self.side, Side::Upper | Side::Cap)
-    }
-
     /// Its log probit at log R `x`.
     fn ln_p(&self, x: f64) -> f64 {
-        log_ndtr_value(if self.upper() { self.eta - x } else { x - self.eta } / self.sd)
+        log_ndtr_value(if self.side == Side::Upper { self.eta - x } else { x - self.eta } / self.sd)
     }
 }
 
@@ -1739,24 +1731,25 @@ pub fn support_tree(scans: &[&ScanIndex], rows: &Rows, context: &[(Point, Point,
         }
     }
 
-    // the site's D/H cap on every node's R, from its reach to the tips (3dtrees research 62's cap, now a bound in the
-    // solve, so a radius on it is reported so); it enters only where no circle of the node's own does
-    if prior.dh > 0.0 {
-        for (s, l) in sums.iter_mut().zip(reach(rows, &fr, &nd)) {
-            s.bounds.push(Bound { eta: (0.5 * prior.dh * l).ln(), sd: DH_SD, side: Side::Cap });
-        }
-    }
     let (mut sol, converged) = tree_solve(rows, &fr, &nd, &sums, prior, EP_ROUNDS)?;
     let (mut held, mut bits) = hold(&terms(&sums), nd.row.len(), &mut sol);
+    let unmeasured: Vec<bool> = sums.iter().map(|s| s.used().is_none() || s.shadowed).collect();
     // what the rays don't measure is held under the veto about its own posterior circle too: a woody run's bounds
     // straddle its run, not the circle served (research 106: 17 % of such rows' volume was refuted)
-    for k in (0..nd.row.len()).filter(|&k| sums[k].used().is_none() || sums[k].shadowed) {
+    for k in (0..nd.row.len()).filter(|&k| unmeasured[k]) {
         if let Some(eta) = veto_at(&sums[nd.src(k).0].seen, &sol.x[k]) {
             sol.x[k][4] = eta;
             held[k] = (held[k].0.min(eta), held[k].1.min(eta));
             bits[k] |= diag::PINNED;
         }
     }
+    // the site's D/H cap (log R; NaN without one), after the solve, on each unmeasured node alone
+    let caps: Vec<f64> = if prior.dh > 0.0 {
+        reach(rows, &fr, &nd).iter().map(|l| (0.5 * prior.dh * l).ln()).collect()
+    } else {
+        vec![f64::NAN; nd.row.len()]
+    };
+    cap(&caps, &unmeasured, &mut sol, &mut held, &mut bits);
     let p_wood = existence(&nd.parent, &sums.iter().map(|s| s.log_odds).collect::<Vec<_>>(), prior);
     // the classification on the support path: each stop by its piece's circle (its own, or the tree's) and its echo
     for (k, s) in sums.iter().enumerate().filter(|(_, s)| s.exact.is_none()) {
@@ -1794,7 +1787,7 @@ pub fn support_tree(scans: &[&ScanIndex], rows: &Rows, context: &[(Point, Point,
     // the tightest bound of a side
     let bound = |s: &Summary, side: Side| {
         let it = s.bounds.iter().filter(|b| b.side == side).map(|b| b.eta);
-        let e = if matches!(side, Side::Upper | Side::Cap) { it.fold(f64::INFINITY, f64::min) } else { it.fold(f64::NEG_INFINITY, f64::max) };
+        let e = if side == Side::Upper { it.fold(f64::INFINITY, f64::min) } else { it.fold(f64::NEG_INFINITY, f64::max) };
         if e.is_finite() { e.exp() } else { f64::NAN }
     };
     for (k, s) in sums.iter().enumerate() {
@@ -1813,7 +1806,7 @@ pub fn support_tree(scans: &[&ScanIndex], rows: &Rows, context: &[(Point, Point,
             r_lo: bound(s, Side::Lower),
             r_hi: bound(s, Side::Upper),
             r_floor: bound(s, Side::Floor),
-            r_cap: if measured { f64::NAN } else { bound(s, Side::Cap) },
+            r_cap: if unmeasured[k] { caps[k].exp() } else { f64::NAN },
             log_odds: s.log_odds,
             p_wood: p_wood[k],
             flags: s.outcome.flags(),
@@ -1906,29 +1899,41 @@ fn reach(rows: &Rows, fr: &[Frame], nd: &Nodes) -> Vec<f64> {
 }
 
 /// Holds each bounded node's posterior log R inside its own bounds (3dtrees research 106: 5.6 % of rows lay outside
-/// them): between the tightest lower (detection, the capacity floor) and the tightest upper (passes, the site's cap),
-/// the upper where they cross. Returns each node's interval (log R; unbounded where it has none) and its
-/// [`diag::PINNED`] or [`diag::CAPPED`] bit: where its cavity (the tree without its bounds) or its posterior lay beyond
-/// one, CAPPED where that is the cap and it is the tighter upper.
+/// them): between the tightest lower (detection, the capacity floor) and the tightest upper (passes), the upper where
+/// they cross. Returns each node's interval (log R; unbounded where it has none) and its [`diag::PINNED`] bit: where
+/// its cavity (the tree without its bounds) or its posterior lay beyond one.
 fn hold(terms: &[(usize, Vec<Bound>)], n: usize, sol: &mut Solved) -> (Vec<(f64, f64)>, Vec<u16>) {
     let (mut held, mut bits) = (vec![(f64::NEG_INFINITY, f64::INFINITY); n], vec![0u16; n]);
     for (k, bs) in terms {
         let k = *k;
-        let eta = |keep: &dyn Fn(&Bound) -> bool, up: bool| {
-            let it = bs.iter().filter(|b| keep(b)).map(|b| b.eta);
-            if up { it.fold(f64::INFINITY, f64::min) } else { it.fold(f64::NEG_INFINITY, f64::max) }
+        let eta = |side: Side| {
+            let it = bs.iter().filter(|b| b.side == side).map(|b| b.eta);
+            if side == Side::Upper { it.fold(f64::INFINITY, f64::min) } else { it.fold(f64::NEG_INFINITY, f64::max) }
         };
-        let (lo, hi, cap) = (eta(&|b| !b.upper(), false), eta(&|b| b.side == Side::Upper, true), eta(&|b| b.side == Side::Cap, true));
-        let upper = hi.min(cap);
+        let (lo, upper) = (eta(Side::Lower).max(eta(Side::Floor)), eta(Side::Upper));
         let lower = lo.min(upper);
         let (x, mc) = (sol.x[k][4], sol.cavity[k]);
-        let (over, under) = (x > upper || mc > upper, x < lower || mc < lo);
-        let capped = over && cap <= hi;
-        bits[k] = if capped { diag::CAPPED } else { 0 } | if (over && !capped) || under { diag::PINNED } else { 0 };
+        if x > upper || mc > upper || x < lower || mc < lo {
+            bits[k] = diag::PINNED;
+        }
         sol.x[k][4] = x.max(lower).min(upper);
         held[k] = (lower, upper);
     }
     (held, bits)
+}
+
+/// The site's D/H cap (3dtrees research 106 `uncertain.md`), after the solve and on each `free` node alone (one whose
+/// own circle doesn't enter): its log R (`caps`, NaN for none) clipped there, its interval's upper end too (so are its
+/// volume's draws), and [`diag::CAPPED`] where its posterior median reached it.
+fn cap(caps: &[f64], free: &[bool], sol: &mut Solved, held: &mut [(f64, f64)], bits: &mut [u16]) {
+    for k in (0..caps.len()).filter(|&k| free[k] && caps[k].is_finite()) {
+        let c = caps[k];
+        if sol.x[k][4] >= c {
+            bits[k] |= diag::CAPPED;
+            sol.x[k][4] = c;
+        }
+        held[k] = (held[k].0.min(c), held[k].1.min(c));
+    }
 }
 
 /// A tree's volume ([`Volume`]): its pieces' (a routed piece's further stems aside), at their posterior R and split by
@@ -2184,8 +2189,8 @@ struct Solved {
     /// The fork terms' weights the solve ended with (1 where a piece has none), and the rounds it took.
     fork_w: Vec<f64>,
     rounds: usize,
-    /// Each piece's data bounds' site precision on log R (0 where it has none: the site's cap is a prior), and its
-    /// cavity's mean (NaN where it has no bounds).
+    /// Each piece's bounds' site precision on log R (0 where it has none), and its cavity's mean (NaN where it has no
+    /// bounds).
     site_tau: Vec<f64>,
     cavity: Vec<f64>,
     /// Each piece's covariance given its parent (`H_k^-1` after its children's elimination): with `y`, the tree's
@@ -2279,26 +2284,14 @@ fn tree_solve(rows: &Rows, fr: &[Frame], nd: &Nodes, sums: &[Summary], p: &Prior
         }
         round += 1;
         if (round >= 3 && moved < EP_TOL) || round >= rounds.max(3) {
-            // each bounded piece's cavity (its marginal without its own bounds), and what its data bounds alone (not
-            // the site's cap, a prior) say of it: the precision of the site that would match them
+            // each bounded piece's site precision, and its cavity's mean (its marginal without its own bounds)
             let (mut site_tau, mut cavity) = (vec![0.0; n], vec![f64::NAN; n]);
-            for (&(k, ref bs), &(tau, nu)) in terms.iter().zip(&site) {
+            for (&(k, _), &(tau, nu)) in terms.iter().zip(&site) {
                 let (v, mu) = (sol.cov[k][(4, 4)], sol.x[k][4]);
-                let pc = 1.0 / v - tau;
-                if !(pc > 0.0) {
-                    site_tau[k] = tau;
-                    continue;
+                site_tau[k] = tau;
+                if 1.0 / v - tau > 0.0 {
+                    cavity[k] = (mu / v - nu) / (1.0 / v - tau);
                 }
-                let mc = (mu / v - nu) / pc;
-                cavity[k] = mc;
-                let data: Vec<Bound> = bs.iter().copied().filter(|b| b.side != Side::Cap).collect();
-                site_tau[k] = if data.len() == bs.len() {
-                    tau
-                } else if data.is_empty() {
-                    0.0
-                } else {
-                    tilted(mc, 1.0 / pc, (mu, v.sqrt()), &data).map_or(0.0, |(_, vh)| (1.0 / vh - pc).max(0.0))
-                };
             }
             return Ok((Solved { fork_w, rounds: round, site_tau, cavity, ..sol }, moved < EP_TOL));
         }
@@ -2307,7 +2300,7 @@ fn tree_solve(rows: &Rows, fr: &[Frame], nd: &Nodes, sums: &[Summary], p: &Prior
 
 /// The censored terms of each piece that has any (see the module documentation): its bounds where no circle of its
 /// own enters the tree, a routed piece's without its detection bound (its woody run can span several stems), and a
-/// shadowed exact stem's own beside its message; and with each the site's D/H cap where it has one.
+/// shadowed exact stem's own beside its message.
 fn terms(sums: &[Summary]) -> Vec<(usize, Vec<Bound>)> {
     (0..sums.len()).filter(|&k| sums[k].used().is_none() || sums[k].shadowed).map(|k| {
         let routed = matches!(sums[k].outcome, Outcome::Routed { .. }) && !sums[k].shadowed;
@@ -3153,7 +3146,7 @@ mod tests {
     }
 
     #[test]
-    fn the_sites_cap_holds_what_the_rays_dont_measure() {
+    fn the_sites_cap_holds_each_unmeasured_node_alone_after_the_solve() {
         // a 1.2 m stem (four pieces of 30 cm) forking into two 0.6 m rows (two pieces each), RCT's taper claiming 10, 6
         // and 5 cm; one child's first piece measured at 3 cm, nothing else seen
         let ra = [[0.0, 0.0, 0.0], [0.0, 0.0, 1.2], [0.0, 0.0, 1.2]];
@@ -3165,30 +3158,24 @@ mod tests {
         // the reach to the tips: the stem's first piece 1.2 + 0.6 m, each later one 30 cm less; a child's first 0.6 m
         let l = reach(&rows, &fr, &nd);
         assert!([1.8, 1.5, 1.2, 0.9, 0.6, 0.3, 0.6, 0.3].iter().zip(&l).all(|(a, b)| (a - b).abs() < 1e-9), "{l:?}");
-        let pp = PriorParams { dh: 0.035, ..PriorParams::default() };
         let mut sums: Vec<Summary> = (0..n).map(|_| summary(Outcome::Bounded, Vec::new())).collect();
         sums[4] = summary(Outcome::Measured(circle(Vector5::new(0.0, 0.0, 0.0, 0.0, 0.03), 1e-3)), Vec::new());
-        for (s, l) in sums.iter_mut().zip(&l) {
-            s.bounds.push(Bound { eta: (0.5 * pp.dh * l).ln(), sd: DH_SD, side: Side::Cap });
-        }
-        let (mut sol, converged) = tree_solve(&rows, &fr, &nd, &sums, &pp, EP_ROUNDS).unwrap();
+        let (mut sol, converged) = tree_solve(&rows, &fr, &nd, &sums, &PriorParams::default(), EP_ROUNDS).unwrap();
         assert!(converged);
-        let (held, bits) = hold(&terms(&sums), n, &mut sol);
-        // every unmeasured radius is at most its cap; it is CAPPED where the tree without its own cap would put it
-        // past it (the tips: the caps above hold the stem below its own), and the cap is the prior's, so it adds
-        // nothing to the data's share
-        for k in (0..n).filter(|&k| k != 4) {
-            let cap = (0.5 * pp.dh * l[k]).ln();
-            assert!(sol.x[k][4] <= cap + 1e-12 && held[k].1 == cap, "piece {k}: {} against {cap}", sol.x[k][4]);
-            assert!(bits[k] == if sol.cavity[k] > cap { diag::CAPPED } else { 0 } && sol.site_tau[k] == 0.0, "piece {k}: bits {}", bits[k]);
+        let before: Vec<f64> = sol.x.iter().map(|x| x[4]).collect();
+        let caps: Vec<f64> = l.iter().map(|l| (0.5 * 0.035 * l).ln()).collect();
+        let free: Vec<bool> = (0..n).map(|k| k != 4).collect();
+        let (mut held, mut bits) = (vec![(f64::NEG_INFINITY, f64::INFINITY); n], vec![0u16; n]);
+        cap(&caps, &free, &mut sol, &mut held, &mut bits);
+        for k in (0..n).filter(|&k| free[k]) {
+            // each node alone: clipped at its own cap where it reached it, else as the solve left it (the tips' caps
+            // don't carry down the stem), its draws held under it, and CAPPED where it was clipped
+            assert!((sol.x[k][4] - before[k].min(caps[k])).abs() < 1e-12 && held[k].1 == caps[k], "piece {k}");
+            assert_eq!(bits[k], if before[k] >= caps[k] { diag::CAPPED } else { 0 }, "piece {k}");
         }
-        assert!(bits[5] == diag::CAPPED && bits[7] == diag::CAPPED && sol.x[0][4].exp() < 0.1);
-        // the measured piece keeps its circle: the cap bounds only what the rays don't measure
-        assert!((sol.x[4][4].exp() - 0.03).abs() < 0.001 && bits[4] == 0 && held[4] == (f64::NEG_INFINITY, f64::INFINITY));
-        // with no cap, the stem keeps RCT's level
-        let plain: Vec<Summary> = sums.iter().map(|s| Summary { bounds: Vec::new(), seen: Vec::new(), seeds: Vec::new(), ..*s }).collect();
-        let (sol, _) = tree_solve(&rows, &fr, &nd, &plain, &PriorParams::default(), EP_ROUNDS).unwrap();
-        assert!(sol.x[0][4].exp() > 0.06, "{}", sol.x[0][4].exp());
+        assert!(bits[5] == diag::CAPPED && bits[7] == diag::CAPPED);
+        // the measured piece keeps its circle: the cap holds only what the rays don't measure
+        assert!(sol.x[4][4] == before[4] && bits[4] == 0 && held[4] == (f64::NEG_INFINITY, f64::INFINITY));
     }
 
     #[test]
