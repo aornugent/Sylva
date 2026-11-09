@@ -453,6 +453,25 @@ fn pair<N: Num>(pu: &Pulse, s: [N; 4], p: &JointParams) -> N {
     pair_terms(pu, s, p).0
 }
 
+/// One pair's log likelihood at state `s` (see [`pair`]), as a plain value (3dtrees research 113's cluster evidence).
+pub(crate) fn pair_value(pu: &Pulse, s: [f64; 4], p: &JointParams) -> f64 {
+    pair(pu, s, p)
+}
+
+/// One pair's log likelihood with its gradient and Hessian in the state `s` (see [`pair`]).
+pub(crate) fn pair_derivs(pu: &Pulse, s: [f64; 4], p: &JointParams) -> (f64, [f64; 4], [[f64; 4]; 4]) {
+    let d = pair(pu, [D::var(s[0], 0), D::var(s[1], 1), D::var(s[2], 2), D::var(s[3], 3)], p);
+    (d.v, d.g, d.h)
+}
+
+/// A stop's chance of being the wood's echo at state `s` (the softmax of its wood and leaf terms); NaN for a pass.
+pub(crate) fn pair_wood_share(pu: &Pulse, s: [f64; 4], p: &JointParams) -> f64 {
+    match pair_terms(pu, s, p).1 {
+        Some((w, l)) => 1.0 / (1.0 + (l - w).exp()),
+        None => f64::NAN,
+    }
+}
+
 /// [`pair`], and for a stop its wood and leaf terms (`l_wood`, `l_leaf`: its echo the wood's or foliage's, before
 /// selection), whose softmax is the stop's chance of being the wood's echo.
 #[inline(always)]
