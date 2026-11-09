@@ -587,6 +587,11 @@ pub struct SupportTree {
     pub rounds: u32,
     pub echoes: Echoes,
     pub volume: Volume,
+    /// Research (3dtrees research 117): each node's share of the volume's mean (the draws' mean of its volume; 0 for a
+    /// routed piece's further stems), and per root node of the call (a tree, where one call holds several) its
+    /// `[root node, mean, q05, q95, point]` from the same draws as [`Volume`].
+    pub piece_mean: Vec<f64>,
+    pub root_volume: Vec<[f64; 5]>,
 }
 
 /// A pulse in a piece's cross-section: impact, axial position from the piece's middle, depth of its stop (NaN:
@@ -1969,6 +1974,8 @@ pub fn support_tree(scans: &[&ScanIndex], rows: &Rows, context: &[(Point, Point,
         rounds: sol.rounds as u32,
         echoes,
         volume: Volume::default(),
+        piece_mean: Vec::new(),
+        root_volume: Vec::new(),
     };
     // the tightest bound of a side
     let bound = |s: &Summary, side: Side| {
@@ -2068,6 +2075,7 @@ pub fn support_tree(scans: &[&ScanIndex], rows: &Rows, context: &[(Point, Point,
         out.rows.push(&x, &cov, fr[k], rows.a[k], own);
     }
     out.volume = volume(&nd, &sol, &held, &out.pieces.basis);
+    (out.piece_mean, out.root_volume) = volume_parts(&nd, &sol, &held, &out.pieces.basis);
     Ok(out)
 }
 
@@ -2163,6 +2171,53 @@ fn volume(nd: &Nodes, sol: &Solved, held: &[(f64, f64)], basis: &[u8]) -> Volume
     (v.q05, v.q95) = (q(0.05), q(0.95));
     [v.measured, v.points, v.bounded, v.prior, v.capped] = parts.map(|x| x / VOLUME_DRAWS as f64);
     v
+}
+
+/// [`volume`]'s draws (the same seed, so the same numbers) split by node and by root (research 117): each node's
+/// draws' mean, and per root node `[root, mean, q05, q95, point]` over the pieces under it.
+fn volume_parts(nd: &Nodes, sol: &Solved, held: &[(f64, f64)], basis: &[u8]) -> (Vec<f64>, Vec<[f64; 5]>) {
+    let n = nd.row.len();
+    let pieces: Vec<usize> = (0..n).filter(|&k| nd.further[k].is_none()).collect();
+    let vol = |k: usize, eta: f64| std::f64::consts::PI * (2.0 * eta).exp() * nd.frame[k].3;
+    let root_of = |mut k: usize| {
+        while let Some(q) = nd.parent[k] {
+            k = q;
+        }
+        k
+    };
+    let roots: Vec<usize> = { let mut r: Vec<usize> = pieces.iter().map(|&k| root_of(k)).collect(); r.sort_unstable(); r.dedup(); r };
+    let slot: Vec<usize> = (0..n).map(|k| roots.binary_search(&root_of(k)).unwrap_or(0)).collect();
+    let chol: Vec<Matrix5<f64>> = sol.inv.iter().map(|m| m.cholesky().map_or_else(|| Matrix5::from_diagonal(&m.diagonal().map(|d| d.max(0.0).sqrt())), |c| c.l())).collect();
+    let mut rng = Normal::new(0x5EED_0F_7EE5);
+    let k_of: Vec<f64> = basis.iter().map(|&b| widen(b)).collect();
+    let mut d = vec![Vector5::<f64>::zeros(); n];
+    let mut per = vec![0.0f64; n];
+    let mut draws: Vec<Vec<f64>> = vec![Vec::with_capacity(VOLUME_DRAWS); roots.len()];
+    for _ in 0..VOLUME_DRAWS {
+        for k in 0..n {
+            let z = Vector5::from_fn(|_, _| rng.next());
+            d[k] = chol[k] * z - nd.parent[k].map_or(Vector5::zeros(), |q| sol.y[k] * d[q]);
+        }
+        let mut s = vec![0.0f64; roots.len()];
+        for &k in &pieces {
+            let x = vol(k, (sol.x[k][4] + k_of[k] * d[k][4]).max(held[k].0).min(held[k].1));
+            per[k] += x;
+            s[slot[k]] += x;
+        }
+        for (r, x) in s.into_iter().enumerate() {
+            draws[r].push(x);
+        }
+    }
+    let mut point = vec![0.0f64; roots.len()];
+    for &k in &pieces {
+        point[slot[k]] += vol(k, sol.x[k][4]);
+    }
+    let out = roots.iter().zip(draws.iter_mut()).zip(point).map(|((&r, v), p)| {
+        v.sort_unstable_by(f64::total_cmp);
+        let q = |f: f64| v[(f * (VOLUME_DRAWS - 1) as f64).round() as usize];
+        [r as f64, v.iter().sum::<f64>() / VOLUME_DRAWS as f64, q(0.05), q(0.95), p]
+    }).collect();
+    (per.into_iter().map(|x| x / VOLUME_DRAWS as f64).collect(), out)
 }
 
 /// Standard normal draws from a fixed seed (splitmix64, Box-Muller): the volume's draws are reproducible.

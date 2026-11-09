@@ -825,6 +825,9 @@ fn qsm_support_tree<'py>(py: Python<'py>, scans: Vec<Bound<'py, PyScanIndex>>, a
         volume.set_item(k, x)?;
     }
     d.set_item("volume", volume)?;
+    d.set_item("piece_mean", f.piece_mean.into_pyarray(py))?;
+    let rv: Vec<f64> = f.root_volume.iter().flatten().copied().collect();
+    d.set_item("root_volume", numpy::ndarray::Array2::from_shape_vec((f.root_volume.len(), 5), rv).map_err(|e| PyValueError::new_err(e.to_string()))?.into_pyarray(py))?;
     Ok(d)
 }
 
@@ -923,6 +926,7 @@ impl PyClusterTable {
             d.set_item(k, v.clone().into_pyarray(py))?;
         }
         d.set_item("echo", t.echo.clone().into_pyarray(py))?;
+        d.set_item("xy", numpy::ndarray::Array2::from_shape_vec((t.xy.len(), 2), t.xy.iter().flatten().copied().collect()).map_err(|e| PyValueError::new_err(e.to_string()))?.into_pyarray(py))?;
         d.set_item("layer", t.layer.clone().into_pyarray(py))?;
         d.set_item("start", t.start.clone().into_pyarray(py))?;
         d.set_item("seg", t.seg.clone().into_pyarray(py))?;
