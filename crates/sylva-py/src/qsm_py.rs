@@ -845,7 +845,71 @@ fn qsm_support_tree<'py>(py: Python<'py>, scans: Vec<Bound<'py, PyScanIndex>>, a
     Ok(d)
 }
 
+/// A base's sections and columns as a dict of arrays (see `sylva.qsm.rebase`).
+fn sections_to_py<'py>(py: Python<'py>, d: &Bound<'py, PyDict>, secs: &[support_tree::base::Section], cols: &[support_tree::base::Column]) -> PyResult<()> {
+    use support_tree::base::Section;
+    let f = |g: fn(&Section) -> f64| secs.iter().map(g).collect::<Vec<f64>>();
+    for (k, v) in [("z", f(|s| s.z)), ("x", f(|s| s.c[0])), ("y", f(|s| s.c[1])), ("r", f(|s| s.r)), ("hits", f(|s| s.hits)), ("evidence", f(|s| s.evidence))] {
+        d.set_item(k, v.into_pyarray(py))?;
+    }
+    d.set_item("slab", secs.iter().map(|s| s.slab).collect::<Vec<u32>>().into_pyarray(py))?;
+    d.set_item("fitted", secs.iter().map(|s| s.fitted).collect::<Vec<bool>>().into_pyarray(py))?;
+    d.set_item("column", secs.iter().map(|s| s.column).collect::<Vec<i32>>().into_pyarray(py))?;
+    d.set_item("col_parent", cols.iter().map(|c| c.parent).collect::<Vec<i32>>().into_pyarray(py))?;
+    d.set_item("col_at", cols.iter().map(|c| c.at).collect::<Vec<i32>>().into_pyarray(py))?;
+    Ok(())
+}
+
+/// A plant's base re-sectioned from the rays (see `sylva.qsm.rebase`).
+#[pyfunction]
+#[pyo3(signature = (scans, a, b, r_prior, parent, member, centre, ctx_a, ctx_b, ctx_r, params, z_lo=0.1, z_hi=1.5, dz=0.1, reach=0.6, link=0.02, keep=0.8, threads=0))]
+#[allow(clippy::too_many_arguments)]
+fn qsm_rebase<'py>(py: Python<'py>, scans: Vec<Bound<'py, PyScanIndex>>, a: PyReadonlyArray2<f64>, b: PyReadonlyArray2<f64>, r_prior: PyReadonlyArray1<f64>, parent: PyReadonlyArray1<i64>, member: PyReadonlyArray1<i64>, centre: [f64; 3], ctx_a: PyReadonlyArray2<f64>, ctx_b: PyReadonlyArray2<f64>, ctx_r: PyReadonlyArray1<f64>, params: Bound<'py, PyDict>, z_lo: f64, z_hi: f64, dz: f64, reach: f64, link: f64, keep: f64, threads: usize) -> PyResult<Bound<'py, PyDict>> {
+    let (a, b) = (xyz_from_py(a)?, xyz_from_py(b)?);
+    let (ca, cb, cr) = (xyz_from_py(ctx_a)?, xyz_from_py(ctx_b)?, ctx_r.as_array().to_vec());
+    if ca.len() != cb.len() || ca.len() != cr.len() {
+        return Err(PyValueError::new_err("rebase: the context's a, b and r must have one entry per cylinder"));
+    }
+    let context: Vec<_> = ca.into_iter().zip(cb).zip(cr).map(|((a, b), r)| (a, b, r)).collect();
+    let (r_prior, parent, member) = (r_prior.as_array().to_vec(), parent.as_array().to_vec(), member.as_array().to_vec());
+    let p = tree_params(&params)?;
+    let bp = support_tree::base::BaseParams { z_lo, z_hi, dz, reach, link, keep };
+    let refs: Vec<&ScanIndex> = scans.iter().map(|s| &s.get().inner).collect();
+    let f = py.detach(|| {
+        let rows = Rows { a: &a, b: &b, r_prior: &r_prior, r_max: &[], parent: &parent };
+        support_tree::base::rebase(&refs, &rows, &member, &centre, &bp, &context, &p.like, &p.prior, threads)
+    }).map_err(err)?;
+    let d = PyDict::new(py);
+    d.set_item("a", xyz_to_py(py, &f.a))?;
+    d.set_item("b", xyz_to_py(py, &f.b))?;
+    d.set_item("r_prior", f.r_prior.into_pyarray(py))?;
+    d.set_item("parent", f.parent.into_pyarray(py))?;
+    d.set_item("member", f.member.into_pyarray(py))?;
+    d.set_item("column", f.column.into_pyarray(py))?;
+    let s = PyDict::new(py);
+    sections_to_py(py, &s, &f.sections, &f.columns)?;
+    d.set_item("sections", s)?;
+    let c = PyDict::new(py);
+    let g = |h: fn(&support_tree::base::ColumnOut) -> f64| f.out.iter().map(h).collect::<Vec<f64>>();
+    for (k, v) in [("e_col", g(|c| c.e_col)), ("e_rct", g(|c| c.e_rct)), ("measured", g(|c| c.measured)), ("r", g(|c| c.r))] {
+        c.set_item(k, v.into_pyarray(py))?;
+    }
+    c.set_item("chosen", f.out.iter().map(|c| c.chosen).collect::<Vec<bool>>().into_pyarray(py))?;
+    c.set_item("believable", f.out.iter().map(|c| c.believable).collect::<Vec<bool>>().into_pyarray(py))?;
+    c.set_item("owner", f.out.iter().map(|c| c.owner).collect::<Vec<i64>>().into_pyarray(py))?;
+    c.set_item("joined", f.out.iter().map(|c| c.joined).collect::<Vec<u32>>().into_pyarray(py))?;
+    c.set_item("grafted", f.out.iter().map(|c| c.grafted).collect::<Vec<u32>>().into_pyarray(py))?;
+    d.set_item("columns", c)?;
+    let counts = PyDict::new(py);
+    for (k, v) in ["entries", "joined", "grafted", "kept", "dropped", "hung", "reverted"].iter().zip(f.counts) {
+        counts.set_item(*k, v)?;
+    }
+    d.set_item("counts", counts)?;
+    Ok(d)
+}
+
 pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
+    m.add_function(wrap_pyfunction!(qsm_rebase, m)?)?;
     m.add_function(wrap_pyfunction!(qsm_support_flags, m)?)?;
     m.add_function(wrap_pyfunction!(qsm_support_refusals, m)?)?;
     m.add_function(wrap_pyfunction!(qsm_support_diags, m)?)?;

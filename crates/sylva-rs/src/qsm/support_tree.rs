@@ -190,6 +190,7 @@ use crate::transform::{cross, dot, sub};
 use crate::trees::{fit_circle_ransac, RansacCircleParams};
 use crate::Point;
 
+pub mod base;
 mod routed;
 
 /// Why a piece's own summary is not used (bits of [`Fit::flags`]): [`RUNS`] and [`HULL`] pieces are fitted by the
@@ -1542,17 +1543,23 @@ fn point_circle(xy: &[[f64; 2]], r0: f64, believe: f64) -> Option<Vector5<f64>> 
     let band = (PTS_BAND_SHARE * r0).min(PTS_BAND).max(PTS_BAND_MIN);
     let ransac = RansacCircleParams { threshold: band, iterations: 200, min_radius: 0.002, max_radius: 1.0, seed: 0 };
     let (cx, cy, r, inl) = fit_circle_ransac(xy, &ransac).ok()?;
-    let on: Vec<[f64; 2]> = xy.iter().zip(&inl).filter(|q| *q.1).map(|(q, _)| [q[0] - cx, q[1] - cy]).collect();
-    if (on.len() as f64) < PTS_INLIERS * xy.len() as f64 || !(r.is_finite() && r > 0.0) || r > PTS_GROW * r0 || r > believe {
+    let (on, rmse, arc) = ring(xy, &inl, cx, cy, r);
+    if on < PTS_INLIERS * xy.len() as f64 || !(r.is_finite() && r > 0.0) || r > PTS_GROW * r0 || r > believe {
         return None;
     }
-    let rmse = (on.iter().map(|q| (q[0].hypot(q[1]) - r).powi(2)).sum::<f64>() / on.len() as f64).sqrt();
+    (cx.hypot(cy) <= r.max(r0) + PTS_SHIFT && rmse <= PTS_RMSE.0 * r + PTS_RMSE.1 && arc >= PTS_ARC).then(|| Vector5::new(cx, cy, 0.0, 0.0, r))
+}
+
+/// A circle `(cx, cy, r)`'s fit to the stops `xy` whose `inliers` it is: how many there are, their rms misfit about it
+/// and the ten-degree bins they fill (a point circle's tests, [`point_circle`], and a base section's).
+fn ring(xy: &[[f64; 2]], inliers: &[bool], cx: f64, cy: f64, r: f64) -> (f64, f64, usize) {
+    let on: Vec<[f64; 2]> = xy.iter().zip(inliers).filter(|q| *q.1).map(|(q, _)| [q[0] - cx, q[1] - cy]).collect();
+    let rmse = (on.iter().map(|q| (q[0].hypot(q[1]) - r).powi(2)).sum::<f64>() / on.len().max(1) as f64).sqrt();
     let mut bins = [false; 36];
     for q in &on {
         bins[(((q[1].atan2(q[0]).to_degrees() + 180.0) / 10.0) as usize).min(35)] = true;
     }
-    let arc = bins.iter().filter(|&&b| b).count();
-    (cx.hypot(cy) <= r.max(r0) + PTS_SHIFT && rmse <= PTS_RMSE.0 * r + PTS_RMSE.1 && arc >= PTS_ARC).then(|| Vector5::new(cx, cy, 0.0, 0.0, r))
+    (on.len() as f64, rmse, bins.iter().filter(|&&b| b).count())
 }
 
 /// The stops in row `k`'s pieces' tubes (their places across its axis) that lie nearer its claimed axis than any
