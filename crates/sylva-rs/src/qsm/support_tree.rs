@@ -1465,8 +1465,8 @@ fn veto_at(gs: &[Group], x: &Vector5<f64>) -> Option<f64> {
 
 /// An unmeasured piece's upper bound from the ray veto (3dtrees research 106 `geometry.md`): the widest circle about
 /// the claim's axis, of [`VETO_STEPS`] radii from [`VETO_MIN`] to the `tube`, below the narrowest the veto refutes;
-/// None where it refutes none (passes alone bound R where no woody stop gives a centre: trees 4 and 3098's 47-84
-/// passes through RCT's circle).
+/// None where it refutes none (passes alone bound R where no woody stop gives a centre: research 106 found trunks with
+/// 47-84 passes through RCT's circle and no bound).
 fn veto(gs: &[Group], tube: f64) -> Option<Bound> {
     let step = (tube.max(2.0 * VETO_MIN) / VETO_MIN).ln() / (VETO_STEPS - 1) as f64;
     let first = (0..VETO_STEPS).find(|&i| refuted(tally(gs, &Vector5::new(0.0, 0.0, 0.0, 0.0, VETO_MIN * (step * i as f64).exp()))))?;
@@ -1843,8 +1843,8 @@ pub fn support_tree(scans: &[&ScanIndex], rows: &Rows, context: &[(Point, Point,
             if v.is_empty() { f64::NAN } else { v.iter().sum::<f64>() / v.len() as f64 }
         };
         let audit = audit[k0..k1].iter().fold((0, 0), |a, q| (a.0 + q.0, a.1 + q.1));
-        // most of its pieces' basis, the less known on a tie
-        let basis = (1..=basis::CAPPED).rev().max_by_key(|&b| p.basis[k0..k1].iter().filter(|&&x| x == b).count()).unwrap_or(basis::PRIOR);
+        // most of its pieces' basis, the less known on a tie (max_by_key keeps the last of equal maxima)
+        let basis = (1..=basis::CAPPED).max_by_key(|&b| p.basis[k0..k1].iter().filter(|&&x| x == b).count()).unwrap_or(basis::PRIOR);
         let own = Own {
             diag: (p.diag[k0..k1].iter().fold(0, |a, &f| a | f) & !diag::REFUTED) | if refuted(audit) { diag::REFUTED } else { 0 },
             data_share: mean(&p.data_share),
@@ -1923,16 +1923,18 @@ fn hold(terms: &[(usize, Vec<Bound>)], n: usize, sol: &mut Solved) -> (Vec<(f64,
 }
 
 /// The site's D/H cap (3dtrees research 106 `uncertain.md`), after the solve and on each `free` node alone (one whose
-/// own circle doesn't enter): its log R (`caps`, NaN for none) clipped there, its interval's upper end too (so are its
-/// volume's draws), and [`diag::CAPPED`] where its posterior median reached it.
+/// own circle doesn't enter), never below what its rays hold it above (its interval's lower end, `held`): its log R
+/// (`caps`, NaN for none) clipped there, its interval's upper end too (so are its volume's draws), and
+/// [`diag::CAPPED`] where its posterior median reached a cap above that lower end. A site rule never overrides the
+/// rays.
 fn cap(caps: &[f64], free: &[bool], sol: &mut Solved, held: &mut [(f64, f64)], bits: &mut [u16]) {
     for k in (0..caps.len()).filter(|&k| free[k] && caps[k].is_finite()) {
-        let c = caps[k];
+        let c = caps[k].max(held[k].0);
         if sol.x[k][4] >= c {
-            bits[k] |= diag::CAPPED;
+            bits[k] |= if caps[k] >= held[k].0 { diag::CAPPED } else { 0 };
             sol.x[k][4] = c;
         }
-        held[k] = (held[k].0.min(c), held[k].1.min(c));
+        held[k].1 = held[k].1.min(c);
     }
 }
 
@@ -3176,6 +3178,14 @@ mod tests {
         assert!(bits[5] == diag::CAPPED && bits[7] == diag::CAPPED);
         // the measured piece keeps its circle: the cap holds only what the rays don't measure
         assert!(sol.x[4][4] == before[4] && bits[4] == 0 && held[4] == (f64::NEG_INFINITY, f64::INFINITY));
+        // a cap below what the rays hold a node above gives way to them: it is served at its lower bound, not capped
+        let lo = caps[5] + 0.5;
+        let mut held = vec![(f64::NEG_INFINITY, f64::INFINITY); n];
+        held[5] = (lo, f64::INFINITY);
+        sol.x[5][4] = lo + 1.0;
+        let mut bits = vec![0u16; n];
+        cap(&caps, &free, &mut sol, &mut held, &mut bits);
+        assert!(sol.x[5][4] == lo && held[5] == (lo, lo) && bits[5] == 0, "{} {:?} {}", sol.x[5][4], held[5], bits[5]);
     }
 
     #[test]
@@ -3185,7 +3195,7 @@ mod tests {
         let group = |recs: Vec<Rec>| Group { scan: 0, n: [1.0, 0.0], v: [0.0, 1.0], recs };
         let circle = |r: f64| Vector5::new(0.0, 0.0, 0.0, 0.0, r);
         // a phantom: RCT claims 5 cm where a grid of pulses 5 mm apart passes, but for a 2 mm twig on the axis that
-        // stops the middle column (trees 4 and 3098: 47-84 passes through RCT's circle, and no bound)
+        // stops the middle column (research 106: trunks with 47-84 passes through RCT's circle, and no bound)
         let mut v = Vec::new();
         for j in 0..20 {
             for i in -12..=12 {
@@ -3224,7 +3234,7 @@ mod tests {
     #[test]
     fn a_posterior_is_held_inside_its_own_bounds() {
         // a base piece claimed at 2 cm whose passes say at most 3 mm, softly (a footprint wide against a thin piece:
-        // 3058 r2's bound of 0.1-0.5 cm under a posterior of 1.3-2.3 cm, research 106)
+        // research 106 found bounds of 0.1-0.5 cm under posteriors of 1.3-2.3 cm)
         let rows = Rows { a: &[[0.0, 0.0, 0.0]], b: &[[0.0, 0.0, 0.2]], r_prior: &[0.02], r_max: &[], parent: &[-1] };
         let fr = rows.check("test").unwrap();
         let nd = Nodes::of(&rows, &fr);

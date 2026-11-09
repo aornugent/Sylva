@@ -359,10 +359,10 @@ pub struct JointParams {
     /// (3dtrees research 93 §19). Read by [`crate::qsm::support_tree`] only.
     pub thin_seed: u64,
     /// The factor [`crate::qsm::support_tree`] widens its posterior sds of log R by, in its reported `sd_log_r` and
-    /// its volume's draws: the raw posterior is overconfident. Learned as research 106 `uncertain.md` did, on this fit
-    /// (3dtrees ticket 105: the veto in the solve, the cap after it): the factor that puts 90 % of Alice Mulga's refit
-    /// circles (their own noise, 0.136 in log R, added) inside the 90 % interval, 2.54 [2.42-2.67] on random halves of
-    /// the trees, 90.1 % [88.8-91.2] on the other halves. Read by [`crate::qsm::support_tree`] only.
+    /// its volume's draws: the raw posterior is overconfident. Calibrated on research 106's circles (Alice Mulga's
+    /// refit circles, their own noise added; 3dtrees ticket 105): 90 % of them inside the 90 % interval at 2.54
+    /// [2.42-2.67] over random halves of the trees, 88.8-91.2 % on the held-out halves. Read by
+    /// [`crate::qsm::support_tree`] only.
     pub widen: f64,
 }
 

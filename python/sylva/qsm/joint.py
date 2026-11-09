@@ -274,7 +274,8 @@ def support_tree(scans, a, b, r_prior, parent, context=None, params: JointParams
     research 106): its R is at most the widest circle about the claim's axis that fewer than 10 pulses, or under a
     quarter of its stops and passes, pass through. With ``dh``, the site's largest stem D/H caps it after the solve, on
     that node alone (a stem-scale rule, so it doesn't carry down the tree): R is at most ``dh`` times its reach to the
-    tips (the longest path from its start) over 2, its point and its volume's draws clipped there. Each piece also has an existence log odds from
+    tips (the longest path from its start) over 2, its point and its volume's draws clipped there, never below what
+    its own rays hold it above. Each piece also has an existence log odds from
     its core's stops and passes (echo character, and opacity: a stop for wood, a pass against it), over the beam's
     oversampling and weighted by ``exist_scale``, and a chain along the branches (wood doesn't stop and restart:
     ``exist``, ``exist_off``) gives ``p_wood``. The tree is one solve: the unflagged pieces' summaries as Gaussian
