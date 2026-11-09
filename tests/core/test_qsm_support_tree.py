@@ -150,7 +150,7 @@ def test_a_clump_of_stems_is_flagged_as_runs(tmp_path):
 
 def test_a_tree_reports_how_its_radii_are_known_and_its_volume_with_an_interval(tmp_path):
     # the thin far stems again: measured or bounded, each row says how, the veto audits every circle served, and the
-    # site's cap holds what the rays don't measure (a cap of D/H 0.002 on a 30 cm reach: 0.3 mm)
+    # site's cap holds what the rays don't measure (a cap of D/H 0.006 on a 30 cm reach: 0.9 mm, above the capacity floor)
     radii = np.array([0.002, 0.003, 0.005, 0.008])
     xs = np.arange(4) * 0.3 - 0.45
     scans = scanned(tmp_path, np.c_[xs, np.zeros(4), np.zeros(4)], np.c_[xs, np.zeros(4), np.full(4, 1.8)], radii,
@@ -165,9 +165,9 @@ def test_a_tree_reports_how_its_radii_are_known_and_its_volume_with_an_interval(
     parts = v["measured"] + v["bounded"] + v["prior"] + v["capped"]
     assert np.isclose(parts, v["point"]) and v["q05"] < v["point"] < v["q95"] and v["capped"] == 0
     capped = support_tree(scans, a, a + [0, 0, 0.3], 1.5 * radii, np.full(4, -1),
-                          params=dataclasses.replace(PARAMS, dh=0.002), threads=2)
+                          params=dataclasses.replace(PARAMS, dh=0.006), threads=2)
     held = capped["basis"] != SupportBasis.MEASURED
-    assert held.any() and np.allclose(capped["r_cap"][held], 0.0003)
+    assert held.any() and np.allclose(capped["r_cap"][held], 0.0009)
     assert (capped["r"][held] <= capped["r_cap"][held] * (1 + 1e-9)).all()
     assert (capped["basis"][held] == SupportBasis.CAPPED).all() and (capped["diag"][held] & SupportDiag.CAPPED).all()
     assert capped["volume"]["capped"] > 0 and capped["volume"]["q95"] < v["q95"]
