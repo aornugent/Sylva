@@ -74,6 +74,9 @@ pub struct PriorParams {
     /// (wood doesn't stop and restart). Read by [`crate::qsm::support_tree`] only.
     pub exist: f64,
     pub exist_off: f64,
+    /// The site's largest stem D/H: no radius the rays don't measure is wider than `dh` times its reach to the tips
+    /// over 2 (0: no cap; Alice Mulga's census 0.035, 3dtrees research 62). Read by [`crate::qsm::support_tree`] only.
+    pub dh: f64,
 }
 
 impl Default for PriorParams {
@@ -81,7 +84,7 @@ impl Default for PriorParams {
     /// than a synthetic bench's, and RCT's taper is no guide to the rays' radii there (§21: rows fitted alone
     /// disagree with its steps by ~1 in log R, which `sig_eta` 0.05 priced at ~10^6 log units).
     fn default() -> Self {
-        PriorParams { lam_prior: 1.0, lam_sd: 2.0, sig_ell: 1.0, sig_eta: 0.5, mu_fork: 0.10, sig_fork: 0.17, sig_root: 0.5, r_tip: 0.0, sig_tip: 0.3, sig_delta: 0.02, centre_rel: 1.0, centre_abs: 0.003, scan_abs: 0.002, scan_rel: 0.3, lean_sd: 0.5, lean_bend: 0.3, exist: 0.65, exist_off: 0.5 }
+        PriorParams { lam_prior: 1.0, lam_sd: 2.0, sig_ell: 1.0, sig_eta: 0.5, mu_fork: 0.10, sig_fork: 0.17, sig_root: 0.5, r_tip: 0.0, sig_tip: 0.3, sig_delta: 0.02, centre_rel: 1.0, centre_abs: 0.003, scan_abs: 0.002, scan_rel: 0.3, lean_sd: 0.5, lean_bend: 0.3, exist: 0.65, exist_off: 0.5, dh: 0.0 }
     }
 }
 
@@ -94,7 +97,7 @@ impl PriorParams {
         if let Some((k, _)) = [("exist", self.exist), ("exist_off", self.exist_off)].iter().find(|(_, v)| !(*v > 0.0 && *v < 1.0)) {
             return Err(Error::invalid(format!("joint fit: {k} must be a probability in (0, 1)")));
         }
-        let shares = [("mu_fork", self.mu_fork), ("centre_rel", self.centre_rel), ("centre_abs", self.centre_abs), ("scan_abs", self.scan_abs), ("scan_rel", self.scan_rel), ("r_tip", self.r_tip)];
+        let shares = [("dh", self.dh), ("mu_fork", self.mu_fork), ("centre_rel", self.centre_rel), ("centre_abs", self.centre_abs), ("scan_abs", self.scan_abs), ("scan_rel", self.scan_rel), ("r_tip", self.r_tip)];
         if let Some((k, _)) = shares.iter().find(|(k, v)| !v.is_finite() || (*k != "mu_fork" && *v < 0.0)) {
             return Err(Error::invalid(format!("joint fit: {k} must be finite (and not negative)")));
         }
