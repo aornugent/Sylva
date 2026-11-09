@@ -31,7 +31,9 @@
 //! **The join** ([`rebase`]), over the plant's grounded members' rows, `H` the slabs' top:
 //! - **Believable columns.** A column whose median radius is over [`COL_R_MAX`] or the plant's cap (the site's D/H
 //!   at its tallest point, times [`super::PTS_BELIEVE`], the joint fit's own ceiling on a point circle) is no stem
-//!   (the ground, a rock); one with [`CTX_SHARE`] of its sections inside another plant's cylinder is that plant's.
+//!   (the ground, a rock); one with [`CTX_SHARE`] of its sections inside another plant's cylinder is that plant's;
+//!   one standing on the ground must start within [`FOOT`] of it (its base would be drawn through what no section
+//!   saw).
 //!   A fork of one left out stands on the ground.
 //! - **Entries.** A row rising through a column's top (its highest section) is an entry there, cut at that height;
 //!   its chain is its ancestors under the cut. It joins the column whose top lies nearest its cut, within [`JOIN`]
@@ -85,6 +87,8 @@ const JOIN: f64 = 0.08;
 const GRAFT: f64 = 0.3;
 const IN_COL: f64 = 0.02;
 const COL_R_MAX: f64 = 0.3;
+/// The highest a column standing on the ground may start (m above it): its first section's middle.
+const FOOT: f64 = 0.5;
 const HANG: f64 = 0.3;
 const CONNECT: f64 = 1.0;
 /// The share of a column's sections inside another plant's cylinder (within [`IN_COL`] of its radius) that makes
@@ -541,13 +545,20 @@ fn join(rows: &Rows, member: &[i64], centre: &Point, p: &BaseParams, secs: &[Sec
         let q: Point = std::array::from_fn(|i| a[i] + t * ab[i]);
         norm3(&sub(x, &q)) <= rr
     };
-    let ok: Vec<bool> = (0..nc).map(|k| {
+    let mut ok: Vec<bool> = (0..nc).map(|k| {
         let inside = cols[k].sections.iter().filter(|&&i| {
             let x = [secs[i].c[0], secs[i].c[1], secs[i].z];
             context.iter().any(|(ca, cb, cr)| in_tube(ca, cb, &x, cr + IN_COL))
         }).count();
         col_r[k] <= COL_R_MAX.min(cap) && (inside as f64) < CTX_SHARE * cols[k].sections.len() as f64
     }).collect();
+    // a column standing on the ground starts within FOOT of it (forks come after their parents): one starting higher
+    // would draw its base through what no section saw
+    for k in 0..nc {
+        let on_parent = cols[k].parent >= 0 && ok[cols[k].parent as usize];
+        let foot = cols[k].sections.iter().map(|&i| secs[i].z).fold(f64::INFINITY, f64::min) - centre[2];
+        ok[k] = ok[k] && (on_parent || foot <= FOOT);
+    }
     // a fork of a column left out stands on the ground
     let cpar: Vec<i32> = (0..nc).map(|k| if cols[k].parent >= 0 && ok[cols[k].parent as usize] { cols[k].parent } else { -1 }).collect();
     let root_of = |mut k: usize| {

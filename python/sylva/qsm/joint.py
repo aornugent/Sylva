@@ -568,7 +568,8 @@ def rebase(scans, a, b, r_prior, parent, member, centre, context=None, params: J
     crosses, at the best of its radius, a half and a quarter of it.
 
     A column wider than 0.3 m or twice the site's cap at the plant's top (``dh``), or with half its sections inside
-    the ``context``'s cylinders (other plants'), is none of this plant's stems. A row rising through a column's top
+    the ``context``'s cylinders (other plants'), or (on the ground) starting over 0.5 m above it, is none of this
+    plant's stems. A row rising through a column's top
     (its highest section) joins the column whose top lies nearest where it does, within 8 cm beyond the column's
     radius, or else, where the rays refute the row's chain under that height, is grafted to the nearest column top
     within 30 cm; it is cut there. A column and its forks replace the chains of the rows they take only where their
