@@ -66,7 +66,7 @@ pub struct TreeParams {
 
 impl TreeParams {
     /// Bumped whenever the fit (`joint_tree`'s or `support_tree`'s) changes for the same settings.
-    pub const VERSION: u32 = 8;
+    pub const VERSION: u32 = 9;
 }
 
 impl Default for TreeParams {

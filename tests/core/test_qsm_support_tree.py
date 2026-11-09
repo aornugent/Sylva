@@ -4,7 +4,7 @@ import numpy as np
 import pytest
 
 from sylva import PointCloud
-from sylva.qsm import EchoPath, JointParams, ScanIndex, SupportDiag, SupportFlag, support_tree
+from sylva.qsm import EchoPath, JointParams, ScanIndex, SupportBasis, SupportDiag, SupportFlag, support_tree
 
 # the synthetic VZ-400i beam's detection share, calibrated on its vertical stems (3dtrees research 93 §10), and its
 # echo character: wood reflects 0.5 (-3 dB) and these scenes hold no leaf
@@ -56,7 +56,7 @@ def test_separated_stems_upright_and_leaning_are_measured(tmp_path):
         # the lean, along the row's frame, against the truth's
         t = f["lean"][k] @ np.c_[f["e1"][k], f["e2"][k]].T
         assert np.allclose(t[:2], lean[k], atol=0.01), (k, t, lean[k])
-    assert (f["sd_log_r"] < 0.2).all() and (np.isnan(f["chi2"]) | (f["chi2"] < 9)).all() and (f["chi2_front"] < 9).all()
+    assert (f["sd_log_r"] < 0.2 * PARAMS.widen).all() and (np.isnan(f["chi2"]) | (f["chi2"] < 9)).all() and (f["chi2_front"] < 9).all()
     # seen from three sides, every edge: no diagnostic, and the rows' own data say most of their radii
     assert (f["diag"] & (SupportDiag.ONE_SIDED | SupportDiag.SHADOWED | SupportDiag.TUBE_EDGE)).sum() == 0, f["diag"]
     assert (f["data_share"] > 0.5).all() and (f["data_share"] <= 1).all() and (f["deleted"] == 0).all(), f["data_share"]
@@ -146,3 +146,32 @@ def test_a_clump_of_stems_is_flagged_as_runs(tmp_path):
         support_tree(scans, a, b, [0.093, 0.093], [0, 0], params=PARAMS)
     with pytest.raises(TypeError):
         support_tree(scans, a, b, [0.093, 0.093], [-1, 0], params=dataclasses.asdict(PARAMS))
+
+
+def test_a_tree_reports_how_its_radii_are_known_and_its_volume_with_an_interval(tmp_path):
+    # the thin far stems again: measured or bounded, each row says how, the veto audits every circle served, and the
+    # site's cap holds what the rays don't measure (a cap of D/H 0.002 on a 30 cm reach: 0.3 mm)
+    radii = np.array([0.002, 0.003, 0.005, 0.008])
+    xs = np.arange(4) * 0.3 - 0.45
+    scans = scanned(tmp_path, np.c_[xs, np.zeros(4), np.zeros(4)], np.c_[xs, np.zeros(4), np.full(4, 1.8)], radii,
+                    [(0.3, -20.0), (14.0, 14.0)], zenith=(75.0, 110.0))
+    a = np.c_[xs + 0.3 * radii, np.zeros(4), np.full(4, 0.75)]
+    f = support_tree(scans, a, a + [0, 0, 0.3], 1.5 * radii, np.full(4, -1), params=PARAMS, threads=2)
+    measured = f["basis"] == SupportBasis.MEASURED
+    assert set(f["basis"]) <= set(SupportBasis) and np.isnan(f["r_cap"]).all()
+    assert (measured == ((f["flags"] == 0) & np.isfinite(f["r_row"]))).all()
+    assert not (f["diag"] & SupportDiag.REFUTED).any() and (np.isnan(f["pass_share"]) | (f["pass_share"] < 0.25)).all()
+    v = f["volume"]
+    parts = v["measured"] + v["bounded"] + v["prior"] + v["capped"]
+    assert np.isclose(parts, v["point"]) and v["q05"] < v["point"] < v["q95"] and v["capped"] == 0
+    capped = support_tree(scans, a, a + [0, 0, 0.3], 1.5 * radii, np.full(4, -1),
+                          params=dataclasses.replace(PARAMS, dh=0.002), threads=2)
+    held = capped["basis"] != SupportBasis.MEASURED
+    assert held.any() and np.allclose(capped["r_cap"][held], 0.0003)
+    assert (capped["r"][held] <= capped["r_cap"][held] * (1 + 1e-9)).all()
+    assert (capped["basis"][held] == SupportBasis.CAPPED).all() and (capped["diag"][held] & SupportDiag.CAPPED).all()
+    assert capped["volume"]["capped"] > 0 and capped["volume"]["q95"] < v["q95"]
+    # neighbours' cylinders are context: the call takes them, and a context far away changes nothing
+    far = (np.array([[50.0, 0, 0]]), np.array([[50.0, 0, 1]]), np.array([0.1]))
+    g = support_tree(scans, a, a + [0, 0, 0.3], 1.5 * radii, np.full(4, -1), context=far, params=PARAMS, threads=2)
+    assert np.array_equal(g["r"], f["r"]) and g["volume"] == f["volume"]

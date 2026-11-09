@@ -513,7 +513,7 @@ fn joint_params(params: &Bound<'_, PyDict>) -> PyResult<JointParams> {
     let get = |k: &str| -> PyResult<f64> { params.get_item(k)?.ok_or_else(|| PyValueError::new_err(format!("joint params: no {k:?}")))?.extract() };
     Ok(JointParams { exit: get("exit")?, divergence: get("divergence")?, sigma_r: get("sigma_r")?, rough: get("rough")?, tau: get("tau")?, edge: get("edge")?, eps: get("eps")?, eps_min: get("eps_min")?, mp_len: get("mp_len")?, hide: get("hide")?,
         refl_wood: get("refl_wood")?, refl_wood_sd: get("refl_wood_sd")?, refl_leaf: get("refl_leaf")?, refl_leaf_sd: get("refl_leaf_sd")?, refl_multi: get("refl_multi")?, refl_multi_sd: get("refl_multi_sd")?,
-        refl_thin: get("refl_thin")?, stop_wood: get("stop_wood")?, stop_leaf: get("stop_leaf")?, exist_scale: get("exist_scale")?, model_sd: get("model_sd")?,
+        refl_thin: get("refl_thin")?, stop_wood: get("stop_wood")?, stop_leaf: get("stop_leaf")?, exist_scale: get("exist_scale")?, model_sd: get("model_sd")?, widen: get("widen")?,
         thin_seed: params.get_item("thin_seed")?.ok_or_else(|| PyValueError::new_err("joint params: no \"thin_seed\""))?.extract()? })
 }
 
@@ -622,8 +622,8 @@ fn qsm_joint_fit<'py>(py: Python<'py>, table: Bound<'py, PyDict>, a: PyReadonlyA
     Ok(d)
 }
 
-const JOINT_LIKE: [&str; 21] = ["exit", "divergence", "sigma_r", "rough", "tau", "edge", "eps", "eps_min", "mp_len", "hide", "refl_wood", "refl_wood_sd", "refl_leaf", "refl_leaf_sd", "refl_multi", "refl_multi_sd", "refl_thin", "stop_wood", "stop_leaf", "exist_scale", "model_sd"];
-const JOINT_PRIOR: [&str; 18] = ["lam_prior", "lam_sd", "sig_ell", "sig_eta", "mu_fork", "sig_fork", "sig_root", "r_tip", "sig_tip", "sig_delta", "centre_rel", "centre_abs", "scan_abs", "scan_rel", "lean_sd", "lean_bend", "exist", "exist_off"];
+const JOINT_LIKE: [&str; 22] = ["exit", "divergence", "sigma_r", "rough", "tau", "edge", "eps", "eps_min", "mp_len", "hide", "refl_wood", "refl_wood_sd", "refl_leaf", "refl_leaf_sd", "refl_multi", "refl_multi_sd", "refl_thin", "stop_wood", "stop_leaf", "exist_scale", "model_sd", "widen"];
+const JOINT_PRIOR: [&str; 19] = ["lam_prior", "lam_sd", "sig_ell", "sig_eta", "mu_fork", "sig_fork", "sig_root", "r_tip", "sig_tip", "sig_delta", "centre_rel", "centre_abs", "scan_abs", "scan_rel", "lean_sd", "lean_bend", "exist", "exist_off", "dh"];
 const JOINT_TREE: [&str; 9] = ["version", "thin_seed", "iters", "tol", "sweeps", "split_min_r", "split_through", "split_min_votes", "drop"];
 
 /// The default settings of `qsm_joint_tree`, flat.
@@ -632,10 +632,10 @@ fn qsm_joint_defaults(py: Python<'_>) -> PyResult<Bound<'_, PyDict>> {
     let t = TreeParams::default();
     let (l, p) = (t.like, t.prior);
     let d = PyDict::new(py);
-    for (k, v) in JOINT_LIKE.iter().zip([l.exit, l.divergence, l.sigma_r, l.rough, l.tau, l.edge, l.eps, l.eps_min, l.mp_len, l.hide, l.refl_wood, l.refl_wood_sd, l.refl_leaf, l.refl_leaf_sd, l.refl_multi, l.refl_multi_sd, l.refl_thin, l.stop_wood, l.stop_leaf, l.exist_scale, l.model_sd]) {
+    for (k, v) in JOINT_LIKE.iter().zip([l.exit, l.divergence, l.sigma_r, l.rough, l.tau, l.edge, l.eps, l.eps_min, l.mp_len, l.hide, l.refl_wood, l.refl_wood_sd, l.refl_leaf, l.refl_leaf_sd, l.refl_multi, l.refl_multi_sd, l.refl_thin, l.stop_wood, l.stop_leaf, l.exist_scale, l.model_sd, l.widen]) {
         d.set_item(k, v)?;
     }
-    for (k, v) in JOINT_PRIOR.iter().zip([p.lam_prior, p.lam_sd, p.sig_ell, p.sig_eta, p.mu_fork, p.sig_fork, p.sig_root, p.r_tip, p.sig_tip, p.sig_delta, p.centre_rel, p.centre_abs, p.scan_abs, p.scan_rel, p.lean_sd, p.lean_bend, p.exist, p.exist_off]) {
+    for (k, v) in JOINT_PRIOR.iter().zip([p.lam_prior, p.lam_sd, p.sig_ell, p.sig_eta, p.mu_fork, p.sig_fork, p.sig_root, p.r_tip, p.sig_tip, p.sig_delta, p.centre_rel, p.centre_abs, p.scan_abs, p.scan_rel, p.lean_sd, p.lean_bend, p.exist, p.exist_off, p.dh]) {
         d.set_item(k, v)?;
     }
     d.set_item("version", TreeParams::VERSION)?;
@@ -668,7 +668,7 @@ fn tree_params(d: &Bound<'_, PyDict>) -> PyResult<TreeParams> {
         return Err(PyValueError::new_err("joint params: unexpected fields"));
     }
     let prior = PriorParams { lam_prior: f("lam_prior")?, lam_sd: f("lam_sd")?, sig_ell: f("sig_ell")?, sig_eta: f("sig_eta")?, mu_fork: f("mu_fork")?, sig_fork: f("sig_fork")?, sig_root: f("sig_root")?, r_tip: f("r_tip")?, sig_tip: f("sig_tip")?, sig_delta: f("sig_delta")?, centre_rel: f("centre_rel")?, centre_abs: f("centre_abs")?, scan_abs: f("scan_abs")?, scan_rel: f("scan_rel")?,
-        lean_sd: f("lean_sd")?, lean_bend: f("lean_bend")?, exist: f("exist")?, exist_off: f("exist_off")? };
+        lean_sd: f("lean_sd")?, lean_bend: f("lean_bend")?, exist: f("exist")?, exist_off: f("exist_off")?, dh: f("dh")? };
     Ok(TreeParams { like: joint_params(d)?, prior, iters: u("iters")?, tol: f("tol")?, sweeps: u("sweeps")?, split_min_r: f("split_min_r")?, split_through: f("split_through")?, split_min_votes: u("split_min_votes")?, drop: f("drop")? })
 }
 
@@ -749,7 +749,14 @@ fn qsm_support_refusals() -> Vec<(&'static str, u8)> {
 #[pyfunction]
 fn qsm_support_diags() -> Vec<(&'static str, u16)> {
     use support_tree::diag::*;
-    vec![("ONE_SIDED", ONE_SIDED), ("SHADOWED", SHADOWED), ("SUB_FOOTPRINT", SUB_FOOTPRINT), ("TUBE_EDGE", TUBE_EDGE), ("CONTESTED", CONTESTED)]
+    vec![("ONE_SIDED", ONE_SIDED), ("SHADOWED", SHADOWED), ("SUB_FOOTPRINT", SUB_FOOTPRINT), ("TUBE_EDGE", TUBE_EDGE), ("CONTESTED", CONTESTED), ("REFUTED", REFUTED), ("PINNED", PINNED), ("CAPPED", CAPPED)]
+}
+
+/// The names of the `basis` codes of `qsm_support_tree`.
+#[pyfunction]
+fn qsm_support_bases() -> Vec<(&'static str, u8)> {
+    use support_tree::basis::*;
+    vec![("MEASURED", MEASURED), ("BOUNDED", BOUNDED), ("PRIOR", PRIOR), ("CAPPED", CAPPED)]
 }
 
 /// A support fit's rows or pieces as a dict of arrays.
@@ -766,7 +773,7 @@ fn support_fit<'py>(py: Python<'py>, f: support_tree::Fit) -> PyResult<Bound<'py
     d.set_item("sd_centre", two(&f.sd_centre)?)?;
     d.set_item("lean", two(&f.lean)?)?;
     d.set_item("sd_lean", two(&f.sd_lean)?)?;
-    for (k, v) in [("r", f.r), ("sd_log_r", f.sd_log_r), ("r_row", f.r_row), ("sd_r_row", f.sd_r_row), ("chi2", f.chi2), ("chi2_front", f.chi2_front), ("r_lo", f.r_lo), ("r_hi", f.r_hi), ("r_floor", f.r_floor), ("log_odds", f.log_odds), ("p_wood", f.p_wood), ("lam", f.lam), ("data_share", f.data_share), ("contested", f.contested), ("deleted", f.deleted)] {
+    for (k, v) in [("r", f.r), ("sd_log_r", f.sd_log_r), ("r_row", f.r_row), ("sd_r_row", f.sd_r_row), ("chi2", f.chi2), ("chi2_front", f.chi2_front), ("r_lo", f.r_lo), ("r_hi", f.r_hi), ("r_floor", f.r_floor), ("log_odds", f.log_odds), ("p_wood", f.p_wood), ("lam", f.lam), ("data_share", f.data_share), ("contested", f.contested), ("deleted", f.deleted), ("r_cap", f.r_cap), ("pass_share", f.pass_share)] {
         d.set_item(k, v.into_pyarray(py))?;
     }
     d.set_item("diag", f.diag.into_pyarray(py))?;
@@ -780,21 +787,28 @@ fn support_fit<'py>(py: Python<'py>, f: support_tree::Fit) -> PyResult<Bound<'py
     d.set_item("evals_value", f.evals_value.into_pyarray(py))?;
     d.set_item("evals_deriv", f.evals_deriv.into_pyarray(py))?;
     d.set_item("refused", f.refused.into_pyarray(py))?;
+    d.set_item("n_pass", f.n_pass.into_pyarray(py))?;
+    d.set_item("basis", f.basis.into_pyarray(py))?;
     Ok(d)
 }
 
 /// Fits one tree from its rows' support summaries (see `sylva.qsm.support_tree`); `params` as `qsm_joint_tree`'s.
 #[pyfunction]
-#[pyo3(signature = (scans, a, b, r_prior, parent, params, threads=0))]
+#[pyo3(signature = (scans, a, b, r_prior, parent, ctx_a, ctx_b, ctx_r, params, threads=0))]
 #[allow(clippy::too_many_arguments)]
-fn qsm_support_tree<'py>(py: Python<'py>, scans: Vec<Bound<'py, PyScanIndex>>, a: PyReadonlyArray2<f64>, b: PyReadonlyArray2<f64>, r_prior: PyReadonlyArray1<f64>, parent: PyReadonlyArray1<i64>, params: Bound<'py, PyDict>, threads: usize) -> PyResult<Bound<'py, PyDict>> {
+fn qsm_support_tree<'py>(py: Python<'py>, scans: Vec<Bound<'py, PyScanIndex>>, a: PyReadonlyArray2<f64>, b: PyReadonlyArray2<f64>, r_prior: PyReadonlyArray1<f64>, parent: PyReadonlyArray1<i64>, ctx_a: PyReadonlyArray2<f64>, ctx_b: PyReadonlyArray2<f64>, ctx_r: PyReadonlyArray1<f64>, params: Bound<'py, PyDict>, threads: usize) -> PyResult<Bound<'py, PyDict>> {
     let (a, b) = (xyz_from_py(a)?, xyz_from_py(b)?);
+    let (ca, cb, cr) = (xyz_from_py(ctx_a)?, xyz_from_py(ctx_b)?, ctx_r.as_array().to_vec());
+    if ca.len() != cb.len() || ca.len() != cr.len() {
+        return Err(PyValueError::new_err("support tree: the context's a, b and r must have one entry per cylinder"));
+    }
+    let context: Vec<_> = ca.into_iter().zip(cb).zip(cr).map(|((a, b), r)| (a, b, r)).collect();
     let (r_prior, parent) = (r_prior.as_array().to_vec(), parent.as_array().to_vec());
     let p = tree_params(&params)?;
     let refs: Vec<&ScanIndex> = scans.iter().map(|s| &s.get().inner).collect();
     let f = py.detach(|| {
         let rows = Rows { a: &a, b: &b, r_prior: &r_prior, r_max: &[], parent: &parent };
-        support_tree::support_tree(&refs, &rows, &p.like, &p.prior, threads)
+        support_tree::support_tree(&refs, &rows, &context, &p.like, &p.prior, threads)
     }).map_err(err)?;
     let d = support_fit(py, f.rows)?;
     let pieces = support_fit(py, f.pieces)?;
@@ -805,6 +819,12 @@ fn qsm_support_tree<'py>(py: Python<'py>, scans: Vec<Bound<'py, PyScanIndex>>, a
     d.set_item("converged", f.converged)?;
     d.set_item("rounds", f.rounds)?;
     d.set_item("echoes", echoes_to_py(py, f.echoes)?)?;
+    let v = f.volume;
+    let volume = PyDict::new(py);
+    for (k, x) in [("point", v.point), ("mean", v.mean), ("q05", v.q05), ("q95", v.q95), ("measured", v.measured), ("bounded", v.bounded), ("prior", v.prior), ("capped", v.capped)] {
+        volume.set_item(k, x)?;
+    }
+    d.set_item("volume", volume)?;
     Ok(d)
 }
 
@@ -812,6 +832,7 @@ pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(qsm_support_flags, m)?)?;
     m.add_function(wrap_pyfunction!(qsm_support_refusals, m)?)?;
     m.add_function(wrap_pyfunction!(qsm_support_diags, m)?)?;
+    m.add_function(wrap_pyfunction!(qsm_support_bases, m)?)?;
     m.add_function(wrap_pyfunction!(qsm_echo_paths, m)?)?;
     m.add_function(wrap_pyfunction!(qsm_support_tree, m)?)?;
     m.add_function(wrap_pyfunction!(qsm_joint_defaults, m)?)?;
