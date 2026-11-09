@@ -552,8 +552,9 @@ def rebase(scans, a, b, r_prior, parent, member, centre, context=None, params: J
     member's row it takes starts that member's base at its cut (a fork, at the fork). A member that would stand on two
     bases keeps its rows as they were. Of a member re-sectioned, other rows under ``z_hi`` whose middle lies in a
     chosen column's circle, or whose evidence is negative, are dropped; a kept row whose parent was dropped hangs
-    from its member's nearest row end within 30 cm, else is dropped (or, where its subtree reaches above ``z_hi``,
-    its member keeps its rows).
+    from its member's nearest row end within 30 cm; one whose subtree reaches above ``z_hi`` is else joined to it
+    within 1 m by a row of its dropped parent's radius (else its member keeps its rows); any other is dropped. A
+    column whose owner keeps a base of its own (a stem the columns missed) starts there.
     ``support_tree.rs``'s ``base`` module documentation says it in full.
 
     Parameters

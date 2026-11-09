@@ -43,14 +43,16 @@
 //!   already on its wood keeps it; one beside it, inside a trunk wider than its claim, or a fan's axes through air,
 //!   don't; a column of thin stems the rays see between loses to their own rows.
 //! - **Ownership.** A column's rows go to the member whose taken entries carry the most of the skeleton's volume
-//!   above their cuts (of its own and its forks' entries); a fork owned by another member starts that member's base
+//!   above their cuts (of its own and its forks' entries), from the ground under it, or from its owner's own base
+//!   where the owner keeps one (a stem the columns missed stands there too); a fork owned by another member starts that member's base
 //!   at the fork, and an entry whose column is another member's starts its member's base at its cut. A column no
 //!   entry takes is left out. A member that would stand on two bases keeps its rows as they were.
 //! - **What else under `H`,** of a member re-sectioned: the chains replaced are dropped, and so is any other row
 //!   under `H` whose middle lies in a chosen column's circle (the same wood twice) or whose evidence is negative (a
 //!   fan's row through air). A kept row whose parent was dropped hangs from its member's nearest row end within
-//!   [`HANG`]; else, if its subtree reaches above `H`, it starts a base of its own (so its member keeps its rows),
-//!   and is otherwise dropped.
+//!   [`HANG`]; else, if its subtree reaches above `H`, it is joined to its member's nearest row end within
+//!   [`CONNECT`] by a row of its dropped parent's radius (the stem RCT drew there, redrawn from the column), or
+//!   starts a base of its own (so its member keeps its rows); any other is dropped.
 use super::*;
 use crate::trees::fit_circle;
 
@@ -75,12 +77,13 @@ const ARC_NOISE: f64 = 0.003;
 const ARC_BIN: f64 = 2.0;
 /// The join (module documentation), in m: an entry's reach to a column's top beyond its radius; a graft's reach; how far beyond a column's circle a row's
 /// middle still lies in it; the widest column that is a stem; how far a kept row's start may lie from the row end
-/// it is hung from.
+/// it is hung from; how far a row reaching above the slabs' top may be joined to its member's nearest row end.
 const JOIN: f64 = 0.08;
 const GRAFT: f64 = 0.3;
 const IN_COL: f64 = 0.02;
 const COL_R_MAX: f64 = 0.3;
 const HANG: f64 = 0.3;
+const CONNECT: f64 = 1.0;
 /// The share of a column's sections inside another plant's cylinder (within [`IN_COL`] of its radius) that makes
 /// it that plant's.
 const CTX_SHARE: f64 = 0.5;
@@ -617,7 +620,10 @@ fn join(rows: &Rows, member: &[i64], centre: &Point, p: &BaseParams, secs: &[Sec
         for c in (0..nc).filter(|&c| owner[c] >= 0) {
             let s = sec_of(c);
             let (mut start, mut par) = if cpar[c] < 0 {
-                ([secs[s[0]].c[0], secs[s[0]].c[1], centre[2]], -1)
+                // from the ground under it, or from its owner's own base where its owner keeps one (a stem the
+                // columns missed still stands there): one base
+                let own = (0..n).find(|&i| member[i] == owner[c] && parent[i] < 0 && !drop[i] && !fate.get(&i).is_some_and(|f| col_of(*f).is_some()));
+                (own.map_or([secs[s[0]].c[0], secs[s[0]].c[1], centre[2]], |i| a[i]), -1)
             } else {
                 let at = cols[c].at as usize;
                 let same = owner[cpar[c] as usize] == owner[c];
@@ -646,12 +652,23 @@ fn join(rows: &Rows, member: &[i64], centre: &Point, p: &BaseParams, secs: &[Sec
                     Some(new_of[parent[i] as usize])
                 } else {
                     // its parent was dropped: its member's nearest row end within HANG; else a row whose subtree
-                    // reaches above the slabs' top starts a base of its own (and its member then keeps its rows),
-                    // and any other is dropped
-                    let near = (0..reb.a.len()).filter(|&k| reb.member[k] == member[i]).map(|k| (k, norm3(&sub(&reb.b[k], &a[i]))))
-                        .filter(|q| q.1 <= HANG).min_by(|x, y| x.1.total_cmp(&y.1));
-                    hung += near.is_some() as u32;
-                    near.map(|q| q.0 as i64).or(reaches[i].then_some(-1))
+                    // reaches above the slabs' top is joined by a row of its dropped parent's radius from its
+                    // member's nearest row end within CONNECT (the stem RCT drew there, redrawn from the column),
+                    // else starts a base of its own (and its member then keeps its rows); any other is dropped
+                    let near = |within: f64| (0..reb.a.len()).filter(|&k| reb.member[k] == member[i]).map(|k| (k, norm3(&sub(&reb.b[k], &a[i]))))
+                        .filter(|q| q.1 <= within).min_by(|x, y| x.1.total_cmp(&y.1)).map(|q| q.0);
+                    hung += 1;
+                    match (near(HANG), reaches[i]) {
+                        (Some(k), _) => Some(k as i64),
+                        (None, true) => Some(near(CONNECT).map_or(-1, |k| {
+                            let x = reb.b[k];
+                            push(&mut reb, x, a[i], r[parent[i] as usize], k as i64, member[i], -1)
+                        })),
+                        (None, false) => {
+                            hung -= 1;
+                            None
+                        }
+                    }
                 };
                 match par {
                     Some(par) => new_of[i] = push(&mut reb, a[i], b[i], r[i], par, member[i], -1),
@@ -861,12 +878,13 @@ mod tests {
         one_base(&f);
     }
 
-    /// One RCT tree whose trunk (from `root` to 1 m at `fork`) forks into a stem onto the column at the origin and a
-    /// stem the columns missed, to (0.6, 0, 2); every row without evidence.
-    fn forked(root: Point, fork: Point) -> Rebased {
-        let (mut a, mut b, mut r, mut p, mut m) = plant(&[(&[root, fork, [0.02, 0.0, 1.6]], 0.05)]);
+    /// One RCT tree whose trunk (from `root` to `fork` at 1 m) forks into a stem rising onto the column at the
+    /// origin (through `via`) and a stem the columns missed, to 50 cm beyond the fork at 2 m; every row without
+    /// evidence.
+    fn forked(root: Point, fork: Point, via: Point) -> Rebased {
+        let (mut a, mut b, mut r, mut p, mut m) = plant(&[(&[root, fork, via, [0.0, 0.0, 2.5]], 0.05)]);
         a.push(fork);
-        b.push([0.6, 0.0, 2.0]);
+        b.push([fork[0] + 0.5, 0.0, 2.0]);
         r.push(0.02);
         p.push(0);
         m.push(0);
@@ -876,13 +894,17 @@ mod tests {
     #[test]
     fn a_stem_forking_under_the_top_hangs_from_the_column_or_its_member_keeps_its_rows() {
         // the fork 20 cm from the column: the trunk is the column's, the missed stem hangs from it
-        let f = forked([0.0, 0.2, 0.0], [0.0, 0.2, 1.0]);
+        let f = forked([0.0, 0.2, 0.0], [0.0, 0.2, 1.0], [0.02, 0.0, 1.6]);
         assert!(f.out[0].chosen && f.counts == [1, 1, 0, 0, 1, 1, 0], "{:?} {:?}", f.out, f.counts);
         one_base(&f);
-        // the fork 40 cm off it: the missed stem can't hang from it, so its tree would stand on two bases, and is
-        // left as it was
-        let f = forked([0.4, 0.0, 0.0], [0.4, 0.0, 1.0]);
-        assert!(!f.out[0].chosen && f.counts[6] == 1 && f.a.len() == 3 && f.a[0] == [0.4, 0.0, 0.0], "{:?} {:?}", f.out, f.counts);
+        // 60 cm off it: joined to the column's nearest row end by a row of the trunk's radius
+        let f = forked([0.6, 0.0, 0.0], [0.6, 0.0, 1.0], [0.02, 0.0, 1.47]);
+        assert!(f.out[0].chosen && f.counts[5] == 1 && f.a.len() == 14 + 4, "{:?} {:?}", f.out, f.counts);
+        one_base(&f);
+        // 1.2 m off it: the missed stem can't be joined to it, so its tree would stand on two bases, and is left as
+        // it was
+        let f = forked([1.2, 0.0, 0.0], [1.2, 0.0, 1.0], [0.02, 0.0, 1.46]);
+        assert!(!f.out[0].chosen && f.counts[6] == 1 && f.a.len() == 4 && f.a[0] == [1.2, 0.0, 0.0], "{:?} {:?}", f.out, f.counts);
     }
 
     #[test]
