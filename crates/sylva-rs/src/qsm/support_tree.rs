@@ -120,7 +120,9 @@
 //!   tangle a circle can be another tree's), it measures each of the row's n
 //!   pieces' R and both coordinates of its centre with sd `PTS_SD R sqrt(n)`
 //!   ([`PTS_SD`] in log R; one circle shared by n pieces, not n circles), and the
-//!   pieces' bounds enter beside it ([`basis::POINTS`]).
+//!   pieces' upper bounds (passes) enter beside it ([`basis::POINTS`]); the
+//!   bounds its own stops gave (a woody run's span, the capacity floor) it
+//!   replaces, so they aren't counted twice (3dtrees ticket 115).
 //! - **The site's cap** (`PriorParams::dh`, 3dtrees research 62, 106
 //!   `uncertain.md`): after the solve, every node into which no circle
 //!   enters (its own or its row's point circle) has R at most `dh` times its
@@ -134,7 +136,7 @@
 //! - **The volume** ([`Volume`]): the tree's pieces' at their posterior R, by
 //!   basis, and an interval from draws of the joint posterior, each node's
 //!   sd [`WIDEN`] times the solve's for its basis (as the reported
-//!   `sd_log_r`).
+//!   `sd_log_r`; a row's from its pieces', each widened by its own).
 //! - **Diagnostics** ([`diag`]): a flag word and three numbers per node and row
 //!   for a reviewer or the screen.
 //! - **The classification:** every stop of the tree, keyed by scan, pulse row
@@ -226,8 +228,8 @@ pub mod diag {
     pub const SUB_FOOTPRINT: u16 = 4;
     /// Its own fitted circle reaches within [`super::TUBE_MARGIN`] of the tube its pulses were taken in: evidence
     /// beyond it is cut off. A piece's own circle that does is not used (3dtrees ticket 109: a stem captured by a
-    /// neighbour's or the ground's mass, or drifted onto a leaf clump at the tube's edge): its bounds are; an exact
-    /// stem's is only reported.
+    /// neighbour's or the ground's mass, or drifted onto a leaf clump at the tube's edge): its bounds are, but for the
+    /// lower bound of a scan whose woody run the circle spans (the captor's); an exact stem's is only reported.
     pub const TUBE_EDGE: u16 = 8;
     /// At least [`super::CONTESTED_SHARE`] of its stops are claimed by context or a neighbouring node (`contested`).
     pub const CONTESTED: u16 = 16;
@@ -356,7 +358,8 @@ struct Sight {
 /// The directions of a circle's `(c1, c2, R)` that the sides its scans see leave free, where they leave its radius
 /// undetermined (none where R is determined): each side is a measurement of the support function, `n.c + R`, `-n.c
 /// + R` or the front's `-v.c + R`, of its weight (research 93 §10: the rank and conditioning of the design matrix).
-/// One scan's edge and front leave R trading against the centre (tree 849 row 4's stem A, research 93 §20).
+/// One scan's edge and front leave R trading against the centre (a fork's stem with its other edge behind a crossing
+/// branch, research 93 §20).
 fn unseen(sights: &[Sight]) -> Vec<Vector3<f64>> {
     let mut m = Matrix3::zeros();
     let mut total = 0.0;
@@ -444,8 +447,9 @@ const LLR_CLIP: f64 = 3.0;
 /// The capacity floor's sd in log R (`tau` itself is a calibration).
 const CAP_SD: f64 = 0.3;
 /// The fork-share term's degrees of freedom: Student-t, so a child far off its share (a basal shoot measured fat, a
-/// clump's envelope) is discounted rather than moving its parent (research 93 §17 review: tree 849's stem, 26 cm at
-/// 4 degrees of freedom, 19.5 at 2 and 18.9 at 1, against RCT's 15.8 and a lower bound's truncation at ~19).
+/// clump's envelope) is discounted rather than moving its parent (research 93 §17 review: a trunk with basal
+/// shoots, 26 cm at 4 degrees of freedom, 19.5 at 2 and 18.9 at 1, against RCT's 15.8 and a lower bound's truncation
+/// at ~19).
 const FORK_DF: f64 = 2.0;
 /// Where thin wood's reflectance shift is full (R at most this, m) and where it is none (from this).
 const THIN_FULL: f64 = 0.01;
@@ -453,8 +457,8 @@ const THIN_NONE: f64 = 0.03;
 /// The censored solve: at most `EP_ROUNDS` rounds, each site moved `EP_DAMP` of the way (halved, down to
 /// `EP_DAMP_MIN`, each time its step turns back, and grown back by `EP_REGROW` while it doesn't; a fork weight likewise
 /// from a full step), until no linearisation moves, and no site or fork weight would move undamped, by more than
-/// `EP_TOL` (in units of its piece's sd; a fork weight by more than that itself) (tree 849
-/// takes ~200 rounds at 1e-4 and fewer at 1e-3, with the same radii to the bench's precision; a round is one
+/// `EP_TOL` (in units of its piece's sd; a fork weight by more than that itself) (the bench's
+/// largest tree takes ~200 rounds at 1e-4 and fewer at 1e-3, with the same radii to the bench's precision; a round is one
 /// elimination, ~3 us per piece; 3dtrees research 93 §19).
 const EP_ROUNDS: usize = 300;
 const EP_DAMP: f64 = 0.5;
@@ -472,8 +476,11 @@ const FIRST_ROUNDS: usize = 5;
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Fit {
     /// The fitted axis (world coordinates: the claim moved by the centre and turned by the lean) and radius, with
-    /// the posterior sd of log R. A routed (RUNS or HULL) piece's follow its exact fit's continuing stem, or where it
-    /// has none accepted, the prior's cut by its bounds.
+    /// the posterior sd of log R widened by its basis's factor ([`WIDEN`]). A routed (RUNS or HULL) piece's follow its
+    /// exact fit's continuing stem, or where it has none accepted, the prior's cut by its bounds. A row's: the line
+    /// from its first piece's start to its last's end, its pieces' root mean square R, and the sd of that R's log,
+    /// linearised from the chain's joint covariance with each piece's log R widened by its own basis's factor (a row of
+    /// mixed bases piece by piece, not by its own `basis`).
     pub a: Vec<Point>,
     pub b: Vec<Point>,
     pub r: Vec<f64>,
@@ -557,19 +564,15 @@ pub struct Fit {
 /// each piece's posterior R (the drawn geometry's: per-piece medians); the mean and the 5th and 95th percentiles of
 /// [`VOLUME_DRAWS`] draws from the tree's joint posterior (the solve's exact covariance, each node's sd widened by
 /// [`WIDEN`] for its basis, each draw held inside its piece's bounds): the mean is the volume of record (3dtrees
-/// ticket 109: a sum of medians can lie under its own q05); and the mean split by each piece's [`basis`] (the
-/// draws' mean of its pieces' volume, so the parts add to the mean).
+/// ticket 109: a sum of medians can lie under its own q05); and the mean split by each piece's [`basis`], `by_basis`
+/// indexed as [`WIDEN`] is, from MEASURED (the draws' mean of its pieces' volume, so the parts add to the mean).
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub struct Volume {
     pub point: f64,
     pub mean: f64,
     pub q05: f64,
     pub q95: f64,
-    pub measured: f64,
-    pub points: f64,
-    pub bounded: f64,
-    pub prior: f64,
-    pub capped: f64,
+    pub by_basis: [f64; 5],
 }
 
 /// The fit of one tree: per row (in the input's order) and per node, with each node's row; the nodes are the pieces,
@@ -760,7 +763,8 @@ struct Summary {
     /// nothing along what they leave free, and its own bounds (in `bounds`) enter the tree with it.
     shadowed: bool,
     /// Its row's point circle, where the rays gave none of its pieces a circle of their own and the veto doesn't
-    /// refute it ([`point_circle`]): it enters the tree with the piece's bounds beside it.
+    /// refute it ([`point_circle`]): it enters the tree with the piece's upper bounds beside it (its lower bound and
+    /// floor, from the same stops, dropped).
     points: Option<Circle>,
     diag: DiagIn,
 }
@@ -1396,14 +1400,17 @@ impl<'a> Profile<'a> {
     /// Its bounds on R from detection and passes (see the module documentation): a slice's numbers are valid bounds
     /// unless clutter joins the run or an echo was lost inside it, so the group's are their medians over at least
     /// three slices (looser than the tightest, robust to a minority of corrupted ones). None without woody stops near
-    /// the claim: then no centre is known for the passes to straddle.
-    fn bounds(&self, r_claim: f64, p: &JointParams) -> Vec<Bound> {
+    /// the claim: then no centre is known for the passes to straddle. With a `captor` (the piece's own circle, refused
+    /// at its tube's edge: [`diag::TUBE_EDGE`]) whose silhouette, as this scan sees it, holds the woody centre, no
+    /// lower bound: the run about it is the captor's, and its span says nothing of the piece.
+    fn bounds(&self, r_claim: f64, p: &JointParams, captor: Option<&Vector5<f64>>) -> Vec<Bound> {
         let Some(c) = self.centre(&self.woody, r_claim) else { return Vec::new() };
         let (mut lo_s, mut hi_s) = self.runs(&self.woody, c, r_claim, true);
         let (app, floor) = (p.app(self.w), 0.5 * p.tau * self.w);
         let sd = p.edge * self.w / std::f64::consts::SQRT_2;
+        let captured = captor.is_some_and(|x| (c - (self.g.n[0] * x[0] + self.g.n[1] * x[1])).abs() < x[4] + app);
         let mut out = Vec::new();
-        if lo_s.len() >= 3 {
+        if lo_s.len() >= 3 && !captured {
             let lo_r = median(&mut lo_s) - app;
             if lo_r > floor {
                 out.push(Bound { eta: lo_r.ln(), sd: sd / lo_r, side: Side::Lower });
@@ -1479,18 +1486,24 @@ fn summarise_piece(scans: &[&ScanIndex], a: &Point, b: &Point, frame: Frame, r_c
     let diag = DiagIn { tube, w, one_sided: one_sided(&gs), deleted, n_ctx: 0, edge: false };
     let mut out = Summary { outcome: Outcome::Bounded, chi2_front: f64::NAN, n_runs: 0, n_scans: 0, n_pairs, bounds: Vec::new(), log_odds, seeds: Vec::new(), exact: None, seen: Vec::new(),
         shadowed: false, points: None, diag };
-    out.outcome = outcome(&gs, r_claim, p, lean_sd, 0.5 * frame.3, &mut out);
+    out.outcome = outcome(&gs, r_claim, p, lean_sd, &mut out);
+    // a circle reaching its tube's edge, past which the evidence is cut off, is a capture (by a neighbour's or the
+    // ground's mass) or a drift (onto a leaf clump), not a measurement: the piece is bounded, but not by the woody run
+    // the captor spans ([`diag::TUBE_EDGE`])
+    let captor = match out.outcome {
+        Outcome::Measured(c) if reaches_edge(&c.x, 0.5 * frame.3, tube) => Some(c.x),
+        _ => None,
+    };
+    if captor.is_some() {
+        (out.outcome, out.diag.edge) = (Outcome::Bounded, true);
+    }
     if !matches!(out.outcome, Outcome::Measured(_)) {
-        out.bounds = profiles.iter().flat_map(|q| q.bounds(r_claim, p)).collect();
+        out.bounds = profiles.iter().flat_map(|q| q.bounds(r_claim, p, captor.as_ref())).collect();
         match profiles.iter().filter_map(|q| q.woody_w(r_claim)).reduce(f64::max) {
             Some(w) => out.bounds.push(Bound { eta: (0.5 * p.tau * w).ln(), sd: CAP_SD, side: Side::Floor }),
             // no woody stop near the claim gives a centre for the passes to straddle: passes through the claim's
             // axis alone bound it (a veto about an axis off the wood would cut real wood: research 106, 103 §20)
             None => out.bounds.extend(veto(&gs, tube)),
-        }
-        if out.diag.edge {
-            // the woody run its refused circle spanned is the captor's: its span says nothing of this piece
-            out.bounds.retain(|b| b.side != Side::Lower);
         }
     }
     if let Outcome::Routed { .. } = out.outcome {
@@ -1623,10 +1636,10 @@ fn veto(gs: &[Group], tube: f64) -> Option<Bound> {
     Some(Bound { eta: VETO_MIN.ln() + step * first.saturating_sub(1) as f64, sd: VETO_SD, side: Side::Upper })
 }
 
-/// What becomes of a piece's own summary: porous (pulses, no opaque run), bounded (no circle determined, or one that
-/// reaches the edge of its tube, `out.diag.tube`, along its half-length `half`: [`diag::TUBE_EDGE`]), routed (several
-/// stems or a hull) or measured; recording its runs, scans and front misfit in `out`.
-fn outcome(gs: &[Group], r_claim: f64, p: &JointParams, lean_sd: f64, half: f64, out: &mut Summary) -> Outcome {
+/// What becomes of a piece's own summary: porous (pulses, no opaque run), bounded (no circle determined), routed
+/// (several stems or a hull) or measured (its circle, which [`summarise_piece`] still refuses at its tube's edge);
+/// recording its runs, scans and front misfit in `out`.
+fn outcome(gs: &[Group], r_claim: f64, p: &JointParams, lean_sd: f64, out: &mut Summary) -> Outcome {
     // the first pass: each stop by its echo
     let first: Vec<GroupOut> = gs.iter().map(|g| {
         let f: Vec<Fate> = g.recs.iter().map(|r| fate(r, g, None)).collect();
@@ -1695,10 +1708,6 @@ fn outcome(gs: &[Group], r_claim: f64, p: &JointParams, lean_sd: f64, half: f64,
     // ridge it leaves; bounding it instead cost its circles, research 93 §20: 0.064 to 0.150 on the bench's 15)
     if runs || hull {
         Outcome::Routed { circle: c2, runs, hull }
-    } else if reaches_edge(&y, half, out.diag.tube) {
-        // the evidence beyond the tube is cut off: a circle there is a capture or a drift, not a measurement
-        out.diag.edge = true;
-        Outcome::Bounded
     } else {
         Outcome::Measured(c2)
     }
@@ -1920,6 +1929,8 @@ pub fn support_tree(scans: &[&ScanIndex], rows: &Rows, context: &[(Point, Point,
             let c = point_measure(&x, (k1 - k0) as f64);
             for s in &mut sums[k0..k1] {
                 s.points = Some(c);
+                // the bounds its stops gave (the woody run's span, the capacity floor) are the circle's own data
+                s.bounds.retain(|b| b.side == Side::Upper);
             }
         }
     }
@@ -1986,7 +1997,17 @@ pub fn support_tree(scans: &[&ScanIndex], rows: &Rows, context: &[(Point, Point,
     for (k, s) in sums.iter().enumerate() {
         let (diag, data_share, contested) = diagnose(s, sol.x[k][4].exp(), sol.cov[k][(4, 4)], sol.site_tau[k], 0.5 * nd.frame[k].3, (seen_stops[k], kept_stops[k]));
         let diag = diag | bits[k] | if refuted(audit[k]) { diag::REFUTED } else { 0 };
-        let measured = !s.bounded();
+        let basis = if !s.bounded() {
+            basis::MEASURED
+        } else if s.points.is_some() {
+            basis::POINTS
+        } else if diag & diag::CAPPED != 0 {
+            basis::CAPPED
+        } else if diag & diag::PINNED != 0 || !(data_share >= BOUNDED_SHARE) {
+            basis::PRIOR
+        } else {
+            basis::BOUNDED
+        };
         let own = Own {
             diag,
             data_share,
@@ -2010,24 +2031,16 @@ pub fn support_tree(scans: &[&ScanIndex], rows: &Rows, context: &[(Point, Point,
             lam: lam[k],
             audit: audit[k],
             r_points: r_points[k],
-            basis: if measured {
-                basis::MEASURED
-            } else if s.points.is_some() {
-                basis::POINTS
-            } else if diag & diag::CAPPED != 0 {
-                basis::CAPPED
-            } else if diag & diag::PINNED != 0 || !(data_share >= BOUNDED_SHARE) {
-                basis::PRIOR
-            } else {
-                basis::BOUNDED
-            },
+            basis,
         };
-        out.pieces.push(&sol.x[k], &sol.cov[k], nd.frame[k], nd.a[k], own);
+        out.pieces.push(&sol.x[k], &widened(&sol.cov[k], widen(basis)), nd.frame[k], nd.a[k], own);
     }
     for k in 0..rows.a.len() {
         let (k0, k1) = (nd.first[k], nd.first[k + 1]);
-        let (x, cov) = row_line(&sol, k0, k1, fr[k].3, nd.frame[k0].3);
         let p = &out.pieces;
+        // each piece's log R widened by its own basis's factor: a row of mixed bases piece by piece
+        let k_of: Vec<f64> = p.basis[k0..k1].iter().map(|&b| widen(b)).collect();
+        let (x, cov) = row_line(&sol, k0, k1, fr[k].3, nd.frame[k0].3, &k_of);
         let fold = |v: &[f64], f: fn(f64, f64) -> f64| v[k0..k1].iter().copied().filter(|x| x.is_finite()).reduce(f).unwrap_or(f64::NAN);
         // the measured pieces' own radii, independent: the geometric mean and its sd
         let used: Vec<(f64, f64)> = (k0..k1).filter(|&j| p.r_row[j].is_finite()).map(|j| (p.r_row[j].ln(), p.sd_r_row[j] / p.r_row[j])).collect();
@@ -2148,8 +2161,6 @@ fn volume(nd: &Nodes, sol: &Solved, held: &[(f64, f64)], basis: &[u8]) -> Volume
     let pieces: Vec<usize> = (0..n).filter(|&k| nd.further[k].is_none()).collect();
     let vol = |k: usize, eta: f64| std::f64::consts::PI * (2.0 * eta).exp() * nd.frame[k].3;
     let mut v = Volume { point: pieces.iter().map(|&k| vol(k, sol.x[k][4])).sum(), ..Volume::default() };
-    // each piece's basis's part of the mean
-    let mut parts = [0.0f64; 5];
     let chol: Vec<Matrix5<f64>> = sol.inv.iter().map(|m| m.cholesky().map_or_else(|| Matrix5::from_diagonal(&m.diagonal().map(|d| d.max(0.0).sqrt())), |c| c.l())).collect();
     let mut rng = Normal::new(0x5EED_0F_7EE5);
     let k_of: Vec<f64> = basis.iter().map(|&b| widen(b)).collect();
@@ -2161,7 +2172,7 @@ fn volume(nd: &Nodes, sol: &Solved, held: &[(f64, f64)], basis: &[u8]) -> Volume
         }
         pieces.iter().map(|&k| {
             let x = vol(k, (sol.x[k][4] + k_of[k] * d[k][4]).max(held[k].0).min(held[k].1));
-            parts[usize::from(basis[k]) - 1] += x;
+            v.by_basis[usize::from(basis[k]) - 1] += x;
             x
         }).sum()
     }).collect();
@@ -2169,7 +2180,7 @@ fn volume(nd: &Nodes, sol: &Solved, held: &[(f64, f64)], basis: &[u8]) -> Volume
     let q = |p: f64| draws[(p * (VOLUME_DRAWS - 1) as f64).round() as usize];
     v.mean = draws.iter().sum::<f64>() / VOLUME_DRAWS as f64;
     (v.q05, v.q95) = (q(0.05), q(0.95));
-    [v.measured, v.points, v.bounded, v.prior, v.capped] = parts.map(|x| x / VOLUME_DRAWS as f64);
+    v.by_basis = v.by_basis.map(|x| x / VOLUME_DRAWS as f64);
     v
 }
 
@@ -2341,16 +2352,24 @@ impl Default for ExactOut {
     }
 }
 
+/// A covariance of `[c1, c2, t1, t2, log R]` with log R's sd `f` times as wide.
+fn widened(cov: &Matrix5<f64>, f: f64) -> Matrix5<f64> {
+    let mut c = *cov;
+    c.row_mut(4).scale_mut(f);
+    c.column_mut(4).scale_mut(f);
+    c
+}
+
 impl Fit {
-    /// Appends a piece or row: its state `[c1, c2, t1, t2, log R]` and covariance, frame and claimed start `a0`, its
-    /// sd of log R [`WIDEN`] times the posterior's for its basis.
+    /// Appends a piece or row: its state `[c1, c2, t1, t2, log R]` and covariance (log R's widened: [`WIDEN`]), frame
+    /// and claimed start `a0`.
     fn push(&mut self, x: &Vector5<f64>, cov: &Matrix5<f64>, (u, e1, e2, len): Frame, a0: Point, own: Own) {
         let at = |s: f64| -> Point { std::array::from_fn(|i| a0[i] + (s + 0.5 * len) * u[i] + (x[0] + s * x[2]) * e1[i] + (x[1] + s * x[3]) * e2[i]) };
         self.a.push(at(-0.5 * len));
         self.b.push(at(0.5 * len));
         self.r.push(x[4].exp());
         let sd = |i: usize| cov[(i, i)].max(0.0).sqrt();
-        self.sd_log_r.push(widen(own.basis) * sd(4));
+        self.sd_log_r.push(sd(4));
         self.centre.push([x[0], x[1]]);
         self.sd_centre.push([sd(0), sd(1)]);
         self.lean.push([x[2], x[3]]);
@@ -2394,8 +2413,8 @@ impl Fit {
 /// to the last's end as the centre at the row's middle and the lean, and the log of their root mean square R, so the
 /// row's volume is its pieces' (3dtrees ticket 109: one volume per tree); with its covariance from the chain's joint
 /// covariance (`Cov(x_j, x_i) = -Y_j Cov(x_{j-1}, x_i)` below the diagonal), log R's linearised (each piece's weight
-/// its share of the row's area).
-fn row_line(sol: &Solved, k0: usize, k1: usize, len: f64, pl: f64) -> (Vector5<f64>, Matrix5<f64>) {
+/// its share of the row's area) with each piece's log R widened by its factor `k_of` (its basis's: [`WIDEN`]).
+fn row_line(sol: &Solved, k0: usize, k1: usize, len: f64, pl: f64, k_of: &[f64]) -> (Vector5<f64>, Matrix5<f64>) {
     let m = k1 - k0;
     let mut a = vec![Matrix5::<f64>::zeros(); m];
     for i in 0..2 {
@@ -2411,11 +2430,11 @@ fn row_line(sol: &Solved, k0: usize, k1: usize, len: f64, pl: f64) -> (Vector5<f
     }
     let area: Vec<f64> = (k0..k1).map(|k| (2.0 * sol.x[k][4]).exp()).collect();
     let total: f64 = area.iter().sum();
-    for (aj, s) in a.iter_mut().zip(&area) {
-        aj[(4, 4)] = s / total;
-    }
     let mut x: Vector5<f64> = (0..m).map(|j| a[j] * sol.x[k0 + j]).sum();
     x[4] = 0.5 * (total / m as f64).ln();
+    for ((aj, s), k) in a.iter_mut().zip(&area).zip(k_of) {
+        aj[(4, 4)] = k * s / total;
+    }
     let mut c: Vec<Vec<Matrix5<f64>>> = vec![Vec::with_capacity(m); m];
     let mut cov = Matrix5::zeros();
     for j in 0..m {
@@ -2463,10 +2482,10 @@ fn tree_solve(rows: &Rows, fr: &[Frame], nd: &Nodes, sums: &[Summary], p: &Prior
     // each piece's site: precision and precision times mean, on its log R
     let mut site = vec![(0.0, 0.0); terms.len()];
     // each site's damping and its last step: a site whose step turns back is damped harder (an oscillating site,
-    // a base piece's bounds against its linked measurements, held tree 2776's solve for its 300 rounds)
+    // a base piece's bounds against its linked measurements, held one tree's solve for its 300 rounds)
     let mut damp = vec![EP_DAMP; terms.len()];
     let mut last = vec![(0.0f64, 0.0f64); terms.len()];
-    // and each fork weight's (the Student-t's reweighting turns with its sites: tree 2776's node 88), at first in full
+    // and each fork weight's (the Student-t's reweighting turns with its sites at a fork), at first in full
     let (mut fork_damp, mut fork_last) = (vec![1.0f64; n], vec![0.0f64; n]);
     let mut round = 0;
     loop {
@@ -2561,7 +2580,7 @@ fn terms(sums: &[Summary]) -> Vec<(usize, Vec<Bound>)> {
 
 /// The mean and variance of `N(mu, v)` times a piece's probit terms `bs`, by the trapezoid rule on [`EP_NODES`]
 /// points across `at.0 ± 6 at.1` (the piece's marginal, which the tilted distribution approaches), or where its mass
-/// peaks at that grid's edge (the cavity far from the bounds: tree 2776's base, research 93 §19), across the cavity's
+/// peaks at that grid's edge (the cavity far from the bounds, as at a tree's base: research 93 §19), across the cavity's
 /// ±8 sd and the bounds and again about the peak; None where the grid holds no mass. One site per piece makes the
 /// expectation propagation exact for a piece alone (a site per
 /// term would not: two bounds on one piece leave its sd ~10 % wide); across linked pieces it is within ~0.1 sd of
@@ -2874,10 +2893,14 @@ mod tests {
             }
         }
         // the base row from its two pieces: its mean log R and lean along e1, against the dense covariance
-        let (xr, cr) = row_line(&se, 0, 2, 0.6, 0.3);
+        let (xr, cr) = row_line(&se, 0, 2, 0.6, 0.3, &[1.0, 1.0]);
         let mut a = nalgebra::DVector::<f64>::zeros(5 * n);
         (a[4], a[9]) = (0.5, 0.5);
         assert!((xr[4] - (0.5 * (xd[4] + xd[9]))).abs() < 1e-12 && (cr[(4, 4)] - (a.transpose() * &inv * &a)[0]).abs() < 1e-12);
+        // a row of mixed bases is widened piece by piece: its log R's variance is the pieces' widened, its line not
+        let (xw, cw) = row_line(&se, 0, 2, 0.6, 0.3, &[2.0, 3.0]);
+        (a[4], a[9]) = (1.0, 1.5);
+        assert!(xw == xr && (cw[(4, 4)] - (a.transpose() * &inv * &a)[0]).abs() < 1e-12 && cw[(2, 2)] == cr[(2, 2)]);
         let mut l = nalgebra::DVector::<f64>::zeros(5 * n);
         (l[0], l[2], l[5], l[7]) = (-1.0 / 0.6, 0.25, 1.0 / 0.6, 0.25);
         assert!((cr[(2, 2)] - (l.transpose() * &inv * &l)[0]).abs() < 1e-12, "{} {}", cr[(2, 2)], (l.transpose() * &inv * &l)[0]);
@@ -2888,7 +2911,7 @@ mod tests {
 
     #[test]
     fn tilted_moments_reach_bounds_far_from_the_marginal() {
-        // a cavity at log R -4.7 (sd 0.16) and two-sided bounds 15 sd away at -2.25 (tree 2776's base piece): the
+        // a cavity at log R -4.7 (sd 0.16) and two-sided bounds 15 sd away at -2.25 (a tree's base piece): the
         // moments lie between the bounds, as brute force on a fine grid says, not at the marginal's grid's edge
         let bs = [Bound { eta: -2.28, sd: 0.04, side: Side::Lower }, Bound { eta: -2.22, sd: 0.05, side: Side::Upper }];
         let (mu, v) = (-4.7, 0.16f64.powi(2));
@@ -3059,14 +3082,20 @@ mod tests {
         };
         let g = grid(&|_| true);
         let q = Profile::of(&g, 0.03, &p);
-        let bs = q.bounds(0.03, &p);
+        let bs = q.bounds(0.03, &p, None);
         let side = |s: Side| bs.iter().find(|b| b.side == s).map(|b| b.eta.exp());
         let (lo, hi) = (side(Side::Lower).unwrap(), side(Side::Upper).unwrap());
         assert!(lo <= r && r <= hi && hi - lo < 0.006, "lo {lo} hi {hi}");
         assert_eq!(q.woody_w(0.03), Some(w));
+        // a captor refused at the tube's edge (TUBE_EDGE) takes only the lower bound of a scan whose woody run it
+        // spans: a 4 cm circle 1 cm off spans the stem's run, a 3 cm one 9 cm off (its silhouette from 6 cm) doesn't
+        let captor = |c: f64, r: f64| q.bounds(0.03, &p, Some(&Vector5::new(c, 0.0, 0.0, 0.0, r)));
+        let spanned = captor(0.01, 0.04);
+        assert!(spanned.iter().all(|b| b.side != Side::Lower) && spanned.iter().any(|b| b.side == Side::Upper), "{spanned:?}");
+        assert_eq!(captor(0.09, 0.03), bs);
         // an export of echoes only keeps no misses: with nothing recorded beside the stem, no upper bound
         let g = grid(&|_| false);
-        let bs = Profile::of(&g, 0.03, &p).bounds(0.03, &p);
+        let bs = Profile::of(&g, 0.03, &p).bounds(0.03, &p, None);
         assert!(bs.iter().all(|b| b.side == Side::Lower), "{bs:?}");
         // a 1 mm wire the grid hits in three rows and passes through, either side of it, in the others: the passes
         // through bound it
@@ -3080,12 +3109,12 @@ mod tests {
             }
         }
         let g = group(v);
-        let bs = Profile::of(&g, 0.01, &p).bounds(0.01, &p);
+        let bs = Profile::of(&g, 0.01, &p).bounds(0.01, &p, None);
         let hi = bs.iter().find(|b| b.side == Side::Upper).map(|b| b.eta.exp()).unwrap();
         assert!(hi >= 0.0005 && hi <= (0.0025 - app).max(0.5 * p.tau * w) + 1e-9, "hi {hi} {bs:?}");
         // and with no woody stop, no centre to bound about
         let g = group((0..20).map(|j| rec(0.0, j as f64 * 0.005, f64::NAN)).collect());
-        assert!(Profile::of(&g, 0.01, &p).bounds(0.01, &p).is_empty());
+        assert!(Profile::of(&g, 0.01, &p).bounds(0.01, &p, None).is_empty());
     }
 
     #[test]
@@ -3533,7 +3562,7 @@ mod tests {
     #[test]
     fn a_point_circle_measures_its_pieces_with_their_bounds_beside_it() {
         // a row of two pieces under a measured base: the point circle (5 cm) enters each piece at PTS_SD times the
-        // root of two in log R, and the pieces' bounds still enter beside it
+        // root of two in log R, and the pieces' upper bounds still enter beside it
         let rows_a = [[0.0, 0.0, 0.0], [0.0, 0.0, 0.3]];
         let rows_b = [[0.0, 0.0, 0.3], [0.0, 0.0, 0.9]];
         let rows = Rows { a: &rows_a, b: &rows_b, r_prior: &[0.1, 0.09], r_max: &[], parent: &[-1, 0] };
@@ -3677,7 +3706,8 @@ mod tests {
                 "{v:?} against q05 {q05} q95 {q95} mean {mean} (se {se})");
             // the point is the posterior's; the mean is split by basis (the first row prior, the child bounded)
             let point: f64 = (0..n).map(|k| std::f64::consts::PI * (2.0 * sol.x[k][4]).exp() * nd.frame[k].3).sum();
-            assert!((v.point - point).abs() < 1e-12 && (v.prior + v.bounded - v.mean).abs() < 1e-9 * v.mean && v.prior > 0.0 && v.bounded > 0.0 && v.q05 < v.point && v.point < v.q95);
+            let (prior, bounded) = (v.by_basis[usize::from(basis::PRIOR) - 1], v.by_basis[usize::from(basis::BOUNDED) - 1]);
+            assert!((v.point - point).abs() < 1e-12 && (prior + bounded - v.mean).abs() < 1e-9 * v.mean && prior > 0.0 && bounded > 0.0 && v.q05 < v.point && v.point < v.q95);
         }
         // a piece held in its interval holds every draw: none wider than its upper bound
         let mut held = free.clone();

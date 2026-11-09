@@ -19,7 +19,7 @@
 //!   edge); hulls (a quarter of the pulses aimed at the core go through) are
 //!   dropped; and at most [`EXACT_K`] that don't overlap are taken greedily,
 //!   strongest first. Never the piece's circle: on a hull its lean is the line
-//!   between two stems (tree 849 row 4).
+//!   between two stems (a fork's stems side by side in one piece).
 //! - **The fit.** The piece's pulses are taken once, in a tube about the
 //!   claim's axis that holds every seed, and each seed's view of them is the
 //!   pair measured again from its own leaning axis (the chord through the tube
@@ -84,7 +84,7 @@ const EXACT_TOL: f64 = 3e-4;
 const THIN: u32 = 1;
 const FIT_PAIRS: usize = 8000;
 /// A stem whose message's sd of log R exceeds this says nothing of its radius (a factor of e either way): the fit is
-/// refused, as no measurement of the stem (tree 849 row 81's had 4e4).
+/// refused, as no measurement of the stem (a stem on a piece of twigs had 4e4).
 const UNINFORMED_SD: f64 = 1.0;
 
 /// How far from a shadowed stem's fitted surface its stops may lie and bound it from below (m, plus `0.3 R`): the range
@@ -295,7 +295,7 @@ const BAND: (f64, f64) = (0.01, 0.03);
 /// edge, `R` to `R + W` beyond the axis across the beam, `W` [`BAND_SHARE`] of the radius within [`BAND`], or the
 /// front's middle) is seen where at least [`SEEN_MIN`] pulses reached it (an echo at or behind it, or none recorded
 /// where none was deleted), and weighs the pulses that did per m across the beam; one whose pulses all echoed
-/// further in front (a crossing branch's shadow, tree 849 row 4's stem A) is not seen. The directions are the
+/// further in front (a crossing branch's shadow over a fork's stem) is not seen. The directions are the
 /// piece's (`claim`: its axis' start, frame, and the table's tube about it). And the stem's bounds: below, half the
 /// span of the stops on its front arc (less [`ARC_TRIM`] at each end, from at least [`ARC_MIN`]) less the
 /// footprint's widening, the tightest of the scans'; the capacity floor at the widest footprint.
