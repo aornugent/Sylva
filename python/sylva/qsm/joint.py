@@ -255,6 +255,31 @@ SupportBasis = IntEnum("SupportBasis", _core.qsm_support_bases())
 EchoPath = IntEnum("EchoPath", _core.qsm_echo_paths())
 
 
+def tree_context(a, b, cyl_offsets, trees, reach: float) -> list:
+    """Each of ``trees``' context for :func:`support_tree`: of a plot's cylinders, the other trees' whose segments come
+    within ``reach`` of one of its own.
+
+    Parameters
+    ----------
+    a, b
+        ``(n, 3)`` cylinders ``a[i] -> b[i]``, grouped by tree.
+    cyl_offsets
+        ``n_trees + 1`` offsets: tree ``g`` owns cylinders ``cyl_offsets[g]:cyl_offsets[g + 1]``.
+    trees
+        The trees whose context is wanted (indices into the groups).
+    reach
+        Closest distance between segments (m). A cylinder of zero length is never close.
+
+    Returns
+    -------
+    list of numpy.ndarray
+        Per tree of ``trees``, in order, the sorted indices of its context's cylinders.
+    """
+    off, idx = _core.qsm_tree_context(np.ascontiguousarray(a, np.float64), np.ascontiguousarray(b, np.float64),
+                                      [int(o) for o in cyl_offsets], [int(t) for t in trees], float(reach))
+    return [idx[off[i]:off[i + 1]].astype(np.int64) for i in range(len(off) - 1)]
+
+
 def support_tree(scans, a, b, r_prior, parent, context=None, params: JointParams = JointParams(),
                  threads: int = 0) -> dict:
     """Fits one tree from the support function of each row's cross-section: the fast path of :func:`joint_tree`.
