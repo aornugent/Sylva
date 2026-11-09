@@ -358,12 +358,6 @@ pub struct JointParams {
     /// hash of each pulse's direction and this): 0 in production; the bench varies it to measure the thinning's noise
     /// (3dtrees research 93 §19). Read by [`crate::qsm::support_tree`] only.
     pub thin_seed: u64,
-    /// The factor [`crate::qsm::support_tree`] widens its posterior sds of log R by, in its reported `sd_log_r` and
-    /// its volume's draws: the raw posterior is overconfident. Calibrated on research 106's circles (Alice Mulga's
-    /// refit circles, their own noise added; 3dtrees ticket 105): 90 % of them inside the 90 % interval at 2.54
-    /// [2.42-2.67] over random halves of the trees, 88.8-91.2 % on the held-out halves. Read by
-    /// [`crate::qsm::support_tree`] only.
-    pub widen: f64,
 }
 
 impl Default for JointParams {
@@ -372,7 +366,7 @@ impl Default for JointParams {
         JointParams {
             exit: 0.007, divergence: 0.35e-3, sigma_r: 0.005, rough: 0.03, tau: 0.11, edge: 0.5, eps: 0.1, eps_min: 0.01, mp_len: 0.5, hide: 0.09,
             refl_wood: -15.45, refl_wood_sd: 1.0, refl_leaf: -19.7, refl_leaf_sd: 1.4, refl_multi: -3.0, refl_multi_sd: 1.2,
-            refl_thin: -3.0, stop_wood: 0.99, stop_leaf: 0.1, exist_scale: 0.2, model_sd: 0.004, thin_seed: 0, widen: 2.5,
+            refl_thin: -3.0, stop_wood: 0.99, stop_leaf: 0.1, exist_scale: 0.2, model_sd: 0.004, thin_seed: 0,
         }
     }
 }

@@ -46,8 +46,7 @@ The parameters are a :class:`JointParams`, whose fields are:
   (existence along a branch: a base piece is wood with ``exist``, one after a
   piece that isn't with ``exist_off``), ``dh`` (the site's largest stem D/H:
   no radius the rays don't measure is wider than ``dh`` times its reach to the
-  tips over 2; 0 for no cap) and ``widen`` (the factor its posterior sds of
-  log R are widened by, calibrated against the refit's circles);
+  tips over 2; 0 for no cap);
 - the prior: ``lam_prior`` and ``lam_sd`` (foliage's median, 1/m, and log
   sd), ``sig_ell`` (its random walk), ``sig_eta`` (the taper's random walk per
   sqrt(m)), ``mu_fork`` and ``sig_fork`` (soft Leonardo's log area ratio and
@@ -121,7 +120,6 @@ class JointParams:
     exist: float = _DEFAULTS["exist"]
     exist_off: float = _DEFAULTS["exist_off"]
     dh: float = _DEFAULTS["dh"]
-    widen: float = _DEFAULTS["widen"]
     #: Newton iterations per continuation stage at most, and the stopping tolerance.
     iters: int = _DEFAULTS["iters"]
     tol: float = _DEFAULTS["tol"]
@@ -229,7 +227,8 @@ SupportRefusal = IntFlag("SupportRefusal", _core.qsm_support_refusals())
 #:   against its centre: its message says nothing along what they leave free, and its own bounds (the span of its
 #:   front arc's stops, the capacity floor) enter the tree beside it. A side past the fit's table isn't judged;
 #: - ``SUB_FOOTPRINT``: R below about half the footprint at its range;
-#: - ``TUBE_EDGE``: its own fitted circle reaches the edge of the tube its pulses were taken in: evidence cut off;
+#: - ``TUBE_EDGE``: its own fitted circle reaches the edge of the tube its pulses were taken in: evidence cut off, so
+#:   a piece's own circle there isn't used (a capture or a drift), nor its woody run's span as a lower bound;
 #: - ``CONTESTED``: most of its stops are claimed by context or a neighbouring node (``contested``);
 #: - ``REFUTED``: the ray veto refutes its fitted circle: at least 10 pulses pass through it, and passes are at least a
 #:   quarter of its stops and passes (3dtrees research 106; a row's: of its pieces' counts summed);
@@ -239,7 +238,8 @@ SupportRefusal = IntFlag("SupportRefusal", _core.qsm_support_refusals())
 SupportDiag = IntFlag("SupportDiag", _core.qsm_support_diags())
 
 #: How a node's radius is known (:func:`support_tree`'s ``basis``; a row's: most of its pieces', the less known on a
-#: tie): ``MEASURED`` (its own circle, or an exact stem's message, not ``SHADOWED``), ``BOUNDED`` (its own bounds give
+#: tie): ``MEASURED`` (its own circle, or an exact stem's message, not ``SHADOWED``), ``POINTS`` (its row's point
+#: circle: the rays gave it no circle of its own), ``BOUNDED`` (its own bounds give
 #: at least 0.1 of its precision, ``data_share``, and it isn't pinned), ``PRIOR`` (the prior's, given the rest of the
 #: tree, or pinned to its own bound) and ``CAPPED`` (on the site's cap). Its tree's volume is split by them.
 SupportBasis = IntEnum("SupportBasis", _core.qsm_support_bases())
@@ -287,6 +287,15 @@ def support_tree(scans, a, b, r_prior, parent, context=None, params: JointParams
     inside its own bounds (between the tightest lower and upper, the upper where they cross), and says where it sits
     on them (``PINNED``).
 
+    Point evidence (3dtrees ticket 109): a row none of whose pieces has a circle of its own gets one from the stops
+    in its pieces' tubes nearer its claimed axis than any other the tree or its context claims, placed across its
+    axis, as the refit fitted RCT's points (RANSAC, least squares on its inliers, and the refit's tests: at least 12
+    stops on a claim of at least 1 cm, half of them on it, filling 120 degrees of it, its centre near the axis, at
+    most twice the claim and twice the site's cap, and short of the edge of its pieces' tubes). Unless the ray veto
+    refutes it (on a tangle it can be another tree's), it measures each of the row's n pieces' R and centre (each
+    coordinate) with sd 0.136 R sqrt(n) (0.136 in log R, the refit circles' noise, shared by the n pieces), its
+    pieces' bounds beside it, and isn't capped (``POINTS``).
+
     A ``RUNS`` or ``HULL`` piece is fitted by the exact likelihood, seeded from its runs (3dtrees research 93 §18):
     each scan's runs, found slice by slice along the piece, measured as circles with their own centre, lean and
     radius (as a piece's own circle is), scored by every scan's woody stops on their front arcs, hulls dropped,
@@ -311,9 +320,11 @@ def support_tree(scans, a, b, r_prior, parent, context=None, params: JointParams
     tree's) times its echo character's weight, or on a routed piece with an exact fit by the exact likelihood's wood
     and leaf terms at its stem's fit (:class:`EchoPath`).
 
-    The tree's volume is its pieces' (a routed piece's further stems aside): at their posterior R, split by how each is
-    known (:class:`SupportBasis`), and as an interval from 1,000 draws of the tree's joint posterior (the solve's
-    exact covariance, its sds ``widen`` times wider, each draw held inside its piece's bounds; a fixed seed).
+    The tree's volume is its pieces' (a routed piece's further stems aside): at their posterior R (the drawing's,
+    ``point``), and as the mean (the volume of record, split by how each piece is known, :class:`SupportBasis`) and an
+    interval from 1,000 draws of the tree's joint posterior (the solve's exact covariance, each node's sd widened by
+    its basis's factor, each draw held inside its piece's bounds; a fixed seed). The factors are Sylva's calibration
+    (``WIDEN`` in ``support_tree.rs``, learned per basis against Alice Mulga's refit circles), not a setting.
 
     Parameters
     ----------
@@ -329,7 +340,7 @@ def support_tree(scans, a, b, r_prior, parent, context=None, params: JointParams
         :class:`JointParams`: the likelihood's footprint, ``tau``, ``edge``, ``sigma_r``, ``rough`` and ``refl_*``,
         ``stop_wood``, ``stop_leaf``, ``exist_scale``, ``refl_thin`` and ``model_sd``, and the prior's ``sig_eta``,
         ``mu_fork``, ``sig_fork``, ``sig_root``, ``sig_delta``, ``lean_sd``, ``lean_bend``, ``exist``, ``exist_off``,
-        ``centre_rel``, ``centre_abs`` and ``dh``, and ``widen``; the rest are unused.
+        ``centre_rel``, ``centre_abs`` and ``dh``; the rest are unused.
     threads
         Threads to use (0: one per core).
 
@@ -341,8 +352,8 @@ def support_tree(scans, a, b, r_prior, parent, context=None, params: JointParams
 
     - ``a``, ``b`` ``(n, 3)``: the fitted axis, world coordinates (the claim moved by the centre and turned by the
       lean; a row's runs from its first piece's start to its last's end); ``r``, ``sd_log_r``: the radius, held inside
-      its own bounds, and its posterior sd in log, ``widen`` times the solve's (a row's: the mean of its pieces' log
-      R);
+      its own bounds, and its posterior sd in log, the solve's widened by its basis's factor (a row's: its pieces' root
+      mean square R, so its volume is theirs);
     - ``centre``, ``sd_centre``, ``lean``, ``sd_lean`` ``(n, 2)``: the centre at the middle (m) and the lean (m per
       m of axis) along ``e1``, ``e2`` ``(n, 3)``, with their posterior sds;
     - ``r_row``, ``sd_r_row``: the own summary's radius and its sd (a routed piece's: its exact fit's stem's), NaN
@@ -354,7 +365,8 @@ def support_tree(scans, a, b, r_prior, parent, context=None, params: JointParams
       a woody run, or through the claim: the veto), and the capacity floor ``tau w / 2`` (which says only that
       something was hit), on a piece that isn't measured, else NaN (they enter the tree where no circle does, a
       routed piece's without its detection bound; a row's: its pieces' widest); ``r_cap``, the site's cap on it (NaN
-      without ``dh``, or where it is measured; a row's: its first piece's);
+      without ``dh``, or where a circle measures it; a row's: its first piece's); ``r_points``, its row's point
+      circle's radius, NaN where none passed its tests (it entered unless the veto refuted it: ``basis`` says so);
     - ``n_pass``, ``pass_share``: the ray veto's audit of its fitted circle, the pulses passing through it and their
       share of its stops and passes (NaN with none; a row's: its pieces' summed), ``REFUTED`` where they refute it;
     - ``basis`` (:class:`SupportBasis`): how its radius is known;
@@ -377,8 +389,9 @@ def support_tree(scans, a, b, r_prior, parent, context=None, params: JointParams
       ``chi2`` and ``chi2_front``, a refusal ``refused``, a thinned fit ``n_exact`` over the budget;
 
     and per tree ``converged``, whether the censored solve settled; ``volume``, a dict of m^3: ``point`` (at each
-    piece's posterior R), ``mean``, ``q05`` and ``q95`` (of the draws), and the point by basis, ``measured``,
-    ``bounded``, ``prior`` and ``capped``; and ``echoes``, one record per stop of the tree
+    piece's posterior R: the drawn geometry's, per-piece medians), ``mean`` (the volume of record), ``q05`` and
+    ``q95`` (of the draws), and the mean by basis (each piece's draws' mean, adding to it), ``measured``,
+    ``points``, ``bounded``, ``prior`` and ``capped``; and ``echoes``, one record per stop of the tree
     (of an echo several pieces saw, the one whose surface it lies nearest), keyed as the tile sidecars are: ``scan``
     (an index into ``scans``), ``pulse`` (the pulse's row in its Shots file), ``echo`` (its place in the pulse);
     with ``p_wood`` (the chance it is wood's echo), ``node`` (its piece or stem, in ``pieces``), ``path``

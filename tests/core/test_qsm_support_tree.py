@@ -56,7 +56,7 @@ def test_separated_stems_upright_and_leaning_are_measured(tmp_path):
         # the lean, along the row's frame, against the truth's
         t = f["lean"][k] @ np.c_[f["e1"][k], f["e2"][k]].T
         assert np.allclose(t[:2], lean[k], atol=0.01), (k, t, lean[k])
-    assert (f["sd_log_r"] < 0.2 * PARAMS.widen).all() and (np.isnan(f["chi2"]) | (f["chi2"] < 9)).all() and (f["chi2_front"] < 9).all()
+    assert (f["sd_log_r"] < 0.2 * 2.1).all() and (np.isnan(f["chi2"]) | (f["chi2"] < 9)).all() and (f["chi2_front"] < 9).all()
     # seen from three sides, every edge: no diagnostic, and the rows' own data say most of their radii
     assert (f["diag"] & (SupportDiag.ONE_SIDED | SupportDiag.SHADOWED | SupportDiag.TUBE_EDGE)).sum() == 0, f["diag"]
     assert (f["data_share"] > 0.5).all() and (f["data_share"] <= 1).all() and (f["deleted"] == 0).all(), f["data_share"]
@@ -160,10 +160,12 @@ def test_a_tree_reports_how_its_radii_are_known_and_its_volume_with_an_interval(
     measured = f["basis"] == SupportBasis.MEASURED
     assert set(f["basis"]) <= set(SupportBasis) and np.isnan(f["r_cap"]).all()
     assert (measured == ((f["flags"] == 0) & np.isfinite(f["r_row"]))).all()
+    # a row's point circle only where the rays gave none of its own, and entered where its basis says so
+    assert np.isnan(f["r_points"][measured]).all() and np.isfinite(f["r_points"][f["basis"] == SupportBasis.POINTS]).all()
     assert not (f["diag"] & SupportDiag.REFUTED).any() and (np.isnan(f["pass_share"]) | (f["pass_share"] < 0.25)).all()
     v = f["volume"]
-    parts = v["measured"] + v["bounded"] + v["prior"] + v["capped"]
-    assert np.isclose(parts, v["point"]) and v["q05"] < v["point"] < v["q95"] and v["capped"] == 0
+    parts = v["measured"] + v["points"] + v["bounded"] + v["prior"] + v["capped"]
+    assert np.isclose(parts, v["mean"]) and v["q05"] < v["point"] < v["q95"] and v["capped"] == 0
     capped = support_tree(scans, a, a + [0, 0, 0.3], 1.5 * radii, np.full(4, -1),
                           params=dataclasses.replace(PARAMS, dh=0.006), threads=2)
     held = capped["basis"] != SupportBasis.MEASURED
