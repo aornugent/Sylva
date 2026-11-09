@@ -190,6 +190,7 @@ use crate::transform::{cross, dot, sub};
 use crate::trees::{fit_circle_ransac, RansacCircleParams};
 use crate::Point;
 
+pub mod base;
 mod routed;
 
 /// Why a piece's own summary is not used (bits of [`Fit::flags`]): [`RUNS`] and [`HULL`] pieces are fitted by the
