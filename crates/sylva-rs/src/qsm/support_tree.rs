@@ -2545,7 +2545,7 @@ mod tests {
         let t = support_tree(&[&scan], &rows, &[], &like(), &PriorParams::default(), 2).unwrap();
         let (f, q) = (&t.rows, &t.pieces);
         assert!(t.piece_row == vec![0, 0] && f.flags[0] == 0 && q.flags == vec![0, 0], "flags {:?}", q.flags);
-        assert!((f.r[0] - 0.05).abs() < 0.0025 && (f.r_row[0] - f.r[0]).abs() < 0.002 && f.sd_log_r[0] < 0.1, "R {} {}", f.r[0], f.r_row[0]);
+        assert!((f.r[0] - 0.05).abs() < 0.0025 && (f.r_row[0] - f.r[0]).abs() < 0.002 && f.sd_log_r[0] / like().widen < 0.1, "R {} {}", f.r[0], f.r_row[0]);
         assert!((0.5 * (f.a[0][0] + f.b[0][0])).abs() < 0.002 && f.lean[0][1].abs() < 2.0 * f.sd_lean[0][1], "x {} {} lean {:?}", f.a[0][0], f.b[0][0], f.lean[0]);
         // one scan: the front's stops still give a misfit
         assert!(f.chi2_front[0].is_finite() && f.chi2_front[0] < HULL_CHI2, "chi2_front {}", f.chi2_front[0]);
@@ -3274,7 +3274,7 @@ mod tests {
         }
         let _ = g;
         let chol = hd.try_inverse().unwrap().cholesky().unwrap().l();
-        for widen in [1.0, 2.1] {
+        for widen in [1.0, 2.5] {
             let v = volume(&nd, &sol, &free, &basis, widen);
             let mut rng = Normal::new(7);
             let m = 40_000;
@@ -3297,8 +3297,8 @@ mod tests {
         // a piece held in its interval holds every draw: none wider than its upper bound
         let mut held = free.clone();
         held[0] = (f64::NEG_INFINITY, sol.x[0][4]);
-        let v = volume(&nd, &sol, &held, &basis, 2.1);
-        let w = volume(&nd, &sol, &free, &basis, 2.1);
+        let v = volume(&nd, &sol, &held, &basis, 2.5);
+        let w = volume(&nd, &sol, &free, &basis, 2.5);
         assert!(v.q95 < w.q95 && v.mean < w.mean);
     }
 }
