@@ -278,6 +278,8 @@ const VETO_TOL: f64 = 0.02;
 const VETO_STEPS: usize = 48;
 const VETO_MIN: f64 = 0.001;
 const VETO_SD: f64 = 0.1;
+/// The step (log R) by which an unmeasured node's posterior circle the veto refutes is narrowed until it doesn't.
+const VETO_STEP: f64 = 0.05;
 /// The site's D/H cap enters as an upper bound of this sd in log R (soft as the bounds are, and held hard by the
 /// posterior's projection into its bounds).
 const DH_SD: f64 = 0.1;
@@ -1449,6 +1451,26 @@ fn refuted((stop, pass): (u32, u32)) -> bool {
     pass >= VETO_PASSES && f64::from(pass) >= VETO_SHARE * f64::from(stop + pass)
 }
 
+/// Where the veto refutes the circle `x` (`[c1, c2, t1, t2, log R]`) against a piece's groups: the log of the widest
+/// radius below it, in steps of [`VETO_STEP`] down to [`VETO_MIN`], about the same axis, that it doesn't refute; None
+/// where it doesn't refute `x`.
+fn veto_at(gs: &[Group], x: &Vector5<f64>) -> Option<f64> {
+    let mut y = *x;
+    y[4] = x[4].exp();
+    if !refuted(tally(gs, &y)) {
+        return None;
+    }
+    let mut eta = x[4];
+    while eta > VETO_MIN.ln() {
+        eta -= VETO_STEP;
+        y[4] = eta.exp();
+        if !refuted(tally(gs, &y)) {
+            break;
+        }
+    }
+    Some(eta.max(VETO_MIN.ln()))
+}
+
 /// An unmeasured piece's upper bound from the ray veto (3dtrees research 106 `geometry.md`): the widest circle about
 /// the claim's axis, of [`VETO_STEPS`] radii from [`VETO_MIN`] to the `tube`, below the narrowest the veto refutes;
 /// None where it refutes none (passes alone bound R where no woody stop gives a centre: trees 4 and 3098's 47-84
@@ -1725,7 +1747,16 @@ pub fn support_tree(scans: &[&ScanIndex], rows: &Rows, context: &[(Point, Point,
         }
     }
     let (mut sol, converged) = tree_solve(rows, &fr, &nd, &sums, prior, EP_ROUNDS)?;
-    let (held, bits) = hold(&terms(&sums), nd.row.len(), &mut sol);
+    let (mut held, mut bits) = hold(&terms(&sums), nd.row.len(), &mut sol);
+    // what the rays don't measure is held under the veto about its own posterior circle too: a woody run's bounds
+    // straddle its run, not the circle served (research 106: 17 % of such rows' volume was refuted)
+    for k in (0..nd.row.len()).filter(|&k| sums[k].used().is_none() || sums[k].shadowed) {
+        if let Some(eta) = veto_at(&sums[nd.src(k).0].seen, &sol.x[k]) {
+            sol.x[k][4] = eta;
+            held[k] = (held[k].0.min(eta), held[k].1.min(eta));
+            bits[k] |= diag::PINNED;
+        }
+    }
     let p_wood = existence(&nd.parent, &sums.iter().map(|s| s.log_odds).collect::<Vec<_>>(), prior);
     // the classification on the support path: each stop by its piece's circle (its own, or the tree's) and its echo
     for (k, s) in sums.iter().enumerate().filter(|(_, s)| s.exact.is_none()) {
@@ -3181,6 +3212,9 @@ mod tests {
         assert!(!refuted(tally(&phantom, &circle(0.004))));
         let b = veto(&phantom, 0.1).unwrap();
         assert!(b.side == Side::Upper && b.eta.exp() >= 0.002 && b.eta.exp() < 0.006, "{}", b.eta.exp());
+        // a posterior circle the veto refutes is narrowed, about its own axis, until it isn't
+        let eta = veto_at(&phantom, &Vector5::new(0.0, 0.0, 0.0, 0.0, 0.05f64.ln())).unwrap();
+        assert!(eta.exp() < 0.006 && !refuted(tally(&phantom, &circle(eta.exp()))), "{}", eta.exp());
         // a solid 2 cm stem, hit across its silhouette and passed beside it: the veto leaves it its radius and a
         // pulse spacing, and its own circle reads no passes
         let mut v = Vec::new();
@@ -3191,7 +3225,7 @@ mod tests {
             }
         }
         let stem = [group(v)];
-        assert_eq!(tally(&stem, &circle(0.02)).1, 0);
+        assert!(tally(&stem, &circle(0.02)).1 == 0 && veto_at(&stem, &Vector5::new(0.0, 0.0, 0.0, 0.0, 0.02f64.ln())).is_none());
         let b = veto(&stem, 0.1).unwrap();
         assert!(b.eta.exp() >= 0.02 && b.eta.exp() < 0.03, "{}", b.eta.exp());
         // a pulse blocked in front, or stopping before the circle, says nothing of it
