@@ -286,7 +286,10 @@ def support_tree(scans, a, b, r_prior, parent, context=None, params: JointParams
     shoot measured fat can't inflate its parent, the centre's continuity along a branch and the lean's random walk
     between a row's pieces, the centre's anchor and a weak anchor of the lean; no tip anchor). A posterior is then held
     inside its own bounds (between the tightest lower and upper, the upper where they cross), and says where it sits
-    on them (``PINNED``).
+    on them (``PINNED``). A piece with no circle of its own whose posterior circle the veto refutes is then narrowed
+    about its own centre until it isn't; where that would take it below its lower bound, it moves instead (up to
+    three of those radii) onto the unrefuted circle as wide as that bound with the most stops on it (3dtrees research
+    127: a stem beside the claim's axis), and only where there is none narrows past the bound.
 
     Point evidence (3dtrees ticket 109): a row none of whose pieces has a circle of its own gets one from the stops
     in its pieces' tubes nearer its claimed axis than any other the tree or its context claims, placed across its
@@ -366,8 +369,11 @@ def support_tree(scans, a, b, r_prior, parent, context=None, params: JointParams
       none (a row's: its pieces' largest);
     - ``r_lo``, ``r_hi``, ``r_floor``: the tightest lower bound on R from detection, upper bound from passes (beside
       a woody run, or through the claim: the veto), and the capacity floor ``tau w / 2`` (which says only that
-      something was hit), on a piece that isn't measured, else NaN (they enter the tree where no circle does, a
-      routed piece's without its detection bound; a row's: its pieces' widest); ``r_cap``, the site's cap on it (NaN
+      something was hit), of those that entered the tree, else NaN (they enter where no circle of its own does, a
+      routed piece's without its detection bound, a point circle's piece's upper alone), so ``r`` lies inside them
+      but where ``PINNED`` says the rays contradict themselves (bounds that cross, or a veto that refutes every
+      circle as wide as the lower bound); a row's: its pieces' root mean square, as its ``r`` is (a piece without a
+      lower bound at 0, without an upper unbounded); ``r_cap``, the site's cap on it (NaN
       without ``dh``, or where a circle measures it; a row's: its first piece's); ``r_points``, its row's point
       circle's radius, NaN where none passed its tests (it entered unless the veto refuted it: ``basis`` says so);
     - ``n_pass``, ``pass_share``: the ray veto's audit of its fitted circle, the pulses passing through it and their
