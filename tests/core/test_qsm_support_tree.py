@@ -188,6 +188,8 @@ def test_a_tree_reports_how_its_radii_are_known_and_its_volume_with_an_interval(
     assert (capped["r"][held] <= capped["r_cap"][held] * (1 + 1e-9)).all()
     assert (capped["basis"][held] == SupportBasis.CAPPED).all() and (capped["diag"][held] & SupportDiag.CAPPED).all()
     inside_own_bounds(capped)
+    # the cap comes before the veto, so a capped circle is one the rays don't refute either
+    assert not (capped["diag"] & SupportDiag.REFUTED).any()
     assert capped["volume"]["capped"] > 0 and capped["volume"]["q95"] < v["q95"]
     # neighbours' cylinders are context: the call takes them, and a context far away changes nothing
     far = (np.array([[50.0, 0, 0]]), np.array([[50.0, 0, 1]]), np.array([0.1]))

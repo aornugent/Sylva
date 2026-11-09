@@ -287,7 +287,7 @@ def support_tree(scans, a, b, r_prior, parent, context=None, params: JointParams
     between a row's pieces, the centre's anchor and a weak anchor of the lean; no tip anchor). A posterior is then held
     inside its own bounds (between the tightest lower and upper, the upper where they cross), and says where it sits
     on them (``PINNED``). A piece with no circle of its own whose posterior circle the veto refutes is then narrowed
-    about its own centre until it isn't; where that would take it below its lower bound, it moves instead (up to
+    about its own centre until it isn't (after the site's cap); where that would take it below its lower bound, it moves instead (up to
     three of those radii) onto the unrefuted circle as wide as that bound with the most stops on it (3dtrees research
     127: a stem beside the claim's axis), and only where there is none narrows past the bound.
 

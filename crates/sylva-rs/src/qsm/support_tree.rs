@@ -135,7 +135,8 @@
 //!   [`diag::CAPPED`]). A node with no circle of its own whose posterior
 //!   circle the veto refutes is narrowed about its centre until it isn't, or
 //!   where that would cut it below its lower bound, moved onto the unrefuted
-//!   circle that wide ([`recentre`]: its wood beside the claim's axis).
+//!   circle that wide ([`recentre`]: its wood beside the claim's axis),
+//!   after the site's cap (a narrower circle can be one the rays refute).
 //! - **The volume** ([`Volume`]): the tree's pieces' at their posterior R, by
 //!   basis, and an interval from draws of the joint posterior, each node's
 //!   sd [`WIDEN`] times the solve's for its basis (as the reported
@@ -1974,6 +1975,9 @@ pub fn support_tree(scans: &[&ScanIndex], rows: &Rows, context: &[(Point, Point,
     // holds
     let unmeasured: Vec<bool> = sums.iter().map(Summary::bounded).collect();
     let free: Vec<bool> = sums.iter().map(|s| s.bounded() && s.points.is_none()).collect();
+    // the cap, after the solve, on each node with no circle at all, alone; before the veto, since a narrower circle
+    // can be one the rays refute (its stops on the front arc fall away before its passes do: 3dtrees research 127)
+    cap(&caps, &free, &mut sol, &mut held, &mut bits);
     // what the rays don't measure is held under the veto about its own posterior circle too: a woody run's bounds
     // straddle its run, not the circle served (research 106: 17 % of such rows' volume was refuted). Where that would
     // narrow it below its own lower bound, the circle is beside the wood its bound saw: it moves onto it, where the
@@ -1996,8 +2000,6 @@ pub fn support_tree(scans: &[&ScanIndex], rows: &Rows, context: &[(Point, Point,
         held[k] = (held[k].0.min(eta), held[k].1.min(eta));
         bits[k] |= diag::PINNED;
     }
-    // the cap, after the solve, on each node with no circle at all, alone
-    cap(&caps, &free, &mut sol, &mut held, &mut bits);
     let p_wood = existence(&nd.parent, &sums.iter().map(|s| s.log_odds).collect::<Vec<_>>(), prior);
     // the classification on the support path: each stop by its piece's circle (its own, or the tree's) and its echo
     for (k, s) in sums.iter().enumerate().filter(|(_, s)| s.exact.is_none()) {
