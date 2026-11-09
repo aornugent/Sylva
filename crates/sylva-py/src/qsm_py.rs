@@ -828,7 +828,161 @@ fn qsm_support_tree<'py>(py: Python<'py>, scans: Vec<Bound<'py, PyScanIndex>>, a
     Ok(d)
 }
 
+// ------------------------------------------------------------ cluster evidence (3dtrees research 113)
+
+use sylva_rs::qsm::cluster_evidence::{self as cev, ClusterTable, EvidenceOpts};
+
+fn evidence_opts(d: Option<&Bound<'_, PyDict>>) -> PyResult<EvidenceOpts> {
+    let mut o = EvidenceOpts::default();
+    let Some(d) = d else { return Ok(o) };
+    for (k, v) in d.iter() {
+        let k: String = k.extract()?;
+        match k.as_str() {
+            "temper" => o.temper = v.extract()?,
+            "oversample" => o.oversample = v.extract()?,
+            "sig_root" => o.sig_root = v.extract()?,
+            "sig_eta" => o.sig_eta = v.extract()?,
+            "sig_fork" => o.sig_fork = v.extract()?,
+            "centre_rel" => o.centre_rel = v.extract()?,
+            "centre_abs" => o.centre_abs = v.extract()?,
+            "sig_delta" => o.sig_delta = v.extract()?,
+            "lam_prior" => o.lam_prior = v.extract()?,
+            "lam_sd" => o.lam_sd = v.extract()?,
+            "iters" => o.iters = v.extract()?,
+            "tol" => o.tol = v.extract()?,
+            "thin" => o.thin = v.extract()?,
+            "thin_seed" => o.thin_seed = v.extract()?,
+            "owner_rule" => o.owner_rule = v.extract()?,
+            "exclude" => o.exclude = v.extract()?,
+            _ => return Err(PyValueError::new_err(format!("evidence opts: unknown {k:?}"))),
+        }
+    }
+    Ok(o)
+}
+
+/// One cluster's fixed echo set and its candidate segments' pairs (research prototype; see the Rust module).
+#[pyclass(name = "ClusterTable", frozen)]
+struct PyClusterTable {
+    inner: ClusterTable,
+    like: JointParams,
+}
+
+fn fit_to_py<'py>(py: Python<'py>, f: cev::EvidenceFit) -> PyResult<Bound<'py, PyDict>> {
+    let d = PyDict::new(py);
+    for (k, v) in [("logz", f.logz), ("loglik", f.loglik), ("logprior", f.logprior), ("logdet", f.logdet), ("clipped", f.clipped)] {
+        d.set_item(k, v)?;
+    }
+    d.set_item("dim", f.dim)?;
+    d.set_item("iters", f.iters)?;
+    d.set_item("converged", f.converged)?;
+    d.set_item("evals", (f.evals[0], f.evals[1]))?;
+    d.set_item("x", f.x.into_pyarray(py))?;
+    d.set_item("sd", f.sd.into_pyarray(py))?;
+    d.set_item("index", f.index.into_pyarray(py))?;
+    d.set_item("owner", f.owner.into_pyarray(py))?;
+    d.set_item("ll", f.ll.into_pyarray(py))?;
+    d.set_item("wood", f.wood.into_pyarray(py))?;
+    d.set_item("precision", f.precision.into_pyarray(py))?;
+    Ok(d)
+}
+
+fn fit_from_py(d: &Bound<'_, PyDict>) -> PyResult<cev::EvidenceFit> {
+    let what = "evidence fit";
+    let v = |k: &str| -> PyResult<Vec<f64>> { Ok(dict_item(d, k, what)?.extract::<PyReadonlyArray1<f64>>()?.as_array().to_vec()) };
+    Ok(cev::EvidenceFit { x: v("x")?, precision: v("precision")?, logz: dict_item(d, "logz", what)?.extract()?, ..Default::default() })
+}
+
+#[pymethods]
+impl PyClusterTable {
+    #[getter]
+    fn n_records(&self) -> usize {
+        self.inner.n_records()
+    }
+
+    #[getter]
+    fn n_pairs(&self) -> usize {
+        self.inner.n_pairs()
+    }
+
+    #[getter]
+    fn n_layers(&self) -> usize {
+        self.inner.n_layers
+    }
+
+    /// The records' columns (scan, pulse, c0, c1, x, echo, stop, early, deleted, layer, m, tmid, z) and the pairs'
+    /// `start` and `seg`.
+    fn records<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
+        let t = &self.inner;
+        let d = PyDict::new(py);
+        d.set_item("scan", t.scan.clone().into_pyarray(py))?;
+        d.set_item("pulse", t.pulse.clone().into_pyarray(py))?;
+        for (k, v) in [("c0", &t.c0), ("c1", &t.c1), ("x", &t.x), ("m", &t.m), ("tmid", &t.tmid), ("z", &t.z)] {
+            d.set_item(k, v.clone().into_pyarray(py))?;
+        }
+        for (k, v) in [("stop", &t.stop), ("early", &t.early), ("deleted", &t.deleted)] {
+            d.set_item(k, v.clone().into_pyarray(py))?;
+        }
+        d.set_item("echo", t.echo.clone().into_pyarray(py))?;
+        d.set_item("layer", t.layer.clone().into_pyarray(py))?;
+        d.set_item("start", t.start.clone().into_pyarray(py))?;
+        d.set_item("seg", t.seg.clone().into_pyarray(py))?;
+        Ok(d)
+    }
+
+    /// The Laplace evidence of the hypothesis `active` with `parent` (see the Rust module).
+    #[pyo3(signature = (active, parent, opts=None, x0=None, threads=1))]
+    fn evidence<'py>(&self, py: Python<'py>, active: PyReadonlyArray1<bool>, parent: PyReadonlyArray1<i64>, opts: Option<Bound<'py, PyDict>>, x0: Option<PyReadonlyArray1<f64>>, threads: usize) -> PyResult<Bound<'py, PyDict>> {
+        let (act, par) = (active.as_array().to_vec(), parent.as_array().to_vec());
+        let o = evidence_opts(opts.as_ref())?;
+        let x0 = x0.map(|v| v.as_array().to_vec());
+        let f = py.detach(|| self.inner.evidence(&act, &par, &o, &self.like, x0.as_deref(), threads)).map_err(err)?;
+        fit_to_py(py, f)
+    }
+
+    /// The unnormalised log posterior at each row of `xs`.
+    #[pyo3(signature = (active, parent, xs, opts=None, threads=1))]
+    fn objective<'py>(&self, py: Python<'py>, active: PyReadonlyArray1<bool>, parent: PyReadonlyArray1<i64>, xs: PyReadonlyArray2<f64>, opts: Option<Bound<'py, PyDict>>, threads: usize) -> PyResult<Bound<'py, PyArray1<f64>>> {
+        let (act, par) = (active.as_array().to_vec(), parent.as_array().to_vec());
+        let o = evidence_opts(opts.as_ref())?;
+        let xs: Vec<Vec<f64>> = xs.as_array().rows().into_iter().map(|r| r.to_vec()).collect();
+        let v = py.detach(|| self.inner.objective(&act, &par, &o, &self.like, &xs, threads)).map_err(err)?;
+        Ok(v.into_pyarray(py))
+    }
+
+    /// Importance sampling's log Z about a Laplace `fit` (the dict `evidence` returned).
+    #[pyo3(signature = (active, parent, fit, n=2000, df=5.0, scale=1.2, seed=0, opts=None, threads=1))]
+    #[allow(clippy::too_many_arguments)]
+    fn importance<'py>(&self, py: Python<'py>, active: PyReadonlyArray1<bool>, parent: PyReadonlyArray1<i64>, fit: Bound<'py, PyDict>, n: usize, df: f64, scale: f64, seed: u64, opts: Option<Bound<'py, PyDict>>, threads: usize) -> PyResult<Bound<'py, PyDict>> {
+        let (act, par) = (active.as_array().to_vec(), parent.as_array().to_vec());
+        let o = evidence_opts(opts.as_ref())?;
+        let f = fit_from_py(&fit)?;
+        let r = py.detach(|| self.inner.importance(&act, &par, &o, &self.like, &f, n, df, scale, seed, threads)).map_err(err)?;
+        let d = PyDict::new(py);
+        for (k, v) in [("logz", r.logz), ("se", r.se), ("ess", r.ess), ("max_share", r.max_share)] {
+            d.set_item(k, v)?;
+        }
+        d.set_item("log_w", r.log_w.into_pyarray(py))?;
+        Ok(d)
+    }
+}
+
+/// One cluster's table (see `ClusterTable`): segments `a -> b` with claimed radii, layers `layer_h` m from `z0`, the
+/// scans' angular step (rad) for the beam's oversampling, the likelihood's `params` (a JointParams dict).
+#[pyfunction]
+#[pyo3(signature = (scans, a, b, r_prior, z0, z1, layer_h, step, params, threads=1))]
+#[allow(clippy::too_many_arguments)]
+fn qsm_cluster_table<'py>(py: Python<'py>, scans: Vec<Bound<'py, PyScanIndex>>, a: PyReadonlyArray2<f64>, b: PyReadonlyArray2<f64>, r_prior: PyReadonlyArray1<f64>, z0: f64, z1: f64, layer_h: f64, step: f64, params: Bound<'py, PyDict>, threads: usize) -> PyResult<PyClusterTable> {
+    let (a, b) = (xyz_from_py(a)?, xyz_from_py(b)?);
+    let r = r_prior.as_array().to_vec();
+    let like = joint_params(&params)?;
+    let refs: Vec<&ScanIndex> = scans.iter().map(|s| &s.get().inner).collect();
+    let inner = py.detach(|| cev::cluster_table(&refs, &a, &b, &r, z0, z1, layer_h, step, &like, threads)).map_err(err)?;
+    Ok(PyClusterTable { inner, like })
+}
+
 pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
+    m.add_function(wrap_pyfunction!(qsm_cluster_table, m)?)?;
+    m.add_class::<PyClusterTable>()?;
     m.add_function(wrap_pyfunction!(qsm_support_flags, m)?)?;
     m.add_function(wrap_pyfunction!(qsm_support_refusals, m)?)?;
     m.add_function(wrap_pyfunction!(qsm_support_diags, m)?)?;

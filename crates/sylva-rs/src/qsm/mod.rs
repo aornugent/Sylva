@@ -11,6 +11,7 @@
 
 pub mod buttress;
 pub mod buttress_detect;
+pub mod cluster_evidence;
 pub mod cylinder;
 pub mod evidence;
 pub mod joint;
