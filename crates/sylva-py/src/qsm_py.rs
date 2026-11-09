@@ -794,6 +794,18 @@ fn support_fit<'py>(py: Python<'py>, f: support_tree::Fit) -> PyResult<Bound<'py
 
 /// Fits one tree from its rows' support summaries (see `sylva.qsm.support_tree`); `params` as `qsm_joint_tree`'s.
 #[pyfunction]
+fn qsm_tree_context<'py>(py: Python<'py>, a: PyReadonlyArray2<f64>, b: PyReadonlyArray2<f64>, cyl_offsets: Vec<usize>, trees: Vec<usize>,
+                         reach: f64) -> PyResult<(Bound<'py, PyArray1<usize>>, Bound<'py, PyArray1<usize>>)> {
+    let (a, b) = (xyz_from_py(a)?, xyz_from_py(b)?);
+    if b.len() != a.len() || cyl_offsets.last() != Some(&a.len()) || cyl_offsets.windows(2).any(|w| w[0] > w[1])
+        || trees.iter().any(|&g| g + 1 >= cyl_offsets.len()) {
+        return Err(PyValueError::new_err("a and b one row per cylinder; cyl_offsets rising to the cylinder count; trees indices into them"));
+    }
+    let (off, idx) = py.detach(|| support_tree::tree_context(&a, &b, &cyl_offsets, &trees, reach));
+    Ok((off.into_pyarray(py), idx.into_pyarray(py)))
+}
+
+#[pyfunction]
 #[pyo3(signature = (scans, a, b, r_prior, parent, ctx_a, ctx_b, ctx_r, params, threads=0))]
 #[allow(clippy::too_many_arguments)]
 fn qsm_support_tree<'py>(py: Python<'py>, scans: Vec<Bound<'py, PyScanIndex>>, a: PyReadonlyArray2<f64>, b: PyReadonlyArray2<f64>, r_prior: PyReadonlyArray1<f64>, parent: PyReadonlyArray1<i64>, ctx_a: PyReadonlyArray2<f64>, ctx_b: PyReadonlyArray2<f64>, ctx_r: PyReadonlyArray1<f64>, params: Bound<'py, PyDict>, threads: usize) -> PyResult<Bound<'py, PyDict>> {
@@ -839,6 +851,7 @@ pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(qsm_support_bases, m)?)?;
     m.add_function(wrap_pyfunction!(qsm_echo_paths, m)?)?;
     m.add_function(wrap_pyfunction!(qsm_support_tree, m)?)?;
+    m.add_function(wrap_pyfunction!(qsm_tree_context, m)?)?;
     m.add_function(wrap_pyfunction!(qsm_joint_defaults, m)?)?;
     m.add_function(wrap_pyfunction!(qsm_joint_reasons, m)?)?;
     m.add_function(wrap_pyfunction!(qsm_joint_tree, m)?)?;
