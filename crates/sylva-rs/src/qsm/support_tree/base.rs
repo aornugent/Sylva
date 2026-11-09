@@ -10,10 +10,10 @@
 //!   each a vertical piece about the plant's base whose tube is [`BaseParams::reach`] wide: each scan's pulses
 //!   through it, as [`super::groups`] takes a piece's.
 //! - **Sections.** A slab's woody stops (echo character over a half, [`super::p_wood`] for wood of [`WOOD_R`]), from
-//!   every scan, linked where they lie within [`BaseParams::link`] of each other, are its sections: a stem is a
-//!   connected arc or ring of stops, a grass tussock or leaf clump a scatter the veto refutes. Each section with
-//!   [`super::RUN_HITS`] woody hits gets a circle: RANSAC and least squares on its stops ([`super::point_circle`]'s
-//!   band), filling at least [`ARC_MIN`] ten-degree bins, its arc's covariance ([`arc_cov`]) for its sd; a section
+//!   every scan, linked where they lie within [`BaseParams::link`] of each other ([`crate::cluster::euclidean_clusters`]),
+//!   are its sections: a stem is a connected arc or ring of stops, a grass tussock or leaf clump a scatter the veto
+//!   refutes. Each section with [`super::RUN_HITS`] woody hits gets a circle: RANSAC and least squares on its stops,
+//!   a point circle's band and tests ([`super::ring`]) on an arc of [`SECTION_ARC`] ten-degree bins; a section
 //!   whose stops make no circle (a sliver one scan grazes) is centred behind its stops by half their width. The ray
 //!   veto ([`super::tally`]) audits each circle, and a refuted one, or one at the tube's edge, is left out.
 //! - **Columns.** Sections are linked upward, slab by slab (a slab's gap bridged), each to the column whose last
@@ -47,19 +47,19 @@
 //!   don't; a column of thin stems the rays see between loses to their own rows. A column another member's rows
 //!   already stand on (on [`CTX_SHARE`] of its sections) isn't given to members other than it.
 //! - **Ownership.** A column's rows (one a section, its prior that section's radius) go to the member whose taken
-//!   entries carry the most of the skeleton's volume above their cuts (of its own and its forks' entries), from the
+//!   entries carry the most of the skeleton's volume above their cuts (of its own and its forks' entries; of the
+//!   takers whose rows already stand on it, where any do), from the
 //!   ground under it, or from its owner's own base where the owner keeps one (a stem the columns missed stands there
 //!   too); a fork owned by another member starts that member's base at the fork, and an entry whose column is another
 //!   member's starts its member's base at its cut. A column no entry takes is left out. A member that would stand on
 //!   two bases keeps its rows as they were.
-//! - **What else under the cut** (the chosen columns' top), of a member re-sectioned: the chains replaced are
-//!   dropped, and so is any other row whose middle lies in a chosen column's circle (the same wood twice) or that
-//!   the veto refutes at a quarter of its radius in every slab it crosses (a fan's row through air); a thin stem
-//!   beside the column is neither. A kept row whose parent was dropped hangs from its member's nearest row end within
-//!   [`HANG`] no more than [`HANG_UP`] above its start (a branch leaves its stem at its height); else, if its subtree
-//!   reaches above `H`, it is joined to such an end within [`CONNECT`] by a row of its dropped parent's radius (the
-//!   stem RCT drew there, redrawn from the column), or starts a base of its own (so its member keeps its rows); any
-//!   other is dropped.
+//! - **What else under the cut** (the top of the chosen columns a member takes), of a member re-sectioned: the chains
+//!   replaced are dropped, and so is any other row whose middle lies in a chosen column's circle (the same wood
+//!   twice) or that the veto refutes at a quarter of its radius in every slab it crosses (a fan's row through air);
+//!   nothing else. A kept row whose parent was dropped hangs from its member's nearest row end within [`HANG`] no
+//!   more than [`HANG_UP`] above its start (a branch leaves its stem at its height); else it is joined to such an end
+//!   within [`CONNECT`] by a row of its dropped parent's radius (the stem RCT drew there, redrawn from the column);
+//!   else it starts a base of its own, so its member keeps its rows.
 use super::*;
 use crate::trees::fit_circle;
 
@@ -74,14 +74,9 @@ const MIN_SECTIONS: usize = 3;
 /// that may lie further (stray stops: a leaf, a grass blade linked to the stem).
 const SPAN_SLACK: f64 = 0.02;
 const SPAN_OUT: f64 = 0.1;
-/// A scan counts toward a section's `n_scans` with at least this many of its stops.
-const SCAN_STOPS: usize = 5;
 /// A section's circle fills at least this many of the 36 ten-degree bins (60 degrees: one scan's view of a trunk's
-/// front), its sd the covariance its arc leaves ([`arc_cov`]): its stops' rms about it (at least [`ARC_NOISE`]) over
-/// the [`ARC_BIN`]-degree bins they fill (a scan's stops in one such bin are one look at the surface).
-const ARC_MIN: usize = 6;
-const ARC_NOISE: f64 = 0.003;
-const ARC_BIN: f64 = 2.0;
+/// front; a row's point circle needs [`super::PTS_ARC`], two scans' worth).
+const SECTION_ARC: usize = 6;
 /// The join (module documentation), in m: an entry's reach to a column's top beyond its radius; a graft's reach; how far beyond a column's circle a row's
 /// middle still lies in it; the widest column that is a stem; how far a kept row's start may lie from the row end
 /// it is hung from; how far a row reaching above the slabs' top may be joined to its member's nearest row end.
@@ -131,27 +126,20 @@ impl Default for BaseParams {
     }
 }
 
-/// One slab's section: its slab and height (world), centre (world x, y), radius and sd of log R (NaN where no
-/// circle was fitted: `fitted`), the ten-degree bins its stops fill, its scans and woody hits, the veto's audit
-/// (passes through its circle, their share, `refuted`), whether it reaches the tube's edge, its evidence
-/// ([`support`]) and the pulses through it, and its column (-1: none).
+/// One slab's section: its slab and height (world), centre (world x, y) and radius, whether a circle was fitted
+/// (else a sliver's), its woody hits, whether the veto refutes it, whether it reaches the tube's edge, its evidence
+/// ([`support`]) and its column (-1: none).
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Section {
     pub slab: u32,
     pub z: f64,
     pub c: [f64; 2],
     pub r: f64,
-    pub sd_log_r: f64,
     pub fitted: bool,
-    pub arc: u32,
-    pub n_scans: u32,
     pub hits: f64,
-    pub n_pass: u32,
-    pub pass_share: f64,
     pub refuted: bool,
     pub edge: bool,
     pub evidence: f64,
-    pub n_through: u32,
     pub column: i32,
 }
 
@@ -164,52 +152,12 @@ pub struct Column {
     pub at: i32,
 }
 
-/// Union-find's root, with path halving.
-fn root(p: &mut [usize], mut i: usize) -> usize {
-    while p[i] != i {
-        p[i] = p[p[i]];
-        i = p[i];
-    }
-    i
-}
-
-/// A circle fitted to an arc's stops `on` (about its centre): the covariance of `(c1, c2, R)` the arc leaves
-/// ([`ARC_MIN`]), its own noise aside; None where the arc doesn't determine it.
-fn arc_cov(on: &[[f64; 2]], rmse: f64) -> Option<Matrix3<f64>> {
-    let mut jtj = Matrix3::zeros();
-    let mut bins = std::collections::HashSet::new();
-    for q in on {
-        let d = q[0].hypot(q[1]).max(1e-9);
-        let j = Vector3::new(-q[0] / d, -q[1] / d, -1.0);
-        jtj += j * j.transpose();
-        bins.insert((q[1].atan2(q[0]).to_degrees() / ARC_BIN).floor() as i64);
-    }
-    let s2 = rmse.max(ARC_NOISE).powi(2) * on.len() as f64 / bins.len().max(1) as f64;
-    jtj.try_inverse().map(|i| i * s2).filter(|c| c.iter().all(|x| x.is_finite()) && c[(2, 2)] > 0.0)
-}
-
 /// A circle `x` (`[c1, c2, t1, t2, R]`, in the slab's frame)'s evidence against the slab's groups, by their
-/// opacity (module documentation), and the pulses through it.
-fn support(gs: &[Group], x: &Vector5<f64>, p: &JointParams) -> (f64, u32) {
+/// opacity (module documentation): the veto's tally ([`super::tally`]) weighed.
+fn support(gs: &[Group], x: &Vector5<f64>, p: &JointParams) -> f64 {
+    let (stop, pass) = tally(gs, x);
     let (on, off) = ((p.stop_wood / p.stop_leaf).ln(), ((1.0 - p.stop_wood) / (1.0 - p.stop_leaf)).ln());
-    let (mut e, mut n) = (0.0, 0u32);
-    for g in gs {
-        for r in g.recs.iter().filter(|r| !r.blocked) {
-            let (cx, cy) = (x[0] + r.s * x[2], x[1] + r.s * x[3]);
-            let bc = r.b - (g.n[0] * cx + g.n[1] * cy);
-            if bc.abs() >= x[4] {
-                continue;
-            }
-            let half = (x[4] * x[4] - bc * bc).sqrt();
-            let d = r.depth - (g.v[0] * cx + g.v[1] * cy);
-            if !d.is_finite() || d > half + VETO_TOL {
-                (e, n) = (e + off, n + 1);
-            } else if d >= -half - VETO_TOL {
-                (e, n) = (e + on, n + 1);
-            }
-        }
-    }
-    (p.exist_scale * e, n)
+    p.exist_scale * (f64::from(stop) * on + f64::from(pass) * off)
 }
 
 /// A slab's sections: its stops linked within `link`, each group with enough woody hits given a circle.
@@ -217,29 +165,12 @@ fn sections(gs: &[Group], slab: u32, z: f64, centre: &Point, p: &BaseParams, lik
     let stops: Vec<(usize, [f64; 2], f64)> = gs.iter().enumerate()
         .flat_map(|(gi, g)| g.recs.iter().filter(|r| r.is_stop()).map(move |r| (gi, r.xy, p_wood(r, WOOD_R, like))))
         .filter(|s| s.2 >= 0.5).collect();
-    let cell = |q: [f64; 2]| ((q[0] / p.link).floor() as i64, (q[1] / p.link).floor() as i64);
-    let mut grid: std::collections::HashMap<(i64, i64), Vec<usize>> = std::collections::HashMap::new();
-    for (i, s) in stops.iter().enumerate() {
-        grid.entry(cell(s.1)).or_default().push(i);
-    }
-    let mut parent: Vec<usize> = (0..stops.len()).collect();
-    for (i, s) in stops.iter().enumerate() {
-        let (cx, cy) = cell(s.1);
-        for dx in -1..=1 {
-            for dy in -1..=1 {
-                for &j in grid.get(&(cx + dx, cy + dy)).map_or(&[][..], |v| &v[..]) {
-                    if j > i && (s.1[0] - stops[j].1[0]).hypot(s.1[1] - stops[j].1[1]) <= p.link {
-                        let (a, b) = (root(&mut parent, i), root(&mut parent, j));
-                        parent[a] = b;
-                    }
-                }
-            }
+    let pts: Vec<Point> = stops.iter().map(|s| [s.1[0], s.1[1], 0.0]).collect();
+    let mut groups: std::collections::BTreeMap<i64, Vec<usize>> = std::collections::BTreeMap::new();
+    for (i, l) in crate::cluster::euclidean_clusters(&pts, p.link, PTS_MIN).into_iter().enumerate() {
+        if l >= 0 {
+            groups.entry(l).or_default().push(i);
         }
-    }
-    let mut groups: std::collections::BTreeMap<usize, Vec<usize>> = std::collections::BTreeMap::new();
-    for i in 0..stops.len() {
-        let r = root(&mut parent, i);
-        groups.entry(r).or_default().push(i);
     }
     let mut out = Vec::new();
     for members in groups.values() {
@@ -252,13 +183,12 @@ fn sections(gs: &[Group], slab: u32, z: f64, centre: &Point, p: &BaseParams, lik
         for &i in members {
             per[stops[i].0] += 1;
         }
-        let n_scans = per.iter().filter(|&&n| n >= SCAN_STOPS).count() as u32;
         let (lo, hi) = xy.iter().fold(([f64::INFINITY; 2], [f64::NEG_INFINITY; 2]), |(lo, hi), q| {
             ([lo[0].min(q[0]), lo[1].min(q[1])], [hi[0].max(q[0]), hi[1].max(q[1])])
         });
         let extent = (hi[0] - lo[0]).hypot(hi[1] - lo[1]);
-        let (x, sd, arc, fitted) = match circle_of(&xy, extent) {
-            Some((x, sd, arc)) => (x, sd, arc, true),
+        let (x, fitted) = match circle_of(&xy, extent) {
+            Some(x) => (x, true),
             None => {
                 // a sliver: its stops are the front of a stem as wide as they are, behind them from the scan that
                 // saw most of it
@@ -266,38 +196,30 @@ fn sections(gs: &[Group], slab: u32, z: f64, centre: &Point, p: &BaseParams, lik
                 let m = [xy.iter().map(|q| q[0]).sum::<f64>() / n, xy.iter().map(|q| q[1]).sum::<f64>() / n];
                 let main = per.iter().enumerate().max_by_key(|q| *q.1).map_or(0, |q| q.0);
                 let r = (0.5 * extent).max(0.005);
-                (Vector5::new(m[0] + r * gs[main].v[0], m[1] + r * gs[main].v[1], 0.0, 0.0, r), f64::NAN, 0, false)
+                (Vector5::new(m[0] + r * gs[main].v[0], m[1] + r * gs[main].v[1], 0.0, 0.0, r), false)
             }
         };
-        let (stop, pass) = tally(gs, &x);
-        let (evidence, n_through) = support(gs, &x, like);
         out.push(Section {
             slab,
             z,
             c: [centre[0] + x[0], centre[1] + x[1]],
             r: x[4],
-            sd_log_r: sd,
             fitted,
-            arc,
-            n_scans,
             hits,
-            n_pass: pass,
-            pass_share: if stop + pass > 0 { f64::from(pass) / f64::from(stop + pass) } else { f64::NAN },
-            refuted: refuted((stop, pass)),
+            refuted: refuted(tally(gs, &x)),
             edge: x[0].hypot(x[1]) + x[4] > p.reach - TUBE_MARGIN,
-            evidence,
-            n_through,
+            evidence: support(gs, &x, like),
             column: -1,
         });
     }
     out
 }
 
-/// A section's circle from its stops: `[c1, c2, 0, 0, R]`, its sd of log R (its arc's and [`PTS_SD`]) and the
-/// ten-degree bins its stops fill; None where they make none (an arc under [`ARC_MIN`], or a poor fit). The circle
-/// must span its section: the stops are one connected object, so a circle narrower than their span (a small circle
-/// RANSAC finds in a big trunk's bark) is not its section's; the stops are then fitted whole (least squares).
-fn circle_of(xy: &[[f64; 2]], extent: f64) -> Option<(Vector5<f64>, f64, u32)> {
+/// A section's circle from its stops, `[c1, c2, 0, 0, R]`; None where they make none (an arc under [`SECTION_ARC`], or a
+/// poor fit). The circle must span its section: the stops are one connected object, so a circle narrower than their
+/// span (a small circle RANSAC finds in a big trunk's bark) is not its section's; the stops are then fitted whole
+/// (least squares). Its tests are a point circle's ([`super::ring`]).
+fn circle_of(xy: &[[f64; 2]], extent: f64) -> Option<Vector5<f64>> {
     let n = xy.len() as f64;
     let band = (PTS_BAND_SHARE * 0.5 * extent).min(PTS_BAND).max(PTS_BAND_MIN);
     // the share of the stops outside the circle's disc (beyond its band and SPAN_SLACK): a circle spans its section
@@ -314,21 +236,9 @@ fn circle_of(xy: &[[f64; 2]], extent: f64) -> Option<(Vector5<f64>, f64, u32)> {
             (cx, cy, r, inl)
         }
     };
-    let on: Vec<[f64; 2]> = xy.iter().zip(&inl).filter(|q| *q.1).map(|(q, _)| [q[0] - cx, q[1] - cy]).collect();
-    if (on.len() as f64) < PTS_INLIERS * n || !(r.is_finite() && r > 0.0) || r > extent.max(0.01) * 1.5 || !spans(cx, cy, r) {
-        return None;
-    }
-    let rmse = (on.iter().map(|q| (q[0].hypot(q[1]) - r).powi(2)).sum::<f64>() / on.len() as f64).sqrt();
-    let mut bins = [false; 36];
-    for q in &on {
-        bins[(((q[1].atan2(q[0]).to_degrees() + 180.0) / 10.0) as usize).min(35)] = true;
-    }
-    let arc = bins.iter().filter(|&&b| b).count();
-    if arc < ARC_MIN || rmse > PTS_RMSE.0 * r + PTS_RMSE.1 {
-        return None;
-    }
-    let var = arc_cov(&on, rmse).map_or(f64::INFINITY, |c| c[(2, 2)]) / (r * r);
-    Some((Vector5::new(cx, cy, 0.0, 0.0, r), (PTS_SD * PTS_SD + var).sqrt(), arc as u32))
+    let (on, rmse, arc) = ring(xy, &inl, cx, cy, r);
+    let ok = on >= PTS_INLIERS * n && r.is_finite() && r > 0.0 && r <= extent.max(0.01) * 1.5 && spans(cx, cy, r);
+    (ok && arc >= SECTION_ARC && rmse <= PTS_RMSE.0 * r + PTS_RMSE.1).then(|| Vector5::new(cx, cy, 0.0, 0.0, r))
 }
 
 /// Each slab's groups and sections about `centre` (world x, y and the ground's z).
@@ -466,7 +376,7 @@ fn row_support(gs: &[Group], a: &Point, b: &Point, r: f64, z: f64, centre: &Poin
     let f = (z - a[2]) / dz;
     let (t1, t2) = ((b[0] - a[0]) / dz, (b[1] - a[1]) / dz);
     let (c1, c2) = (a[0] + f * (b[0] - a[0]) - centre[0], a[1] + f * (b[1] - a[1]) - centre[1]);
-    NARROW.iter().map(|s| support(gs, &Vector5::new(c1, c2, t1, t2, (s * r).max(NARROW_MIN)), p).0).max_by(f64::total_cmp)
+    NARROW.iter().map(|s| support(gs, &Vector5::new(c1, c2, t1, t2, (s * r).max(NARROW_MIN)), p)).max_by(f64::total_cmp)
 }
 
 /// A plant's base re-sectioned from the rays (module documentation): its grounded members' rows (`rows`, each one's
@@ -488,9 +398,9 @@ pub fn rebase(scans: &[&ScanIndex], rows: &Rows, member: &[i64], centre: &Point,
             (0..mids.len()).map(|k| row_support(&gs[k], &rows.a[i], &rows.b[i], rows.r_prior[i], mids[k], centre, like)).collect()
         }).collect()
     });
-    // each row under the slabs' top: the share of its pieces the rays measure (an own circle the veto doesn't refute),
+    // each row in the slabs: the share of its pieces there the rays measure (an own circle the veto doesn't refute),
     // and whether they refute it at the narrowest it is weighed at in every slab it crosses (through air)
-    let z_h = centre[2] + p.z_hi;
+    let (z_lo, z_h) = (centre[2] + p.z_lo, centre[2] + p.z_hi);
     let (measured, air): (Vec<f64>, Vec<bool>) = pool(threads)?.install(|| {
         (0..n).into_par_iter().map(|i| {
             let (a, b) = (rows.a[i], rows.b[i]);
@@ -500,7 +410,9 @@ pub fn rebase(scans: &[&ScanIndex], rows: &Rows, member: &[i64], centre: &Point,
             let len = norm3(&sub(&b, &a));
             let k = (len / PIECE_LEN).ceil().max(1.0) as usize;
             let at = |f: f64| -> Point { std::array::from_fn(|d| a[d] + f * (b[d] - a[d])) };
-            let own = (0..k).filter(|&j| {
+            // its pieces in the slabs (their middles), as `support_tree` cuts a row
+            let inside: Vec<usize> = (0..k).filter(|&j| ((z_lo..z_h).contains(&at((j as f64 + 0.5) / k as f64)[2]))).collect();
+            let own = inside.iter().filter(|&&j| {
                 let (pa, pb) = (at(j as f64 / k as f64), at((j + 1) as f64 / k as f64));
                 let s = summarise_piece(scans, &pa, &pb, crate::qsm::joint::frames(&[pa], &[pb])[0], rows.r_prior[i], like, prior.lean_sd);
                 matches!(s.outcome, Outcome::Measured(c) if !refuted(tally(&s.seen, &c.x)))
@@ -516,7 +428,7 @@ pub fn rebase(scans: &[&ScanIndex], rows: &Rows, member: &[i64], centre: &Point,
                 Some(refuted(tally(g, &x)))
             };
             let seen: Vec<bool> = (0..mids.len()).filter_map(|s| thin(&gs[s], mids[s])).collect();
-            (own as f64 / k as f64, !seen.is_empty() && seen.iter().all(|&x| x))
+            (own as f64 / inside.len().max(1) as f64, !seen.is_empty() && seen.iter().all(|&x| x))
         }).unzip()
     });
     let top = rows.a.iter().chain(rows.b).map(|q| q[2]).fold(centre[2], f64::max) - centre[2];
@@ -531,7 +443,6 @@ fn join(rows: &Rows, member: &[i64], centre: &Point, p: &BaseParams, secs: &[Sec
     use std::collections::{BTreeSet, HashMap};
     let n = rows.a.len();
     let (a, b, r, parent) = (rows.a, rows.b, rows.r_prior, rows.parent);
-    let z_h = centre[2] + p.z_hi;
     let hi = |i: usize| a[i][2].max(b[i][2]);
     let nc = cols.len();
     let sec_of = |k: usize| -> Vec<usize> {
@@ -639,7 +550,6 @@ fn join(rows: &Rows, member: &[i64], centre: &Point, p: &BaseParams, secs: &[Sec
         }).sum::<f64>();
         (i, v)
     }).collect();
-    let reaches: Vec<bool> = (0..n).map(|i| subtree(i).iter().any(|&j| hi(j) > z_h)).collect();
     // each column's holders: the members with a row on CTX_SHARE of its sections (the axis within its circle and
     // IN_COL at the section's height): their drawing stands on that wood already
     let holders: Vec<BTreeSet<i64>> = (0..nc).map(|k| {
@@ -660,7 +570,6 @@ fn join(rows: &Rows, member: &[i64], centre: &Point, p: &BaseParams, secs: &[Sec
     // hung
     let assemble = |owner: &[i64], fate: &HashMap<usize, Fate>| -> Rebased {
         let chosen_secs: Vec<usize> = (0..secs.len()).filter(|&i| secs[i].column >= 0 && owner[secs[i].column as usize] >= 0).collect();
-        let resected: BTreeSet<i64> = entries.iter().filter(|i| col_of(fate[i]).is_some()).map(|&i| member[i]).collect();
         let mut replaced = vec![false; n];
         for &i in &entries {
             if col_of(fate[&i]).is_some() {
@@ -671,10 +580,17 @@ fn join(rows: &Rows, member: &[i64], centre: &Point, p: &BaseParams, secs: &[Sec
             let m: Point = std::array::from_fn(|d| 0.5 * (a[j][d] + b[j][d]));
             chosen_secs.iter().any(|&i| (secs[i].z - m[2]).abs() <= p.dz && (secs[i].c[0] - m[0]).hypot(secs[i].c[1] - m[1]) <= secs[i].r)
         };
-        // the rows a column replaces: under its top, never the drawing above it
-        let z_cut = chosen_secs.iter().map(|&i| secs[i].z + 0.5 * p.dz).fold(f64::NEG_INFINITY, f64::max).min(z_h);
+        // the rows a column replaces: under its top (each member's, the highest of the columns it takes an entry on),
+        // never the drawing above it
+        let mut z_cut: HashMap<i64, f64> = HashMap::new();
+        for &i in &entries {
+            if let Some(c) = col_of(fate[&i]) {
+                let z = top[c].0[2] + 0.5 * p.dz;
+                z_cut.entry(member[i]).and_modify(|q| *q = q.max(z)).or_insert(z);
+            }
+        }
         let drop: Vec<bool> = (0..n).map(|j| {
-            resected.contains(&member[j]) && hi(j) <= z_cut && !fate.get(&j).is_some_and(|f| col_of(*f).is_some())
+            z_cut.get(&member[j]).is_some_and(|&z| hi(j) <= z) && !fate.get(&j).is_some_and(|f| col_of(*f).is_some())
                 && (replaced[j] || inside(j) || air[j])
         }).collect();
         let mut reb = Rebased { sections: secs.to_vec(), columns: cols.clone(), ..Default::default() };
@@ -722,33 +638,25 @@ fn join(rows: &Rows, member: &[i64], centre: &Point, p: &BaseParams, secs: &[Sec
                 dropped += 1;
             } else {
                 let par = if parent[i] < 0 {
-                    Some(-1)
+                    -1
                 } else if new_of[parent[i] as usize] >= 0 {
-                    Some(new_of[parent[i] as usize])
+                    new_of[parent[i] as usize]
                 } else {
-                    // its parent was dropped: its member's nearest row end within HANG; else a row whose subtree
-                    // reaches above the slabs' top is joined by a row of its dropped parent's radius from its
-                    // member's nearest row end within CONNECT (the stem RCT drew there, redrawn from the column),
-                    // else starts a base of its own (and its member then keeps its rows); any other is dropped
+                    // its parent was dropped: its member's nearest row end within HANG; else it is joined by a row of
+                    // its dropped parent's radius from such an end within CONNECT (the stem RCT drew there, redrawn
+                    // from the column); else it starts a base of its own, and its member then keeps its rows
                     let near = |within: f64| (0..reb.a.len()).filter(|&k| reb.member[k] == member[i] && reb.b[k][2] <= a[i][2] + HANG_UP).map(|k| (k, norm3(&sub(&reb.b[k], &a[i]))))
                         .filter(|q| q.1 <= within).min_by(|x, y| x.1.total_cmp(&y.1)).map(|q| q.0);
                     hung += 1;
-                    match (near(HANG), reaches[i]) {
-                        (Some(k), _) => Some(k as i64),
-                        (None, true) => Some(near(CONNECT).map_or(-1, |k| {
+                    match near(HANG) {
+                        Some(k) => k as i64,
+                        None => near(CONNECT).map_or(-1, |k| {
                             let x = reb.b[k];
                             push(&mut reb, x, a[i], r[parent[i] as usize], k as i64, member[i], -1)
-                        })),
-                        (None, false) => {
-                            hung -= 1;
-                            None
-                        }
+                        }),
                     }
                 };
-                match par {
-                    Some(par) => new_of[i] = push(&mut reb, a[i], b[i], r[i], par, member[i], -1),
-                    None => dropped += 1,
-                }
+                new_of[i] = push(&mut reb, a[i], b[i], r[i], par, member[i], -1);
             }
         }
         (reb.counts[4], reb.counts[5]) = (dropped, hung);
@@ -779,8 +687,12 @@ fn join(rows: &Rows, member: &[i64], centre: &Point, p: &BaseParams, secs: &[Sec
                 ev[i].iter().enumerate().filter(|(k, _)| *k as u32 <= last && slabs.contains(&(*k as u32))).filter_map(|q| *q.1).sum()
             };
             let e_rct: f64 = replaced.iter().map(|&j| row_e(j, Some(&slabs))).sum::<f64>() + taken.iter().map(|&i| under(i)).sum::<f64>();
+            // the length of the rows replaced within the column's slabs, and of it, measured
+            let (z0, z1) = (slabs.iter().min().map_or(0.0, |&q| centre[2] + p.z_lo + f64::from(q) * p.dz),
+                            slabs.iter().max().map_or(0.0, |&q| centre[2] + p.z_lo + f64::from(q + 1) * p.dz));
             let (lm, lt) = replaced.iter().map(|&j| {
-                let l = norm3(&sub(&b[j], &a[j])) * f64::from(ev[j].iter().enumerate().any(|(k, e)| e.is_some() && slabs.contains(&(k as u32))) as u8);
+                let (lo_j, hi_j) = (a[j][2].min(b[j][2]), hi(j));
+                let l = norm3(&sub(&b[j], &a[j])) * (hi_j.min(z1) - lo_j.max(z0)).max(0.0) / (hi_j - lo_j).max(1e-9);
                 (l * measured[j], l)
             }).fold((0.0, 0.0), |x, y| (x.0 + y.0, x.1 + y.1));
             let ms = if lt > 0.0 { lm / lt } else { 0.0 };
@@ -811,8 +723,11 @@ fn join(rows: &Rows, member: &[i64], centre: &Point, p: &BaseParams, secs: &[Sec
                 }
             }
         }
+        // (of the takers whose rows already stand on it, where any do: it stays theirs, however big another's crown)
         let owner: Vec<i64> = (0..nc).map(|c| {
-            by[c].iter().max_by(|x, y| x.1.total_cmp(y.1).then(y.0.cmp(x.0))).map_or(-1, |q| *q.0)
+            let on: Vec<(&i64, &f64)> = by[c].iter().filter(|q| holders[c].contains(q.0)).collect();
+            let pool: Vec<(&i64, &f64)> = if on.is_empty() { by[c].iter().collect() } else { on };
+            pool.into_iter().max_by(|x, y| x.1.total_cmp(y.1).then(y.0.cmp(x.0))).map_or(-1, |q| *q.0)
         }).collect();
         let reb = assemble(&owner, &fate);
         // a member on two bases (its rows with no parent start at more than one point) keeps its rows
@@ -858,8 +773,8 @@ mod tests {
     /// A column standing at (x, y) from 0.15 to 1.45 m, radius `r`, each section's evidence `e`, numbered `k`.
     fn column(x: f64, y: f64, r: f64, e: f64, k: i32) -> Vec<Section> {
         (0..14).map(|s| Section {
-            slab: s, z: 0.15 + 0.1 * s as f64, c: [x, y], r, sd_log_r: 0.05, fitted: true, arc: 30, n_scans: 3, hits: 50.0,
-            n_pass: 0, pass_share: 0.0, refuted: false, edge: false, evidence: e, n_through: 100, column: k,
+            slab: s, z: 0.15 + 0.1 * s as f64, c: [x, y], r, fitted: true, hits: 50.0, refuted: false, edge: false,
+            evidence: e, column: k,
         }).collect()
     }
 
@@ -1018,7 +933,32 @@ mod tests {
     }
 
     #[test]
-    fn a_short_arc_leaves_a_wider_radius_than_a_long_one() {
+    fn a_column_a_taker_already_stands_on_stays_its_whatever_the_fan_carries() {
+        // RCT tree 1 drawn on the column's wood and rising through its top on it; tree 0 a fan through air onto the
+        // same top with a bigger crown: both take the column, which is tree 1's
+        let fan: &[Point] = &[[0.4, -0.3, 0.0], [0.25, -0.2, 0.8], [0.02, 0.0, 1.6], [0.0, 0.0, 4.0]];
+        let stem: &[Point] = &[[0.0, 0.0, 0.0], [0.0, 0.0, 0.5], [0.0, 0.0, 1.0], [0.0, 0.0, 1.6], [0.0, 0.05, 2.0]];
+        let f = joined(&plant(&[(fan, 0.08), (stem, 0.03)]), &column(0.0, 0.0, 0.08, 100.0, 0), |i| if i < 3 { -20.0 } else { 10.0 });
+        assert!(f.out[0].chosen && f.out[0].owner == 1 && f.out[0].joined == 2, "{:?} {:?}", f.out, f.counts);
+        one_base(&f);
+    }
+
+    #[test]
+    fn a_row_whose_parent_was_dropped_connects_or_its_tree_keeps_its_rows() {
+        // a fan's axis from 1.3 m off through air onto the column's top, and a low branch from its chain at 0.4 m,
+        // on wood, more than CONNECT from any row end the tree keeps: no row is dropped, the tree keeps its rows
+        let (mut a, mut b, mut r, mut p, mut m) = plant(&[(&[[1.3, 0.0, 0.0], [1.2, 0.0, 0.4], [0.02, 0.0, 1.6], [0.0, 0.0, 2.5]], 0.05)]);
+        a.push([1.2, 0.0, 0.4]);
+        b.push([1.5, 0.0, 0.6]);
+        r.push(0.02);
+        p.push(0);
+        m.push(0);
+        let f = joined(&(a.clone(), b.clone(), r, p, m), &column(0.0, 0.0, 0.08, 100.0, 0), |i| if i < 3 { -20.0 } else { 5.0 });
+        assert!(!f.out[0].chosen && f.counts[6] == 1 && f.a == a && f.b == b, "{:?} {:?}", f.out, f.counts);
+    }
+
+    #[test]
+    fn a_section_is_a_circle_on_sixty_degrees_of_its_stops() {
         let arc = |a1: f64| -> Vec<[f64; 2]> {
             (0..60).map(|i| {
                 let t = (a1 * i as f64 / 59.0).to_radians();
@@ -1026,8 +966,8 @@ mod tests {
                 [r * t.cos(), r * t.sin()]
             }).collect()
         };
-        let (_, short, _) = circle_of(&arc(70.0), 0.12).unwrap();
-        let (_, long, _) = circle_of(&arc(200.0), 0.2).unwrap();
-        assert!(short > long && long >= PTS_SD, "{short} {long}");
+        let x = circle_of(&arc(70.0), 0.12).unwrap();
+        assert!((x[4] - 0.1).abs() < 0.01 && x[0].hypot(x[1]) < 0.01, "{x:?}");
+        assert!(circle_of(&arc(40.0), 0.07).is_none());
     }
 }

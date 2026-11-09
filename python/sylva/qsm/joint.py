@@ -560,8 +560,8 @@ def rebase(scans, a, b, r_prior, parent, member, centre, context=None, params: J
 
     From ``z_lo`` to ``z_hi`` above the ground ``centre[2]``, slabs ``dz`` thick about ``centre``'s vertical axis,
     each scan's pulses within ``reach`` of it; a slab's woody stops (echo character over a half) from every scan,
-    linked where within ``link`` of each other, are its sections, each with a circle (RANSAC and least squares, its
-    arc's covariance for its sd; a sliver one scan grazes is centred behind its stops) the ray veto audits. Sections
+    linked where within ``link`` of each other, are its sections, each with a circle (RANSAC and least squares, a point
+    circle's tests on an arc of 60 degrees; a sliver one scan grazes is centred behind its stops) the ray veto audits. Sections
     are linked upward into columns, which may fork. Each circle's evidence is its log odds of wood against foliage
     from the pulses through it, by their opacity (a stop on its chord for it, a pass against it, as a piece's
     existence weighs them, ``stop_wood``, ``stop_leaf``, ``exist_scale``); a row's is its axis's in each slab it
@@ -581,9 +581,8 @@ def rebase(scans, a, b, r_prior, parent, member, centre, context=None, params: J
     bases keeps its rows as they were. Of a member re-sectioned, other rows under the chosen columns' top whose
     middle lies in a chosen column's circle, or that the veto refutes at a quarter of their radius, are dropped; a
     kept row whose parent was dropped hangs from its member's nearest row end within 30 cm, no more than 5 cm above
-    its start; one whose subtree reaches above ``z_hi`` is else joined to such an end within 1 m by a row of its
-    dropped parent's radius (else its member keeps its rows); any other is dropped. A
-    column whose owner keeps a base of its own (a stem the columns missed) starts there.
+    its start, else is joined to such an end within 1 m by a row of its dropped parent's radius, else its member keeps
+    its rows. A column whose owner keeps a base of its own (a stem the columns missed) starts there.
     ``support_tree.rs``'s ``base`` module documentation says it in full.
 
     Parameters
@@ -613,8 +612,8 @@ def rebase(scans, a, b, r_prior, parent, member, centre, context=None, params: J
 
     Returns a dict: the rows ``a``, ``b`` ``(m, 3)``, ``r_prior``, ``parent`` (a row of the same member, -1 at its
     base: every member's rows hang from one base, parents first), ``member`` and ``column`` (-1 for a skeleton row);
-    ``sections``, per section ``slab``, ``z``, ``x``, ``y``, ``r``, ``sd_log_r``, ``fitted``, ``arc``, ``n_scans``,
-    ``hits``, ``n_pass``, ``pass_share``, ``evidence``, ``n_through``, ``column`` (-1: none), and per column
+    ``sections``, per section ``slab``, ``z``, ``x``, ``y``, ``r``, ``fitted``, ``hits``, ``evidence``, ``column``
+    (-1: none), and per column
     ``col_parent``, ``col_at``; ``columns``, per column ``e_col``, ``e_rct`` and ``measured`` (its root column's,
     with its forks), ``chosen``, ``owner`` (-1: none), ``r`` (its median), ``believable``, ``joined``, ``grafted``;
     and

@@ -849,13 +849,10 @@ fn qsm_support_tree<'py>(py: Python<'py>, scans: Vec<Bound<'py, PyScanIndex>>, a
 fn sections_to_py<'py>(py: Python<'py>, d: &Bound<'py, PyDict>, secs: &[support_tree::base::Section], cols: &[support_tree::base::Column]) -> PyResult<()> {
     use support_tree::base::Section;
     let f = |g: fn(&Section) -> f64| secs.iter().map(g).collect::<Vec<f64>>();
-    for (k, v) in [("z", f(|s| s.z)), ("x", f(|s| s.c[0])), ("y", f(|s| s.c[1])), ("r", f(|s| s.r)), ("sd_log_r", f(|s| s.sd_log_r)), ("hits", f(|s| s.hits)), ("pass_share", f(|s| s.pass_share)), ("evidence", f(|s| s.evidence))] {
+    for (k, v) in [("z", f(|s| s.z)), ("x", f(|s| s.c[0])), ("y", f(|s| s.c[1])), ("r", f(|s| s.r)), ("hits", f(|s| s.hits)), ("evidence", f(|s| s.evidence))] {
         d.set_item(k, v.into_pyarray(py))?;
     }
-    let u = |g: fn(&Section) -> u32| secs.iter().map(g).collect::<Vec<u32>>();
-    for (k, v) in [("slab", u(|s| s.slab)), ("arc", u(|s| s.arc)), ("n_scans", u(|s| s.n_scans)), ("n_pass", u(|s| s.n_pass)), ("n_through", u(|s| s.n_through))] {
-        d.set_item(k, v.into_pyarray(py))?;
-    }
+    d.set_item("slab", secs.iter().map(|s| s.slab).collect::<Vec<u32>>().into_pyarray(py))?;
     d.set_item("fitted", secs.iter().map(|s| s.fitted).collect::<Vec<bool>>().into_pyarray(py))?;
     d.set_item("column", secs.iter().map(|s| s.column).collect::<Vec<i32>>().into_pyarray(py))?;
     d.set_item("col_parent", cols.iter().map(|c| c.parent).collect::<Vec<i32>>().into_pyarray(py))?;
