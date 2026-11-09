@@ -861,6 +861,9 @@ fn evidence_opts(d: Option<&Bound<'_, PyDict>>) -> PyResult<EvidenceOpts> {
             "thin_seed" => o.thin_seed = v.extract()?,
             "owner_rule" => o.owner_rule = v.extract()?,
             "exclude" => o.exclude = v.extract()?,
+            "hold_scan" => o.hold_scan = v.extract()?,
+            "hold_mod" => o.hold_mod = v.extract()?,
+            "hold_seed" => o.hold_seed = v.extract()?,
             _ => return Err(PyValueError::new_err(format!("evidence opts: unknown {k:?}"))),
         }
     }
@@ -945,6 +948,24 @@ impl PyClusterTable {
         let x0 = x0.map(|v| v.as_array().to_vec());
         let f = py.detach(|| self.inner.evidence(&act, &par, &o, &self.like, x0.as_deref(), threads)).map_err(err)?;
         fit_to_py(py, f)
+    }
+
+    /// A fixed geometry `x0` scored record by record, the layers fitted on the records not held out (3dtrees
+    /// research 123; see the Rust `ClusterTable::score`): layers, owner, ll, lpass, wood, held.
+    #[pyo3(signature = (active, parent, x0, opts=None, threads=1))]
+    fn score<'py>(&self, py: Python<'py>, active: PyReadonlyArray1<bool>, parent: PyReadonlyArray1<i64>, x0: PyReadonlyArray1<f64>, opts: Option<Bound<'py, PyDict>>, threads: usize) -> PyResult<Bound<'py, PyDict>> {
+        let (act, par) = (active.as_array().to_vec(), parent.as_array().to_vec());
+        let o = evidence_opts(opts.as_ref())?;
+        let x0 = x0.as_array().to_vec();
+        let s = py.detach(|| self.inner.score(&act, &par, &o, &self.like, &x0, threads)).map_err(err)?;
+        let d = PyDict::new(py);
+        d.set_item("layers", s.layers.into_pyarray(py))?;
+        d.set_item("owner", s.owner.into_pyarray(py))?;
+        d.set_item("ll", s.ll.into_pyarray(py))?;
+        d.set_item("lpass", s.lpass.into_pyarray(py))?;
+        d.set_item("wood", s.wood.into_pyarray(py))?;
+        d.set_item("held", s.held.into_pyarray(py))?;
+        Ok(d)
     }
 
     /// The unnormalised log posterior at each row of `xs`.

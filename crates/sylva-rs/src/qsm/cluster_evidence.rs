@@ -125,12 +125,32 @@ pub struct EvidenceOpts {
     pub owner_rule: u8,
     /// Stems may not overlap: the sd (m) of a soft hinge on two non-adjacent segments' circles overlapping (0: off).
     pub exclude: f64,
+    /// Held-out records (3dtrees research 123), weighed 0 in the fit: those of scan `hold_scan` (-1: none), and one
+    /// in `hold_mod` by a hash of its scan, pulse and `hold_seed` (0: none).
+    pub hold_scan: i64,
+    pub hold_mod: u32,
+    pub hold_seed: u64,
 }
 
 impl Default for EvidenceOpts {
     fn default() -> Self {
-        EvidenceOpts { temper: 1.0, oversample: true, sig_root: 0.5, sig_eta: 0.5, sig_fork: 0.17, centre_rel: 1.0, centre_abs: 0.003, sig_delta: 0.02, lam_prior: 1.0, lam_sd: 2.0, iters: 200, tol: 1e-4, thin: 1, thin_seed: 0, owner_rule: 2, exclude: 0.002 }
+        EvidenceOpts { temper: 1.0, oversample: true, sig_root: 0.5, sig_eta: 0.5, sig_fork: 0.17, centre_rel: 1.0, centre_abs: 0.003, sig_delta: 0.02, lam_prior: 1.0, lam_sd: 2.0, iters: 200, tol: 1e-4, thin: 1, thin_seed: 0, owner_rule: 2, exclude: 0.002, hold_scan: -1, hold_mod: 0, hold_seed: 0 }
     }
+}
+
+/// A fixed geometry's per-record scores (see [`ClusterTable::score`]).
+#[derive(Debug, Clone, Default)]
+pub struct Score {
+    /// The layers' fitted log foliage rates.
+    pub layers: Vec<f64>,
+    /// Per record: its owner (-1 foliage alone), its log likelihood unweighted, the log chance it would pass (the
+    /// same pulse as a pass: its likelihood for a pass), a stop's chance of being wood's echo, and whether it was held
+    /// out of the layers' fit.
+    pub owner: Vec<i32>,
+    pub ll: Vec<f64>,
+    pub lpass: Vec<f64>,
+    pub wood: Vec<f64>,
+    pub held: Vec<bool>,
 }
 
 /// A hypothesis' fit and evidence (see [`ClusterTable::evidence`]).
@@ -344,6 +364,84 @@ impl ClusterTable {
         self.seg.len()
     }
 
+    /// Whether record `i` is held out of the fit (see [`EvidenceOpts::hold_scan`]).
+    fn held(&self, i: usize, o: &EvidenceOpts) -> bool {
+        (o.hold_scan >= 0 && self.scan[i] as i64 == o.hold_scan) || (o.hold_mod > 0 && hash(self.scan[i], self.pulse[i], o.hold_seed ^ 0x5bd1_e995) % o.hold_mod as u64 == 0)
+    }
+
+    /// A fixed geometry scored record by record (3dtrees research 123): the active segments at `x0`'s offsets and log
+    /// radii (`[d1, d2, eta]` per active segment, in order; its layers are ignored), each layer's log foliage rate
+    /// fitted by Newton on the records not held out (with its prior), then every record's log likelihood, held out
+    /// or not, unweighted, and the log chance the same pulse would pass. No dense algebra: the geometry isn't fitted.
+    pub fn score(&self, active: &[bool], parent: &[i64], o: &EvidenceOpts, like: &JointParams, x0: &[f64], threads: usize) -> Result<Score> {
+        let st = self.setup(active, parent, o, like)?;
+        if x0.len() < st.l0 {
+            return Err(Error::invalid("cluster score: x0 is shorter than the active segments' state"));
+        }
+        let mut x = DVector::zeros(st.dim);
+        for i in 0..st.l0 {
+            x[i] = x0[i];
+        }
+        for l in 0..self.n_layers {
+            x[st.l0 + l] = o.lam_prior.ln();
+        }
+        let n = self.n_records();
+        // ownership depends on the geometry alone (owner rule 2): once
+        let views: Vec<(Pulse, Option<usize>)> = pool(threads)?.install(|| (0..n).into_par_iter().map(|i| self.view(i, &x, &st, like)).collect());
+        let pm = o.lam_prior.ln();
+        let pw = 1.0 / (o.lam_sd * o.lam_sd);
+        for _ in 0..o.iters.clamp(1, 50) {
+            let nl = self.n_layers;
+            let chunk = n.div_ceil(threads.max(1) * 4).max(1);
+            let parts: Vec<(Vec<f64>, Vec<f64>)> = pool(threads)?.install(|| (0..n).step_by(chunk).collect::<Vec<_>>().par_iter().map(|&s0| {
+                let (mut g, mut h) = (vec![0.0; nl], vec![0.0; nl]);
+                for i in s0..(s0 + chunk).min(n) {
+                    let w = st.weight[i];
+                    if w <= 0.0 {
+                        continue;
+                    }
+                    let (pu, own) = &views[i];
+                    let (v, gi, hi) = pair_derivs(pu, self.state(*own, i, &x, &st), like);
+                    if !(v.is_finite() && gi[3].is_finite() && hi[3][3].is_finite()) {
+                        continue;
+                    }
+                    let l = self.layer[i] as usize;
+                    g[l] += w * gi[3];
+                    h[l] += w * hi[3][3];
+                }
+                (g, h)
+            }).collect());
+            let (mut g, mut h) = (vec![0.0; nl], vec![0.0; nl]);
+            for (pg, ph) in parts {
+                for l in 0..nl {
+                    g[l] += pg[l];
+                    h[l] += ph[l];
+                }
+            }
+            let mut moved: f64 = 0.0;
+            for l in 0..self.n_layers {
+                let xl = x[st.l0 + l];
+                let gl = g[l] - pw * (xl - pm);
+                let hl = (-h[l] + pw).max(pw);
+                let d = (gl / hl).clamp(-1.0, 1.0);
+                x[st.l0 + l] = xl + d;
+                moved = moved.max(d.abs());
+            }
+            if moved < o.tol.max(1e-4) {
+                break;
+            }
+        }
+        let out: Vec<(i32, f64, f64, f64)> = pool(threads)?.install(|| views.par_iter().enumerate().map(|(i, (pu, own))| {
+            let s = self.state(*own, i, &x, &st);
+            let ll = pair_value(pu, s, like);
+            let lp = if pu.stop { pair_value(&Pulse { stop: false, x: 0.0, ..*pu }, s, like) } else { ll };
+            let wood = if own.is_some() && pu.stop { pair_wood_share(pu, s, like) } else if pu.stop { 0.0 } else { f64::NAN };
+            (own.map_or(-1, |k| k as i32), ll, lp, wood)
+        }).collect());
+        Ok(Score { layers: x.iter().skip(st.l0).copied().collect(), owner: out.iter().map(|q| q.0).collect(), ll: out.iter().map(|q| q.1).collect(),
+            lpass: out.iter().map(|q| q.2).collect(), wood: out.iter().map(|q| q.3).collect(), held: (0..n).map(|i| self.held(i, o)).collect() })
+    }
+
     fn setup(&self, active: &[bool], parent: &[i64], o: &EvidenceOpts, like: &JointParams) -> Result<Setup> {
         let ns = self.a.len();
         if active.len() != ns || parent.len() != ns {
@@ -411,7 +509,7 @@ impl ClusterTable {
         let prior = Prior::of(&fs, dim);
         let weight: Vec<f64> = (0..self.n_records()).map(|i| {
             let keep = o.thin <= 1 || hash(self.scan[i], self.pulse[i], o.thin_seed) % o.thin as u64 == 0;
-            if !keep {
+            if !keep || self.held(i, o) {
                 return 0.0;
             }
             o.temper * o.thin.max(1) as f64 / if o.oversample { self.m[i] } else { 1.0 }
