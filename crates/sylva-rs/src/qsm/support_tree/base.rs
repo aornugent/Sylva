@@ -10,8 +10,9 @@
 //!   each a vertical piece about the plant's base whose tube is [`BaseParams::reach`] wide: each scan's pulses
 //!   through it, as [`super::groups`] takes a piece's.
 //! - **Sections.** A slab's woody stops (echo character over a half, [`super::p_wood`] for wood of [`WOOD_R`]), from
-//!   every scan, linked where they lie within [`BaseParams::link`] of each other ([`crate::cluster::euclidean_clusters`]),
-//!   are its sections: a stem is a connected arc or ring of stops, a grass tussock or leaf clump a scatter the veto
+//!   every scan, linked where they lie within [`BaseParams::link`] of each other (union-find on a grid of that size:
+//!   [`crate::cluster::euclidean_clusters`]' adjacency lists took 5-7 s on a slab of 37,000 stops by a scanner), are
+//!   its sections: a stem is a connected arc or ring of stops, a grass tussock or leaf clump a scatter the veto
 //!   refutes. Each section with [`super::RUN_HITS`] woody hits gets a circle: RANSAC and least squares on its stops,
 //!   a point circle's band and tests ([`super::ring`]) on an arc of [`SECTION_ARC`] ten-degree bins; a section
 //!   whose stops make no circle (a sliver one scan grazes) is centred behind its stops by half their width. The ray
@@ -160,17 +161,43 @@ fn support(gs: &[Group], x: &Vector5<f64>, p: &JointParams) -> f64 {
     p.exist_scale * (f64::from(stop) * on + f64::from(pass) * off)
 }
 
+/// Union-find's root, with path halving.
+fn root(p: &mut [usize], mut i: usize) -> usize {
+    while p[i] != i {
+        p[i] = p[p[i]];
+        i = p[i];
+    }
+    i
+}
+
 /// A slab's sections: its stops linked within `link`, each group with enough woody hits given a circle.
 fn sections(gs: &[Group], slab: u32, z: f64, centre: &Point, p: &BaseParams, like: &JointParams) -> Vec<Section> {
     let stops: Vec<(usize, [f64; 2], f64)> = gs.iter().enumerate()
         .flat_map(|(gi, g)| g.recs.iter().filter(|r| r.is_stop()).map(move |r| (gi, r.xy, p_wood(r, WOOD_R, like))))
         .filter(|s| s.2 >= 0.5).collect();
-    let pts: Vec<Point> = stops.iter().map(|s| [s.1[0], s.1[1], 0.0]).collect();
-    let mut groups: std::collections::BTreeMap<i64, Vec<usize>> = std::collections::BTreeMap::new();
-    for (i, l) in crate::cluster::euclidean_clusters(&pts, p.link, PTS_MIN).into_iter().enumerate() {
-        if l >= 0 {
-            groups.entry(l).or_default().push(i);
+    let cell = |q: [f64; 2]| ((q[0] / p.link).floor() as i64, (q[1] / p.link).floor() as i64);
+    let mut grid: std::collections::HashMap<(i64, i64), Vec<usize>> = std::collections::HashMap::new();
+    for (i, s) in stops.iter().enumerate() {
+        grid.entry(cell(s.1)).or_default().push(i);
+    }
+    let mut parent: Vec<usize> = (0..stops.len()).collect();
+    for (i, s) in stops.iter().enumerate() {
+        let (cx, cy) = cell(s.1);
+        for dx in -1..=1 {
+            for dy in -1..=1 {
+                for &j in grid.get(&(cx + dx, cy + dy)).map_or(&[][..], |v| &v[..]) {
+                    if j > i && (s.1[0] - stops[j].1[0]).hypot(s.1[1] - stops[j].1[1]) <= p.link {
+                        let (a, b) = (root(&mut parent, i), root(&mut parent, j));
+                        parent[a] = b;
+                    }
+                }
+            }
         }
+    }
+    let mut groups: std::collections::BTreeMap<usize, Vec<usize>> = std::collections::BTreeMap::new();
+    for i in 0..stops.len() {
+        let r = root(&mut parent, i);
+        groups.entry(r).or_default().push(i);
     }
     let mut out = Vec::new();
     for members in groups.values() {
