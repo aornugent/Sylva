@@ -272,7 +272,8 @@ def support_tree(scans, a, b, r_prior, parent, context=None, params: JointParams
     middle, the lean and the radius with their covariance; a stop is a hit only on the first such circle's front
     arc (the second pass). Where no circle is determined, each scan still bounds R, slice by slice along the piece:
     its woody stops' span is no wider than the silhouette, the nearest passes either side of them (or, in a slice
-    with no woody stop, either side of the woody centre) no narrower, and wood that was hit fills at least ``tau``
+    with no woody stop, either side of the woody centre; a pass a pulse that met nothing in the tube) no narrower,
+    and wood that was hit fills at least ``tau``
     of the footprint; a side with nothing recorded gives no bound. Passes alone bound it too, the ray veto (3dtrees
     research 106): its R is at most the widest circle about the claim's axis that fewer than 10 pulses, or under a
     quarter of its stops and passes, pass through. With ``dh``, the site's largest stem D/H caps it after the solve, on
@@ -299,8 +300,8 @@ def support_tree(scans, a, b, r_prior, parent, context=None, params: JointParams
     most twice the claim and twice the site's cap, and short of the edge of its pieces' tubes). Unless the ray veto
     refutes it (on a tangle it can be another tree's), it measures each of the row's n pieces' R and centre (each
     coordinate) with sd 0.136 R sqrt(n) (0.136 in log R, the refit circles' noise, shared by the n pieces), its
-    pieces' upper bounds beside it, read about the circle's own centre (the lower bound and capacity floor its own
-    stops gave it replaces), and isn't capped (``POINTS``).
+    pieces' upper bounds beside it (the lower bound and capacity floor its own stops gave it replaces), and isn't
+    capped (``POINTS``).
 
     A ``RUNS`` or ``HULL`` piece is fitted by the exact likelihood, seeded from its runs (3dtrees research 93 §18):
     each scan's runs, found slice by slice along the piece, measured as circles with their own centre, lean and

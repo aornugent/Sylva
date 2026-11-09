@@ -58,8 +58,10 @@
 //!   nearest the axis, span no more than the silhouette (a lower bound, `R >=
 //!   span / 2 - w (1/2 - tau)`); the nearest passes either side of them, or
 //!   either side of the woody centre in a slice where no woody stop is, lie
-//!   outside it (an upper bound, `R <= gap / 2 - w (1/2 - tau)`; a side with
-//!   no recorded pulse, or a stop or blocked pulse next, gives none); and wood
+//!   outside it (an upper bound, `R <= gap / 2 - w (1/2 - tau)`, a pass
+//!   there a pulse that met nothing in the tube; a side with no recorded
+//!   pulse, or a stop anywhere in the tube or a blocked pulse next, gives
+//!   none); and wood
 //!   that was hit fills at least `tau` of the footprint (the capacity floor `R
 //!   >= tau w / 2`, reported apart as `r_floor`). Each is a probit term on log
 //!   R: the bounds of the edge's sd (and the impacts' quantisation), the floor
@@ -120,10 +122,8 @@
 //!   tangle a circle can be another tree's), it measures each of the row's n
 //!   pieces' R and both coordinates of its centre with sd `PTS_SD R sqrt(n)`
 //!   ([`PTS_SD`] in log R; one circle shared by n pieces, not n circles), and the
-//!   pieces' upper bounds (passes) enter beside it ([`basis::POINTS`]), read
-//!   about the circle's own centre ([`bounds_about`]: about the claim's axis a
-//!   stem off it in depth reads its own flanks as passes, 3dtrees research 127);
-//!   the bounds its own stops gave (a woody run's span, the capacity floor) it
+//!   pieces' upper bounds (passes) enter beside it ([`basis::POINTS`]); the
+//!   bounds its own stops gave (a woody run's span, the capacity floor) it
 //!   replaces, so they aren't counted twice (3dtrees ticket 115).
 //! - **The site's cap** (`PriorParams::dh`, 3dtrees research 62, 106
 //!   `uncertain.md`): after the solve, every node into which no circle
@@ -1385,7 +1385,10 @@ impl<'a> Profile<'a> {
     /// ends, so nothing recorded there is no evidence of sky.
     fn runs(&self, member: &[bool], c: f64, r_claim: f64, through: bool) -> (Vec<f64>, Vec<f64>) {
         let bp = &self.bp;
-        let pass = |i: usize| self.fates[i] == Fate::Pass;
+        // a pass beside the run is a pulse that met nothing in the tube: one that stopped behind the claim's depth
+        // window may have stopped on this wood, off the claim's axis in depth (a thin claim in a fat stem, a point
+        // circle behind it), and read as a pass it bounded that wood at millimetres (3dtrees research 127)
+        let pass = |i: usize| self.fates[i] == Fate::Pass && !self.g.recs[i].depth.is_finite();
         let (mut lo_s, mut hi_s) = (Vec::new(), Vec::new());
         for sl in &self.slices {
             let j0 = (0..sl.len()).filter(|&j| member[sl[j]] && (bp[sl[j]] - c).abs() < r_claim + self.w).min_by(|&x, &y| (bp[sl[x]] - c).abs().total_cmp(&(bp[sl[y]] - c).abs()));
@@ -1589,22 +1592,6 @@ fn owner(k: usize, rows: &Rows, context: &[(Point, Point, f64)], reach: f64) -> 
         let own = to_axis(x, &(a, b));
         others.iter().all(|o| to_axis(x, o) >= own)
     }
-}
-
-/// A piece's upper bounds read about a circle `x` (`[c1, c2, t1, t2, R]`) rather than the claim's axis: each group's
-/// impacts and depths taken about the circle's centre and its R as the claim, then [`Profile::bounds`]'s upper side.
-/// About the claim, a stem off its axis in depth leaves its own stops behind the claim's depth window, as passes, and
-/// the "passes" either side of its woody run can be millimetres apart (3dtrees research 127).
-fn bounds_about(gs: &[Group], x: &Vector5<f64>, p: &JointParams) -> Vec<Bound> {
-    gs.iter().filter(|g| !g.recs.is_empty()).flat_map(|g| {
-        let recs = g.recs.iter().map(|r| {
-            let (cx, cy) = (x[0] + r.s * x[2], x[1] + r.s * x[3]);
-            Rec { b: r.b - (g.n[0] * cx + g.n[1] * cy), depth: r.depth - (g.v[0] * cx + g.v[1] * cy), ..*r }
-        }).collect();
-        let about = Group { scan: g.scan, n: g.n, v: g.v, recs };
-        let bs: Vec<Bound> = Profile::of(&about, x[4], p).bounds(x[4], p, None).into_iter().filter(|b| b.side == Side::Upper).collect();
-        bs
-    }).collect()
 }
 
 /// A point circle `x` as the measurement of one of a row's `pieces` pieces: its centre and R, each of sd [`PTS_SD`] R
@@ -1999,9 +1986,8 @@ pub fn support_tree(scans: &[&ScanIndex], rows: &Rows, context: &[(Point, Point,
             let c = point_measure(&x, (k1 - k0) as f64);
             for s in &mut sums[k0..k1] {
                 s.points = Some(c);
-                // the bounds its stops gave (the woody run's span, the capacity floor) are the circle's own data, and
-                // its passes bound it about its own centre, not the claim's
-                s.bounds = bounds_about(&s.seen, &x, like);
+                // the bounds its stops gave (the woody run's span, the capacity floor) are the circle's own data
+                s.bounds.retain(|b| b.side == Side::Upper);
             }
         }
     }
@@ -3701,10 +3687,10 @@ mod tests {
     }
 
     #[test]
-    fn a_point_circles_passes_bound_it_about_its_own_centre() {
-        // a 2.25 cm stem 4.5 cm behind a 5 mm claim's axis: about the claim, its flanks fall behind the claim's depth
-        // window and read as passes either side of a 2 cm run, an upper bound under its radius that would pin a
-        // point circle on it (3dtrees research 127); about the circle the passes are beside the stem
+    fn a_stem_off_the_claims_axis_in_depth_is_not_bounded_by_its_own_flanks() {
+        // a 2.25 cm stem 4.5 cm behind a 5 mm claim's axis: its flanks fall behind the claim's depth window, and read
+        // as passes either side of a 2 cm run they bounded it at 1.5 cm, pinning a point circle on it or a thin
+        // claim in a fat base (3dtrees research 127); a pass is a pulse that met nothing in the tube
         let rec = |b: f64, s: f64, depth: f64| Rec { b, s, depth, xy: [f64::NAN; 2], w: 0.005, refl: f64::NAN, single: true, blocked: false, lost: false, pulse: 0, echo: 0 };
         let mut v = Vec::new();
         for j in 0..20 {
@@ -3716,10 +3702,11 @@ mod tests {
         let gs = [Group { scan: 0, n: [1.0, 0.0], v: [0.0, 1.0], recs: v }];
         let p = like();
         let upper = |bs: Vec<Bound>| bs.iter().filter(|b| b.side == Side::Upper).map(|b| b.eta.exp()).fold(f64::INFINITY, f64::min);
-        let claim = upper(Profile::of(&gs[0], 0.005, &p).bounds(0.005, &p, None));
-        assert!(claim < 0.016, "{claim}");
-        let about = upper(bounds_about(&gs, &Vector5::new(0.0, 0.045, 0.0, 0.0, 0.0225), &p));
-        assert!(about >= 0.0225 && about < 0.03, "{about}");
+        assert!(upper(Profile::of(&gs[0], 0.005, &p).bounds(0.005, &p, None)) >= 0.0225);
+        // the same stem on the claim's axis is bounded by the passes beside it
+        let on: Vec<Rec> = gs[0].recs.iter().map(|r| Rec { depth: r.depth - 0.045, ..*r }).collect();
+        let hi = upper(Profile::of(&Group { scan: 0, n: [1.0, 0.0], v: [0.0, 1.0], recs: on }, 0.02, &p).bounds(0.02, &p, None));
+        assert!((0.0225..0.03).contains(&hi), "{hi}");
     }
 
     #[test]
