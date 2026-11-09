@@ -288,11 +288,13 @@ def support_tree(scans, a, b, r_prior, parent, context=None, params: JointParams
     on them (``PINNED``).
 
     Point evidence (3dtrees ticket 109): a row none of whose pieces has a circle of its own gets one from the stops
-    in its pieces' tubes nearer its claimed axis than any other the tree or its context claims, placed across its axis, as the refit fitted RCT's points (RANSAC, least squares on its
-    inliers, and the refit's tests: at least 12 stops on a claim of at least 1 cm, half of them on it, filling 120
-    degrees of it, its centre near the axis, at most twice the claim and twice the site's cap). Unless the ray veto
-    refutes it (on a tangle it can be another tree's), it measures each of the row's pieces' centre and R with sd
-    0.136 in log R (times the root of the pieces), its pieces' bounds beside it, and isn't capped (``POINTS``).
+    in its pieces' tubes nearer its claimed axis than any other the tree or its context claims, placed across its
+    axis, as the refit fitted RCT's points (RANSAC, least squares on its inliers, and the refit's tests: at least 12
+    stops on a claim of at least 1 cm, half of them on it, filling 120 degrees of it, its centre near the axis, at
+    most twice the claim and twice the site's cap, and short of the edge of its pieces' tubes). Unless the ray veto
+    refutes it (on a tangle it can be another tree's), it measures each of the row's n pieces' R and centre (each
+    coordinate) with sd 0.136 R sqrt(n) (0.136 in log R, the refit circles' noise, shared by the n pieces), its
+    pieces' bounds beside it, and isn't capped (``POINTS``).
 
     A ``RUNS`` or ``HULL`` piece is fitted by the exact likelihood, seeded from its runs (3dtrees research 93 §18):
     each scan's runs, found slice by slice along the piece, measured as circles with their own centre, lean and
@@ -318,11 +320,11 @@ def support_tree(scans, a, b, r_prior, parent, context=None, params: JointParams
     tree's) times its echo character's weight, or on a routed piece with an exact fit by the exact likelihood's wood
     and leaf terms at its stem's fit (:class:`EchoPath`).
 
-    The tree's volume is its pieces' (a routed piece's further stems aside): at their posterior R (the drawing's), and
-    as the mean (the volume of record, split by how each piece is known, :class:`SupportBasis`) and an interval from 1,000 draws of the tree's joint posterior (the solve's
-    exact covariance, each node's sd widened by its basis's factor, each draw held inside its piece's bounds; a fixed
-    seed). The factors are Sylva's calibration (``WIDEN`` in ``support_tree.rs``, learned per basis against Alice
-    Mulga's refit circles), not a setting.
+    The tree's volume is its pieces' (a routed piece's further stems aside): at their posterior R (the drawing's,
+    ``point``), and as the mean (the volume of record, split by how each piece is known, :class:`SupportBasis`) and an
+    interval from 1,000 draws of the tree's joint posterior (the solve's exact covariance, each node's sd widened by
+    its basis's factor, each draw held inside its piece's bounds; a fixed seed). The factors are Sylva's calibration
+    (``WIDEN`` in ``support_tree.rs``, learned per basis against Alice Mulga's refit circles), not a setting.
 
     Parameters
     ----------

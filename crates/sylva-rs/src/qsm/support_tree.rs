@@ -114,12 +114,13 @@
 //!   whose pieces has a circle of its own gets one from the stops in its
 //!   pieces' tubes, placed across its axis, as the refit fitted RCT's points
 //!   ([`point_circle`]: RANSAC, least squares on its inliers, and the refit's
-//!   tests of inliers, arc, misfit, shift and width, and at most
-//!   [`PTS_BELIEVE`] times the site's cap). Unless the ray veto refutes it (on
-//!   a tangle a circle can be another tree's), it measures each of the row's
-//!   pieces' centre and R with sd [`PTS_SD`] in log R (times the root of the
-//!   pieces: one circle, not one per piece), and the pieces' bounds enter
-//!   beside it ([`basis::POINTS`]).
+//!   tests of inliers, arc, misfit, shift and width, at most [`PTS_BELIEVE`]
+//!   times the site's cap, and short of its pieces' tubes' edge, where a piece's
+//!   own circle would be refused too). Unless the ray veto refutes it (on a
+//!   tangle a circle can be another tree's), it measures each of the row's n
+//!   pieces' R and both coordinates of its centre with sd `PTS_SD R sqrt(n)`
+//!   ([`PTS_SD`] in log R; one circle shared by n pieces, not n circles), and the
+//!   pieces' bounds enter beside it ([`basis::POINTS`]).
 //! - **The site's cap** (`PriorParams::dh`, 3dtrees research 62, 106
 //!   `uncertain.md`): after the solve, every node into which no circle
 //!   enters (its own or its row's point circle) has R at most `dh` times its
@@ -314,7 +315,7 @@ pub const WIDEN: [f64; 5] = [2.1, 2.1, 3.6, 3.1, 2.3];
 
 /// The factor a node of basis `b` is widened by ([`WIDEN`]).
 fn widen(b: u8) -> f64 {
-    WIDEN[usize::from(b.clamp(basis::MEASURED, basis::CAPPED) - 1)]
+    WIDEN[usize::from(b) - 1]
 }
 
 /// Point evidence ([`point_circle`], 3dtrees research 111), with the refit's settings (3dtrees research 52, 62): a row
@@ -1905,6 +1906,10 @@ pub fn support_tree(scans: &[&ScanIndex], rows: &Rows, context: &[(Point, Point,
         }
         let xy = own_stops(k, rows, context, &nd, &sums);
         let Some(x) = point_circle(&xy, rows.r_prior[k], PTS_BELIEVE * caps[k0].exp()) else { continue };
+        // a circle at its pieces' tubes' edge is the captor a piece's own circle there was refused for (TUBE_EDGE)
+        if (k0..k1).any(|j| reaches_edge(&x, 0.0, sums[j].diag.tube)) {
+            continue;
+        }
         r_points[k0..k1].fill(x[4]);
         if !refuted((k0..k1).map(|j| tally(&sums[j].seen, &x)).fold((0, 0), |a, q| (a.0 + q.0, a.1 + q.1))) {
             let c = point_measure(&x, (k1 - k0) as f64);
@@ -2062,7 +2067,7 @@ pub fn support_tree(scans: &[&ScanIndex], rows: &Rows, context: &[(Point, Point,
         };
         out.rows.push(&x, &cov, fr[k], rows.a[k], own);
     }
-    out.volume = volume(&nd, &sol, &held, &out.pieces.basis, &WIDEN);
+    out.volume = volume(&nd, &sol, &held, &out.pieces.basis);
     Ok(out)
 }
 
@@ -2130,17 +2135,16 @@ fn cap(caps: &[f64], free: &[bool], sol: &mut Solved, held: &mut [(f64, f64)], b
 /// times for its basis (a diagonal scaling of the joint covariance: the nodes' correlations kept, each sd widened as
 /// its basis's), each piece's log R then held in its interval (`held`). A fixed seed, so a tree's volume is a function
 /// of its fit.
-fn volume(nd: &Nodes, sol: &Solved, held: &[(f64, f64)], basis: &[u8], widen: &[f64; 5]) -> Volume {
+fn volume(nd: &Nodes, sol: &Solved, held: &[(f64, f64)], basis: &[u8]) -> Volume {
     let n = nd.row.len();
     let pieces: Vec<usize> = (0..n).filter(|&k| nd.further[k].is_none()).collect();
     let vol = |k: usize, eta: f64| std::f64::consts::PI * (2.0 * eta).exp() * nd.frame[k].3;
     let mut v = Volume { point: pieces.iter().map(|&k| vol(k, sol.x[k][4])).sum(), ..Volume::default() };
-    // each piece's basis's part of the mean (the codes beyond CAPPED, none, are prior's)
+    // each piece's basis's part of the mean
     let mut parts = [0.0f64; 5];
-    let slot: Vec<usize> = basis.iter().map(|&b| usize::from(if (basis::MEASURED..=basis::CAPPED).contains(&b) { b } else { basis::PRIOR }) - 1).collect();
     let chol: Vec<Matrix5<f64>> = sol.inv.iter().map(|m| m.cholesky().map_or_else(|| Matrix5::from_diagonal(&m.diagonal().map(|d| d.max(0.0).sqrt())), |c| c.l())).collect();
     let mut rng = Normal::new(0x5EED_0F_7EE5);
-    let k_of: Vec<f64> = basis.iter().map(|&b| widen[usize::from(b.clamp(basis::MEASURED, basis::CAPPED) - 1)]).collect();
+    let k_of: Vec<f64> = basis.iter().map(|&b| widen(b)).collect();
     let mut d = vec![Vector5::<f64>::zeros(); n];
     let mut draws: Vec<f64> = (0..VOLUME_DRAWS).map(|_| {
         for k in 0..n {
@@ -2149,7 +2153,7 @@ fn volume(nd: &Nodes, sol: &Solved, held: &[(f64, f64)], basis: &[u8], widen: &[
         }
         pieces.iter().map(|&k| {
             let x = vol(k, (sol.x[k][4] + k_of[k] * d[k][4]).max(held[k].0).min(held[k].1));
-            parts[slot[k]] += x;
+            parts[usize::from(basis[k]) - 1] += x;
             x
         }).sum()
     }).collect();
@@ -3431,6 +3435,13 @@ mod tests {
             "flags {} diag {} r_row {} basis {}", q.flags[0], q.diag[0], q.r_row[0], q.basis[0]);
         // nor is the captor's span a lower bound on it
         assert!(q.r_lo[0].is_nan() && q.r[0] < 0.02, "r_lo {} r {}", q.r_lo[0], q.r[0]);
+        // nor does the row's point circle re-fit the captor: a 2.5 cm claim 4.8 cm off the stem, whose own circle and
+        // point circle (inside the refit's shift and width tests) both reach its 10.5 cm tube's edge
+        let rows = Rows { a: &[[0.048, 5.0, -0.05]], b: &[[0.048, 5.0, 0.05]], r_prior: &[0.025], r_max: &[], parent: &[-1] };
+        let t = support_tree(&[&scan], &rows, &[], &like(), &PriorParams::default(), 2).unwrap();
+        let q = &t.pieces;
+        assert!(q.flags[0] == flag::BOUNDS && q.diag[0] & diag::TUBE_EDGE != 0 && q.basis[0] != basis::POINTS && q.r_points[0].is_nan(),
+            "flags {} diag {} basis {} r_points {}", q.flags[0], q.diag[0], q.basis[0], q.r_points[0]);
         assert!(reaches_edge(&Vector5::new(0.07, 0.0, 0.0, 0.0, 0.05), 0.15, 0.115) && !reaches_edge(&Vector5::new(0.01, 0.0, 0.0, 0.0, 0.05), 0.15, 0.115));
         // a lean carries a circle to the edge at its ends
         assert!(reaches_edge(&Vector5::new(0.0, 0.0, 0.3, 0.0, 0.05), 0.15, 0.1));
@@ -3592,14 +3603,15 @@ mod tests {
         }
         let _ = g;
         let chol = hd.try_inverse().unwrap().cholesky().unwrap().l();
-        for widen in [[1.0; 5], WIDEN] {
-            let v = volume(&nd, &sol, &free, &basis, &widen);
+        // each piece widened by its basis's factor
+        {
+            let v = volume(&nd, &sol, &free, &basis);
             let mut rng = Normal::new(7);
             let m = 40_000;
             let mut draws: Vec<f64> = (0..m).map(|_| {
                 let z = nalgebra::DVector::<f64>::from_fn(5 * n, |_, _| rng.next());
                 let d = &chol * z;
-                (0..n).map(|k| std::f64::consts::PI * (2.0 * (sol.x[k][4] + widen[usize::from(basis[k] - 1)] * d[5 * k + 4])).exp() * nd.frame[k].3).sum::<f64>()
+                (0..n).map(|k| std::f64::consts::PI * (2.0 * (sol.x[k][4] + widen(basis[k]) * d[5 * k + 4])).exp() * nd.frame[k].3).sum::<f64>()
             }).collect();
             draws.sort_unstable_by(f64::total_cmp);
             let (q05, q95) = (draws[m / 20], draws[19 * m / 20]);
@@ -3607,7 +3619,7 @@ mod tests {
             // within three standard errors of a percentile of VOLUME_DRAWS draws (in log V, its sd from its spread)
             let se = (0.05f64 * 0.95 / VOLUME_DRAWS as f64).sqrt() / npdf(1.645) * (q95 / q05).ln() / 3.29;
             assert!((v.q05 / q05).ln().abs() < 3.0 * se && (v.q95 / q95).ln().abs() < 3.0 * se && (v.mean / mean).ln().abs() < 3.0 * se,
-                "widen {widen:?}: {v:?} against q05 {q05} q95 {q95} mean {mean} (se {se})");
+                "{v:?} against q05 {q05} q95 {q95} mean {mean} (se {se})");
             // the point is the posterior's; the mean is split by basis (the first row prior, the child bounded)
             let point: f64 = (0..n).map(|k| std::f64::consts::PI * (2.0 * sol.x[k][4]).exp() * nd.frame[k].3).sum();
             assert!((v.point - point).abs() < 1e-12 && (v.prior + v.bounded - v.mean).abs() < 1e-9 * v.mean && v.prior > 0.0 && v.bounded > 0.0 && v.q05 < v.point && v.point < v.q95);
@@ -3615,8 +3627,8 @@ mod tests {
         // a piece held in its interval holds every draw: none wider than its upper bound
         let mut held = free.clone();
         held[0] = (f64::NEG_INFINITY, sol.x[0][4]);
-        let v = volume(&nd, &sol, &held, &basis, &WIDEN);
-        let w = volume(&nd, &sol, &free, &basis, &WIDEN);
+        let v = volume(&nd, &sol, &held, &basis);
+        let w = volume(&nd, &sol, &free, &basis);
         assert!(v.q95 < w.q95 && v.mean < w.mean);
     }
 }
