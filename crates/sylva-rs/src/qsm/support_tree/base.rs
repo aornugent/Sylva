@@ -46,11 +46,12 @@
 //!   already on its wood keeps it; one beside it, inside a trunk wider than its claim, or a fan's axes through air,
 //!   don't; a column of thin stems the rays see between loses to their own rows. A column another member's rows
 //!   already stand on (on [`CTX_SHARE`] of its sections) isn't given to members other than it.
-//! - **Ownership.** A column's rows go to the member whose taken entries carry the most of the skeleton's volume
-//!   above their cuts (of its own and its forks' entries), from the ground under it, or from its owner's own base
-//!   where the owner keeps one (a stem the columns missed stands there too); a fork owned by another member starts that member's base
-//!   at the fork, and an entry whose column is another member's starts its member's base at its cut. A column no
-//!   entry takes is left out. A member that would stand on two bases keeps its rows as they were.
+//! - **Ownership.** A column's rows (one a section, its prior that section's radius) go to the member whose taken
+//!   entries carry the most of the skeleton's volume above their cuts (of its own and its forks' entries), from the
+//!   ground under it, or from its owner's own base where the owner keeps one (a stem the columns missed stands there
+//!   too); a fork owned by another member starts that member's base at the fork, and an entry whose column is another
+//!   member's starts its member's base at its cut. A column no entry takes is left out. A member that would stand on
+//!   two bases keeps its rows as they were.
 //! - **What else under the cut** (the chosen columns' top), of a member re-sectioned: the chains replaced are
 //!   dropped, and so is any other row whose middle lies in a chosen column's circle (the same wood twice) or that
 //!   the veto refutes at a quarter of its radius in every slab it crosses (a fan's row through air); a thin stem
@@ -702,7 +703,10 @@ fn join(rows: &Rows, member: &[i64], centre: &Point, p: &BaseParams, secs: &[Sec
             };
             for &i in &s {
                 let q = [secs[i].c[0], secs[i].c[1], secs[i].z];
-                par = push(&mut reb, start, q, col_r[c], par, owner[c], c as i32);
+                // each row's prior its own section's radius (a sliver's, none: the column's median): the median
+                // overshoots a tapering stem and drew it over its neighbour's points (research 125's shadows)
+                let rr = if secs[i].fitted { secs[i].r } else { col_r[c] };
+                par = push(&mut reb, start, q, rr, par, owner[c], c as i32);
                 sec_row.insert(i, par);
                 start = q;
             }
