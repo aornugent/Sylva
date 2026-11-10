@@ -33,18 +33,18 @@ use crate::Point;
 use nalgebra::{Matrix3, SymmetricEigen, Vector3};
 use std::collections::HashMap;
 
-type V = Vector3<f64>;
+pub(super) type V = Vector3<f64>;
 
-fn v(p: &Point) -> V {
+pub(super) fn v(p: &Point) -> V {
     V::new(p[0], p[1], p[2])
 }
 
-fn pt(x: &V) -> Point {
+pub(super) fn pt(x: &V) -> Point {
     [x[0], x[1], x[2]]
 }
 
 /// Eigenvalues descending, with their unit eigenvectors.
-fn eig(m: &Matrix3<f64>) -> ([f64; 3], [V; 3]) {
+pub(super) fn eig(m: &Matrix3<f64>) -> ([f64; 3], [V; 3]) {
     let e = SymmetricEigen::new(*m);
     let mut idx = [0usize, 1, 2];
     idx.sort_by(|&a, &b| e.eigenvalues[b].partial_cmp(&e.eigenvalues[a]).unwrap_or(std::cmp::Ordering::Equal));
@@ -52,7 +52,7 @@ fn eig(m: &Matrix3<f64>) -> ([f64; 3], [V; 3]) {
     ([e.eigenvalues[idx[0]], e.eigenvalues[idx[1]], e.eigenvalues[idx[2]]], [col(idx[0]), col(idx[1]), col(idx[2])])
 }
 
-fn mad(mut x: Vec<f64>) -> f64 {
+pub(super) fn mad(mut x: Vec<f64>) -> f64 {
     if x.is_empty() {
         return f64::NAN;
     }
@@ -241,7 +241,7 @@ impl Default for RegionStats {
 }
 
 /// Medial collapse about axis `a`: (R, spread, spread at 0, the line's mean point), over the surfels in `idx`.
-fn collapse(p: &[V], n: &[V], idx: &[usize], a: &V, r_max: f64) -> (f64, f64, f64, V) {
+pub(super) fn collapse(p: &[V], n: &[V], idx: &[usize], a: &V, r_max: f64) -> (f64, f64, f64, V) {
     let proj = Matrix3::identity() - a * a.transpose();
     let k = idx.len() as f64;
     let pp: Vec<V> = idx.iter().map(|&i| proj * p[i]).collect();
@@ -262,44 +262,67 @@ fn collapse(p: &[V], n: &[V], idx: &[usize], a: &V, r_max: f64) -> (f64, f64, f6
     (r, s2.sqrt(), aa.sqrt(), q)
 }
 
-/// Each region's statistics over the surfels `p`, `n` (world) of scans `scan`: a surfel counts when it lies within
-/// `1.5 r + margin` of the region's axis and `max(half, r) + margin` of its centre along it.
+/// The surfels in a hash grid, to gather a region's.
+pub struct SurfelGrid {
+    cell: f64,
+    grid: HashMap<[i32; 3], Vec<u32>>,
+}
+
+impl SurfelGrid {
+    pub fn new(p: &[Point]) -> Self {
+        let cell = 0.05;
+        let mut grid: HashMap<[i32; 3], Vec<u32>> = HashMap::new();
+        for (i, x) in p.iter().enumerate() {
+            grid.entry(Self::key(cell, x)).or_default().push(i as u32);
+        }
+        SurfelGrid { cell, grid }
+    }
+
+    fn key(cell: f64, x: &Point) -> [i32; 3] {
+        [(x[0] / cell).floor() as i32, (x[1] / cell).floor() as i32, (x[2] / cell).floor() as i32]
+    }
+
+    /// The surfels of `g` (of its scan, or every scan's): within `1.5 r + margin` of its axis and `max(half, r) +
+    /// margin` of its centre along it.
+    pub fn gather(&self, pv: &[V], scan: &[i32], g: &Region, margin: f64) -> Vec<usize> {
+        let (c, u) = (v(&g.p), v(&g.u).normalize());
+        let (rho, h) = (1.5 * g.r + margin, g.half.max(g.r) + margin);
+        let reach = (rho * rho + h * h).sqrt();
+        let (k0, k1) = (Self::key(self.cell, &pt(&c.add_scalar(-reach))), Self::key(self.cell, &pt(&c.add_scalar(reach))));
+        let mut idx = Vec::new();
+        for x in k0[0]..=k1[0] {
+            for y in k0[1]..=k1[1] {
+                for z in k0[2]..=k1[2] {
+                    for &i in self.grid.get(&[x, y, z]).map(|v| v.as_slice()).unwrap_or(&[]) {
+                        let i = i as usize;
+                        if g.scan >= 0 && scan[i] != g.scan {
+                            continue;
+                        }
+                        let d = pv[i] - c;
+                        let s = d.dot(&u);
+                        if s.abs() <= h && (d - u * s).norm() <= rho {
+                            idx.push(i);
+                        }
+                    }
+                }
+            }
+        }
+        idx
+    }
+}
+
+/// Each region's statistics over the surfels `p`, `n` (world) of scans `scan`, gathered as `SurfelGrid::gather` does.
 pub fn region_stats(p: &[Point], n: &[Point], scan: &[i32], regions: &[Region], margin: f64, min_n: usize, r_max: f64) -> Vec<RegionStats> {
     use rayon::prelude::*;
-    let cell = 0.05;
-    let key = |x: &Point| [(x[0] / cell).floor() as i32, (x[1] / cell).floor() as i32, (x[2] / cell).floor() as i32];
-    let mut grid: HashMap<[i32; 3], Vec<u32>> = HashMap::new();
-    for (i, x) in p.iter().enumerate() {
-        grid.entry(key(x)).or_default().push(i as u32);
-    }
+    let grid = SurfelGrid::new(p);
     let pv: Vec<V> = p.iter().map(v).collect();
     let nv: Vec<V> = n.iter().map(v).collect();
     regions
         .par_iter()
         .map(|g| {
             let mut st = RegionStats::default();
-            let (c, u) = (v(&g.p), v(&g.u).normalize());
-            let (rho, h) = (1.5 * g.r + margin, g.half.max(g.r) + margin);
-            let reach = (rho * rho + h * h).sqrt();
-            let (k0, k1) = (key(&pt(&c.add_scalar(-reach))), key(&pt(&c.add_scalar(reach))));
-            let mut idx = Vec::new();
-            for x in k0[0]..=k1[0] {
-                for y in k0[1]..=k1[1] {
-                    for z in k0[2]..=k1[2] {
-                        for &i in grid.get(&[x, y, z]).map(|v| v.as_slice()).unwrap_or(&[]) {
-                            let i = i as usize;
-                            if g.scan >= 0 && scan[i] != g.scan {
-                                continue;
-                            }
-                            let d = pv[i] - c;
-                            let s = d.dot(&u);
-                            if s.abs() <= h && (d - u * s).norm() <= rho {
-                                idx.push(i);
-                            }
-                        }
-                    }
-                }
-            }
+            let c = v(&g.p);
+            let idx = grid.gather(&pv, scan, g, margin);
             st.n = idx.len() as u32;
             let mut sc: Vec<i32> = idx.iter().map(|&i| scan[i]).collect();
             sc.sort_unstable();
@@ -350,7 +373,7 @@ pub fn region_stats(p: &[Point], n: &[Point], scan: &[i32], regions: &[Region], 
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::*;
     use crate::shots::lattice::scan_lattice;
     use crate::shots::reconstruct::dir;
@@ -359,7 +382,7 @@ mod tests {
 
     /// A regular little scan (0.03 deg steps) of a vertical cylinder `r` at (0, d, 0) before a wall at 20 m, with
     /// `noise` (m) of uniform-ish range noise: the lattice, directions and ranges.
-    fn scene(r: f64, d: f64, noise: f64) -> (Lattice, Vec<Point>, Vec<f32>) {
+    pub(in crate::shots) fn scene(r: f64, d: f64, noise: f64) -> (Lattice, Vec<Point>, Vec<f32>) {
         let (period, interval, step) = (6.6e-3, 0.825e-6, 0.03);
         let omega = step / interval;
         let (mut t, mut dirs, mut rng) = (Vec::new(), Vec::new(), Vec::new());

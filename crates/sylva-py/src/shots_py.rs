@@ -476,6 +476,199 @@ fn shots_surfel_stats<'py>(py: Python<'py>, p: PyReadonlyArray2<f64>, n: PyReado
     Ok(d)
 }
 
+/// One scan's identity signals (sylva_rs::shots::identities), for 3dtrees research 128's identities spike: per kept
+/// pulse (first echo in the box `lo`..`hi`) its world `p`, `surfel` (whether it has a plane-fit surfel; its normal in
+/// `n_plane`, NaN without), the gradient-of-log-range normals `n_grad1` / `n_grad3` (3 x 3 and 7 x 7 windows) with
+/// `cos_grad1` / `cos_grad3` and `full1` / `full3`, and `ridge` (its ridge, -1 none); per ridge `r_cells`,
+/// `r_len_cells`, `r_width_cells`, `r_centre`, `r_u`, `r_len`, `r_rms_off`, `r_end0`, `r_end1`, `r_plane`, `r_refl`,
+/// `r_multi`, `r_range`; and the seconds each step took.
+#[pyfunction]
+#[pyo3(signature = (time, direction, range, refl, echoes, rot, origin, lo, hi, jump=0.05))]
+#[allow(clippy::too_many_arguments)]
+fn shots_scan_identities<'py>(py: Python<'py>, time: PyReadonlyArray1<f64>, direction: PyReadonlyArray2<f64>, range: PyReadonlyArray1<f32>, refl: PyReadonlyArray1<f32>, echoes: PyReadonlyArray1<u8>, rot: PyReadonlyArray2<f64>, origin: Vec<f64>, lo: Vec<f64>, hi: Vec<f64>, jump: f64) -> PyResult<Bound<'py, PyDict>> {
+    use sylva_rs::shots::identities::{grad_normals, ridges};
+    use sylva_rs::shots::opacity::ShadowMap;
+    use sylva_rs::shots::surfels::{surfels, SurfelParams};
+    let dir = xyz_from_py(direction)?;
+    let t = time.as_array().to_vec();
+    let r = range.as_array().to_vec();
+    let (rf, ne) = (refl.as_array().to_vec(), echoes.as_array().to_vec());
+    let rot = xyz_from_py(rot)?;
+    if t.len() != dir.len() || r.len() != dir.len() || rf.len() != dir.len() || ne.len() != dir.len() || rot.len() != 3 {
+        return Err(PyValueError::new_err("per-pulse arrays differ in length, or rot isn't 3 x 3"));
+    }
+    let (origin, lo, hi) = (point3(origin, "origin")?, point3(lo, "lo")?, point3(hi, "hi")?);
+    let rot = [rot[0], rot[1], rot[2]];
+    let nan = [f64::NAN; 3];
+    let out = py.detach(|| {
+        let c0 = std::time::Instant::now();
+        let lat = sylva_rs::shots::lattice::scan_lattice(&t, &dir);
+        let map = ShadowMap::new(&lat, &r, rot, origin);
+        let beam = sylva_rs::qsm::joint::JointParams::default();
+        let keep = |_: usize, p: &[f64; 3]| (0..3).all(|k| p[k] >= lo[k] && p[k] <= hi[k]);
+        let c1 = std::time::Instant::now();
+        let (s, _) = surfels(&map, &dir, keep, |x| beam.footprint(x), &SurfelParams::default());
+        let c2 = std::time::Instant::now();
+        let g1 = grad_normals(&map, &dir, keep, 1, 0.05, 0.2);
+        let c3 = std::time::Instant::now();
+        let g3 = grad_normals(&map, &dir, keep, 3, 0.05, 0.2);
+        let c4 = std::time::Instant::now();
+        let mut has = vec![false; dir.len()];
+        for x in &s {
+            has[x.pulse as usize] = true;
+        }
+        let (label, rd) = ridges(&map, &dir, &rf, &ne, keep, &has, jump);
+        let c5 = std::time::Instant::now();
+        // the kept pulses are those with a gradient normal attempt: every kept first echo
+        let pulses: Vec<usize> = g3.iter().map(|x| x.pulse as usize).collect();
+        let secs = [(c1 - c0).as_secs_f64(), (c2 - c1).as_secs_f64(), (c3 - c2).as_secs_f64(), (c4 - c3).as_secs_f64(), (c5 - c4).as_secs_f64()];
+        (s, g1, g3, label, rd, pulses, secs)
+    });
+    let (s, g1, g3, label, rd, pulses, secs) = out;
+    // the kept pulses: those with a 7 x 7 gradient normal (every kept cell with a neighbour), plus surfel pulses
+    let mut all: Vec<usize> = pulses.clone();
+    all.extend(s.iter().map(|x| x.pulse as usize));
+    all.extend(label.iter().enumerate().filter(|(_, &l)| l != u32::MAX).map(|(i, _)| i));
+    all.sort_unstable();
+    all.dedup();
+    let pos: std::collections::HashMap<usize, usize> = all.iter().enumerate().map(|(k, &i)| (i, k)).collect();
+    let n = all.len();
+    let mut n_plane = vec![nan; n];
+    let mut surf = vec![false; n];
+    for x in &s {
+        let k = pos[&(x.pulse as usize)];
+        n_plane[k] = x.n;
+        surf[k] = true;
+    }
+    let fill = |g: &[sylva_rs::shots::identities::GradNormal]| {
+        let (mut nn, mut cs, mut fl) = (vec![nan; n], vec![f64::NAN; n], vec![false; n]);
+        for x in g {
+            let k = pos[&(x.pulse as usize)];
+            nn[k] = x.n;
+            cs[k] = x.cos_inc;
+            fl[k] = x.full;
+        }
+        (nn, cs, fl)
+    };
+    let (n1, c1, f1) = fill(&g1);
+    let (n3, c3, f3) = fill(&g3);
+    let rot_m = rot;
+    let p: Vec<[f64; 3]> = all
+        .iter()
+        .map(|&i| {
+            let x = [dir[i][0] * r[i] as f64, dir[i][1] * r[i] as f64, dir[i][2] * r[i] as f64];
+            [0, 1, 2].map(|a| rot_m[a][0] * x[0] + rot_m[a][1] * x[1] + rot_m[a][2] * x[2] + origin[a])
+        })
+        .collect();
+    let d = PyDict::new(py);
+    d.set_item("pulse", all.iter().map(|&i| i as u32).collect::<Vec<_>>().into_pyarray(py))?;
+    d.set_item("p", xyz_to_py(py, &p))?;
+    d.set_item("surfel", surf.into_pyarray(py))?;
+    d.set_item("n_plane", xyz_to_py(py, &n_plane))?;
+    d.set_item("n_grad1", xyz_to_py(py, &n1))?;
+    d.set_item("n_grad3", xyz_to_py(py, &n3))?;
+    d.set_item("cos_grad1", c1.into_pyarray(py))?;
+    d.set_item("cos_grad3", c3.into_pyarray(py))?;
+    d.set_item("full1", f1.into_pyarray(py))?;
+    d.set_item("full3", f3.into_pyarray(py))?;
+    d.set_item("ridge", all.iter().map(|&i| if label[i] == u32::MAX { -1 } else { label[i] as i64 }).collect::<Vec<_>>().into_pyarray(py))?;
+    macro_rules! col {
+        ($name:literal, $f:expr) => {
+            d.set_item($name, rd.iter().map($f).collect::<Vec<_>>().into_pyarray(py))?;
+        };
+    }
+    macro_rules! xyz {
+        ($name:literal, $f:expr) => {
+            d.set_item($name, xyz_to_py(py, &rd.iter().map($f).collect::<Vec<_>>()))?;
+        };
+    }
+    col!("r_cells", |x| x.cells);
+    col!("r_len_cells", |x| x.len_cells);
+    col!("r_width_cells", |x| x.width_cells);
+    col!("r_len", |x| x.len);
+    col!("r_rms_off", |x| x.rms_off);
+    col!("r_refl", |x| x.refl);
+    col!("r_multi", |x| x.multi);
+    col!("r_range", |x| x.range);
+    xyz!("r_centre", |x| x.centre);
+    xyz!("r_u", |x| x.u);
+    xyz!("r_end0", |x| x.end0);
+    xyz!("r_end1", |x| x.end1);
+    xyz!("r_plane", |x| x.plane);
+    for (k, name) in ["lattice_s", "surfels_s", "grad1_s", "grad3_s", "ridges_s"].iter().enumerate() {
+        d.set_item(*name, secs[k])?;
+    }
+    Ok(d)
+}
+
+/// Line-complex axes, medial collapse and support harmonics of query regions (sylva_rs::shots::identities::
+/// region_lines): surfels `p`, `n` (m, 3), `scan`, `delta` (m; each surfel moved along its normal by it before the
+/// fits, after the gather; empty for none), `attr` (k, m: k attributes averaged over each region); regions as
+/// `shots_surfel_stats`; `what` as region_lines. Returns per region `n`, `n_scans`; for the cylinder (`cyl_`) and
+/// cone (`cone_`) fits `u`, `c` (k, 3), `lam`, `lam2`, `r`, `nu`, `used`; medial `med_u`, `med_c`, `med_r`,
+/// `med_spread`, `med_spread0`; the same about the line-complex axis `mlc_c`, `mlc_r`, `mlc_spread`, `mlc_spread0`;
+/// `harm` (k, 5), `harm_gap` (rad), `harm_rms` (m), `harm_n`; `attr` (k_regions, k);
+/// `secs`.
+#[pyfunction]
+#[pyo3(signature = (p, n, scan, delta, attr, reg_p, reg_u, reg_half, reg_r, reg_scan, margin=0.02, min_n=10, what=31))]
+#[allow(clippy::too_many_arguments)]
+fn shots_region_lines<'py>(py: Python<'py>, p: PyReadonlyArray2<f64>, n: PyReadonlyArray2<f64>, scan: PyReadonlyArray1<i32>, delta: PyReadonlyArray1<f64>, attr: PyReadonlyArray2<f64>, reg_p: PyReadonlyArray2<f64>, reg_u: PyReadonlyArray2<f64>, reg_half: PyReadonlyArray1<f64>, reg_r: PyReadonlyArray1<f64>, reg_scan: PyReadonlyArray1<i32>, margin: f64, min_n: usize, what: u32) -> PyResult<Bound<'py, PyDict>> {
+    use numpy::PyArray2;
+    use sylva_rs::shots::identities::region_lines;
+    use sylva_rs::shots::surfels::Region;
+    let (p, n, scan, delta) = (xyz_from_py(p)?, xyz_from_py(n)?, scan.as_array().to_vec(), delta.as_array().to_vec());
+    let attr: Vec<Vec<f64>> = attr.as_array().rows().into_iter().map(|r| r.to_vec()).collect();
+    let (rp, ru) = (xyz_from_py(reg_p)?, xyz_from_py(reg_u)?);
+    let (rh, rr, rs) = (reg_half.as_array().to_vec(), reg_r.as_array().to_vec(), reg_scan.as_array().to_vec());
+    if n.len() != p.len() || scan.len() != p.len() || (!delta.is_empty() && delta.len() != p.len()) || attr.iter().any(|a| a.len() != p.len())
+        || ru.len() != rp.len() || rh.len() != rp.len() || rr.len() != rp.len() || rs.len() != rp.len()
+    {
+        return Err(PyValueError::new_err("surfel or region arrays differ in length"));
+    }
+    let regs: Vec<Region> = (0..rp.len()).map(|i| Region { p: rp[i], u: ru[i], half: rh[i], r: rr[i], scan: rs[i] }).collect();
+    let (st, secs) = py.detach(|| {
+        let c0 = std::time::Instant::now();
+        let st = region_lines(&p, &n, &scan, &delta, &attr, &regs, margin, min_n, what);
+        (st, c0.elapsed().as_secs_f64())
+    });
+    let d = PyDict::new(py);
+    let nan = [f64::NAN; 3];
+    let p3 = |x: &nalgebra::Vector3<f64>| [x[0], x[1], x[2]];
+    d.set_item("n", st.iter().map(|x| x.n).collect::<Vec<_>>().into_pyarray(py))?;
+    d.set_item("n_scans", st.iter().map(|x| x.n_scans).collect::<Vec<_>>().into_pyarray(py))?;
+    for (pre, get) in [("cyl_", 0usize), ("cone_", 1)] {
+        let f = |x: &sylva_rs::shots::identities::RegionLines| if get == 0 { x.cyl } else { x.cone };
+        d.set_item(format!("{pre}u"), xyz_to_py(py, &st.iter().map(|x| f(x).map(|l| p3(&l.u)).unwrap_or(nan)).collect::<Vec<_>>()))?;
+        d.set_item(format!("{pre}c"), xyz_to_py(py, &st.iter().map(|x| f(x).map(|l| p3(&l.c)).unwrap_or(nan)).collect::<Vec<_>>()))?;
+        d.set_item(format!("{pre}lam"), st.iter().map(|x| f(x).map(|l| l.lam).unwrap_or(f64::NAN)).collect::<Vec<_>>().into_pyarray(py))?;
+        d.set_item(format!("{pre}lam2"), st.iter().map(|x| f(x).map(|l| l.lam2).unwrap_or(f64::NAN)).collect::<Vec<_>>().into_pyarray(py))?;
+        d.set_item(format!("{pre}r"), st.iter().map(|x| f(x).map(|l| l.r).unwrap_or(f64::NAN)).collect::<Vec<_>>().into_pyarray(py))?;
+        d.set_item(format!("{pre}nu"), st.iter().map(|x| f(x).map(|l| l.nu).unwrap_or(f64::NAN)).collect::<Vec<_>>().into_pyarray(py))?;
+        d.set_item(format!("{pre}used"), st.iter().map(|x| f(x).map(|l| l.used as i64).unwrap_or(0)).collect::<Vec<_>>().into_pyarray(py))?;
+    }
+    d.set_item("med_u", xyz_to_py(py, &st.iter().map(|x| x.medial.map(|m| p3(&m.0)).unwrap_or(nan)).collect::<Vec<_>>()))?;
+    d.set_item("med_c", xyz_to_py(py, &st.iter().map(|x| x.medial.map(|m| p3(&m.4)).unwrap_or(nan)).collect::<Vec<_>>()))?;
+    d.set_item("med_r", st.iter().map(|x| x.medial.map(|m| m.1).unwrap_or(f64::NAN)).collect::<Vec<_>>().into_pyarray(py))?;
+    d.set_item("med_spread", st.iter().map(|x| x.medial.map(|m| m.2).unwrap_or(f64::NAN)).collect::<Vec<_>>().into_pyarray(py))?;
+    d.set_item("med_spread0", st.iter().map(|x| x.medial.map(|m| m.3).unwrap_or(f64::NAN)).collect::<Vec<_>>().into_pyarray(py))?;
+    d.set_item("mlc_c", xyz_to_py(py, &st.iter().map(|x| x.medial_lc.map(|m| p3(&m.4)).unwrap_or(nan)).collect::<Vec<_>>()))?;
+    d.set_item("mlc_r", st.iter().map(|x| x.medial_lc.map(|m| m.1).unwrap_or(f64::NAN)).collect::<Vec<_>>().into_pyarray(py))?;
+    d.set_item("mlc_spread", st.iter().map(|x| x.medial_lc.map(|m| m.2).unwrap_or(f64::NAN)).collect::<Vec<_>>().into_pyarray(py))?;
+    d.set_item("mlc_spread0", st.iter().map(|x| x.medial_lc.map(|m| m.3).unwrap_or(f64::NAN)).collect::<Vec<_>>().into_pyarray(py))?;
+    let harm: Vec<Vec<f64>> = st.iter().map(|x| x.support.map(|s| s.0.to_vec()).unwrap_or(vec![f64::NAN; 5])).collect();
+    d.set_item("harm", PyArray2::from_vec2(py, &harm)?)?;
+    d.set_item("harm_gap", st.iter().map(|x| x.support.map(|s| s.1).unwrap_or(f64::NAN)).collect::<Vec<_>>().into_pyarray(py))?;
+    d.set_item("harm_rms", st.iter().map(|x| x.support.map(|s| s.2).unwrap_or(f64::NAN)).collect::<Vec<_>>().into_pyarray(py))?;
+    d.set_item("harm_n", st.iter().map(|x| x.support.map(|s| s.3 as i64).unwrap_or(0)).collect::<Vec<_>>().into_pyarray(py))?;
+    let k = attr.len();
+    let am: Vec<Vec<f64>> = st.iter().map(|x| if k == 0 { vec![] } else { x.attr.clone() }).collect();
+    if k > 0 {
+        d.set_item("attr", PyArray2::from_vec2(py, &am)?)?;
+    }
+    d.set_item("secs", secs)?;
+    Ok(d)
+}
+
 pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     for f in [
         wrap_pyfunction!(shots_shot_of_echo, m)?,
@@ -492,6 +685,8 @@ pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
         wrap_pyfunction!(shots_scan_opacity, m)?,
         wrap_pyfunction!(shots_scan_surfels, m)?,
         wrap_pyfunction!(shots_surfel_stats, m)?,
+        wrap_pyfunction!(shots_scan_identities, m)?,
+        wrap_pyfunction!(shots_region_lines, m)?,
     ] {
         m.add_function(f)?;
     }
