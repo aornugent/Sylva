@@ -171,6 +171,94 @@ fn shots_scan_stripes<'py>(py: Python<'py>, time: PyReadonlyArray1<f64>, directi
     Ok(d)
 }
 
+fn point3(v: Vec<f64>, name: &str) -> PyResult<[f64; 3]> {
+    v.try_into().map_err(|_| PyValueError::new_err(format!("{name} needs 3 values")))
+}
+
+/// One scan's stripes (as `shots_scan_stripes`) as short axis pieces in the
+/// world frame (sylva_rs::shots::tracts::segments): `rot` (3, 3, world =
+/// rot . scanner) and `origin` place the scan; pieces whose point lies in the
+/// box `lo`..`hi` are kept. Returns `p`, `u` (n, 3), `half`, `w`, `r`, the
+/// slice count and the seconds each step took.
+#[pyfunction]
+#[pyo3(signature = (time, direction, range, rot, origin, lo, hi, window=5, max_step=6.0))]
+#[allow(clippy::too_many_arguments)]
+fn shots_scan_segments<'py>(py: Python<'py>, time: PyReadonlyArray1<f64>, direction: PyReadonlyArray2<f64>, range: PyReadonlyArray1<f32>, rot: PyReadonlyArray2<f64>, origin: Vec<f64>, lo: Vec<f64>, hi: Vec<f64>, window: usize, max_step: f64) -> PyResult<Bound<'py, PyDict>> {
+    use sylva_rs::shots::stripes::{stripes, StripeParams};
+    use sylva_rs::shots::tracts::segments;
+    let dir = xyz_from_py(direction)?;
+    let t = time.as_array().to_vec();
+    let r = range.as_array().to_vec();
+    let rot = xyz_from_py(rot)?;
+    if t.len() != dir.len() || r.len() != dir.len() || rot.len() != 3 {
+        return Err(PyValueError::new_err("time, direction and range differ in length, or rot isn't 3 x 3"));
+    }
+    let (origin, lo, hi) = (point3(origin, "origin")?, point3(lo, "lo")?, point3(hi, "hi")?);
+    let (n_sl, segs, secs) = py.detach(|| {
+        let c0 = std::time::Instant::now();
+        let lat = sylva_rs::shots::lattice::scan_lattice(&t, &dir);
+        let c1 = std::time::Instant::now();
+        let s = stripes(&lat, &r, &dir, &StripeParams::default());
+        let c2 = std::time::Instant::now();
+        let g = segments(&s, [rot[0], rot[1], rot[2]], origin, window, max_step, lo, hi);
+        (s.len(), g, [(c1 - c0).as_secs_f64(), (c2 - c1).as_secs_f64(), c2.elapsed().as_secs_f64()])
+    });
+    let d = PyDict::new(py);
+    d.set_item("p", xyz_to_py(py, &segs.iter().map(|x| x.p).collect::<Vec<_>>()))?;
+    d.set_item("u", xyz_to_py(py, &segs.iter().map(|x| x.u).collect::<Vec<_>>()))?;
+    d.set_item("half", segs.iter().map(|x| x.half).collect::<Vec<_>>().into_pyarray(py))?;
+    d.set_item("w", segs.iter().map(|x| x.w).collect::<Vec<_>>().into_pyarray(py))?;
+    d.set_item("r", segs.iter().map(|x| x.r).collect::<Vec<_>>().into_pyarray(py))?;
+    d.set_item("n_slices", n_sl)?;
+    for (k, v) in ["lattice_s", "stripes_s", "segments_s"].iter().zip(secs) {
+        d.set_item(*k, v)?;
+    }
+    Ok(d)
+}
+
+/// Streamlines through the orientation field of axis pieces `p`, `u`, `half`,
+/// `w` (sylva_rs::shots::tracts): from each seed (n, 3), heading up, within
+/// the box `lo`..`hi`. Returns per point `point` (n, 3), `line`, `seed`; per
+/// line `line_seed`, `line_parent` (-1 from the seed) and `line_stop` (0 band,
+/// 1 no data, 2 merged, 3 step cap, 4 line cap); the voxels' `voxel_key`
+/// (n, 3), `voxel_w` and `voxel_l1` (the tensor's l1 / trace); and the seconds
+/// to build the field and to trace.
+#[pyfunction]
+#[pyo3(signature = (p, u, half, w, seeds, lo, hi, voxel=0.025, step=0.01, cone=45.0, min_w=0.05, gap=0.10, seed_gap=0.5, fork_share=0.25, fork_angle=20.0, fork_every=0.10, centre=0.5, merge_after=0.10, max_lines=400))]
+#[allow(clippy::too_many_arguments)]
+fn shots_tracts<'py>(py: Python<'py>, p: PyReadonlyArray2<f64>, u: PyReadonlyArray2<f64>, half: PyReadonlyArray1<f64>, w: PyReadonlyArray1<f64>, seeds: PyReadonlyArray2<f64>, lo: Vec<f64>, hi: Vec<f64>, voxel: f64, step: f64, cone: f64, min_w: f64, gap: f64, seed_gap: f64, fork_share: f64, fork_angle: f64, fork_every: f64, centre: f64, merge_after: f64, max_lines: usize) -> PyResult<Bound<'py, PyDict>> {
+    use sylva_rs::shots::tracts::{trace, Field, Segment, TractParams};
+    let (pp, uu, seeds) = (xyz_from_py(p)?, xyz_from_py(u)?, xyz_from_py(seeds)?);
+    let (half, w) = (half.as_array().to_vec(), w.as_array().to_vec());
+    if uu.len() != pp.len() || half.len() != pp.len() || w.len() != pp.len() {
+        return Err(PyValueError::new_err("p, u, half and w differ in length"));
+    }
+    let (lo, hi) = (point3(lo, "lo")?, point3(hi, "hi")?);
+    let segs: Vec<Segment> = (0..pp.len()).map(|i| Segment { p: pp[i], u: uu[i], half: half[i], w: w[i], r: f64::NAN }).collect();
+    let prm = TractParams { voxel, step, cone, min_w, gap, seed_gap, fork_share, fork_angle, fork_every, centre, merge_after, max_lines, ..TractParams::default() };
+    let (t, summary, secs) = py.detach(|| {
+        let c0 = std::time::Instant::now();
+        let f = Field::build(&segs, prm.voxel);
+        let c1 = std::time::Instant::now();
+        let t = trace(&f, &seeds, lo, hi, &prm);
+        let c2 = std::time::Instant::now();
+        (t, f.summary(), [(c1 - c0).as_secs_f64(), (c2 - c1).as_secs_f64()])
+    });
+    let d = PyDict::new(py);
+    d.set_item("point", xyz_to_py(py, &t.point))?;
+    d.set_item("line", t.line.into_pyarray(py))?;
+    d.set_item("seed", t.seed.into_pyarray(py))?;
+    d.set_item("line_seed", t.line_seed.into_pyarray(py))?;
+    d.set_item("line_parent", t.line_parent.into_pyarray(py))?;
+    d.set_item("line_stop", t.line_stop.into_pyarray(py))?;
+    d.set_item("voxel_key", summary.iter().flat_map(|x| x.0).collect::<Vec<i32>>().into_pyarray(py).reshape([summary.len(), 3])?)?;
+    d.set_item("voxel_w", summary.iter().map(|x| x.1).collect::<Vec<_>>().into_pyarray(py))?;
+    d.set_item("voxel_l1", summary.iter().map(|x| x.2).collect::<Vec<_>>().into_pyarray(py))?;
+    d.set_item("build_s", secs[0])?;
+    d.set_item("trace_s", secs[1])?;
+    Ok(d)
+}
+
 pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     for f in [
         wrap_pyfunction!(shots_shot_of_echo, m)?,
@@ -182,6 +270,8 @@ pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
         wrap_pyfunction!(shots_fill_missing, m)?,
         wrap_pyfunction!(shots_scan_lattice, m)?,
         wrap_pyfunction!(shots_scan_stripes, m)?,
+        wrap_pyfunction!(shots_scan_segments, m)?,
+        wrap_pyfunction!(shots_tracts, m)?,
     ] {
         m.add_function(f)?;
     }

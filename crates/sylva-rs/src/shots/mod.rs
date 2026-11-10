@@ -10,6 +10,7 @@
 
 pub mod lattice;
 pub mod stripes;
+pub mod tracts;
 pub mod ops;
 pub mod reconstruct;
 
