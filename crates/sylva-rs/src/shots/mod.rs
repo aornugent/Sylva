@@ -11,6 +11,7 @@
 pub mod identities;
 pub mod lattice;
 pub mod opacity;
+pub mod strands;
 pub mod stripes;
 pub mod surfels;
 pub mod tracts;
