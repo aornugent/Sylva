@@ -66,6 +66,57 @@ pub struct Lattice {
     pub azimuth_profile: Vec<f64>,
     /// Recorded pulses per cell, row-major `(line, col)`, saturating at 255.
     pub count: Vec<u8>,
+    /// Per line, column 0's cell-centre azimuth before the column profile (degrees, unwrapped along the lines;
+    /// lines without pulses interpolated), and the head's turn per column along a line (degrees): a cell centre's
+    /// azimuth is `line_azimuth0[l] + azimuth_per_col * c + azimuth_profile[c]` ([`Lattice::cell_direction`]).
+    pub line_azimuth0: Vec<f64>,
+    pub azimuth_per_col: f64,
+}
+
+impl Lattice {
+    fn phase0(&self, l: usize) -> f64 {
+        let p = self.line_phase[l];
+        if p.is_finite() { p } else { 0.0 }
+    }
+
+    /// The cell centre's (zenith, azimuth) in degrees, at a fractional cell (the profiles at the nearest column).
+    pub fn cell_angles(&self, l: f64, c: f64) -> (f64, f64) {
+        let li = (l.round().max(0.0) as usize).min(self.n_lines - 1);
+        let ci = (c.round().max(0.0) as usize).min(self.n_cols - 1);
+        let zen = self.zenith0 + (c + self.phase0(li)) * self.zenith_step + self.zenith_profile[ci];
+        let a0 = self.line_azimuth0[li] + (l - li as f64) * self.azimuth_step;
+        (zen, a0 + self.azimuth_per_col * c + self.azimuth_profile[ci])
+    }
+
+    /// The unit direction (scanner frame) of a cell's centre.
+    pub fn cell_direction(&self, l: f64, c: f64) -> Point {
+        let (z, a) = self.cell_angles(l, c);
+        super::reconstruct::dir(z, a)
+    }
+
+    /// The fractional cell `(line, col)` a direction (scanner frame) falls in: the cell-centre model inverted by
+    /// fixed-point steps; `None` outside the lattice. Where the first and last lines overlap (a sweep of a little
+    /// over 360°), the earlier line.
+    pub fn cell_of(&self, d: &Point) -> Option<(f64, f64)> {
+        if self.n_lines < 2 || self.n_cols == 0 {
+            return None;
+        }
+        let (zq, aq) = zen_az(d);
+        let (s, a0) = (self.azimuth_step, self.line_azimuth0[0]);
+        let wrap = |x: f64| x - 360.0 * (x / 360.0).round();
+        let mut c = (zq - self.zenith0) / self.zenith_step;
+        let mut l = 0.0;
+        for _ in 0..4 {
+            let ci = (c.round().max(0.0) as usize).min(self.n_cols - 1);
+            let a = aq - self.azimuth_per_col * c - self.azimuth_profile[ci];
+            let d0 = if s > 0.0 { (a - a0).rem_euclid(360.0) } else { -(a0 - a).rem_euclid(360.0) };
+            let li = ((d0 / s).round().max(0.0) as usize).min(self.n_lines - 1);
+            l = li as f64 + wrap(a - self.line_azimuth0[li]) / s;
+            let li = (l.round().max(0.0) as usize).min(self.n_lines - 1);
+            c = (zq - self.zenith0 - self.zenith_profile[ci]) / self.zenith_step - self.phase0(li);
+        }
+        (l > -0.5 && l < self.n_lines as f64 - 0.5 && c > -0.5 && c < self.n_cols as f64 - 0.5).then_some((l, c))
+    }
 }
 
 /// The native lattice of one scan's pulses, given in acquisition order:
@@ -266,6 +317,25 @@ pub fn scan_lattice(time: &[f64], direction: &[Point]) -> Lattice {
         zres[i] = ((zres[i] as f64 - zp[c]) / step) as f32;
         ares[i] = ((ares[i] as f64 - ap[c]) / az_step) as f32;
     }
+    // Column 0's azimuth per line, before the profile: the head turn at its slot plus the line's own offset;
+    // lines without pulses on the uniform turn.
+    out.line_azimuth0 = (0..n_lines)
+        .map(|l| {
+            if line_epoch[l].is_finite() && line_az[l].is_finite() {
+                az0 + az_rate * (line_epoch[l] + (lo as f64 + phase[l]) * interval) + line_az[l]
+            } else {
+                f64::NAN
+            }
+        })
+        .collect();
+    let first = out.line_azimuth0.iter().position(|a| a.is_finite()).unwrap_or(0);
+    let base = out.line_azimuth0[first] - first as f64 * az_step;
+    for (l, a) in out.line_azimuth0.iter_mut().enumerate() {
+        if !a.is_finite() {
+            *a = base + l as f64 * az_step;
+        }
+    }
+    out.azimuth_per_col = az_rate * interval;
     out.line_azimuth = line_az.iter().map(|a| a / az_step).collect();
     out.zenith_profile = zp;
     out.azimuth_profile = ap;
@@ -338,6 +408,11 @@ mod tests {
         }
         // Each recorded pulse fills one cell; the rest are exactly the dropped ones.
         assert!(lat.count.iter().all(|&c| c <= 1));
+        // The cell-centre model inverts: each pulse's direction falls in its own cell.
+        for (i, dd) in d.iter().enumerate().step_by(7) {
+            let (l, c) = lat.cell_of(dd).expect("inside");
+            assert!((l - lat.line[i] as f64).abs() < 0.5 && (c - lat.col[i] as f64).abs() < 0.5, "pulse {i}: ({l}, {c}) vs ({}, {})", lat.line[i], lat.col[i]);
+        }
         for l in 0..lines {
             for c in 0..lat.n_cols {
                 let k = c as i64 + shift;

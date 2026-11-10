@@ -234,7 +234,7 @@ fn shots_tracts<'py>(py: Python<'py>, p: PyReadonlyArray2<f64>, u: PyReadonlyArr
         return Err(PyValueError::new_err("p, u, half and w differ in length"));
     }
     let (lo, hi) = (point3(lo, "lo")?, point3(hi, "hi")?);
-    let segs: Vec<Segment> = (0..pp.len()).map(|i| Segment { p: pp[i], u: uu[i], half: half[i], w: w[i], r: f64::NAN }).collect();
+    let segs: Vec<Segment> = (0..pp.len()).map(|i| Segment { p: pp[i], u: uu[i], half: half[i], w: w[i], r: f64::NAN, slice: 0 }).collect();
     let prm = TractParams { voxel, step, cone, min_w, gap, seed_gap, fork_share, fork_angle, fork_every, centre, merge_after, max_lines, ..TractParams::default() };
     let (t, summary, secs) = py.detach(|| {
         let c0 = std::time::Instant::now();
@@ -259,6 +259,121 @@ fn shots_tracts<'py>(py: Python<'py>, p: PyReadonlyArray2<f64>, u: PyReadonlyArr
     Ok(d)
 }
 
+/// One scan as a shadow map (sylva_rs::shots::opacity), for 3dtrees research
+/// 128's opacity spike. Takes the pulses as `shots_scan_segments` does, plus
+/// each pulse's echo count `n_echo` and first-echo reflectance `refl`, and
+/// query cylinders `cyl_p`, `cyl_u` (n, 3, world), `cyl_half`, `cyl_r` (m).
+/// Returns the scan's own segments in the box `lo`..`hi` (`p`, `u`, `half`,
+/// `w`, `r`) with their slices' `pass`, `line`, `col`, `lo_cell`, `hi_cell`,
+/// `range`, `half_app`, `edge_lo`, `edge_hi`, `open_lo`, `open_hi`,
+/// `width_cells`, `stripe`, and the single-scan features (`jitter`, `multi`,
+/// `refl`, `empty`, `arc`, `fa`, `cells`); the query cylinders' samples
+/// against this scan (`s_cyl`, `s_outcome` 0 support 1 refute 2 occluded 3
+/// unknown, `s_chord`, `s_miss`, `s_t_in`, `s_depth`); the lattice round trip
+/// on every 997th pulse (`roundtrip_line`, `roundtrip_col`: cell_of minus the
+/// cell); optionally (`image`) every pulse's `pulse_line`, `pulse_col`; and
+/// the seconds each step took.
+#[pyfunction]
+#[pyo3(signature = (time, direction, range, n_echo, refl, rot, origin, lo, hi, cyl_p, cyl_u, cyl_half, cyl_r, tol=0.015, voxel=0.06, pad=3, window=5, max_step=6.0, max_cells=60.0, image=false))]
+#[allow(clippy::too_many_arguments)]
+fn shots_scan_opacity<'py>(py: Python<'py>, time: PyReadonlyArray1<f64>, direction: PyReadonlyArray2<f64>, range: PyReadonlyArray1<f32>, n_echo: PyReadonlyArray1<u8>, refl: PyReadonlyArray1<f32>, rot: PyReadonlyArray2<f64>, origin: Vec<f64>, lo: Vec<f64>, hi: Vec<f64>, cyl_p: PyReadonlyArray2<f64>, cyl_u: PyReadonlyArray2<f64>, cyl_half: PyReadonlyArray1<f64>, cyl_r: PyReadonlyArray1<f64>, tol: f64, voxel: f64, pad: i64, window: usize, max_step: f64, max_cells: f64, image: bool) -> PyResult<Bound<'py, PyDict>> {
+    use sylva_rs::shots::opacity::{features, Cyl, ShadowMap};
+    use sylva_rs::shots::stripes::{stripes, StripeParams};
+    use sylva_rs::shots::tracts::segments;
+    let dir = xyz_from_py(direction)?;
+    let t = time.as_array().to_vec();
+    let r = range.as_array().to_vec();
+    let ne = n_echo.as_array().to_vec();
+    let rf = refl.as_array().to_vec();
+    let rot = xyz_from_py(rot)?;
+    if t.len() != dir.len() || r.len() != dir.len() || ne.len() != dir.len() || rf.len() != dir.len() || rot.len() != 3 {
+        return Err(PyValueError::new_err("per-pulse arrays differ in length, or rot isn't 3 x 3"));
+    }
+    let (origin, lo, hi) = (point3(origin, "origin")?, point3(lo, "lo")?, point3(hi, "hi")?);
+    let (cp, cu) = (xyz_from_py(cyl_p)?, xyz_from_py(cyl_u)?);
+    let (ch, cr) = (cyl_half.as_array().to_vec(), cyl_r.as_array().to_vec());
+    let cyls: Vec<Cyl> = (0..cp.len()).map(|i| Cyl { p: cp[i], u: cu[i], half: ch[i], r: cr[i] }).collect();
+    let rot = [rot[0], rot[1], rot[2]];
+    let (sl, segs, feats, samples, rt, secs, img) = py.detach(|| {
+        let c0 = std::time::Instant::now();
+        let lat = sylva_rs::shots::lattice::scan_lattice(&t, &dir);
+        let c1 = std::time::Instant::now();
+        let prm = StripeParams::default();
+        let sl = stripes(&lat, &r, &dir, &prm);
+        let segs = segments(&sl, rot, origin, window, max_step, lo, hi);
+        let c2 = std::time::Instant::now();
+        let map = ShadowMap::new(&lat, &r, rot, origin);
+        let feats = features(&map, &sl, &segs, &ne, &rf, voxel, pad);
+        let c3 = std::time::Instant::now();
+        let beam = prm.beam.clone();
+        let samples = map.test(&cyls, |x| beam.footprint(x), tol, max_cells);
+        let c4 = std::time::Instant::now();
+        let mut rt = (Vec::new(), Vec::new());
+        for i in (0..dir.len()).step_by(997) {
+            if lat.line[i] == u32::MAX {
+                continue;
+            }
+            if let Some((l, c)) = lat.cell_of(&dir[i]) {
+                rt.0.push(l - lat.line[i] as f64);
+                rt.1.push(c - lat.col[i] as f64);
+            }
+        }
+        let secs = [(c1 - c0).as_secs_f64(), (c2 - c1).as_secs_f64(), (c3 - c2).as_secs_f64(), (c4 - c3).as_secs_f64()];
+        let img = image.then(|| (lat.line.clone(), lat.col.clone(), lat.n_lines, lat.n_cols));
+        (sl, segs, feats, samples, rt, secs, img)
+    });
+    let d = PyDict::new(py);
+    d.set_item("p", xyz_to_py(py, &segs.iter().map(|x| x.p).collect::<Vec<_>>()))?;
+    d.set_item("u", xyz_to_py(py, &segs.iter().map(|x| x.u).collect::<Vec<_>>()))?;
+    macro_rules! col {
+        ($v:expr, $name:literal, $f:expr) => {
+            d.set_item($name, $v.iter().map($f).collect::<Vec<_>>().into_pyarray(py))?;
+        };
+    }
+    col!(segs, "half", |x| x.half);
+    col!(segs, "w", |x| x.w);
+    col!(segs, "r", |x| x.r);
+    col!(segs, "pass", |x| sl[x.slice].pass);
+    col!(segs, "line", |x| sl[x.slice].line);
+    col!(segs, "col", |x| sl[x.slice].col);
+    col!(segs, "lo_cell", |x| sl[x.slice].lo);
+    col!(segs, "hi_cell", |x| sl[x.slice].hi);
+    col!(segs, "range", |x| sl[x.slice].range);
+    col!(segs, "half_app", |x| sl[x.slice].half_app);
+    col!(segs, "edge_lo", |x| sl[x.slice].edge_lo);
+    col!(segs, "edge_hi", |x| sl[x.slice].edge_hi);
+    col!(segs, "open_lo", |x| sl[x.slice].open_lo);
+    col!(segs, "open_hi", |x| sl[x.slice].open_hi);
+    col!(segs, "width_cells", |x| sl[x.slice].width_cells);
+    col!(segs, "stripe", |x| sl[x.slice].stripe);
+    col!(feats, "jitter", |x| x.jitter);
+    col!(feats, "multi", |x| x.multi);
+    col!(feats, "refl", |x| x.refl);
+    col!(feats, "empty", |x| x.empty);
+    col!(feats, "arc", |x| x.arc);
+    col!(feats, "fa", |x| x.fa);
+    col!(feats, "cells", |x| x.cells);
+    col!(samples, "s_cyl", |x| x.cyl);
+    col!(samples, "s_outcome", |x| x.outcome);
+    col!(samples, "s_chord", |x| x.chord);
+    col!(samples, "s_miss", |x| x.miss);
+    col!(samples, "s_t_in", |x| x.t_in);
+    col!(samples, "s_depth", |x| x.depth);
+    d.set_item("roundtrip_line", rt.0.into_pyarray(py))?;
+    d.set_item("roundtrip_col", rt.1.into_pyarray(py))?;
+    d.set_item("n_slices", sl.len())?;
+    if let Some((pl, pc, nl, nc)) = img {
+        d.set_item("pulse_line", pl.into_pyarray(py))?;
+        d.set_item("pulse_col", pc.into_pyarray(py))?;
+        d.set_item("n_lines", nl)?;
+        d.set_item("n_cols", nc)?;
+    }
+    for (k, v) in ["lattice_s", "stripes_s", "features_s", "test_s"].iter().zip(secs) {
+        d.set_item(*k, v)?;
+    }
+    Ok(d)
+}
+
 pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     for f in [
         wrap_pyfunction!(shots_shot_of_echo, m)?,
@@ -272,6 +387,7 @@ pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
         wrap_pyfunction!(shots_scan_stripes, m)?,
         wrap_pyfunction!(shots_scan_segments, m)?,
         wrap_pyfunction!(shots_tracts, m)?,
+        wrap_pyfunction!(shots_scan_opacity, m)?,
     ] {
         m.add_function(f)?;
     }

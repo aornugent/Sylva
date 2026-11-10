@@ -39,6 +39,8 @@ pub struct Segment {
     pub half: f64,
     pub w: f64,
     pub r: f64,
+    /// The index of the slice it came from.
+    pub slice: usize,
 }
 
 fn eig3(m: [[f64; 3]; 3]) -> ([f64; 3], [Point; 3]) {
@@ -109,7 +111,7 @@ pub fn segments(slices: &[Slice], rot: [[f64; 3]; 3], origin: Point, window: usi
                     let sharp = (s.edge_lo == edge::SHARP) as u8 + (s.edge_hi == edge::SHARP) as u8;
                     let ca = scale(&pts[w0..w1].iter().fold([0.0; 3], |s, p| add(&s, p)), 1.0 / n);
                     let p = add(&ca, &scale(&u, dot(&sub(&pts[i], &ca), &u)));
-                    out.push(Segment { p, u, half: 0.5 * spacing, w: lin * (1.0 + sharp as f64) / 3.0, r: s.r });
+                    out.push(Segment { p, u, half: 0.5 * spacing, w: lin * (1.0 + sharp as f64) / 3.0, r: s.r, slice: c0 + i });
                 }
             }
             c0 = c1;
@@ -371,7 +373,7 @@ mod tests {
     use super::*;
 
     fn seg(p: Point, u: Point) -> Segment {
-        Segment { p, u: normalize(&u), half: 0.01, w: 0.5, r: 0.02 }
+        Segment { p, u: normalize(&u), half: 0.01, w: 0.5, r: 0.02, slice: 0 }
     }
 
     /// A Y: a vertical stem to 1 m, then two branches leaning 30 deg either way, sampled every 2 cm.
