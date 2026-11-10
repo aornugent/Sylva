@@ -7,7 +7,7 @@
 //! the misses added from a scan pattern.
 #![allow(clippy::type_complexity)]
 
-use numpy::{IntoPyArray, PyArray1, PyArray2, PyReadonlyArray1, PyReadonlyArray2};
+use numpy::{IntoPyArray, PyArray1, PyArray2, PyArrayMethods, PyReadonlyArray1, PyReadonlyArray2};
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList};
@@ -75,6 +75,36 @@ fn shots_fill_missing<'py>(py: Python<'py>, shots: &Bound<'_, PyDict>, pattern: 
     s.fill_missing(&pattern, pulses_per_line, seed, shot_stride.max(1)).map(|f| shots_to_py(py, &f)).transpose()
 }
 
+/// The scan's native lattice (sylva_rs::shots::lattice): `time` (s) and
+/// `direction` (n, 3, scanner frame) per pulse in acquisition order. Returns
+/// per-pulse `line`, `col` and residuals, the per-cell `count` (n_lines,
+/// n_cols) and the steps.
+#[pyfunction]
+fn shots_scan_lattice<'py>(py: Python<'py>, time: PyReadonlyArray1<f64>, direction: PyReadonlyArray2<f64>) -> PyResult<Bound<'py, PyDict>> {
+    let dir = xyz_from_py(direction)?;
+    let t = time.as_array().to_vec();
+    if t.len() != dir.len() {
+        return Err(PyValueError::new_err(format!("time has {} values for {} pulses", t.len(), dir.len())));
+    }
+    let l = py.detach(|| sylva_rs::shots::lattice::scan_lattice(&t, &dir));
+    let d = PyDict::new(py);
+    d.set_item("line", l.line.into_pyarray(py))?;
+    d.set_item("col", l.col.into_pyarray(py))?;
+    d.set_item("slot_residual", l.slot_residual.into_pyarray(py))?;
+    d.set_item("zenith_residual", l.zenith_residual.into_pyarray(py))?;
+    d.set_item("azimuth_residual", l.azimuth_residual.into_pyarray(py))?;
+    d.set_item("count", l.count.into_pyarray(py).reshape([l.n_lines, l.n_cols])?)?;
+    d.set_item("line_phase", l.line_phase.into_pyarray(py))?;
+    d.set_item("line_jitter", l.line_jitter.into_pyarray(py))?;
+    d.set_item("line_azimuth", l.line_azimuth.into_pyarray(py))?;
+    d.set_item("zenith_profile", l.zenith_profile.into_pyarray(py))?;
+    d.set_item("azimuth_profile", l.azimuth_profile.into_pyarray(py))?;
+    for (k, v) in [("pulse_interval", l.pulse_interval), ("line_period", l.line_period), ("zenith_step", l.zenith_step), ("azimuth_step", l.azimuth_step), ("zenith0", l.zenith0)] {
+        d.set_item(k, v)?;
+    }
+    Ok(d)
+}
+
 pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     for f in [
         wrap_pyfunction!(shots_shot_of_echo, m)?,
@@ -84,6 +114,7 @@ pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
         wrap_pyfunction!(shots_concatenate, m)?,
         wrap_pyfunction!(shots_zenith_azimuth, m)?,
         wrap_pyfunction!(shots_fill_missing, m)?,
+        wrap_pyfunction!(shots_scan_lattice, m)?,
     ] {
         m.add_function(f)?;
     }
