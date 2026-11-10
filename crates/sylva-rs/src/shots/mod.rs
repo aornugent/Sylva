@@ -11,6 +11,7 @@
 pub mod lattice;
 pub mod opacity;
 pub mod stripes;
+pub mod surfels;
 pub mod tracts;
 pub mod ops;
 pub mod reconstruct;

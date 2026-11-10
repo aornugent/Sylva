@@ -374,6 +374,108 @@ fn shots_scan_opacity<'py>(py: Python<'py>, time: PyReadonlyArray1<f64>, directi
     Ok(d)
 }
 
+/// One scan's surfels (sylva_rs::shots::surfels), for 3dtrees research 128's
+/// surfel spike. Takes the pulses as `shots_scan_opacity` does (directions in
+/// the scanner's frame) and keeps first echoes in the box `lo`..`hi`, or, given
+/// `window` (line0, line1, col0, col1), those in that block of cells instead.
+/// Returns per surfel `pulse`, `line`, `col`, world `p` and `n` (toward the
+/// scanner), `sigma_n` (rad), `sigma_lat` (m), `rms` (m), `cells`, `cos_inc`;
+/// `failed` (kept pulses with no surfel) and the seconds each step took.
+#[pyfunction]
+#[pyo3(signature = (time, direction, range, rot, origin, lo, hi, window=None, half=3, jump=0.05, range_noise=0.003, min_aspect=0.2))]
+#[allow(clippy::too_many_arguments)]
+fn shots_scan_surfels<'py>(py: Python<'py>, time: PyReadonlyArray1<f64>, direction: PyReadonlyArray2<f64>, range: PyReadonlyArray1<f32>, rot: PyReadonlyArray2<f64>, origin: Vec<f64>, lo: Vec<f64>, hi: Vec<f64>, window: Option<(u32, u32, u32, u32)>, half: i64, jump: f64, range_noise: f64, min_aspect: f64) -> PyResult<Bound<'py, PyDict>> {
+    use sylva_rs::shots::opacity::ShadowMap;
+    use sylva_rs::shots::surfels::{surfels, SurfelParams};
+    let dir = xyz_from_py(direction)?;
+    let t = time.as_array().to_vec();
+    let r = range.as_array().to_vec();
+    let rot = xyz_from_py(rot)?;
+    if t.len() != dir.len() || r.len() != dir.len() || rot.len() != 3 {
+        return Err(PyValueError::new_err("per-pulse arrays differ in length, or rot isn't 3 x 3"));
+    }
+    let (origin, lo, hi) = (point3(origin, "origin")?, point3(lo, "lo")?, point3(hi, "hi")?);
+    let rot = [rot[0], rot[1], rot[2]];
+    let (s, failed, line, col, secs) = py.detach(|| {
+        let c0 = std::time::Instant::now();
+        let lat = sylva_rs::shots::lattice::scan_lattice(&t, &dir);
+        let c1 = std::time::Instant::now();
+        let map = ShadowMap::new(&lat, &r, rot, origin);
+        let beam = sylva_rs::qsm::joint::JointParams::default();
+        let prm = SurfelParams { half, jump, range_noise, min_aspect, ..SurfelParams::default() };
+        let keep = |i: usize, p: &[f64; 3]| match window {
+            Some((l0, l1, k0, k1)) => (l0..l1).contains(&lat.line[i]) && (k0..k1).contains(&lat.col[i]),
+            None => (0..3).all(|k| p[k] >= lo[k] && p[k] <= hi[k]),
+        };
+        let (s, failed) = surfels(&map, &dir, keep, |x| beam.footprint(x), &prm);
+        let line: Vec<u32> = s.iter().map(|x| lat.line[x.pulse as usize]).collect();
+        let col: Vec<u32> = s.iter().map(|x| lat.col[x.pulse as usize]).collect();
+        let c2 = std::time::Instant::now();
+        (s, failed, line, col, [(c1 - c0).as_secs_f64(), (c2 - c1).as_secs_f64()])
+    });
+    let d = PyDict::new(py);
+    d.set_item("p", xyz_to_py(py, &s.iter().map(|x| x.p).collect::<Vec<_>>()))?;
+    d.set_item("n", xyz_to_py(py, &s.iter().map(|x| x.n).collect::<Vec<_>>()))?;
+    macro_rules! col {
+        ($name:literal, $f:expr) => {
+            d.set_item($name, s.iter().map($f).collect::<Vec<_>>().into_pyarray(py))?;
+        };
+    }
+    col!("pulse", |x| x.pulse);
+    col!("sigma_n", |x| x.sigma_n);
+    col!("sigma_lat", |x| x.sigma_lat);
+    col!("rms", |x| x.rms);
+    col!("cells", |x| x.cells);
+    col!("cos_inc", |x| x.cos_inc);
+    d.set_item("line", line.into_pyarray(py))?;
+    d.set_item("col", col.into_pyarray(py))?;
+    d.set_item("failed", failed)?;
+    d.set_item("lattice_s", secs[0])?;
+    d.set_item("surfels_s", secs[1])?;
+    Ok(d)
+}
+
+/// The surfel statistics of query regions (sylva_rs::shots::surfels::region_stats): surfels `p`, `n` (m, 3) with
+/// their `scan`; regions `reg_p`, `reg_u` (k, 3), `reg_half`, `reg_r` and `reg_scan` (-1: every scan's surfels).
+/// Returns per region `n`, `n_scans`, `thick_plane`, `thick_cyl`, `lam` (k, 3), `axis` (k, 3), `medial_r`,
+/// `spread`, `spread0`, `centre` (k, 3), and `stats_s`.
+#[pyfunction]
+#[pyo3(signature = (p, n, scan, reg_p, reg_u, reg_half, reg_r, reg_scan, margin=0.02, min_n=10, r_max=0.3))]
+#[allow(clippy::too_many_arguments)]
+fn shots_surfel_stats<'py>(py: Python<'py>, p: PyReadonlyArray2<f64>, n: PyReadonlyArray2<f64>, scan: PyReadonlyArray1<i32>, reg_p: PyReadonlyArray2<f64>, reg_u: PyReadonlyArray2<f64>, reg_half: PyReadonlyArray1<f64>, reg_r: PyReadonlyArray1<f64>, reg_scan: PyReadonlyArray1<i32>, margin: f64, min_n: usize, r_max: f64) -> PyResult<Bound<'py, PyDict>> {
+    use sylva_rs::shots::surfels::{region_stats, Region};
+    let (p, n, scan) = (xyz_from_py(p)?, xyz_from_py(n)?, scan.as_array().to_vec());
+    let (rp, ru) = (xyz_from_py(reg_p)?, xyz_from_py(reg_u)?);
+    let (rh, rr, rs) = (reg_half.as_array().to_vec(), reg_r.as_array().to_vec(), reg_scan.as_array().to_vec());
+    if n.len() != p.len() || scan.len() != p.len() || ru.len() != rp.len() || rh.len() != rp.len() || rr.len() != rp.len() || rs.len() != rp.len() {
+        return Err(PyValueError::new_err("surfel or region arrays differ in length"));
+    }
+    let regs: Vec<Region> = (0..rp.len()).map(|i| Region { p: rp[i], u: ru[i], half: rh[i], r: rr[i], scan: rs[i] }).collect();
+    let (st, secs) = py.detach(|| {
+        let c0 = std::time::Instant::now();
+        let st = region_stats(&p, &n, &scan, &regs, margin, min_n, r_max);
+        (st, c0.elapsed().as_secs_f64())
+    });
+    let d = PyDict::new(py);
+    macro_rules! col {
+        ($name:literal, $f:expr) => {
+            d.set_item($name, st.iter().map($f).collect::<Vec<_>>().into_pyarray(py))?;
+        };
+    }
+    col!("n", |x| x.n);
+    col!("n_scans", |x| x.n_scans);
+    col!("thick_plane", |x| x.thick_plane);
+    col!("thick_cyl", |x| x.thick_cyl);
+    col!("medial_r", |x| x.medial_r);
+    col!("spread", |x| x.spread);
+    col!("spread0", |x| x.spread0);
+    d.set_item("lam", xyz_to_py(py, &st.iter().map(|x| x.lam).collect::<Vec<_>>()))?;
+    d.set_item("axis", xyz_to_py(py, &st.iter().map(|x| x.axis).collect::<Vec<_>>()))?;
+    d.set_item("centre", xyz_to_py(py, &st.iter().map(|x| x.centre).collect::<Vec<_>>()))?;
+    d.set_item("stats_s", secs)?;
+    Ok(d)
+}
+
 pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     for f in [
         wrap_pyfunction!(shots_shot_of_echo, m)?,
@@ -388,6 +490,8 @@ pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
         wrap_pyfunction!(shots_scan_segments, m)?,
         wrap_pyfunction!(shots_tracts, m)?,
         wrap_pyfunction!(shots_scan_opacity, m)?,
+        wrap_pyfunction!(shots_scan_surfels, m)?,
+        wrap_pyfunction!(shots_surfel_stats, m)?,
     ] {
         m.add_function(f)?;
     }
