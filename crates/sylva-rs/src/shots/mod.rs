@@ -9,6 +9,7 @@
 //! free space. Modelled on canopygrid's `Shots` and raycloudtools' ray clouds.
 
 pub mod lattice;
+pub mod stripes;
 pub mod ops;
 pub mod reconstruct;
 

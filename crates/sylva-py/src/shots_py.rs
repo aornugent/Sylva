@@ -105,6 +105,72 @@ fn shots_scan_lattice<'py>(py: Python<'py>, time: PyReadonlyArray1<f64>, directi
     Ok(d)
 }
 
+/// One scan's opaque wood as silhouette stripes in its native range image
+/// (sylva_rs::shots::stripes): `time` (s), `direction` (n, 3, unit, scanner
+/// frame) and `range` (first echo, m) per pulse in acquisition order. Builds
+/// the lattice, then returns per slice its stripe, pass, image centre
+/// (`line`, `col`), run ends (`lo`, `hi`), `width_cells`, `lean`, front
+/// `range`, `half_app`, `r`, `r_depth`, edges (`edge_lo`, `edge_hi`: 0 sharp,
+/// 1 unknown, 2 occluded, 3 border), `forked`, `n_runs` and the `axis` point
+/// (n, 3, scanner frame); plus each pulse's lattice `pulse_line`, `pulse_col`,
+/// `n_lines`, `n_cols`, and the seconds each step took.
+#[pyfunction]
+#[pyo3(signature = (time, direction, range, jump=0.05, gap=2, slice=4, min_cells=3, min_lines=8, tau=None))]
+#[allow(clippy::too_many_arguments)]
+fn shots_scan_stripes<'py>(py: Python<'py>, time: PyReadonlyArray1<f64>, direction: PyReadonlyArray2<f64>, range: PyReadonlyArray1<f32>, jump: f64, gap: usize, slice: usize, min_cells: usize, min_lines: usize, tau: Option<f64>) -> PyResult<Bound<'py, PyDict>> {
+    use sylva_rs::shots::stripes::{stripes, StripeParams};
+    let dir = xyz_from_py(direction)?;
+    let t = time.as_array().to_vec();
+    let r = range.as_array().to_vec();
+    if t.len() != dir.len() || r.len() != dir.len() {
+        return Err(PyValueError::new_err("time, direction and range differ in length"));
+    }
+    let mut p = StripeParams { jump, gap, slice: slice.max(1), min_cells, min_lines, ..StripeParams::default() };
+    if let Some(tau) = tau {
+        p.beam.tau = tau;
+    }
+    let (lat, s, t_lat, t_str) = py.detach(|| {
+        let c0 = std::time::Instant::now();
+        let lat = sylva_rs::shots::lattice::scan_lattice(&t, &dir);
+        let c1 = std::time::Instant::now();
+        let s = stripes(&lat, &r, &dir, &p);
+        (lat, s, (c1 - c0).as_secs_f64(), c1.elapsed().as_secs_f64())
+    });
+    let d = PyDict::new(py);
+    macro_rules! col {
+        ($name:literal, $f:expr) => {
+            d.set_item($name, s.iter().map($f).collect::<Vec<_>>().into_pyarray(py))?;
+        };
+    }
+    col!("stripe", |x| x.stripe);
+    col!("pass", |x| x.pass);
+    col!("line", |x| x.line);
+    col!("col", |x| x.col);
+    col!("lo", |x| x.lo);
+    col!("hi", |x| x.hi);
+    col!("n_runs", |x| x.n_runs);
+    col!("forked", |x| x.forked);
+    col!("width_cells", |x| x.width_cells);
+    col!("lean", |x| x.lean);
+    col!("range", |x| x.range);
+    col!("half_app", |x| x.half_app);
+    col!("r", |x| x.r);
+    col!("r_depth", |x| x.r_depth);
+    col!("edge_lo", |x| x.edge_lo);
+    col!("edge_hi", |x| x.edge_hi);
+    col!("open_lo", |x| x.open_lo);
+    col!("open_hi", |x| x.open_hi);
+    col!("step_m", |x| x.step_m);
+    col!("footprint", |x| x.footprint);
+    d.set_item("axis", xyz_to_py(py, &s.iter().map(|x| x.axis).collect::<Vec<_>>()))?;
+    d.set_item("pulse_line", lat.line.into_pyarray(py))?;
+    d.set_item("pulse_col", lat.col.into_pyarray(py))?;
+    for (k, v) in [("n_lines", lat.n_lines as f64), ("n_cols", lat.n_cols as f64), ("lattice_s", t_lat), ("stripes_s", t_str), ("zenith_step", lat.zenith_step), ("azimuth_step", lat.azimuth_step)] {
+        d.set_item(k, v)?;
+    }
+    Ok(d)
+}
+
 pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     for f in [
         wrap_pyfunction!(shots_shot_of_echo, m)?,
@@ -115,6 +181,7 @@ pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
         wrap_pyfunction!(shots_zenith_azimuth, m)?,
         wrap_pyfunction!(shots_fill_missing, m)?,
         wrap_pyfunction!(shots_scan_lattice, m)?,
+        wrap_pyfunction!(shots_scan_stripes, m)?,
     ] {
         m.add_function(f)?;
     }
