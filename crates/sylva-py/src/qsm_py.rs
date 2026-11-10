@@ -908,8 +908,36 @@ fn qsm_rebase<'py>(py: Python<'py>, scans: Vec<Bound<'py, PyScanIndex>>, a: PyRe
     Ok(d)
 }
 
+/// A plant base's merge tree: the slabs' sections and columns, and each section's stops (see
+/// `sylva.qsm.base_sections`).
+#[pyfunction]
+#[pyo3(signature = (scans, centre, params, z_lo=0.1, z_hi=1.5, dz=0.1, reach=0.6, link=0.02, veto=true, threads=0))]
+#[allow(clippy::too_many_arguments)]
+fn qsm_base_sections<'py>(py: Python<'py>, scans: Vec<Bound<'py, PyScanIndex>>, centre: [f64; 3], params: Bound<'py, PyDict>, z_lo: f64, z_hi: f64, dz: f64, reach: f64, link: f64, veto: bool, threads: usize) -> PyResult<Bound<'py, PyDict>> {
+    let p = tree_params(&params)?;
+    let bp = support_tree::base::BaseParams { z_lo, z_hi, dz, reach, link, keep: 0.8 };
+    let refs: Vec<&ScanIndex> = scans.iter().map(|s| &s.get().inner).collect();
+    let f = py.detach(|| support_tree::base::base_sections(&refs, &centre, &bp, &p.like, veto, threads)).map_err(err)?;
+    let d = PyDict::new(py);
+    sections_to_py(py, &d, &f.sections, &f.columns)?;
+    d.set_item("raw_of", f.raw_of.iter().map(|&i| i as u64).collect::<Vec<u64>>().into_pyarray(py))?;
+    let raw = PyDict::new(py);
+    sections_to_py(py, &raw, &f.raw, &[])?;
+    raw.set_item("refuted", f.raw.iter().map(|s| s.refuted).collect::<Vec<bool>>().into_pyarray(py))?;
+    raw.set_item("edge", f.raw.iter().map(|s| s.edge).collect::<Vec<bool>>().into_pyarray(py))?;
+    let st: Vec<_> = f.stops.iter().flatten().collect();
+    raw.set_item("stop_off", std::iter::once(0).chain(f.stops.iter().scan(0u64, |n, s| { *n += s.len() as u64; Some(*n) })).collect::<Vec<u64>>().into_pyarray(py))?;
+    raw.set_item("stop_scan", st.iter().map(|s| s.0).collect::<Vec<u32>>().into_pyarray(py))?;
+    raw.set_item("stop_pulse", st.iter().map(|s| s.1).collect::<Vec<u32>>().into_pyarray(py))?;
+    raw.set_item("stop_echo", st.iter().map(|s| s.2).collect::<Vec<u8>>().into_pyarray(py))?;
+    raw.set_item("stop_xy", st.iter().flat_map(|s| s.3).collect::<Vec<f64>>().into_pyarray(py).reshape([st.len(), 2])?)?;
+    d.set_item("raw", raw)?;
+    Ok(d)
+}
+
 pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(qsm_rebase, m)?)?;
+    m.add_function(wrap_pyfunction!(qsm_base_sections, m)?)?;
     m.add_function(wrap_pyfunction!(qsm_support_flags, m)?)?;
     m.add_function(wrap_pyfunction!(qsm_support_refusals, m)?)?;
     m.add_function(wrap_pyfunction!(qsm_support_diags, m)?)?;

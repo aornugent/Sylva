@@ -550,6 +550,25 @@ def joint_fit(table, a, b, r_prior, parent, n_scans: int, params, *, r_max=None,
                                int(iters), float(tol), theta0, int(threads))
 
 
+def base_sections(scans, centre, params: JointParams = JointParams(), reach: float = 0.6, z_lo: float = 0.1,
+                  z_hi: float = 1.5, dz: float = 0.1, link: float = 0.02, veto: bool = True, threads: int = 0) -> dict:
+    """A plant base's merge tree: the slabs and columns :func:`rebase` builds about ``centre`` (x, y and the ground's
+    z), before it joins them to any rows (same parameters). ``veto``: leave out sections the ray veto refutes, as
+    :func:`rebase` does (False keeps them in the columns).
+
+    Returns a dict, per section: ``slab``, ``z``, ``x``, ``y``, ``r``, ``fitted``, ``hits``, ``evidence``, ``column``;
+    per column: ``col_parent`` (the column it forks from, -1: from the ground) and ``col_at`` (that column's section
+    below the fork); ``raw_of``, each section's index in ``raw``: every slab's sections before the columns' filter
+    (``column`` -1), with ``refuted`` and ``edge`` (at the tube's edge) and the woody stops each claims, raw section
+    ``i``'s at ``stop_off[i]:stop_off[i + 1]`` of ``stop_scan`` (an index into ``scans``), ``stop_pulse`` (the pulse
+    in its scan's index), ``stop_echo`` and ``stop_xy`` (world).
+    """
+    if not all(isinstance(s, ScanIndex) for s in scans):
+        raise TypeError("base_sections: scans must be ScanIndex")
+    return _core.qsm_base_sections([s._core for s in scans], [float(x) for x in centre], dataclasses.asdict(params),
+                                   z_lo, z_hi, dz, reach, link, bool(veto), int(threads))
+
+
 def rebase(scans, a, b, r_prior, parent, member, centre, context=None, params: JointParams = JointParams(),
            reach: float = 0.6, z_lo: float = 0.1, z_hi: float = 1.5, dz: float = 0.1, link: float = 0.02,
            keep: float = 0.8, threads: int = 0) -> dict:

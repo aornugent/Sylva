@@ -170,10 +170,15 @@ fn root(p: &mut [usize], mut i: usize) -> usize {
     i
 }
 
-/// A slab's sections: its stops linked within `link`, each group with enough woody hits given a circle.
-fn sections(gs: &[Group], slab: u32, z: f64, centre: &Point, p: &BaseParams, like: &JointParams) -> Vec<Section> {
-    let stops: Vec<(usize, [f64; 2], f64)> = gs.iter().enumerate()
-        .flat_map(|(gi, g)| g.recs.iter().filter(|r| r.is_stop()).map(move |r| (gi, r.xy, p_wood(r, WOOD_R, like))))
+/// A stop a section claims: its scan (an index into the scans given), its pulse (in that scan's index) and which of
+/// the pulse's echoes it is, and where it lies (world x, y).
+pub type Stop = (u32, u32, u8, [f64; 2]);
+
+/// A slab's sections: its stops linked within `link`, each group with enough woody hits given a circle; with each,
+/// the stops it claims.
+fn sections(gs: &[Group], slab: u32, z: f64, centre: &Point, p: &BaseParams, like: &JointParams) -> Vec<(Section, Vec<Stop>)> {
+    let stops: Vec<(usize, [f64; 2], f64, Stop)> = gs.iter().enumerate()
+        .flat_map(|(gi, g)| g.recs.iter().filter(|r| r.is_stop()).map(move |r| (gi, r.xy, p_wood(r, WOOD_R, like), (g.scan, r.pulse, r.echo, [centre[0] + r.xy[0], centre[1] + r.xy[1]]))))
         .filter(|s| s.2 >= 0.5).collect();
     let cell = |q: [f64; 2]| ((q[0] / p.link).floor() as i64, (q[1] / p.link).floor() as i64);
     let mut grid: std::collections::HashMap<(i64, i64), Vec<usize>> = std::collections::HashMap::new();
@@ -226,7 +231,7 @@ fn sections(gs: &[Group], slab: u32, z: f64, centre: &Point, p: &BaseParams, lik
                 (Vector5::new(m[0] + r * gs[main].v[0], m[1] + r * gs[main].v[1], 0.0, 0.0, r), false)
             }
         };
-        out.push(Section {
+        out.push((Section {
             slab,
             z,
             c: [centre[0] + x[0], centre[1] + x[1]],
@@ -237,7 +242,7 @@ fn sections(gs: &[Group], slab: u32, z: f64, centre: &Point, p: &BaseParams, lik
             edge: x[0].hypot(x[1]) + x[4] > p.reach - TUBE_MARGIN,
             evidence: support(gs, &x, like),
             column: -1,
-        });
+        }, members.iter().map(|&i| stops[i].3).collect()));
     }
     out
 }
@@ -269,7 +274,9 @@ fn circle_of(xy: &[[f64; 2]], extent: f64) -> Option<Vector5<f64>> {
 }
 
 /// Each slab's groups and sections about `centre` (world x, y and the ground's z).
-fn slabs(scans: &[&ScanIndex], centre: &Point, p: &BaseParams, like: &JointParams, threads: usize) -> Result<Vec<(Vec<Group>, Vec<Section>)>> {
+type Slab = (Vec<Group>, Vec<(Section, Vec<Stop>)>);
+
+fn slabs(scans: &[&ScanIndex], centre: &Point, p: &BaseParams, like: &JointParams, threads: usize) -> Result<Vec<Slab>> {
     if !(p.dz > 0.0 && p.z_hi > p.z_lo && p.reach > 0.0 && p.link > 0.0) {
         return Err(Error::invalid("base columns: dz, reach and link must be positive and z_hi above z_lo"));
     }
@@ -287,13 +294,14 @@ fn slabs(scans: &[&ScanIndex], centre: &Point, p: &BaseParams, like: &JointParam
 }
 
 /// The columns linking the slabs' sections (module documentation): every section kept, each with its column.
-fn columns(slabs: Vec<Vec<Section>>) -> (Vec<Section>, Vec<Column>) {
+/// `veto`: leave out the sections the veto refutes ([`rebase`] does; without it the merge tree keeps them).
+fn columns(slabs: Vec<Vec<Section>>, veto: bool) -> (Vec<Section>, Vec<Column>) {
     let n = slabs.len() as u32;
     // one stem per circle: in each slab, a section whose centre lies inside a stronger one's circle (fitted first,
     // then by woody hits) is the same stem seen in pieces (a scan's sliver beside another's arc), and is left out
     let mut secs: Vec<Section> = Vec::new();
     for mut slab in slabs {
-        slab.retain(|s| !s.refuted && !s.edge);
+        slab.retain(|s| !(veto && s.refuted) && !s.edge);
         slab.sort_by(|a, b| b.fitted.cmp(&a.fitted).then(b.hits.total_cmp(&a.hits)));
         let mut kept: Vec<Section> = Vec::new();
         for s in slab {
@@ -357,6 +365,34 @@ fn columns(slabs: Vec<Vec<Section>>) -> (Vec<Section>, Vec<Column>) {
     (secs, out)
 }
 
+/// A base's merge tree ([`base_sections`]): the columns' sections (as [`rebase`] keeps them) and the columns; every
+/// slab's sections before the columns' filter (`raw`: refuted, at the tube's edge or a piece of another's stem
+/// included; their `column` -1), the stops each claims (`stops`), and each kept section's place in `raw` (`raw_of`).
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct BaseSections {
+    pub sections: Vec<Section>,
+    pub columns: Vec<Column>,
+    pub raw: Vec<Section>,
+    pub stops: Vec<Vec<Stop>>,
+    pub raw_of: Vec<usize>,
+}
+
+/// The slabs and columns [`rebase`] builds about `centre` (x, y and the ground's z), kept: the base's merge tree
+/// (columns join going down where a fork's `parent` is set), before any join with a skeleton's rows.
+/// `veto`: as [`rebase`], leave out the sections the veto refutes.
+pub fn base_sections(scans: &[&ScanIndex], centre: &Point, p: &BaseParams, like: &JointParams, veto: bool, threads: usize) -> Result<BaseSections> {
+    let mut all: Vec<(Section, Vec<Stop>)> = Vec::new();
+    let mut by_slab = Vec::new();
+    for (_, s) in slabs(scans, centre, p, like, threads)? {
+        by_slab.push(s.iter().map(|x| x.0).collect());
+        all.extend(s);
+    }
+    let (sections, columns) = columns(by_slab, veto);
+    let raw_of = sections.iter().map(|s| all.iter().position(|(t, _)| t.slab == s.slab && t.c == s.c && t.r == s.r).unwrap_or(0)).collect();
+    let (raw, stops) = all.into_iter().unzip();
+    Ok(BaseSections { sections, columns, raw, stops, raw_of })
+}
+
 /// What became of a column in [`rebase`]: its evidence and its replaced chains' in its slabs, and the share of those
 /// chains the rays measure (each its root column's, with its forks), whether it was chosen and the member it went to (-1: none),
 /// its median radius, whether it is believable as this plant's stem, and the entries it took (joined, grafted).
@@ -417,8 +453,8 @@ pub fn rebase(scans: &[&ScanIndex], rows: &Rows, member: &[i64], centre: &Point,
     }
     let s = slabs(scans, centre, p, like, threads)?;
     let mids: Vec<f64> = (0..s.len()).map(|k| centre[2] + p.z_lo + (k as f64 + 0.5) * p.dz).collect();
-    let (gs, secs): (Vec<Vec<Group>>, Vec<Vec<Section>>) = s.into_iter().unzip();
-    let (secs, cols) = columns(secs);
+    let (gs, secs): (Vec<Vec<Group>>, Vec<Vec<Section>>) = s.into_iter().map(|(g, s)| (g, s.into_iter().map(|x| x.0).collect())).unzip();
+    let (secs, cols) = columns(secs, true);
     // each row's evidence in each slab it crosses
     let ev: Vec<Vec<Option<f64>>> = pool(threads)?.install(|| {
         (0..n).into_par_iter().map(|i| {
