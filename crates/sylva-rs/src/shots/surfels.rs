@@ -282,6 +282,24 @@ impl SurfelGrid {
         [(x[0] / cell).floor() as i32, (x[1] / cell).floor() as i32, (x[2] / cell).floor() as i32]
     }
 
+    /// The surfels within `rad` of `c`.
+    pub fn ball(&self, pv: &[V], c: &V, rad: f64) -> Vec<usize> {
+        let (k0, k1) = (Self::key(self.cell, &pt(&c.add_scalar(-rad))), Self::key(self.cell, &pt(&c.add_scalar(rad))));
+        let mut idx = Vec::new();
+        for x in k0[0]..=k1[0] {
+            for y in k0[1]..=k1[1] {
+                for z in k0[2]..=k1[2] {
+                    for &i in self.grid.get(&[x, y, z]).map(|v| v.as_slice()).unwrap_or(&[]) {
+                        if (pv[i as usize] - c).norm() <= rad {
+                            idx.push(i as usize);
+                        }
+                    }
+                }
+            }
+        }
+        idx
+    }
+
     /// The surfels of `g` (of its scan, or every scan's): within `1.5 r + margin` of its axis and `max(half, r) +
     /// margin` of its centre along it.
     pub fn gather(&self, pv: &[V], scan: &[i32], g: &Region, margin: f64) -> Vec<usize> {

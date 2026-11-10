@@ -607,7 +607,7 @@ fn shots_scan_identities<'py>(py: Python<'py>, time: PyReadonlyArray1<f64>, dire
 /// `shots_surfel_stats`; `what` as region_lines. Returns per region `n`, `n_scans`; for the cylinder (`cyl_`) and
 /// cone (`cone_`) fits `u`, `c` (k, 3), `lam`, `lam2`, `r`, `nu`, `used`; medial `med_u`, `med_c`, `med_r`,
 /// `med_spread`, `med_spread0`; the same about the line-complex axis `mlc_c`, `mlc_r`, `mlc_spread`, `mlc_spread0`;
-/// `harm` (k, 5), `harm_gap` (rad), `harm_rms` (m), `harm_n`; `attr` (k_regions, k);
+/// `harm` (k, 5; with what bit 32 a convex section), `harm_gap` (rad), `harm_rms` (m), `harm_n`; `attr` (k_regions, k);
 /// `secs`.
 #[pyfunction]
 #[pyo3(signature = (p, n, scan, delta, attr, reg_p, reg_u, reg_half, reg_r, reg_scan, margin=0.02, min_n=10, what=31))]
@@ -747,6 +747,102 @@ fn shots_bundles<'py>(py: Python<'py>, p: PyReadonlyArray2<f64>, u: PyReadonlyAr
     Ok(d)
 }
 
+/// Bundles by line consistency (sylva_rs::shots::strands::bundles_lines): pieces as `shots_bundles`, plus `origin`
+/// (k, 3) each piece's scanner position. Returns `bundle` per piece; per stripe line `line_u`, `line_c`, `line_t0`,
+/// `line_t1`, `line_r`, `line_beam`, `line_piece`; and `edges`, `merged`, `blocked`, `cannot`.
+#[pyfunction]
+#[pyo3(signature = (p, u, half, r, scan, stripe, line, col, range, width, origin, k_beam=0.5, sd_beam_min=0.005, sd_across=0.003, sd_floor=0.004, max_ang=20.0, max_dlogr=0.7, max_gap=0.05, chi2=9.21, reach=0.06, near_cells=3.0, depth_step=0.1))]
+#[allow(clippy::too_many_arguments)]
+fn shots_bundles_lines<'py>(py: Python<'py>, p: PyReadonlyArray2<f64>, u: PyReadonlyArray2<f64>, half: PyReadonlyArray1<f64>, r: PyReadonlyArray1<f64>, scan: PyReadonlyArray1<i32>, stripe: PyReadonlyArray1<u32>, line: PyReadonlyArray1<f64>, col: PyReadonlyArray1<f64>, range: PyReadonlyArray1<f64>, width: PyReadonlyArray1<f64>, origin: PyReadonlyArray2<f64>, k_beam: f64, sd_beam_min: f64, sd_across: f64, sd_floor: f64, max_ang: f64, max_dlogr: f64, max_gap: f64, chi2: f64, reach: f64, near_cells: f64, depth_step: f64) -> PyResult<Bound<'py, PyDict>> {
+    use sylva_rs::shots::strands::{bundles_lines, LineParams, Piece};
+    let (p, u, o) = (xyz_from_py(p)?, xyz_from_py(u)?, xyz_from_py(origin)?);
+    let (h, r, s, st) = (half.as_array().to_vec(), r.as_array().to_vec(), scan.as_array().to_vec(), stripe.as_array().to_vec());
+    let (l, c, rg, w) = (line.as_array().to_vec(), col.as_array().to_vec(), range.as_array().to_vec(), width.as_array().to_vec());
+    let n = p.len();
+    if [u.len(), h.len(), r.len(), s.len(), st.len(), l.len(), c.len(), rg.len(), w.len(), o.len()].iter().any(|&k| k != n) {
+        return Err(PyValueError::new_err("piece arrays differ in length"));
+    }
+    let pc: Vec<Piece> = (0..n).map(|i| Piece { p: p[i], u: u[i], half: h[i], r: r[i], scan: s[i], stripe: st[i], line: l[i], col: c[i], range: rg[i] }).collect();
+    let prm = LineParams { k_beam, sd_beam_min, sd_across, sd_floor, max_ang, max_dlogr, max_gap, chi2 };
+    let (b, ms, lines) = py.detach(|| bundles_lines(&pc, &w, &o, &prm, reach, near_cells, depth_step));
+    let d = PyDict::new(py);
+    let p3 = |x: &nalgebra::Vector3<f64>| [x[0], x[1], x[2]];
+    d.set_item("bundle", b.into_pyarray(py))?;
+    d.set_item("line_u", xyz_to_py(py, &lines.iter().map(|x| p3(&x.u)).collect::<Vec<_>>()))?;
+    d.set_item("line_c", xyz_to_py(py, &lines.iter().map(|x| p3(&x.c)).collect::<Vec<_>>()))?;
+    d.set_item("line_beam", xyz_to_py(py, &lines.iter().map(|x| p3(&x.beam)).collect::<Vec<_>>()))?;
+    d.set_item("line_t0", lines.iter().map(|x| x.t0).collect::<Vec<_>>().into_pyarray(py))?;
+    d.set_item("line_t1", lines.iter().map(|x| x.t1).collect::<Vec<_>>().into_pyarray(py))?;
+    d.set_item("line_r", lines.iter().map(|x| x.r).collect::<Vec<_>>().into_pyarray(py))?;
+    d.set_item("line_piece", lines.iter().map(|x| x.piece as u64).collect::<Vec<_>>().into_pyarray(py))?;
+    d.set_item("edges", ms.edges)?;
+    d.set_item("merged", ms.merged)?;
+    d.set_item("blocked", ms.blocked)?;
+    d.set_item("cannot", ms.cannot)?;
+    Ok(d)
+}
+
+/// Per region and scan, offsets and radial distances against given lines (sylva_rs::shots::strands::view_offsets):
+/// surfels `p`, `n`, `scan`; regions `reg_p`, `reg_u`, `reg_half`, `reg_r`; line points `c`, radii `r`; `shift`
+/// (k, n_scans, 3) per region and scan (in `scans`' order), subtracted from that scan's surfels. Returns `region`,
+/// `scan`, `offset` (m, 3), `count`, `radial`.
+#[pyfunction]
+#[pyo3(signature = (p, n, scan, reg_p, reg_u, reg_half, reg_r, c, r, shift, scans, margin=0.02, min_n=8))]
+#[allow(clippy::too_many_arguments)]
+fn shots_view_offsets<'py>(py: Python<'py>, p: PyReadonlyArray2<f64>, n: PyReadonlyArray2<f64>, scan: PyReadonlyArray1<i32>, reg_p: PyReadonlyArray2<f64>, reg_u: PyReadonlyArray2<f64>, reg_half: PyReadonlyArray1<f64>, reg_r: PyReadonlyArray1<f64>, c: PyReadonlyArray2<f64>, r: PyReadonlyArray1<f64>, shift: numpy::PyReadonlyArray3<f64>, scans: Vec<i32>, margin: f64, min_n: usize) -> PyResult<Bound<'py, PyDict>> {
+    use sylva_rs::shots::strands::view_offsets;
+    use sylva_rs::shots::surfels::Region;
+    let (p, n, scan) = (xyz_from_py(p)?, xyz_from_py(n)?, scan.as_array().to_vec());
+    let (rp, ru, cc) = (xyz_from_py(reg_p)?, xyz_from_py(reg_u)?, xyz_from_py(c)?);
+    let (rh, rr, r) = (reg_half.as_array().to_vec(), reg_r.as_array().to_vec(), r.as_array().to_vec());
+    let sh = shift.as_array();
+    if sh.shape() != [rp.len(), scans.len(), 3] || n.len() != p.len() || scan.len() != p.len() || ru.len() != rp.len() || cc.len() != rp.len() || r.len() != rp.len() {
+        return Err(PyValueError::new_err("array shapes differ"));
+    }
+    let shift: Vec<Vec<[f64; 3]>> = (0..rp.len()).map(|k| (0..scans.len()).map(|j| [sh[[k, j, 0]], sh[[k, j, 1]], sh[[k, j, 2]]]).collect()).collect();
+    let regs: Vec<Region> = (0..rp.len()).map(|i| Region { p: rp[i], u: ru[i], half: rh[i], r: rr[i], scan: -1 }).collect();
+    let o = py.detach(|| view_offsets(&p, &n, &scan, &regs, &cc, &r, &shift, &scans, margin, min_n));
+    let d = PyDict::new(py);
+    d.set_item("region", o.iter().map(|x| x.0).collect::<Vec<_>>().into_pyarray(py))?;
+    d.set_item("scan", o.iter().map(|x| x.1).collect::<Vec<_>>().into_pyarray(py))?;
+    d.set_item("offset", xyz_to_py(py, &o.iter().map(|x| x.2).collect::<Vec<_>>()))?;
+    d.set_item("count", o.iter().map(|x| x.3).collect::<Vec<_>>().into_pyarray(py))?;
+    d.set_item("radial", o.iter().map(|x| x.4).collect::<Vec<_>>().into_pyarray(py))?;
+    Ok(d)
+}
+
+/// Surface elements about query points (sylva_rs::shots::elements::elements): surfels `p`, `n`, `scan`, `attr` (k, m);
+/// points `c`. Returns `n`, `n_scans`, `lam` (q, 3), `normal` (q, 3), `extent` (q, 2), `thick`, `attr` (q, k), `secs`.
+#[pyfunction]
+#[pyo3(signature = (p, n, scan, attr, c, rad=0.04, min_n=5))]
+#[allow(clippy::too_many_arguments)]
+fn shots_elements<'py>(py: Python<'py>, p: PyReadonlyArray2<f64>, n: PyReadonlyArray2<f64>, scan: PyReadonlyArray1<i32>, attr: PyReadonlyArray2<f64>, c: PyReadonlyArray2<f64>, rad: f64, min_n: usize) -> PyResult<Bound<'py, PyDict>> {
+    use numpy::PyArray2;
+    use sylva_rs::shots::elements::elements;
+    let (p, n, scan, c) = (xyz_from_py(p)?, xyz_from_py(n)?, scan.as_array().to_vec(), xyz_from_py(c)?);
+    let attr: Vec<Vec<f64>> = attr.as_array().rows().into_iter().map(|r| r.to_vec()).collect();
+    if n.len() != p.len() || scan.len() != p.len() || attr.iter().any(|a| a.len() != p.len()) {
+        return Err(PyValueError::new_err("surfel arrays differ in length"));
+    }
+    let (e, secs) = py.detach(|| {
+        let t = std::time::Instant::now();
+        let e = elements(&p, &n, &scan, &attr, &c, rad, min_n);
+        (e, t.elapsed().as_secs_f64())
+    });
+    let d = PyDict::new(py);
+    d.set_item("n", e.iter().map(|x| x.n).collect::<Vec<_>>().into_pyarray(py))?;
+    d.set_item("n_scans", e.iter().map(|x| x.n_scans).collect::<Vec<_>>().into_pyarray(py))?;
+    d.set_item("lam", xyz_to_py(py, &e.iter().map(|x| x.lam).collect::<Vec<_>>()))?;
+    d.set_item("normal", xyz_to_py(py, &e.iter().map(|x| x.normal).collect::<Vec<_>>()))?;
+    d.set_item("extent", PyArray2::from_vec2(py, &e.iter().map(|x| x.extent.to_vec()).collect::<Vec<_>>())?)?;
+    d.set_item("thick", e.iter().map(|x| x.thick).collect::<Vec<_>>().into_pyarray(py))?;
+    if !attr.is_empty() {
+        d.set_item("attr", PyArray2::from_vec2(py, &e.iter().map(|x| x.attr.clone()).collect::<Vec<_>>())?)?;
+    }
+    d.set_item("secs", secs)?;
+    Ok(d)
+}
+
 pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     for f in [
         wrap_pyfunction!(shots_shot_of_echo, m)?,
@@ -768,6 +864,9 @@ pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
         wrap_pyfunction!(shots_scan_offsets, m)?,
         wrap_pyfunction!(shots_link_ends, m)?,
         wrap_pyfunction!(shots_bundles, m)?,
+        wrap_pyfunction!(shots_bundles_lines, m)?,
+        wrap_pyfunction!(shots_view_offsets, m)?,
+        wrap_pyfunction!(shots_elements, m)?,
     ] {
         m.add_function(f)?;
     }

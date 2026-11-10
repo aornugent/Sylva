@@ -127,8 +127,9 @@ fn medial(p: &[V], n: &[V], idx: &[usize], c: &V, r_max: f64, axis: Option<V>) -
 
 /// The support function about an axis: `h = (p − c)·n⊥` against the normal's angle φ across it, fitted as
 /// `a0 + a1 cos φ + b1 sin φ + a2 cos 2φ + b2 sin 2φ`; also the widest gap in φ (rad), the residuals' rms (m) and
-/// the surfels used.
-fn support(p: &[V], n: &[V], idx: &[usize], f: &LineFit) -> Option<([f64; 5], f64, f64, usize)> {
+/// the surfels used. With `convex`, a fit with `|a2| > a0 / 3` (where `h + h''` goes negative, so no convex section
+/// has it) is refitted with `|a2| = a0 / 3` along its own direction, linear in `a0, a1, b1`.
+fn support(p: &[V], n: &[V], idx: &[usize], f: &LineFit, convex: bool) -> Option<([f64; 5], f64, f64, usize)> {
     let e1 = f.u.cross(&if f.u[2].abs() < 0.9 { V::z() } else { V::x() }).normalize();
     let e2 = f.u.cross(&e1);
     let mut g = SMatrix::<f64, 5, 5>::zeros();
@@ -157,7 +158,20 @@ fn support(p: &[V], n: &[V], idx: &[usize], f: &LineFit) -> Option<([f64; 5], f6
     for w in phis.windows(2) {
         gap = gap.max(w[1] - w[0]);
     }
-    let x = g.try_inverse()? * b;
+    let mut x = g.try_inverse()? * b;
+    let a2 = x[3].hypot(x[4]);
+    if convex && x[0] > 0.0 && a2 > x[0] / 3.0 {
+        let th = x[4].atan2(x[3]);
+        let (mut g3, mut b3) = (nalgebra::Matrix3::<f64>::zeros(), V::zeros());
+        for (r, h) in &rows {
+            // r = (1, cos, sin, cos 2, sin 2): h = a0 (1 + cos(2 phi - th) / 3) + a1 cos + b1 sin
+            let z = V::new(1.0 + (r[3] * th.cos() + r[4] * th.sin()) / 3.0, r[1], r[2]);
+            g3 += z * z.transpose();
+            b3 += z * *h;
+        }
+        let y = g3.try_inverse()? * b3;
+        x = SVector::<f64, 5>::from([y[0], y[1], y[2], y[0] / 3.0 * th.cos(), y[0] / 3.0 * th.sin()]);
+    }
     let rms = (rows.iter().map(|(r, h)| (h - r.dot(&x)).powi(2)).sum::<f64>() / rows.len() as f64).sqrt();
     Some(([x[0], x[1], x[2], x[3], x[4]], gap, rms, rows.len()))
 }
@@ -179,7 +193,8 @@ pub struct RegionLines {
 }
 
 /// What `region_lines` computes: bit 1 the cylinder's line complex, 2 the cone's, 4 medial collapse, 8 the support
-/// harmonics (needs 1), 16 medial collapse about the line-complex axis (needs 1); 0 gathers only (for timing).
+/// harmonics (needs 1; with 32 constrained to a convex section), 16 medial collapse about the line-complex axis
+/// (needs 1); 0 gathers only (for timing).
 pub fn region_lines(
     p: &[Point],
     n: &[Point],
@@ -233,7 +248,7 @@ pub fn region_lines(
             }
             if what & 8 != 0 {
                 if let Some(f) = &out.cyl {
-                    out.support = support(&qv, &nv, &idx, f);
+                    out.support = support(&qv, &nv, &idx, f, what & 32 != 0);
                 }
             }
             out
