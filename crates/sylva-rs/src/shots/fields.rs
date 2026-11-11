@@ -25,6 +25,10 @@
 //!   gradients, matrix-free on the 7-point stencil, κ at a face the harmonic
 //!   mean of its voxels'. Voxels with a finite `fixed` value are Dirichlet;
 //!   the box's faces are closed (zero flux).
+//! - **ownership** (research 128 `fields-plot.md`): the harmonic measure of
+//!   each stem's sinks, one local solve per stem with every other stem's
+//!   sinks, the ground and the box sides absorbing (random-walker
+//!   segmentation).
 
 use super::moments::{per_scan, Octree};
 use crate::Point;
@@ -71,41 +75,28 @@ pub const OCCLUDED: usize = 2;
 pub const NO_RETURN: usize = 3;
 
 /// One scan's ray counts per voxel ([hit, pass, occluded, no return]). Pulse i's world ray is
-/// `origin + t rot·dir[i]`, its first echo at `range[i]` (not finite or ≤ 0: no return).
+/// `origin + t rot·dir[i]`, its first echo at `range[i]` (not finite or ≤ 0: no return). Counted into one shared
+/// array of atomics, so memory stays one grid whatever the thread count (plot-scale boxes).
 pub fn ray_counts(g: &Grid, origin: &Point, rot: &[[f64; 3]; 3], dir: &[Point], range: &[f32]) -> Vec<[u32; 4]> {
+    use std::sync::atomic::{AtomicU32, Ordering};
     let hi = [0, 1, 2].map(|a| g.lo[a] + g.h * g.n[a] as f64);
-    dir.par_chunks(1 << 16)
-        .zip(range.par_chunks(1 << 16))
-        .fold(
-            || vec![[0u32; 4]; g.len()],
-            |mut acc, (ds, rs)| {
-                for (d0, &r) in ds.iter().zip(rs) {
-                    let d = [0, 1, 2].map(|a| rot[a][0] * d0[0] + rot[a][1] * d0[1] + rot[a][2] * d0[2]);
-                    let nd = (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt();
-                    if !(nd > 0.0) {
-                        continue;
-                    }
-                    let d = d.map(|x| x / nd);
-                    let r = if r.is_finite() && r > 0.0 { r as f64 } else { f64::INFINITY };
-                    march(g, origin, &d, &hi, r, &mut acc);
-                }
-                acc
-            },
-        )
-        .reduce(
-            || vec![[0u32; 4]; g.len()],
-            |mut a, b| {
-                for (x, y) in a.iter_mut().zip(&b) {
-                    for k in 0..4 {
-                        x[k] += y[k];
-                    }
-                }
-                a
-            },
-        )
+    let acc: Vec<AtomicU32> = (0..4 * g.len()).into_par_iter().map(|_| AtomicU32::new(0)).collect();
+    dir.par_iter().zip(range.par_iter()).with_min_len(1 << 12).for_each(|(d0, &r)| {
+        let d = [0, 1, 2].map(|a| rot[a][0] * d0[0] + rot[a][1] * d0[1] + rot[a][2] * d0[2]);
+        let nd = (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt();
+        if !(nd > 0.0) {
+            return;
+        }
+        let d = d.map(|x| x / nd);
+        let r = if r.is_finite() && r > 0.0 { r as f64 } else { f64::INFINITY };
+        march(g, origin, &d, &hi, r, &mut |i, o| {
+            acc[4 * i + o].fetch_add(1, Ordering::Relaxed);
+        });
+    });
+    acc.par_chunks(4).map(|c| [0, 1, 2, 3].map(|k| c[k].load(Ordering::Relaxed))).collect()
 }
 
-fn march(g: &Grid, o: &Point, d: &Point, hi: &[f64; 3], r: f64, acc: &mut [[u32; 4]]) {
+fn march(g: &Grid, o: &Point, d: &Point, hi: &[f64; 3], r: f64, add: &mut impl FnMut(usize, usize)) {
     // the slab test: the ray's span inside the box
     let (mut t0, mut t1) = (0.0f64, f64::INFINITY);
     for a in 0..3 {
@@ -151,7 +142,7 @@ fn march(g: &Grid, o: &Point, d: &Point, hi: &[f64; 3], r: f64, acc: &mut [[u32;
         } else {
             PASS
         };
-        acc[i][o] += 1;
+        add(i, o);
         if tb >= t1 {
             return;
         }
@@ -292,6 +283,65 @@ pub fn solve(g: &Grid, kappa: &[f64], sigma: &[f64], s: &[f64], fixed: &[f64], t
     (x, it, res)
 }
 
+/// Soft ownership by harmonic measure (random-walker segmentation), one local solve per stem: on a box of
+/// half-width `half` voxels in x and y (full height) about the stem's first sink voxel, `u` solves
+/// `−∇·(κ∇u) + σu = 0` with u = 1 on the stem's own `sinks`, 0 on every other stem's sinks, on `ground` and on
+/// the box's side faces (absorbing: walks that leave are lost). Returns, for each `targets` voxel inside a stem's
+/// box with u > 0, (target position, stem, u); the caller normalises over stems.
+#[allow(clippy::too_many_arguments)]
+pub fn ownership(g: &Grid, kappa: &[f64], sigma: &[f64], ground: &[bool], sinks: &[Vec<usize>], half: usize, targets: &[usize], tol: f64) -> Vec<(u32, u32, f64)> {
+    let mut sink_of = vec![u32::MAX; g.len()];
+    for (s, vs) in sinks.iter().enumerate() {
+        for &v in vs {
+            sink_of[v] = s as u32;
+        }
+    }
+    let mut target_of = vec![u32::MAX; g.len()];
+    for (t, &v) in targets.iter().enumerate() {
+        target_of[v] = t as u32;
+    }
+    sinks
+        .par_iter()
+        .enumerate()
+        .filter(|(_, vs)| !vs.is_empty())
+        .flat_map_iter(|(s, vs)| {
+            let c = (vs[0] % g.n[0], (vs[0] / g.n[0]) % g.n[1]);
+            let (i0, i1) = (c.0.saturating_sub(half), (c.0 + half + 1).min(g.n[0]));
+            let (j0, j1) = (c.1.saturating_sub(half), (c.1 + half + 1).min(g.n[1]));
+            let sub = Grid { lo: [g.lo[0] + g.h * i0 as f64, g.lo[1] + g.h * j0 as f64, g.lo[2]], h: g.h, n: [i1 - i0, j1 - j0, g.n[2]] };
+            let mut map = Vec::with_capacity(sub.len());
+            for k in 0..g.n[2] {
+                for j in j0..j1 {
+                    for i in i0..i1 {
+                        map.push(g.idx(i, j, k));
+                    }
+                }
+            }
+            let fixed: Vec<f64> = map
+                .iter()
+                .enumerate()
+                .map(|(q, &v)| {
+                    let (i, j) = (q % sub.n[0], (q / sub.n[0]) % sub.n[1]);
+                    if vs.contains(&v) {
+                        1.0
+                    } else if ground[v] || sink_of[v] != u32::MAX || i == 0 || j == 0 || i + 1 == sub.n[0] || j + 1 == sub.n[1] {
+                        0.0
+                    } else {
+                        f64::NAN
+                    }
+                })
+                .collect();
+            let k: Vec<f64> = map.iter().map(|&v| kappa[v]).collect();
+            let sg: Vec<f64> = map.iter().map(|&v| sigma[v]).collect();
+            let (u, _, _) = solve(&sub, &k, &sg, &vec![0.0; sub.len()], &fixed, tol, 5000);
+            map.into_iter()
+                .zip(u)
+                .filter_map(|(v, x)| (target_of[v] != u32::MAX && x > 0.0).then_some((target_of[v], s as u32, x)))
+                .collect::<Vec<_>>()
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -324,5 +374,18 @@ mod tests {
             let want = ((len - x) / l).cosh() / (len / l).cosh();
             assert!((phi[i] - want).abs() < 2e-3, "{i}: {} vs {want}", phi[i]);
         }
+    }
+
+    #[test]
+    fn ownership_is_symmetric_and_favours_the_nearer_stem() {
+        // two stems at x = 5 and x = 15 on a 21 x 9 x 5 box, no ground: the midpoint is owned equally, x = 7 by stem 0
+        let g = Grid { lo: [0.0; 3], h: 1.0, n: [21, 9, 5] };
+        let nv = g.len();
+        let sinks = vec![vec![g.idx(5, 4, 2)], vec![g.idx(15, 4, 2)]];
+        let targets = [g.idx(10, 4, 2), g.idx(7, 4, 2)];
+        let o = ownership(&g, &vec![1.0; nv], &vec![0.1; nv], &vec![false; nv], &sinks, 8, &targets, 1e-12);
+        let u = |t: u32, s: u32| o.iter().find(|x| x.0 == t && x.1 == s).map_or(0.0, |x| x.2);
+        assert!((u(0, 0) - u(0, 1)).abs() < 1e-9 * u(0, 0).max(1e-300), "{} vs {}", u(0, 0), u(0, 1));
+        assert!(u(1, 0) > 5.0 * u(1, 1));
     }
 }

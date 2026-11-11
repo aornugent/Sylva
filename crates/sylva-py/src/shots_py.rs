@@ -1190,6 +1190,41 @@ fn shots_field_solve<'py>(py: Python<'py>, kappa: PyReadonlyArray1<f64>, sigma: 
     Ok(d)
 }
 
+/// Soft ownership of voxels `targets` among stems by harmonic measure (sylva_rs::shots::fields::ownership): stem
+/// `sink_stem[i]` (0..n_stems) owns sink voxel `sink_voxel[i]`; each stem's local box is `half` voxels either side.
+/// Returns flat `target` (position in `targets`), `stem`, `u` (unnormalised), and `secs`.
+#[pyfunction]
+#[pyo3(signature = (kappa, sigma, ground, sink_voxel, sink_stem, n_stems, targets, lo, h, dims, half=16, tol=1e-10))]
+#[allow(clippy::too_many_arguments)]
+fn shots_field_ownership<'py>(py: Python<'py>, kappa: PyReadonlyArray1<f64>, sigma: PyReadonlyArray1<f64>, ground: PyReadonlyArray1<bool>, sink_voxel: PyReadonlyArray1<i64>, sink_stem: PyReadonlyArray1<i64>, n_stems: usize, targets: PyReadonlyArray1<i64>, lo: Vec<f64>, h: f64, dims: Vec<usize>, half: usize, tol: f64) -> PyResult<Bound<'py, PyDict>> {
+    let g = field_grid(lo, h, dims)?;
+    let (k, sg, gr) = (kappa.as_array().to_vec(), sigma.as_array().to_vec(), ground.as_array().to_vec());
+    if [k.len(), sg.len(), gr.len()].iter().any(|&x| x != g.len()) {
+        return Err(PyValueError::new_err("per-voxel arrays must have one value per voxel"));
+    }
+    let (sv, ss, tg) = (sink_voxel.as_array(), sink_stem.as_array(), targets.as_array());
+    let ok = |v: i64| v >= 0 && (v as usize) < g.len();
+    if sv.len() != ss.len() || !sv.iter().all(|&v| ok(v)) || !tg.iter().all(|&v| ok(v)) || !ss.iter().all(|&s| s >= 0 && (s as usize) < n_stems) {
+        return Err(PyValueError::new_err("sink or target voxels out of range, or sink arrays differ in length"));
+    }
+    let mut sinks = vec![Vec::new(); n_stems];
+    for (&v, &s) in sv.iter().zip(ss.iter()) {
+        sinks[s as usize].push(v as usize);
+    }
+    let tg: Vec<usize> = tg.iter().map(|&v| v as usize).collect();
+    let (o, secs) = py.detach(|| {
+        let t0 = std::time::Instant::now();
+        let o = sylva_rs::shots::fields::ownership(&g, &k, &sg, &gr, &sinks, half, &tg, tol);
+        (o, t0.elapsed().as_secs_f64())
+    });
+    let d = PyDict::new(py);
+    d.set_item("target", o.iter().map(|x| x.0).collect::<Vec<u32>>().into_pyarray(py))?;
+    d.set_item("stem", o.iter().map(|x| x.1).collect::<Vec<u32>>().into_pyarray(py))?;
+    d.set_item("u", o.iter().map(|x| x.2).collect::<Vec<f64>>().into_pyarray(py))?;
+    d.set_item("secs", secs)?;
+    Ok(d)
+}
+
 /// Per-scan offsets by alternation on moments (sylva_rs::shots::moments::offsets): for each query point `q` (k, 3)
 /// the per-scan moments of the level-`level` node holding it (with `nbhd`, it and its 26 neighbours), scans with at
 /// least `min_n` surfels there. Returns flat per (query, scan) `query`, `scan`, `t` (m, 3; the shift that brings the
@@ -1305,6 +1340,7 @@ pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
         wrap_pyfunction!(shots_field_counts, m)?,
         wrap_pyfunction!(shots_field_nodes, m)?,
         wrap_pyfunction!(shots_field_solve, m)?,
+        wrap_pyfunction!(shots_field_ownership, m)?,
     ] {
         m.add_function(f)?;
     }
