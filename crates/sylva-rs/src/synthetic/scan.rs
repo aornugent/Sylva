@@ -5,7 +5,12 @@
 //! A terrestrial scanner with a finite beam, cast into a point scene.
 //!
 //! Pulses leave `origin` on a regular zenith / azimuth grid (the two-axis
-//! pattern of a terrestrial scanner, as in [`crate::synthetic::scan`]). A
+//! pattern of a terrestrial scanner, as in [`crate::synthetic::scan`]),
+//! fired in acquisition order: one line per azimuth step, sweeping the
+//! zenith upward, optionally only over an azimuth window. Each echo carries
+//! its pulse's `gps_time` (line `line_period` apart, slots `pulse_interval`
+//! apart, slot 0 at zenith 0), so the scan's lattice
+//! ([`crate::shots::lattice`]) can be rebuilt from it as from a real scan. A
 //! pulse is a cone of full divergence `divergence` leaving an aperture of
 //! `exit_diameter`, so that its footprint at range `R` has diameter
 //! `exit_diameter + R divergence`; it is sampled by `footprint_samples`
@@ -44,6 +49,11 @@
 //! Random numbers come from [`Generator`], `max_echoes` normal draws per
 //! pulse in firing order, so that a seed gives the same scan on any number
 //! of threads.
+//!
+//! [`export`] then turns a scan into what a scanner's export holds: weak
+//! and partial echoes deleted, pulses without an echo dropped, and the
+//! scan's systematic errors (a range law, a turn of its directions, a
+//! smooth local displacement field) applied.
 
 use std::f64::consts::PI;
 
@@ -101,6 +111,12 @@ pub struct BeamScan {
     pub reflectance: Reflectance,
     pub max_range: f64,
     pub seed: u64,
+    /// Azimuth window fired (degrees, `0..360` is the whole turn).
+    pub min_azimuth_deg: f64,
+    pub max_azimuth_deg: f64,
+    /// Time between slots of a line and between lines (s): Alice Mulga's VZ-400i, 0.825 us and 6.593 ms.
+    pub pulse_interval: f64,
+    pub line_period: f64,
     /// Solid cylinders in the scene besides its points (see [`Solid`]). The
     /// points they name stand for them only, and are not patches themselves.
     pub solids: Vec<Solid>,
@@ -108,7 +124,7 @@ pub struct BeamScan {
 
 impl BeamScan {
     pub fn new(origin: Point) -> BeamScan {
-        BeamScan { origin, resolution_deg: 0.25, min_zenith_deg: 0.0, max_zenith_deg: 130.0, max_echoes: 2, echo_separation: 0.5, range_noise: 0.0, range_noise_slope: 0.0, divergence_mrad: 0.0, exit_diameter: 0.0, footprint_samples: 1, mixed_pixels: true, target_radius: None, oriented: true, detection_threshold: 0.0, reflectance: Reflectance::default(), max_range: f64::INFINITY, seed: 0, solids: Vec::new() }
+        BeamScan { origin, resolution_deg: 0.25, min_zenith_deg: 0.0, max_zenith_deg: 130.0, max_echoes: 2, echo_separation: 0.5, range_noise: 0.0, range_noise_slope: 0.0, divergence_mrad: 0.0, exit_diameter: 0.0, footprint_samples: 1, mixed_pixels: true, target_radius: None, oriented: true, detection_threshold: 0.0, reflectance: Reflectance::default(), max_range: f64::INFINITY, seed: 0, min_azimuth_deg: 0.0, max_azimuth_deg: 360.0, pulse_interval: 0.825e-6, line_period: 6.593e-3, solids: Vec::new() }
     }
 }
 
@@ -380,6 +396,12 @@ fn check(p: &BeamScan) -> Result<()> {
             return Err(Error::invalid(format!("{name} must be zero or more, got {v}")));
         }
     }
+    if !(p.min_azimuth_deg >= 0.0 && p.max_azimuth_deg > p.min_azimuth_deg && p.max_azimuth_deg <= 360.0) {
+        return Err(Error::invalid(format!("azimuth window must satisfy 0 <= min < max <= 360, got {} to {}", p.min_azimuth_deg, p.max_azimuth_deg)));
+    }
+    if !(p.pulse_interval > 0.0 && p.line_period >= (p.max_zenith_deg / p.resolution_deg + 1.0) * p.pulse_interval) {
+        return Err(Error::invalid("pulse_interval must be positive and a line's slots must fit in line_period"));
+    }
     if p.max_range.is_nan() || p.max_range <= 0.0 {
         return Err(Error::invalid(format!("max_range must be positive, got {}", p.max_range)));
     }
@@ -489,10 +511,14 @@ pub fn scan_beam(cloud: &PointCloud, p: &BeamScan) -> Result<Shots> {
         let h = ((0..3).map(|k| (s.b[k] - s.a[k]).powi(2)).sum::<f64>()).sqrt() / 2.0;
         (h * h + s.r * s.r).sqrt()
     };
-    let solid_grid = Grid::new(&mid, &(0..p.solids.len()).collect::<Vec<_>>(), bound)?;
+    // solids larger than BIG (ground slabs, walls) are tested on every ray, so they don't coarsen the grid of the rest
+    const BIG: f64 = 1.0;
+    let (big, small): (Vec<usize>, Vec<usize>) = (0..p.solids.len()).partition(|&i| bound(i) > BIG);
+    let solid_grid = Grid::new(&mid, &small, bound)?;
     let res = p.resolution_deg;
     let n_zen = ((p.max_zenith_deg - p.min_zenith_deg) / res).round().max(1.0) as usize;
-    let n_az = (360.0 / res).round().max(1.0) as usize;
+    let ia0 = (p.min_azimuth_deg / res).floor() as usize;
+    let n_az = ((p.max_azimuth_deg / res).ceil() as usize).min((360.0 / res).round().max(1.0) as usize).max(ia0 + 1) - ia0;
     let n_pulses = n_zen * n_az;
     limits::check_cells(n_pulses as u128, 64 + 8 * p.max_echoes as u64, &format!("a scan of {n_pulses} pulses"), "a coarser resolution_deg")?;
     let offsets = footprint_offsets(p.footprint_samples);
@@ -502,18 +528,21 @@ pub fn scan_beam(cloud: &PointCloud, p: &BeamScan) -> Result<Shots> {
     let o = p.origin;
     let mut rng = Generator::new(p.seed);
     let mut direction = Vec::with_capacity(n_pulses);
+    let mut time = Vec::with_capacity(n_pulses);
     let mut per_pulse: Vec<Vec<(Echo, f64)>> = Vec::with_capacity(n_pulses);
     const BLOCK: usize = 1 << 15;
     let mut j0 = 0;
     while j0 < n_pulses {
         let j1 = (j0 + BLOCK).min(n_pulses);
         let noise = if p.range_noise > 0.0 || p.range_noise_slope > 0.0 { rng.normal_n(0.0, 1.0, (j1 - j0) * p.max_echoes) } else { vec![0.0; (j1 - j0) * p.max_echoes] };
-        let block: Vec<(Point, Vec<(Echo, f64)>)> = (j0..j1).into_par_iter().map(|j| {
-            // The pulse's place on the scan pattern: one row per zenith step,
-            // one column per azimuth step, aimed at the middle of its cell.
-            let (iz, ia) = (j / n_az, j % n_az);
-            let z = (p.min_zenith_deg + (iz as f64 + 0.5) * res).to_radians();
+        let block: Vec<(Point, f64, Vec<(Echo, f64)>)> = (j0..j1).into_par_iter().map(|j| {
+            // The pulse's place on the scan pattern: one line per azimuth
+            // step, its slots up the zenith, aimed at the middle of its cell.
+            let (ia, iz) = (ia0 + j / n_zen, j % n_zen);
+            let zdeg = p.min_zenith_deg + (iz as f64 + 0.5) * res;
+            let z = zdeg.to_radians();
             let a = ((ia as f64 + 0.5) * res).to_radians();
+            let t = ia as f64 * p.line_period + (zdeg / res) * p.pulse_interval;
             let d = [z.sin() * a.sin(), z.sin() * a.cos(), z.cos()];
             // Two directions across the beam, so the footprint can be sampled:
             // any vector not parallel to the beam gives the first by a cross
@@ -536,7 +565,14 @@ pub fn scan_beam(cloud: &PointCloud, p: &BeamScan) -> Result<Shots> {
                 let nn = (ds[0] * ds[0] + ds[1] * ds[1] + ds[2] * ds[2]).sqrt();
                 let ds = [ds[0] / nn, ds[1] / nn, ds[2] / nn];
                 let patch = grid.cast(&os, &ds, 0.1, p.max_range, |i| patch_hit(&cloud.xyz[i], &normals[i], r2, &os, &ds));
-                let solid = solid_grid.cast(&os, &ds, 0.1, p.max_range, |i| solid_hit(&p.solids[i], &os, &ds)).map(|(t, i)| (t, p.solids[i].point));
+                let mut solid = solid_grid.cast(&os, &ds, 0.1, p.max_range, |i| solid_hit(&p.solids[i], &os, &ds)).map(|(t, i)| (t, p.solids[i].point));
+                for &i in &big {
+                    if let Some((t, _)) = solid_hit(&p.solids[i], &os, &ds).filter(|h| h.0 > 0.1 && h.0 < p.max_range) {
+                        if solid.is_none_or(|s| t < s.0) {
+                            solid = Some((t, p.solids[i].point));
+                        }
+                    }
+                }
                 match (patch, solid) {
                     (Some(x), Some(y)) => Some(if y.0 < x.0 { y } else { x }),
                     (x, y) => x.or(y),
@@ -581,10 +617,11 @@ pub fn scan_beam(cloud: &PointCloud, p: &BeamScan) -> Result<Shots> {
                 (e, noisy)
             }).collect();
             out.sort_by(|a, b| a.1.total_cmp(&b.1));
-            (d, out)
+            (d, t, out)
         }).collect();
-        for (d, e) in block {
+        for (d, t, e) in block {
             direction.push(d);
+            time.push(t);
             per_pulse.push(e);
         }
         j0 = j1;
@@ -597,7 +634,128 @@ pub fn scan_beam(cloud: &PointCloud, p: &BeamScan) -> Result<Shots> {
     echo_attrs.insert("reflectance".into(), Attr::F32(flat.iter().map(|e| (10.0 * e.0.energy.log10()) as f32).collect()));
     echo_attrs.insert("footprint_fraction".into(), Attr::F32(flat.iter().map(|e| e.0.fraction as f32).collect()));
     echo_attrs.insert("range_spread".into(), Attr::F32(flat.iter().map(|e| e.0.spread as f32).collect()));
+    echo_attrs.insert("gps_time".into(), Attr::F64(count.iter().zip(&time).flat_map(|(&c, &t)| std::iter::repeat_n(t, c as usize)).collect()));
     Ok(Shots { origin: vec![o; n_pulses], direction, echo_start, echo_count: count, echo_range: flat.iter().map(|e| e.1).collect(), echo_attrs })
+}
+
+/// What a scanner's export keeps of a scan, and the systematic errors it
+/// carries ([`export`]); lengths in metres.
+#[derive(Debug, Clone)]
+pub struct Export {
+    /// Partial hits are deleted: an echo is kept with probability
+    /// `1 / (1 + exp(-(footprint_fraction - min_fraction) / fraction_width))`
+    /// (a hard cut at `min_fraction` when the width is 0), the stand-in for a
+    /// filter on pulse-shape deviation.
+    pub min_fraction: f64,
+    pub fraction_width: f64,
+    /// Echoes below this reflectance (dB) are deleted.
+    pub min_reflectance: f64,
+    /// Drop the pulses left without an echo, as an echoes-only export does.
+    pub echoes_only: bool,
+    /// The range law along the beam: every range grows by `range_a + range_b * range`.
+    pub range_a: f64,
+    pub range_b: f64,
+    /// The scan's directions turned about the vertical (mrad).
+    pub yaw_mrad: f64,
+    /// A smooth random displacement field added to every pulse's echoes:
+    /// standard deviation per axis and correlation length (a squared
+    /// exponential), drawn from `seed`.
+    pub offset_sd: f64,
+    pub offset_length: f64,
+    pub seed: u64,
+}
+
+impl Default for Export {
+    /// Keep everything, add nothing.
+    fn default() -> Self {
+        Export { min_fraction: 0.0, fraction_width: 0.0, min_reflectance: f64::NEG_INFINITY, echoes_only: false, range_a: 0.0, range_b: 0.0, yaw_mrad: 0.0, offset_sd: 0.0, offset_length: 0.5, seed: 0 }
+    }
+}
+
+/// A uniform number in `[0, 1)` from three integers (splitmix64), so that an
+/// echo's fate doesn't depend on the order echoes are visited in.
+fn unit_hash(a: u64, b: u64, c: u64) -> f64 {
+    let mut z = a.wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ b.wrapping_mul(0xC2B2_AE3D_27D4_EB4F) ^ c.wrapping_add(0x1656_67B1_9E37_79F9);
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    z ^= z >> 31;
+    (z >> 11) as f64 / (1u64 << 53) as f64
+}
+
+/// What an export of scan `s` ([`scan_beam`]'s output, which carries
+/// `footprint_fraction` and `reflectance`) holds, under `p` (see [`Export`]).
+///
+/// The deletion acts per echo, then a pulse left with none is dropped if
+/// `echoes_only`. The errors act on what is kept: the direction turns by
+/// `yaw_mrad`; the first echo's point moves by the displacement field there
+/// (random Fourier features: 64 cosines whose wave vectors are drawn from
+/// the field's spectrum), which sets the pulse's new direction and adds the
+/// same range to all its echoes; then every range grows by the range law.
+pub fn export(s: &Shots, p: &Export) -> Result<Shots> {
+    let fraction = s.echo_attrs.get("footprint_fraction").ok_or_else(|| Error::invalid("export needs the scan's footprint_fraction"))?;
+    let refl = s.echo_attrs.get("reflectance").ok_or_else(|| Error::invalid("export needs the scan's reflectance"))?;
+    if !(p.fraction_width >= 0.0 && p.offset_sd >= 0.0 && p.offset_length > 0.0) {
+        return Err(Error::invalid("fraction_width and offset_sd must be zero or more, offset_length positive"));
+    }
+    let mut keep_echo = vec![false; s.echo_range.len()];
+    for i in 0..s.n_shots() {
+        for k in 0..s.echo_count[i] as usize {
+            let e = s.echo_start[i] + k;
+            let (f, r) = (fraction.get_f64(e), refl.get_f64(e));
+            let pk = if p.fraction_width > 0.0 { 1.0 / (1.0 + (-(f - p.min_fraction) / p.fraction_width).exp()) } else { f64::from(u8::from(f >= p.min_fraction)) };
+            keep_echo[e] = r >= p.min_reflectance && unit_hash(p.seed, i as u64, k as u64) < pk;
+        }
+    }
+    const K: usize = 64;
+    let mut rng = Generator::new(p.seed ^ 0x5EED_0FF5E7);
+    let wave = rng.normal_n(0.0, 1.0 / p.offset_length, 3 * K);
+    let amp = rng.normal_n(0.0, p.offset_sd * (2.0 / K as f64).sqrt(), 3 * K);
+    let phase: Vec<f64> = (0..K).map(|_| rng.random() * 2.0 * PI).collect();
+    let field = |x: &Point| -> Point {
+        let mut d = [0.0; 3];
+        if p.offset_sd == 0.0 {
+            return d;
+        }
+        for k in 0..K {
+            let c = (wave[3 * k] * x[0] + wave[3 * k + 1] * x[1] + wave[3 * k + 2] * x[2] + phase[k]).cos();
+            for a in 0..3 {
+                d[a] += amp[3 * k + a] * c;
+            }
+        }
+        d
+    };
+    let (sy, cy) = (p.yaw_mrad * 1e-3).sin_cos();
+    let mut out = Shots::default();
+    let mut idx = Vec::new();
+    for i in 0..s.n_shots() {
+        let a = s.echo_start[i];
+        let kept: Vec<usize> = (a..a + s.echo_count[i] as usize).filter(|&e| keep_echo[e]).collect();
+        if kept.is_empty() && p.echoes_only {
+            continue;
+        }
+        let (o, d0) = (s.origin[i], s.direction[i]);
+        let mut d = [cy * d0[0] - sy * d0[1], sy * d0[0] + cy * d0[1], d0[2]];
+        let mut shift = 0.0;
+        if let Some(&e) = kept.first() {
+            let r = s.echo_range[e];
+            let dx = field(&std::array::from_fn(|k| o[k] + r * d[k]));
+            let v: Point = std::array::from_fn(|k| r * d[k] + dx[k]);
+            let len = (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt();
+            d = [v[0] / len, v[1] / len, v[2] / len];
+            shift = len - r;
+        }
+        out.origin.push(o);
+        out.direction.push(d);
+        out.echo_start.push(out.echo_range.len());
+        out.echo_count.push(kept.len() as u32);
+        for &e in &kept {
+            let r = s.echo_range[e] + shift;
+            out.echo_range.push(r + p.range_a + p.range_b * r);
+            idx.push(e);
+        }
+    }
+    out.echo_attrs = s.echo_attrs.iter().map(|(k, v)| (k.clone(), v.take(&idx))).collect();
+    Ok(out)
 }
 
 #[cfg(test)]
@@ -768,6 +926,47 @@ mod tests {
         assert_eq!(beyond, 0, "no sub-beam of a pulse whose footprint lies on the stem reaches the wall");
         p.solids[0].r = -1.0;
         assert!(scan_beam(&cloud, &p).is_err());
+    }
+
+    #[test]
+    fn pulses_come_in_lines_with_their_times() {
+        let cloud = PointCloud::new(wall(10.0, -1.0, 1.0, -1.0, 1.0, 0.01));
+        let mut p = params();
+        p.max_azimuth_deg = 2.0;
+        let s = scan_beam(&cloud, &p).unwrap();
+        assert_eq!(s.n_shots(), 100 * 10);
+        let t = match &s.echo_attrs["gps_time"] { Attr::F64(v) => v.clone(), _ => unreachable!() };
+        assert_eq!(t.len(), s.echo_range.len());
+        assert!(t.len() > 50 && t.windows(2).all(|w| w[1] >= w[0]), "echoes in acquisition order");
+    }
+
+    #[test]
+    fn the_export_deletes_partial_hits_and_shifts_ranges() {
+        let mut pts = wall(10.0, -3.0, 0.0, -1.0, 1.0, 0.005);
+        pts.extend(wall(10.3, -3.0, 3.0, -1.0, 1.0, 0.005));
+        let cloud = PointCloud::new(pts);
+        let mut p = params();
+        p.divergence_mrad = 3.0;
+        p.footprint_samples = 19;
+        p.echo_separation = 0.1;
+        let s = scan_beam(&cloud, &p).unwrap();
+        let partial = |s: &Shots| match &s.echo_attrs["footprint_fraction"] { Attr::F32(v) => v.iter().filter(|&&f| f < 0.5).count(), _ => unreachable!() };
+        assert!(partial(&s) > 0);
+        let e = Export { min_fraction: 0.5, echoes_only: true, range_a: 0.002, range_b: 0.001, ..Export::default() };
+        let x = export(&s, &e).unwrap();
+        assert_eq!(partial(&x), 0);
+        assert!(x.echo_count.iter().all(|&c| c > 0) && x.n_shots() < s.n_shots());
+        // the wall at 10 m straight ahead now reads 2 mm + 1 mm/m x 10 m = 12 mm long
+        let c = (0..x.n_shots()).filter(|&c| x.direction[c][1] > 0.99999).find(|&c| x.echo_range[x.echo_start[c]] < 10.2).unwrap();
+        let r = x.echo_range[x.echo_start[c]] * x.direction[c][1];
+        assert!((r - 10.012).abs() < 1e-3, "{r}");
+        // a displacement field of 3 mm per axis moves echoes by about that much
+        let e = Export { offset_sd: 0.003, offset_length: 0.5, seed: 4, ..Export::default() };
+        let x = export(&s, &e).unwrap();
+        let dy: Vec<f64> = (0..s.n_shots()).filter(|&c| s.echo_count[c] > 0).map(|c| x.echo_range[x.echo_start[c]] * x.direction[c][1] - s.echo_range[s.echo_start[c]] * s.direction[c][1]).collect();
+        let sd = (dy.iter().map(|v| v * v).sum::<f64>() / dy.len() as f64).sqrt();
+        assert!(sd > 0.0005 && sd < 0.009, "{sd}");
+        assert!(export(&s, &Export { offset_length: 0.0, ..Export::default() }).is_err());
     }
 
     #[test]
