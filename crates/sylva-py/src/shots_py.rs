@@ -171,6 +171,125 @@ fn shots_scan_stripes<'py>(py: Python<'py>, time: PyReadonlyArray1<f64>, directi
     Ok(d)
 }
 
+/// Amodal completion in one scan's range image (sylva_rs::shots::amodal), for 3dtrees research 128's amodal spike.
+/// Takes the pulses as `shots_scan_surfels` does; stripe ends `end_p`, `end_d` (outward), `end_r`; candidate pairs
+/// `pair_a`, `pair_b` (indices into the ends); 3-D Hermite paths `h_pa`, `h_ta`, `h_pb`, `h_tb` (m, 3), `h_ra`,
+/// `h_rb`; cylinders `cyl_*` for the wood-only confirmation, with this scan's surfels `wood_p`, `wood_n`.
+/// Returns per end `e_class` (0 occluded 1 real 2 ambiguous 3 none), `e_near`, `e_far`, `e_empty`, `e_same`,
+/// `e_l`, `e_c`, `e_rho`, `e_sl`, `e_sc` (rad per line, per column), `e_ul`, `e_uc`, `e_fore`; per pair `p_ok`, `p_gap_cells`, `p_mis_a`, `p_mis_b` (deg),
+/// `p_straight`, `p_hermite` (n, 4: support refute occluder unknown); per 3-D path `h_count` (m, 4); per
+/// cylinder `c_support`, `c_wood`, `c_inf`; the wood node count and the seconds each step took.
+#[pyfunction]
+#[pyo3(signature = (time, direction, range, rot, origin, end_p, end_d, end_r, pair_a, pair_b, h_pa, h_ta, h_pb, h_tb, h_ra, h_rb, cyl_p, cyl_u, cyl_half, cyl_r, wood_p, wood_n, margin=0.05, window=4, tol=0.03, cyl_tol=0.015, max_cells=60.0))]
+#[allow(clippy::too_many_arguments)]
+fn shots_amodal_scan<'py>(py: Python<'py>, time: PyReadonlyArray1<f64>, direction: PyReadonlyArray2<f64>, range: PyReadonlyArray1<f32>, rot: PyReadonlyArray2<f64>, origin: Vec<f64>, end_p: PyReadonlyArray2<f64>, end_d: PyReadonlyArray2<f64>, end_r: PyReadonlyArray1<f64>, pair_a: PyReadonlyArray1<u32>, pair_b: PyReadonlyArray1<u32>, h_pa: PyReadonlyArray2<f64>, h_ta: PyReadonlyArray2<f64>, h_pb: PyReadonlyArray2<f64>, h_tb: PyReadonlyArray2<f64>, h_ra: PyReadonlyArray1<f64>, h_rb: PyReadonlyArray1<f64>, cyl_p: PyReadonlyArray2<f64>, cyl_u: PyReadonlyArray2<f64>, cyl_half: PyReadonlyArray1<f64>, cyl_r: PyReadonlyArray1<f64>, wood_p: PyReadonlyArray2<f64>, wood_n: PyReadonlyArray2<f64>, margin: f64, window: usize, tol: f64, cyl_tol: f64, max_cells: f64) -> PyResult<Bound<'py, PyDict>> {
+    use sylva_rs::shots::amodal::{image_ends, image_pairs, score_path, wood_keys, wood_support, world_path, AmodalParams, PathCount};
+    use sylva_rs::shots::opacity::{Cyl, ShadowMap};
+    let dir = xyz_from_py(direction)?;
+    let t = time.as_array().to_vec();
+    let r = range.as_array().to_vec();
+    let rot = xyz_from_py(rot)?;
+    if t.len() != dir.len() || r.len() != dir.len() || rot.len() != 3 {
+        return Err(PyValueError::new_err("per-pulse arrays differ in length, or rot isn't 3 x 3"));
+    }
+    let origin = point3(origin, "origin")?;
+    let rot = [rot[0], rot[1], rot[2]];
+    let (ep, ed, er) = (xyz_from_py(end_p)?, xyz_from_py(end_d)?, end_r.as_array().to_vec());
+    let ends: Vec<(sylva_rs::Point, sylva_rs::Point, f64)> = (0..ep.len()).map(|i| (ep[i], ed[i], er[i])).collect();
+    let pairs: Vec<(usize, usize)> = pair_a.as_array().iter().zip(pair_b.as_array().iter()).map(|(&a, &b)| (a as usize, b as usize)).collect();
+    if pairs.iter().any(|&(a, b)| a >= ends.len() || b >= ends.len()) {
+        return Err(PyValueError::new_err("a pair names an end that doesn't exist"));
+    }
+    let (hpa, hta, hpb, htb) = (xyz_from_py(h_pa)?, xyz_from_py(h_ta)?, xyz_from_py(h_pb)?, xyz_from_py(h_tb)?);
+    let (hra, hrb) = (h_ra.as_array().to_vec(), h_rb.as_array().to_vec());
+    let (cp, cu) = (xyz_from_py(cyl_p)?, xyz_from_py(cyl_u)?);
+    let (ch, cr) = (cyl_half.as_array().to_vec(), cyl_r.as_array().to_vec());
+    let cyls: Vec<Cyl> = (0..cp.len()).map(|i| Cyl { p: cp[i], u: cu[i], half: ch[i], r: cr[i] }).collect();
+    let (wp, wn) = (xyz_from_py(wood_p)?, xyz_from_py(wood_n)?);
+    let prm = AmodalParams { margin, window, tol, ..AmodalParams::default() };
+    let (ie, ip, hc, cs, n_wood, secs) = py.detach(|| {
+        use rayon::prelude::*;
+        let c0 = std::time::Instant::now();
+        let lat = sylva_rs::shots::lattice::scan_lattice(&t, &dir);
+        let map = ShadowMap::new(&lat, &r, rot, origin);
+        let c1 = std::time::Instant::now();
+        let ie = image_ends(&map, &ends, &prm);
+        let ip = image_pairs(&map, &ie, &pairs, &prm);
+        let hc: Vec<PathCount> = (0..hpa.len()).into_par_iter().map(|i| score_path(&map, &world_path(&map, &hpa[i], &hta[i], &hpb[i], &htb[i], hra[i], hrb[i]), tol)).collect();
+        let c2 = std::time::Instant::now();
+        let wood = wood_keys(&wp, &wn, 10.0, 0.5, 0.3);
+        let beam = sylva_rs::shots::stripes::StripeParams::default().beam;
+        let cs = wood_support(&map, &dir, &cyls, &wood, |x| beam.footprint(x), cyl_tol, max_cells);
+        let c3 = std::time::Instant::now();
+        (ie, ip, hc, cs, wood.len(), [(c1 - c0).as_secs_f64(), (c2 - c1).as_secs_f64(), (c3 - c2).as_secs_f64()])
+    });
+    let d = PyDict::new(py);
+    let nan = f64::NAN;
+    macro_rules! col {
+        ($v:expr, $name:literal, $f:expr) => {
+            d.set_item($name, $v.iter().map($f).collect::<Vec<_>>().into_pyarray(py))?;
+        };
+    }
+    col!(ie, "e_class", |x| x.map_or(3u8, |e| e.label.class));
+    col!(ie, "e_near", |x| x.map_or(0u32, |e| e.label.near));
+    col!(ie, "e_far", |x| x.map_or(0u32, |e| e.label.far));
+    col!(ie, "e_empty", |x| x.map_or(0u32, |e| e.label.empty));
+    col!(ie, "e_same", |x| x.map_or(0u32, |e| e.label.same));
+    col!(ie, "e_l", |x| x.map_or(nan, |e| e.at.l));
+    col!(ie, "e_c", |x| x.map_or(nan, |e| e.at.c));
+    col!(ie, "e_rho", |x| x.map_or(nan, |e| e.at.rho));
+    col!(ie, "e_sl", |x| x.map_or(nan, |e| e.at.sl));
+    col!(ie, "e_sc", |x| x.map_or(nan, |e| e.at.sc));
+    col!(ie, "e_ul", |x| x.map_or(nan, |e| e.u[0]));
+    col!(ie, "e_uc", |x| x.map_or(nan, |e| e.u[1]));
+    col!(ie, "e_fore", |x| x.map_or(nan, |e| e.fore));
+    col!(ip, "p_ok", |x| x.is_some());
+    col!(ip, "p_gap_cells", |x| x.map_or(nan, |p| p.0));
+    col!(ip, "p_mis_a", |x| x.map_or(nan, |p| p.1));
+    col!(ip, "p_mis_b", |x| x.map_or(nan, |p| p.2));
+    let counts = |v: Vec<PathCount>| -> PyResult<Bound<'py, PyArray2<u32>>> {
+        let n = v.len();
+        Ok(v.into_iter().flat_map(|c| [c.support, c.refute, c.occluder, c.unknown]).collect::<Vec<u32>>().into_pyarray(py).reshape([n, 4])?)
+    };
+    d.set_item("p_straight", counts(ip.iter().map(|x| x.map_or(PathCount::default(), |p| p.3)).collect())?)?;
+    d.set_item("p_hermite", counts(ip.iter().map(|x| x.map_or(PathCount::default(), |p| p.4)).collect())?)?;
+    d.set_item("h_count", counts(hc)?)?;
+    col!(cs, "c_support", |x| x[0]);
+    col!(cs, "c_wood", |x| x[1]);
+    col!(cs, "c_inf", |x| x[2]);
+    d.set_item("n_wood_nodes", n_wood)?;
+    for (k, v) in ["lattice_s", "image_s", "wood_s"].iter().zip(secs) {
+        d.set_item(*k, v)?;
+    }
+    Ok(d)
+}
+
+/// The moment octree of every scan but `exclude` (sylva_rs::shots::amodal::lift), from surfels `p`, `n` of scans
+/// `scan`, queried at `q` with a 9 cm neighbourhood. Returns per point `n`, `ratio`, `r`, `lam3`, `u` (NaN where
+/// fewer than `min_n` surfels) and `secs`.
+#[pyfunction]
+#[pyo3(signature = (p, n, scan, exclude, q, min_n=10.0, r_max=0.3))]
+#[allow(clippy::too_many_arguments)]
+fn shots_amodal_lift<'py>(py: Python<'py>, p: PyReadonlyArray2<f64>, n: PyReadonlyArray2<f64>, scan: PyReadonlyArray1<i32>, exclude: i32, q: PyReadonlyArray2<f64>, min_n: f64, r_max: f64) -> PyResult<Bound<'py, PyDict>> {
+    let (p, nn, scan, q) = (xyz_from_py(p)?, xyz_from_py(n)?, scan.as_array().to_vec(), xyz_from_py(q)?);
+    if nn.len() != p.len() || scan.len() != p.len() {
+        return Err(PyValueError::new_err("surfel arrays differ in length"));
+    }
+    let (o, secs) = py.detach(|| {
+        let t0 = std::time::Instant::now();
+        let o = sylva_rs::shots::amodal::lift(&p, &nn, &scan, exclude, &q, min_n, r_max);
+        (o, t0.elapsed().as_secs_f64())
+    });
+    let d = PyDict::new(py);
+    d.set_item("n", o.iter().map(|x| x.n).collect::<Vec<_>>().into_pyarray(py))?;
+    d.set_item("ratio", o.iter().map(|x| x.ratio).collect::<Vec<_>>().into_pyarray(py))?;
+    d.set_item("r", o.iter().map(|x| x.r).collect::<Vec<_>>().into_pyarray(py))?;
+    d.set_item("lam3", o.iter().map(|x| x.lam3).collect::<Vec<_>>().into_pyarray(py))?;
+    d.set_item("u", xyz_to_py(py, &o.iter().map(|x| x.u).collect::<Vec<_>>()))?;
+    d.set_item("secs", secs)?;
+    Ok(d)
+}
+
 fn point3(v: Vec<f64>, name: &str) -> PyResult<[f64; 3]> {
     v.try_into().map_err(|_| PyValueError::new_err(format!("{name} needs 3 values")))
 }
@@ -1318,6 +1437,8 @@ pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
         wrap_pyfunction!(shots_moment_offsets, m)?,
         wrap_pyfunction!(shots_field_counts, m)?,
         wrap_pyfunction!(shots_field_nodes, m)?,
+        wrap_pyfunction!(shots_amodal_scan, m)?,
+        wrap_pyfunction!(shots_amodal_lift, m)?,
         wrap_pyfunction!(shots_field_solve, m)?,
     ] {
         m.add_function(f)?;

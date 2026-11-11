@@ -66,6 +66,8 @@ pub struct Sample {
     pub sin: f64,
     pub excess: f64,
     pub m: Point,
+    /// The cell's pulse (`u32::MAX` for an empty cell).
+    pub pulse: u32,
 }
 
 /// A scan's range image: the cell -> pulse index (`u32::MAX` empty), with the lattice and the scan's pose
@@ -90,13 +92,13 @@ impl<'a> ShadowMap<'a> {
         ShadowMap { lat, cell, range, rot, origin }
     }
 
-    fn to_scanner(&self, p: &Point) -> Point {
+    pub(crate) fn to_scanner(&self, p: &Point) -> Point {
         let d = sub(p, &self.origin);
         // rot^T d
         [0, 1, 2].map(|k| self.rot[0][k] * d[0] + self.rot[1][k] * d[1] + self.rot[2][k] * d[2])
     }
 
-    fn rot_t(&self, u: &Point) -> Point {
+    pub(crate) fn rot_t(&self, u: &Point) -> Point {
         [0, 1, 2].map(|k| self.rot[0][k] * u[0] + self.rot[1][k] * u[1] + self.rot[2][k] * u[2])
     }
 
@@ -186,7 +188,7 @@ impl<'a> ShadowMap<'a> {
                     let m = [0, 1, 2].map(|a| self.rot[a][0] * ms[0] + self.rot[a][1] * ms[1] + self.rot[a][2] * ms[2]);
                     out.push(Sample {
                         cyl: ci as u32, outcome: o, chord: t1 - t0, miss: miss2.sqrt(), t_in: t0, depth: d,
-                        fp, sin: aa.sqrt(), excess: depth - tm, m,
+                        fp, sin: aa.sqrt(), excess: depth - tm, m, pulse: j,
                     });
                 }
             }

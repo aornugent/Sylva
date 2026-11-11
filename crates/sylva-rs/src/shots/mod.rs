@@ -8,6 +8,7 @@
 //! `echo_count == 0` is a genuine miss and still carries information about
 //! free space. Modelled on canopygrid's `Shots` and raycloudtools' ray clouds.
 
+pub mod amodal;
 pub mod completion;
 pub mod elements;
 pub mod fields;
