@@ -721,6 +721,112 @@ fn shots_link_ends<'py>(py: Python<'py>, p: PyReadonlyArray2<f64>, d: PyReadonly
     Ok(out)
 }
 
+/// The completion field's walk fit (sylva_rs::shots::completion): slice axis points `p`, directions `u` (k, 3) and
+/// fragment ids `frag`. Returns the pairs' `ds`, `theta`, and the Brownian (`b_`) and kinked (`k_`) fits' `d`,
+/// `sigma`, `lambda`, `loglik`.
+#[pyfunction]
+#[pyo3(signature = (p, u, frag, min_sep=0.02, max_sep=0.5, kappa=std::f64::consts::FRAC_PI_2))]
+fn shots_completion_fit<'py>(py: Python<'py>, p: PyReadonlyArray2<f64>, u: PyReadonlyArray2<f64>, frag: PyReadonlyArray1<i64>, min_sep: f64, max_sep: f64, kappa: f64) -> PyResult<Bound<'py, PyDict>> {
+    use sylva_rs::shots::completion::{fit_walk, tangent_pairs};
+    let (p, u, f) = (xyz_from_py(p)?, xyz_from_py(u)?, frag.as_array().to_vec());
+    if u.len() != p.len() || f.len() != p.len() {
+        return Err(PyValueError::new_err("slice arrays differ in length"));
+    }
+    let (pairs, fb, fk) = py.detach(|| {
+        let pairs = tangent_pairs(&p, &u, &f, min_sep, max_sep);
+        let fb = fit_walk(&pairs, false, kappa);
+        let fk = fit_walk(&pairs, true, kappa);
+        (pairs, fb, fk)
+    });
+    let d = PyDict::new(py);
+    d.set_item("ds", pairs.iter().map(|x| x.0).collect::<Vec<_>>().into_pyarray(py))?;
+    d.set_item("theta", pairs.iter().map(|x| x.1).collect::<Vec<_>>().into_pyarray(py))?;
+    for (pre, w) in [("b_", fb), ("k_", fk)] {
+        d.set_item(format!("{pre}d"), w.d)?;
+        d.set_item(format!("{pre}sigma"), w.sigma)?;
+        d.set_item(format!("{pre}lambda"), w.lambda)?;
+        d.set_item(format!("{pre}loglik"), w.loglik)?;
+    }
+    Ok(d)
+}
+
+fn completion_ends(p: PyReadonlyArray2<f64>, d: PyReadonlyArray2<f64>, r: PyReadonlyArray1<f64>, sig_r: Vec<f64>) -> PyResult<Vec<sylva_rs::shots::completion::End>> {
+    let (p, dd, r) = (xyz_from_py(p)?, xyz_from_py(d)?, r.as_array().to_vec());
+    if dd.len() != p.len() || r.len() != p.len() || sig_r.len() != p.len() {
+        return Err(PyValueError::new_err("end arrays differ in length"));
+    }
+    Ok((0..p.len()).map(|i| sylva_rs::shots::completion::End { p: p[i], d: dd[i], r: r[i], sig_r: sig_r[i] }).collect())
+}
+
+/// Each candidate link's Hermite path as short cylinders: ends `p`, `d` (k, 3), `r`, pairs `a`, `b`; about `seg`
+/// metres a cylinder, at most `max_seg`. Returns `p`, `u`, `half`, `r` and each cylinder's `pair`.
+#[pyfunction]
+#[pyo3(signature = (p, d, r, a, b, seg=0.05, max_seg=20))]
+#[allow(clippy::too_many_arguments)]
+fn shots_completion_paths<'py>(py: Python<'py>, p: PyReadonlyArray2<f64>, d: PyReadonlyArray2<f64>, r: PyReadonlyArray1<f64>, a: PyReadonlyArray1<u32>, b: PyReadonlyArray1<u32>, seg: f64, max_seg: usize) -> PyResult<Bound<'py, PyDict>> {
+    use sylva_rs::shots::completion::hermite_cyls;
+    let n_ends = r.as_array().len();
+    let ends = completion_ends(p, d, r, vec![0.0; n_ends])?;
+    let (a, b) = (a.as_array().to_vec(), b.as_array().to_vec());
+    let (cyl, pair) = py.detach(|| {
+        let mut cyl = Vec::new();
+        let mut pair = Vec::new();
+        for k in 0..a.len() {
+            let (ea, eb) = (&ends[a[k] as usize], &ends[b[k] as usize]);
+            let l = ((0..3).map(|i| (eb.p[i] - ea.p[i]).powi(2)).sum::<f64>()).sqrt();
+            let n = ((l / seg).ceil() as usize).clamp(1, max_seg);
+            for c in hermite_cyls(ea, eb, n) {
+                cyl.push(c);
+                pair.push(k as u32);
+            }
+        }
+        (cyl, pair)
+    });
+    let out = PyDict::new(py);
+    out.set_item("p", xyz_to_py(py, &cyl.iter().map(|c| c.p).collect::<Vec<_>>()))?;
+    out.set_item("u", xyz_to_py(py, &cyl.iter().map(|c| c.u).collect::<Vec<_>>()))?;
+    out.set_item("half", cyl.iter().map(|c| c.half).collect::<Vec<_>>().into_pyarray(py))?;
+    out.set_item("r", cyl.iter().map(|c| c.r).collect::<Vec<_>>().into_pyarray(py))?;
+    out.set_item("pair", pair.into_pyarray(py))?;
+    Ok(out)
+}
+
+/// Each candidate link's prior log weight under the completion field: ends `p`, `d`, `r`, `sig_r`, pairs `a`, `b`.
+/// Returns `log_dir` (the walk) and `log_rad` (0 with `radius=False`).
+#[pyfunction]
+#[pyo3(signature = (p, d, r, sig_r, a, b, diff, lam, kappa, sig_dir, sig_pos, taper=0.15, q=0.04, radius=true))]
+#[allow(clippy::too_many_arguments)]
+fn shots_completion_prior<'py>(py: Python<'py>, p: PyReadonlyArray2<f64>, d: PyReadonlyArray2<f64>, r: PyReadonlyArray1<f64>, sig_r: PyReadonlyArray1<f64>, a: PyReadonlyArray1<u32>, b: PyReadonlyArray1<u32>, diff: f64, lam: f64, kappa: f64, sig_dir: f64, sig_pos: f64, taper: f64, q: f64, radius: bool) -> PyResult<Bound<'py, PyDict>> {
+    use rayon::prelude::*;
+    use sylva_rs::shots::completion::{log_prior, Field};
+    let ends = completion_ends(p, d, r, sig_r.as_array().to_vec())?;
+    let (a, b) = (a.as_array().to_vec(), b.as_array().to_vec());
+    let f = Field { d: diff, lambda: lam, kappa, sig_dir, sig_pos, taper, q, radius };
+    let lp: Vec<(f64, f64)> = py.detach(|| (0..a.len()).into_par_iter().map(|k| log_prior(&ends[a[k] as usize], &ends[b[k] as usize], &f)).collect());
+    let out = PyDict::new(py);
+    out.set_item("log_dir", lp.iter().map(|x| x.0).collect::<Vec<_>>().into_pyarray(py))?;
+    out.set_item("log_rad", lp.iter().map(|x| x.1).collect::<Vec<_>>().into_pyarray(py))?;
+    Ok(out)
+}
+
+/// Per-end normalisation of link log weights `logw` over pairs `a`, `b` of `n_ends` ends, with a null option of
+/// weight `log_null`. Returns per pair `pa` (a's share on b), `pb`, and per end `null` and `entropy` (nats).
+#[pyfunction]
+fn shots_completion_normalise<'py>(py: Python<'py>, n_ends: usize, a: PyReadonlyArray1<u32>, b: PyReadonlyArray1<u32>, logw: PyReadonlyArray1<f64>, log_null: f64) -> PyResult<Bound<'py, PyDict>> {
+    use sylva_rs::shots::completion::normalise;
+    let (a, b, w) = (a.as_array().to_vec(), b.as_array().to_vec(), logw.as_array().to_vec());
+    if b.len() != a.len() || w.len() != a.len() || a.iter().chain(&b).any(|&e| e as usize >= n_ends) {
+        return Err(PyValueError::new_err("pair arrays differ in length or name a missing end"));
+    }
+    let (pairs, ends) = py.detach(|| normalise(n_ends, &a, &b, &w, log_null));
+    let out = PyDict::new(py);
+    out.set_item("pa", pairs.iter().map(|x| x.0).collect::<Vec<_>>().into_pyarray(py))?;
+    out.set_item("pb", pairs.iter().map(|x| x.1).collect::<Vec<_>>().into_pyarray(py))?;
+    out.set_item("null", ends.iter().map(|x| x.0).collect::<Vec<_>>().into_pyarray(py))?;
+    out.set_item("entropy", ends.iter().map(|x| x.1).collect::<Vec<_>>().into_pyarray(py))?;
+    Ok(out)
+}
+
 /// Bundles of lifted per-scan pieces (sylva_rs::shots::strands::bundles): `p`, `u` (k, 3), `half`, `r`, `scan`,
 /// `stripe`, image `line`, `col`, front `range`, `width` (cells). Returns `bundle` (a root piece per piece) and the
 /// counts `edges`, `merged`, `blocked`, `cannot`.
@@ -863,6 +969,10 @@ pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
         wrap_pyfunction!(shots_region_lines, m)?,
         wrap_pyfunction!(shots_scan_offsets, m)?,
         wrap_pyfunction!(shots_link_ends, m)?,
+        wrap_pyfunction!(shots_completion_fit, m)?,
+        wrap_pyfunction!(shots_completion_paths, m)?,
+        wrap_pyfunction!(shots_completion_prior, m)?,
+        wrap_pyfunction!(shots_completion_normalise, m)?,
         wrap_pyfunction!(shots_bundles, m)?,
         wrap_pyfunction!(shots_bundles_lines, m)?,
         wrap_pyfunction!(shots_view_offsets, m)?,
