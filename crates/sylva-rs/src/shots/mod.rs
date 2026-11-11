@@ -11,6 +11,7 @@
 pub mod elements;
 pub mod identities;
 pub mod lattice;
+pub mod moments;
 pub mod opacity;
 pub mod strands;
 pub mod stripes;

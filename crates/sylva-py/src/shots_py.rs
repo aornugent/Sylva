@@ -843,6 +843,246 @@ fn shots_elements<'py>(py: Python<'py>, p: PyReadonlyArray2<f64>, n: PyReadonlyA
     Ok(d)
 }
 
+/// One scan's surfels for the moment octree (3dtrees research 128 `octree.md`): the lattice, then a normal per kept
+/// first echo, `method` "grad" (n ∝ ω − ∇ ln r over `half` cells either way, sylva_rs::shots::identities::
+/// grad_normals; only those spanning both directions) or "plane" (sylva_rs::shots::surfels). A pulse is kept when
+/// `keep` (per pulse, optional) is true and its point is inside `lo`..`hi` (optional). Returns `pulse`, world `p`,
+/// `n`, `cos_inc`; `tested` (kept cells); `lattice_s`, `map_s`, `stencil_s` (wall seconds).
+#[pyfunction]
+#[pyo3(signature = (time, direction, range, rot, origin, keep=None, lo=None, hi=None, method="grad", half=3, jump=0.05))]
+#[allow(clippy::too_many_arguments)]
+fn shots_scan_normals<'py>(py: Python<'py>, time: PyReadonlyArray1<f64>, direction: PyReadonlyArray2<f64>, range: PyReadonlyArray1<f32>, rot: PyReadonlyArray2<f64>, origin: Vec<f64>, keep: Option<PyReadonlyArray1<bool>>, lo: Option<Vec<f64>>, hi: Option<Vec<f64>>, method: &str, half: i64, jump: f64) -> PyResult<Bound<'py, PyDict>> {
+    use sylva_rs::shots::identities::grad_normals;
+    use sylva_rs::shots::opacity::ShadowMap;
+    use sylva_rs::shots::surfels::{surfels, SurfelParams};
+    let dir = xyz_from_py(direction)?;
+    let t = time.as_array().to_vec();
+    let r = range.as_array().to_vec();
+    let rot = xyz_from_py(rot)?;
+    let mask: Option<Vec<bool>> = keep.map(|k| k.as_array().to_vec());
+    if t.len() != dir.len() || r.len() != dir.len() || rot.len() != 3 || mask.as_ref().is_some_and(|m| m.len() != dir.len()) {
+        return Err(PyValueError::new_err("per-pulse arrays differ in length, or rot isn't 3 x 3"));
+    }
+    let origin = point3(origin, "origin")?;
+    let lo = lo.map(|x| point3(x, "lo")).transpose()?.unwrap_or([f64::NEG_INFINITY; 3]);
+    let hi = hi.map(|x| point3(x, "hi")).transpose()?.unwrap_or([f64::INFINITY; 3]);
+    let rot = [rot[0], rot[1], rot[2]];
+    let grad = match method {
+        "grad" => true,
+        "plane" => false,
+        _ => return Err(PyValueError::new_err("method is 'grad' or 'plane'")),
+    };
+    let (pulse, p, n, cos, tested, secs) = py.detach(|| {
+        let c0 = std::time::Instant::now();
+        let lat = sylva_rs::shots::lattice::scan_lattice(&t, &dir);
+        let c1 = std::time::Instant::now();
+        let map = ShadowMap::new(&lat, &r, rot, origin);
+        let c2 = std::time::Instant::now();
+        let tested = std::sync::atomic::AtomicUsize::new(0);
+        let keep = |i: usize, x: &[f64; 3]| {
+            let ok = mask.as_ref().is_none_or(|m| m[i]) && (0..3).all(|k| x[k] >= lo[k] && x[k] <= hi[k]);
+            if ok {
+                tested.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+            ok
+        };
+        let world = |i: usize| {
+            let x = [dir[i][0] * r[i] as f64, dir[i][1] * r[i] as f64, dir[i][2] * r[i] as f64];
+            [0, 1, 2].map(|a| rot[a][0] * x[0] + rot[a][1] * x[1] + rot[a][2] * x[2] + origin[a])
+        };
+        let out: Vec<(u32, [f64; 3], [f64; 3], f64)> = if grad {
+            grad_normals(&map, &dir, keep, half, jump, 0.2).into_iter().filter(|g| g.full).map(|g| (g.pulse, world(g.pulse as usize), g.n, g.cos_inc)).collect()
+        } else {
+            let beam = sylva_rs::qsm::joint::JointParams::default();
+            let prm = SurfelParams { half, jump, ..SurfelParams::default() };
+            surfels(&map, &dir, keep, |x| beam.footprint(x), &prm).0.into_iter().map(|s| (s.pulse, s.p, s.n, s.cos_inc)).collect()
+        };
+        let c3 = std::time::Instant::now();
+        let secs = [(c1 - c0).as_secs_f64(), (c2 - c1).as_secs_f64(), (c3 - c2).as_secs_f64()];
+        let pulse: Vec<u32> = out.iter().map(|x| x.0).collect();
+        let p: Vec<[f64; 3]> = out.iter().map(|x| x.1).collect();
+        let n: Vec<[f64; 3]> = out.iter().map(|x| x.2).collect();
+        let cos: Vec<f64> = out.iter().map(|x| x.3).collect();
+        (pulse, p, n, cos, tested.into_inner(), secs)
+    });
+    let d = PyDict::new(py);
+    d.set_item("pulse", pulse.into_pyarray(py))?;
+    d.set_item("p", xyz_to_py(py, &p))?;
+    d.set_item("n", xyz_to_py(py, &n))?;
+    d.set_item("cos_inc", cos.into_pyarray(py))?;
+    d.set_item("tested", tested)?;
+    for (k, name) in ["lattice_s", "map_s", "stencil_s"].iter().enumerate() {
+        d.set_item(*name, secs[k])?;
+    }
+    Ok(d)
+}
+
+/// The moment octree of surfels `p`, `n` (m, 3) from scans `scan` (sylva_rs::shots::moments): per-(voxel, scan)
+/// moments on `voxel` cells, `levels` levels, then per query point `q` (k, 3) and level the node holding it (with
+/// `nbhd`, it and its 26 neighbours summed). Returns, each (levels, k) or flat (levels * k * 3): `count`, `n_scans`;
+/// the normal tensor's `lam` and null direction `t_u`, with medial collapse about it `t_r`, `t_spread`, `spread0`;
+/// the line-complex axis (cylinder rows scaled by `s`) `lc_u`, `lc_c`, `lc_lam`, `lc_lam2`, and collapse about it
+/// `lc_r`, `lc_spread`, `lc_spread0`; with `q_u` (k, 3), collapse about it `g_r`, `g_spread`, `g_spread0`. Also
+/// `nodes` (per level), `voxel_scans` (per-(voxel, scan) entries), `bytes_per_node`, `reduce_s`, `octree_s`, `query_s`.
+#[pyfunction]
+#[pyo3(signature = (p, n, scan, q, q_u=None, voxel=0.03, levels=4, s=0.01, nbhd=false, r_max=0.3))]
+#[allow(clippy::too_many_arguments)]
+fn shots_moment_octree<'py>(py: Python<'py>, p: PyReadonlyArray2<f64>, n: PyReadonlyArray2<f64>, scan: PyReadonlyArray1<i32>, q: PyReadonlyArray2<f64>, q_u: Option<PyReadonlyArray2<f64>>, voxel: f64, levels: usize, s: f64, nbhd: bool, r_max: f64) -> PyResult<Bound<'py, PyDict>> {
+    use nalgebra::Vector3;
+    use rayon::prelude::*;
+    use sylva_rs::shots::moments::{per_scan, Mom, Octree};
+    type V3 = Vector3<f64>;
+    let vv = |x: Vec<[f64; 3]>| x.into_iter().map(|a| V3::new(a[0], a[1], a[2])).collect::<Vec<_>>();
+    let (p, n, scan, q) = (vv(xyz_from_py(p)?), vv(xyz_from_py(n)?), scan.as_array().to_vec(), vv(xyz_from_py(q)?));
+    let qu = q_u.map(|x| xyz_from_py(x).map(vv)).transpose()?;
+    if n.len() != p.len() || scan.len() != p.len() || qu.as_ref().is_some_and(|u| u.len() != q.len()) || levels == 0 {
+        return Err(PyValueError::new_err("surfel or query arrays differ in length"));
+    }
+    const NAN: f64 = f64::NAN;
+    let a3 = |x: &V3| [x[0], x[1], x[2]];
+    // per (level, query): count, n_scans, t_r, t_spread, spread0, lc_lam, lc_lam2, lc_r, lc_spread, g_r, g_spread,
+    // lc_spread0, g_spread0;
+    // and lam, t_u, lc_u, lc_c
+    type Row = ([f64; 13], [[f64; 3]; 4]);
+    let (rows, nodes, nvs, secs) = py.detach(|| {
+        let c0 = std::time::Instant::now();
+        let ps = per_scan(&p, &n, &scan, voxel);
+        let c1 = std::time::Instant::now();
+        let o = Octree::new(&ps, voxel, levels);
+        let c2 = std::time::Instant::now();
+        let rows: Vec<Row> = (0..levels * q.len())
+            .into_par_iter()
+            .map(|j| {
+                let (l, k) = (j / q.len(), j % q.len());
+                let (m, ns): (Mom, u32) = o.query(l, &q[k], nbhd);
+                let mut f = [NAN; 13];
+                let mut x = [[NAN; 3]; 4];
+                f[0] = m.n;
+                f[1] = ns as f64;
+                if m.n < 6.0 {
+                    return (f, x);
+                }
+                let (lam, u) = m.tensor();
+                x[0] = lam;
+                x[1] = a3(&u);
+                (f[2], f[3], f[4]) = m.collapse(&u, r_max);
+                // the line-complex axis, coordinates about the node's centroid
+                if let Some((lu, lc, l1, l2)) = m.axis(&(m.sp / m.n), s) {
+                    let (r, sp, s0) = m.collapse(&lu, r_max);
+                    (f[5], f[6], f[7], f[8], f[11]) = (l1, l2, r, sp, s0);
+                    (x[2], x[3]) = (a3(&lu), a3(&lc));
+                }
+                if let Some(qu) = &qu {
+                    let (r, sp, s0) = m.collapse(&qu[k].normalize(), r_max);
+                    (f[9], f[10], f[12]) = (r, sp, s0);
+                }
+                (f, x)
+            })
+            .collect();
+        let c3 = std::time::Instant::now();
+        let nodes: Vec<usize> = o.levels.iter().map(|l| l.len()).collect();
+        (rows, nodes, ps.len(), [(c1 - c0).as_secs_f64(), (c2 - c1).as_secs_f64(), (c3 - c2).as_secs_f64()])
+    });
+    let k = q.len();
+    let d = PyDict::new(py);
+    let names = ["count", "n_scans", "t_r", "t_spread", "spread0", "lc_lam", "lc_lam2", "lc_r", "lc_spread", "g_r", "g_spread", "lc_spread0", "g_spread0"];
+    for (j, name) in names.iter().enumerate() {
+        let g: Vec<Vec<f64>> = (0..levels).map(|l| rows[l * k..(l + 1) * k].iter().map(|r| r.0[j]).collect()).collect();
+        d.set_item(*name, PyArray2::from_vec2(py, &g)?)?;
+    }
+    for (j, name) in ["lam", "t_u", "lc_u", "lc_c"].iter().enumerate() {
+        d.set_item(*name, rows.iter().flat_map(|r| r.1[j]).collect::<Vec<_>>().into_pyarray(py))?;
+    }
+    d.set_item("nodes", nodes)?;
+    d.set_item("voxel_scans", nvs)?;
+    d.set_item("bytes_per_node", std::mem::size_of::<Mom>())?;
+    for (j, name) in ["reduce_s", "octree_s", "query_s"].iter().enumerate() {
+        d.set_item(*name, secs[j])?;
+    }
+    Ok(d)
+}
+
+/// Per-scan offsets by alternation on moments (sylva_rs::shots::moments::offsets): for each query point `q` (k, 3)
+/// the per-scan moments of the level-`level` node holding it (with `nbhd`, it and its 26 neighbours), scans with at
+/// least `min_n` surfels there. Returns flat per (query, scan) `query`, `scan`, `t` (m, 3; the shift that brings the
+/// scan onto the axis), `medial` (the scan's mean `P(p − R n)` about the axis, count-weighted mean zero: the
+/// per-surfel medial offset on the same surfels), `count`; per query the axis `u`, `c` (k, 3; NaN without two scans).
+#[pyfunction]
+#[pyo3(signature = (p, n, scan, q, level, voxel=0.03, nbhd=true, s=0.01, iters=10, min_n=8))]
+#[allow(clippy::too_many_arguments)]
+fn shots_moment_offsets<'py>(py: Python<'py>, p: PyReadonlyArray2<f64>, n: PyReadonlyArray2<f64>, scan: PyReadonlyArray1<i32>, q: PyReadonlyArray2<f64>, level: u32, voxel: f64, nbhd: bool, s: f64, iters: usize, min_n: usize) -> PyResult<Bound<'py, PyDict>> {
+    use nalgebra::Vector3;
+    use rayon::prelude::*;
+    use std::collections::{BTreeMap, HashMap};
+    use sylva_rs::shots::moments::{key, offsets, per_scan, Key, Mom};
+    let vv = |x: Vec<[f64; 3]>| x.into_iter().map(|a| Vector3::new(a[0], a[1], a[2])).collect::<Vec<_>>();
+    let (p, n, scan, q) = (vv(xyz_from_py(p)?), vv(xyz_from_py(n)?), scan.as_array().to_vec(), vv(xyz_from_py(q)?));
+    let cell = voxel * (1u32 << level) as f64;
+    type Fit = (Vec<(i32, [f64; 3], [f64; 3], f64)>, [f64; 3], [f64; 3]);
+    let out: Vec<Fit> = py.detach(|| {
+        // per-(node, scan) moments at the level, summed from the per-(voxel, scan) ones
+        let mut node: HashMap<Key, BTreeMap<i32, Mom>> = HashMap::new();
+        for ((k, sc), m) in per_scan(&p, &n, &scan, voxel) {
+            node.entry(k.map(|x| x >> level)).or_default().entry(sc).or_insert_with(Mom::zero).merge(&m);
+        }
+        let r = if nbhd { 1 } else { 0 };
+        q.par_iter()
+            .map(|x| {
+                let k = key(x, cell);
+                let mut by: BTreeMap<i32, Mom> = BTreeMap::new();
+                for dx in -r..=r {
+                    for dy in -r..=r {
+                        for dz in -r..=r {
+                            for (sc, m) in node.get(&[k[0] + dx, k[1] + dy, k[2] + dz]).into_iter().flatten() {
+                                by.entry(*sc).or_insert_with(Mom::zero).merge(m);
+                            }
+                        }
+                    }
+                }
+                let sc: Vec<(i32, Mom)> = by.into_iter().filter(|(_, m)| m.n as usize >= min_n).collect();
+                let none = (vec![], [f64::NAN; 3], [f64::NAN; 3]);
+                if sc.len() < 2 {
+                    return none;
+                }
+                let ms: Vec<Mom> = sc.iter().map(|x| x.1).collect();
+                let (sp, cnt) = ms.iter().fold((Vector3::zeros(), 0.0), |a, m| (a.0 + m.sp, a.1 + m.n));
+                let Some((u, c, t)) = offsets(&ms, &(sp / cnt), s, iters) else { return none };
+                // the medial offsets on the same moments: each scan's mean P(p − R n) about the axis (R from all
+                // scans' collapse about it), count-weighted mean zero
+                let all = ms.iter().fold(Mom::zero(), |mut a, m| {
+                    a.merge(m);
+                    a
+                });
+                let r = all.collapse(&u, 0.3).0;
+                let pr = nalgebra::Matrix3::identity() - u * u.transpose();
+                let d: Vec<Vector3<f64>> = ms.iter().map(|m| pr * ((m.sp - m.sn * r) / m.n - c)).collect();
+                let dm = d.iter().zip(&ms).fold(Vector3::zeros(), |a, (x, m)| a + x * m.n) / cnt;
+                let per = sc.iter().zip(t).zip(d).map(|(((s, m), t), d)| (*s, [t[0], t[1], t[2]], [d[0] - dm[0], d[1] - dm[1], d[2] - dm[2]], m.n)).collect();
+                (per, [u[0], u[1], u[2]], [c[0], c[1], c[2]])
+            })
+            .collect()
+    });
+    let (mut qi, mut si, mut ti, mut di, mut ni) = (vec![], vec![], vec![], vec![], vec![]);
+    for (j, (per, _, _)) in out.iter().enumerate() {
+        for (s, t, dd, c) in per {
+            qi.push(j as i64);
+            si.push(*s);
+            ti.push(*t);
+            di.push(*dd);
+            ni.push(*c);
+        }
+    }
+    let d = PyDict::new(py);
+    d.set_item("query", qi.into_pyarray(py))?;
+    d.set_item("scan", si.into_pyarray(py))?;
+    d.set_item("t", xyz_to_py(py, &ti))?;
+    d.set_item("medial", xyz_to_py(py, &di))?;
+    d.set_item("count", ni.into_pyarray(py))?;
+    d.set_item("u", xyz_to_py(py, &out.iter().map(|x| x.1).collect::<Vec<_>>()))?;
+    d.set_item("c", xyz_to_py(py, &out.iter().map(|x| x.2).collect::<Vec<_>>()))?;
+    Ok(d)
+}
+
 pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     for f in [
         wrap_pyfunction!(shots_shot_of_echo, m)?,
@@ -867,6 +1107,9 @@ pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
         wrap_pyfunction!(shots_bundles_lines, m)?,
         wrap_pyfunction!(shots_view_offsets, m)?,
         wrap_pyfunction!(shots_elements, m)?,
+        wrap_pyfunction!(shots_scan_normals, m)?,
+        wrap_pyfunction!(shots_moment_octree, m)?,
+        wrap_pyfunction!(shots_moment_offsets, m)?,
     ] {
         m.add_function(f)?;
     }
