@@ -66,6 +66,8 @@ pub struct Sample {
     pub sin: f64,
     pub excess: f64,
     pub m: Point,
+    /// The cell's pulse (`u32::MAX` for an empty cell), so a caller can place the echo and time it.
+    pub pulse: u32,
 }
 
 /// A scan's range image: the cell -> pulse index (`u32::MAX` empty), with the lattice and the scan's pose
@@ -186,7 +188,7 @@ impl<'a> ShadowMap<'a> {
                     let m = [0, 1, 2].map(|a| self.rot[a][0] * ms[0] + self.rot[a][1] * ms[1] + self.rot[a][2] * ms[2]);
                     out.push(Sample {
                         cyl: ci as u32, outcome: o, chord: t1 - t0, miss: miss2.sqrt(), t_in: t0, depth: d,
-                        fp, sin: aa.sqrt(), excess: depth - tm, m,
+                        fp, sin: aa.sqrt(), excess: depth - tm, m, pulse: j,
                     });
                 }
             }
@@ -371,6 +373,10 @@ mod tests {
         // the chord through the middle is about the diameter
         let cmax = s.iter().filter(|x| x.cyl == 0).map(|x| x.chord).fold(0.0, f64::max);
         assert!((cmax - 0.06).abs() < 0.01, "{cmax}");
+        // a support's pulse is the cell's: its range is the sample's depth
+        for x in s.iter().filter(|x| x.outcome == outcome::SUPPORT) {
+            assert!(x.pulse != u32::MAX && (rng[x.pulse as usize] as f64 - x.depth).abs() < 1e-9);
+        }
     }
 
     #[test]

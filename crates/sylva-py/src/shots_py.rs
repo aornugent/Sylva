@@ -269,7 +269,7 @@ fn shots_tracts<'py>(py: Python<'py>, p: PyReadonlyArray2<f64>, u: PyReadonlyArr
 /// `width_cells`, `stripe`, and the single-scan features (`jitter`, `multi`,
 /// `refl`, `empty`, `arc`, `fa`, `cells`); the query cylinders' samples
 /// against this scan (`s_cyl`, `s_outcome` 0 support 1 refute 2 occluded 3
-/// unknown, `s_chord`, `s_miss`, `s_t_in`, `s_depth`, `s_fp`, `s_sin`, `s_excess`, `s_m` (k, 3, world); with
+/// unknown, `s_chord`, `s_miss`, `s_t_in`, `s_depth`, `s_fp`, `s_sin`, `s_excess`, `s_m` (k, 3, world), `s_pulse` (the cell's pulse, u32 max if empty); with
 /// `margin` > 0, the widened gate's possible refutes only, as opacity's docs say); the lattice round trip
 /// on every 997th pulse (`roundtrip_line`, `roundtrip_col`: cell_of minus the
 /// cell); optionally (`image`) every pulse's `pulse_line`, `pulse_col`; and
@@ -363,6 +363,7 @@ fn shots_scan_opacity<'py>(py: Python<'py>, time: PyReadonlyArray1<f64>, directi
     col!(samples, "s_fp", |x| x.fp as f32);
     col!(samples, "s_sin", |x| x.sin as f32);
     col!(samples, "s_excess", |x| x.excess as f32);
+    col!(samples, "s_pulse", |x| x.pulse);
     d.set_item("s_m", xyz_to_py(py, &samples.iter().map(|x| x.m).collect::<Vec<_>>()))?;
     d.set_item("roundtrip_line", rt.0.into_pyarray(py))?;
     d.set_item("roundtrip_col", rt.1.into_pyarray(py))?;
