@@ -143,7 +143,7 @@ def scan(cloud: PointCloud, origin=(10.0, 10.0, 1.5), resolution_deg: float = 0.
          reflectance=None, target_radius: float | None = None, oriented: bool | None = None,
          detection_threshold: float | None = None, max_range: float | None = None,
          seed: int = 0, solids: dict | None = None, azimuth_deg=(0.0, 360.0),
-         timing=(0.825e-6, 6.593e-3)) -> Shots:
+         timing=(0.825e-6, 6.593e-3), lambertian: bool = False, roughness=(0.0, 0.03, 0)) -> Shots:
     """A pseudo terrestrial scan of ``cloud`` from ``origin``.
 
     Pulses are fired on a regular zenith / azimuth grid. The points falling in
@@ -253,6 +253,12 @@ def scan(cloud: PointCloud, origin=(10.0, 10.0, 1.5), resolution_deg: float = 0.
         line by line (one line per azimuth step, sweeping up the zenith), and
         each echo's ``gps_time`` is its pulse's time on that clock, so
         :func:`sylva._core.shots_scan_lattice` rebuilds the lattice.
+    lambertian
+        Scale each sub-beam's energy by its cosine of incidence (beam model only).
+    roughness
+        ``(sd, wavelength, seed)`` (m, m, int): a smooth random relief on the
+        small solids' surfaces, the same for every scan with the same seed
+        (beam model only).
 
     Returns
     -------
@@ -303,12 +309,15 @@ def scan(cloud: PointCloud, origin=(10.0, 10.0, 1.5), resolution_deg: float = 0.
         None if target_radius is None else float(target_radius), True if oriented is None else bool(oriented),
         0.0 if detection_threshold is None else float(detection_threshold), refl_map, 0.4, refl_attr,
         refl_const, float("inf") if max_range is None else float(max_range), int(seed),
-        *_solids(solids), tuple(float(v) for v in azimuth_deg), tuple(float(v) for v in timing))
+        *_solids(solids), tuple(float(v) for v in azimuth_deg), tuple(float(v) for v in timing),
+        bool(lambertian), (float(roughness[0]), float(roughness[1]), int(roughness[2])))
     return Shots._from_core(d)
 
 
 def export(shots: Shots, *, min_fraction: float = 0.0, fraction_width: float = 0.0,
-           min_reflectance: float = float("-inf"), echoes_only: bool = False, range_a: float = 0.0,
+           min_reflectance: float = float("-inf"), max_spread: float = float("inf"), spread_width: float = 0.0,
+           refl_noise: float = 0.0,
+           echoes_only: bool = False, range_a: float = 0.0,
            range_b: float = 0.0, yaw_mrad: float = 0.0, offset_sd: float = 0.0, offset_length: float = 0.5,
            seed: int = 0) -> Shots:
     """What a scanner's export holds of a beam scan from :func:`scan`.
@@ -316,7 +325,11 @@ def export(shots: Shots, *, min_fraction: float = 0.0, fraction_width: float = 0
     Partial hits are deleted (an echo is kept with probability
     ``1 / (1 + exp(-(footprint_fraction - min_fraction) / fraction_width))``,
     a hard cut when the width is 0), and so are echoes below
-    ``min_reflectance`` dB; ``echoes_only`` drops pulses left without one.
+    ``min_reflectance`` dB, and broadened ones (kept with probability
+    ``1 / (1 + exp(-(max_spread - range_spread) / spread_width))``, the
+    stand-in for a pulse-shape deviation filter), after a per-echo reflectance
+    error of ``refl_noise`` dB (kept in the export); ``echoes_only`` drops pulses
+    left without one.
     The kept echoes then carry the scan's systematic errors: directions
     turned about the vertical by ``yaw_mrad``, a smooth random displacement
     field (``offset_sd`` m per axis, correlation length ``offset_length`` m,
@@ -324,6 +337,7 @@ def export(shots: Shots, *, min_fraction: float = 0.0, fraction_width: float = 0
     ``range += range_a + range_b * range``.
     """
     d = _core.synthetic_export(shots._to_core(), float(min_fraction), float(fraction_width), float(min_reflectance),
+                               float(max_spread), float(spread_width), float(refl_noise),
                                bool(echoes_only), float(range_a), float(range_b), float(yaw_mrad), float(offset_sd),
                                float(offset_length), int(seed))
     return Shots._from_core(d)

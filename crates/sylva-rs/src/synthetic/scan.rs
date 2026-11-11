@@ -50,6 +50,16 @@
 //! pulse in firing order, so that a seed gives the same scan on any number
 //! of threads.
 //!
+//! With `lambertian`, each sub-beam's energy is scaled by the cosine of its
+//! incidence on what it meets (a disc's normal, a solid's surface normal; 1
+//! for a sphere), as a calibrated reflectance reads a surface turned from
+//! the beam. With `roughness` (m), the small solids (bounding radius up to
+//! 1 m) carry a bark-like relief: a smooth random height field (8 cosines of
+//! wavelength `roughness_length` in random directions, drawn from
+//! `roughness_seed`, the same for every scan of a scene) displaces their
+//! surface along its normal, so the hit moves along the sub-beam by the
+//! height over the cosine of incidence (at least 0.3).
+//!
 //! [`export`] then turns a scan into what a scanner's export holds: weak
 //! and partial echoes deleted, pulses without an echo dropped, and the
 //! scan's systematic errors (a range law, a turn of its directions, a
@@ -120,11 +130,17 @@ pub struct BeamScan {
     /// Solid cylinders in the scene besides its points (see [`Solid`]). The
     /// points they name stand for them only, and are not patches themselves.
     pub solids: Vec<Solid>,
+    /// Scale each sub-beam's energy by its cosine of incidence.
+    pub lambertian: bool,
+    /// Relief of the small solids' surfaces (m, standard deviation), its wavelength (m) and seed.
+    pub roughness: f64,
+    pub roughness_length: f64,
+    pub roughness_seed: u64,
 }
 
 impl BeamScan {
     pub fn new(origin: Point) -> BeamScan {
-        BeamScan { origin, resolution_deg: 0.25, min_zenith_deg: 0.0, max_zenith_deg: 130.0, max_echoes: 2, echo_separation: 0.5, range_noise: 0.0, range_noise_slope: 0.0, divergence_mrad: 0.0, exit_diameter: 0.0, footprint_samples: 1, mixed_pixels: true, target_radius: None, oriented: true, detection_threshold: 0.0, reflectance: Reflectance::default(), max_range: f64::INFINITY, seed: 0, min_azimuth_deg: 0.0, max_azimuth_deg: 360.0, pulse_interval: 0.825e-6, line_period: 6.593e-3, solids: Vec::new() }
+        BeamScan { origin, resolution_deg: 0.25, min_zenith_deg: 0.0, max_zenith_deg: 130.0, max_echoes: 2, echo_separation: 0.5, range_noise: 0.0, range_noise_slope: 0.0, divergence_mrad: 0.0, exit_diameter: 0.0, footprint_samples: 1, mixed_pixels: true, target_radius: None, oriented: true, detection_threshold: 0.0, reflectance: Reflectance::default(), max_range: f64::INFINITY, seed: 0, min_azimuth_deg: 0.0, max_azimuth_deg: 360.0, pulse_interval: 0.825e-6, line_period: 6.593e-3, solids: Vec::new(), lambertian: false, roughness: 0.0, roughness_length: 0.03, roughness_seed: 0 }
     }
 }
 
@@ -380,6 +396,48 @@ fn solid_hit(s: &Solid, o: &Point, d: &Point) -> Option<(f64, f64)> {
     best.is_finite().then_some((best, best))
 }
 
+/// The outward surface normal of a capped cylinder at a point on it: radial on
+/// the side, along the axis on a cap.
+fn solid_normal(s: &Solid, x: &Point) -> Point {
+    let ab = [s.b[0] - s.a[0], s.b[1] - s.a[1], s.b[2] - s.a[2]];
+    let len = (ab[0] * ab[0] + ab[1] * ab[1] + ab[2] * ab[2]).sqrt();
+    let u = [ab[0] / len, ab[1] / len, ab[2] / len];
+    let w = [x[0] - s.a[0], x[1] - s.a[1], x[2] - s.a[2]];
+    let along = w[0] * u[0] + w[1] * u[1] + w[2] * u[2];
+    let rad = [w[0] - along * u[0], w[1] - along * u[1], w[2] - along * u[2]];
+    let rl = (rad[0] * rad[0] + rad[1] * rad[1] + rad[2] * rad[2]).sqrt();
+    if rl < 0.999 * s.r {
+        let sg = if along < len / 2.0 { -1.0 } else { 1.0 };
+        return [sg * u[0], sg * u[1], sg * u[2]];
+    }
+    [rad[0] / rl, rad[1] / rl, rad[2] / rl]
+}
+
+/// A smooth random height field: `amp` standard deviation, 8 cosines of
+/// wavelength `length` in random directions from `seed`.
+struct Relief {
+    k: Vec<[f64; 4]>,
+    amp: f64,
+}
+
+impl Relief {
+    fn new(amp: f64, length: f64, seed: u64) -> Relief {
+        const K: usize = 8;
+        let mut rng = Generator::new(seed ^ 0xBA4C_0FF1CE);
+        let w = 2.0 * PI / length;
+        let k = (0..K).map(|_| {
+            let v = rng.normal_n(0.0, 1.0, 3);
+            let l = (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt().max(1e-12);
+            [w * v[0] / l, w * v[1] / l, w * v[2] / l, rng.random() * 2.0 * PI]
+        }).collect();
+        Relief { k, amp: amp * (2.0 / K as f64).sqrt() }
+    }
+
+    fn at(&self, x: &Point) -> f64 {
+        self.amp * self.k.iter().map(|k| (k[0] * x[0] + k[1] * x[1] + k[2] * x[2] + k[3]).cos()).sum::<f64>()
+    }
+}
+
 fn check(p: &BeamScan) -> Result<()> {
     if !p.origin.iter().all(|v| v.is_finite()) {
         return Err(Error::invalid("origin must be finite"));
@@ -390,7 +448,7 @@ fn check(p: &BeamScan) -> Result<()> {
     if !(0.0..180.0).contains(&p.min_zenith_deg) || !(p.max_zenith_deg > p.min_zenith_deg && p.max_zenith_deg <= 180.0) {
         return Err(Error::invalid(format!("zenith range must satisfy 0 <= min < max <= 180, got {} to {}", p.min_zenith_deg, p.max_zenith_deg)));
     }
-    let non_negative = [("echo_separation", p.echo_separation), ("range_noise", p.range_noise), ("range_noise_slope", p.range_noise_slope), ("beam_divergence", p.divergence_mrad), ("exit_diameter", p.exit_diameter), ("detection_threshold", p.detection_threshold)];
+    let non_negative = [("echo_separation", p.echo_separation), ("range_noise", p.range_noise), ("range_noise_slope", p.range_noise_slope), ("beam_divergence", p.divergence_mrad), ("exit_diameter", p.exit_diameter), ("detection_threshold", p.detection_threshold), ("roughness", p.roughness)];
     for (name, v) in non_negative {
         if !(v.is_finite() && v >= 0.0) {
             return Err(Error::invalid(format!("{name} must be zero or more, got {v}")));
@@ -401,6 +459,9 @@ fn check(p: &BeamScan) -> Result<()> {
     }
     if !(p.pulse_interval > 0.0 && p.line_period >= (p.max_zenith_deg / p.resolution_deg + 1.0) * p.pulse_interval) {
         return Err(Error::invalid("pulse_interval must be positive and a line's slots must fit in line_period"));
+    }
+    if !(p.roughness_length > 0.0) {
+        return Err(Error::invalid(format!("roughness_length must be positive, got {}", p.roughness_length)));
     }
     if p.max_range.is_nan() || p.max_range <= 0.0 {
         return Err(Error::invalid(format!("max_range must be positive, got {}", p.max_range)));
@@ -515,6 +576,7 @@ pub fn scan_beam(cloud: &PointCloud, p: &BeamScan) -> Result<Shots> {
     const BIG: f64 = 1.0;
     let (big, small): (Vec<usize>, Vec<usize>) = (0..p.solids.len()).partition(|&i| bound(i) > BIG);
     let solid_grid = Grid::new(&mid, &small, bound)?;
+    let relief = (p.roughness > 0.0).then(|| Relief::new(p.roughness, p.roughness_length, p.roughness_seed));
     let res = p.resolution_deg;
     let n_zen = ((p.max_zenith_deg - p.min_zenith_deg) / res).round().max(1.0) as usize;
     let ia0 = (p.min_azimuth_deg / res).floor() as usize;
@@ -558,21 +620,34 @@ pub fn scan_beam(cloud: &PointCloud, p: &BeamScan) -> Result<Shots> {
             // spreads as it goes, so it is sampled by several sub-rays, each
             // offset across the exit aperture and tilted within the
             // divergence. Each returns the first surface it meets, if any.
-            let mut hits: Vec<(f64, usize)> = offsets.iter().filter_map(|off| {
+            let mut hits: Vec<(f64, usize, f64)> = offsets.iter().filter_map(|off| {
                 let lat: Point = std::array::from_fn(|k| off[0] * e1[k] + off[1] * e2[k]);
                 let os: Point = std::array::from_fn(|k| o[k] + half_exit * lat[k]);
                 let ds: Point = std::array::from_fn(|k| d[k] + half_div * lat[k]);
                 let nn = (ds[0] * ds[0] + ds[1] * ds[1] + ds[2] * ds[2]).sqrt();
                 let ds = [ds[0] / nn, ds[1] / nn, ds[2] / nn];
-                let patch = grid.cast(&os, &ds, 0.1, p.max_range, |i| patch_hit(&cloud.xyz[i], &normals[i], r2, &os, &ds));
-                let mut solid = solid_grid.cast(&os, &ds, 0.1, p.max_range, |i| solid_hit(&p.solids[i], &os, &ds)).map(|(t, i)| (t, p.solids[i].point));
+                let dot = |n: &Point| (ds[0] * n[0] + ds[1] * n[1] + ds[2] * n[2]).abs();
+                // (range, point, cosine of incidence)
+                let patch = grid.cast(&os, &ds, 0.1, p.max_range, |i| patch_hit(&cloud.xyz[i], &normals[i], r2, &os, &ds))
+                    .map(|(t, i)| (t, i, if normals[i] == [0.0; 3] { 1.0 } else { dot(&normals[i]) }));
+                let mut solid = solid_grid.cast(&os, &ds, 0.1, p.max_range, |i| solid_hit(&p.solids[i], &os, &ds)).map(|(t, i)| (t, i, true));
                 for &i in &big {
                     if let Some((t, _)) = solid_hit(&p.solids[i], &os, &ds).filter(|h| h.0 > 0.1 && h.0 < p.max_range) {
                         if solid.is_none_or(|s| t < s.0) {
-                            solid = Some((t, p.solids[i].point));
+                            solid = Some((t, i, false));
                         }
                     }
                 }
+                let solid = solid.map(|(t, i, small)| {
+                    let s = &p.solids[i];
+                    let x: Point = std::array::from_fn(|k| os[k] + t * ds[k]);
+                    let c = dot(&solid_normal(s, &x));
+                    let t = match (&relief, small) {
+                        (Some(rl), true) => t - rl.at(&x) / c.max(0.3),
+                        _ => t,
+                    };
+                    (t, s.point, c)
+                });
                 match (patch, solid) {
                     (Some(x), Some(y)) => Some(if y.0 < x.0 { y } else { x }),
                     (x, y) => x.or(y),
@@ -591,7 +666,7 @@ pub fn scan_beam(cloud: &PointCloud, p: &BeamScan) -> Result<Shots> {
                     g1 += 1;
                 }
                 let group = &hits[g0..g1];
-                let w: Vec<f64> = group.iter().map(|h| share * rho[h.1]).collect();
+                let w: Vec<f64> = group.iter().map(|h| share * rho[h.1] * if p.lambertian { h.2 } else { 1.0 }).collect();
                 let energy: f64 = w.iter().sum();
                 let mut best = 0;
                 for k in 1..group.len() {
@@ -650,6 +725,15 @@ pub struct Export {
     pub fraction_width: f64,
     /// Echoes below this reflectance (dB) are deleted.
     pub min_reflectance: f64,
+    /// Broadened echoes are deleted, the stand-in for a filter on pulse-shape
+    /// deviation: an echo is also kept only with probability
+    /// `1 / (1 + exp(-(max_spread - range_spread) / spread_width))` (a hard
+    /// cut when the width is 0; infinite keeps all).
+    pub max_spread: f64,
+    pub spread_width: f64,
+    /// Standard deviation (dB) of a per-echo reflectance error, drawn before
+    /// the cut and kept in the exported `reflectance`.
+    pub refl_noise: f64,
     /// Drop the pulses left without an echo, as an echoes-only export does.
     pub echoes_only: bool,
     /// The range law along the beam: every range grows by `range_a + range_b * range`.
@@ -668,7 +752,7 @@ pub struct Export {
 impl Default for Export {
     /// Keep everything, add nothing.
     fn default() -> Self {
-        Export { min_fraction: 0.0, fraction_width: 0.0, min_reflectance: f64::NEG_INFINITY, echoes_only: false, range_a: 0.0, range_b: 0.0, yaw_mrad: 0.0, offset_sd: 0.0, offset_length: 0.5, seed: 0 }
+        Export { min_fraction: 0.0, fraction_width: 0.0, min_reflectance: f64::NEG_INFINITY, max_spread: f64::INFINITY, spread_width: 0.0, refl_noise: 0.0, echoes_only: false, range_a: 0.0, range_b: 0.0, yaw_mrad: 0.0, offset_sd: 0.0, offset_length: 0.5, seed: 0 }
     }
 }
 
@@ -694,16 +778,34 @@ fn unit_hash(a: u64, b: u64, c: u64) -> f64 {
 pub fn export(s: &Shots, p: &Export) -> Result<Shots> {
     let fraction = s.echo_attrs.get("footprint_fraction").ok_or_else(|| Error::invalid("export needs the scan's footprint_fraction"))?;
     let refl = s.echo_attrs.get("reflectance").ok_or_else(|| Error::invalid("export needs the scan's reflectance"))?;
-    if !(p.fraction_width >= 0.0 && p.offset_sd >= 0.0 && p.offset_length > 0.0) {
+    let spread = s.echo_attrs.get("range_spread");
+    if p.max_spread.is_finite() && spread.is_none() {
+        return Err(Error::invalid("export with max_spread needs the scan's range_spread"));
+    }
+    if !(p.fraction_width >= 0.0 && p.spread_width >= 0.0 && p.offset_sd >= 0.0 && p.offset_length > 0.0) {
         return Err(Error::invalid("fraction_width and offset_sd must be zero or more, offset_length positive"));
     }
     let mut keep_echo = vec![false; s.echo_range.len()];
+    let mut refl_out: Vec<f32> = vec![0.0; s.echo_range.len()];
     for i in 0..s.n_shots() {
         for k in 0..s.echo_count[i] as usize {
             let e = s.echo_start[i] + k;
-            let (f, r) = (fraction.get_f64(e), refl.get_f64(e));
+            let (f, mut r) = (fraction.get_f64(e), refl.get_f64(e));
+            if p.refl_noise > 0.0 {
+                // a normal draw from two hashed uniforms (Box-Muller), independent of the deletion's
+                let (u1, u2) = (unit_hash(p.seed ^ 0x0DB0_0DB0, i as u64, k as u64).max(1e-300), unit_hash(p.seed ^ 0x0DB1_0DB1, i as u64, k as u64));
+                r += p.refl_noise * (-2.0 * u1.ln()).sqrt() * (2.0 * PI * u2).cos();
+            }
+            refl_out[e] = r as f32;
             let pk = if p.fraction_width > 0.0 { 1.0 / (1.0 + (-(f - p.min_fraction) / p.fraction_width).exp()) } else { f64::from(u8::from(f >= p.min_fraction)) };
-            keep_echo[e] = r >= p.min_reflectance && unit_hash(p.seed, i as u64, k as u64) < pk;
+            let ps = match &spread {
+                Some(sp) if p.max_spread.is_finite() => {
+                    let d = p.max_spread - sp.get_f64(e);
+                    if p.spread_width > 0.0 { 1.0 / (1.0 + (-d / p.spread_width).exp()) } else { f64::from(u8::from(d >= 0.0)) }
+                }
+                _ => 1.0,
+            };
+            keep_echo[e] = r >= p.min_reflectance && unit_hash(p.seed, i as u64, k as u64) < pk * ps;
         }
     }
     const K: usize = 64;
@@ -755,6 +857,9 @@ pub fn export(s: &Shots, p: &Export) -> Result<Shots> {
         }
     }
     out.echo_attrs = s.echo_attrs.iter().map(|(k, v)| (k.clone(), v.take(&idx))).collect();
+    if p.refl_noise > 0.0 {
+        out.echo_attrs.insert("reflectance".into(), Attr::F32(idx.iter().map(|&e| refl_out[e]).collect()));
+    }
     Ok(out)
 }
 
@@ -929,6 +1034,54 @@ mod tests {
     }
 
     #[test]
+    fn lambertian_dims_a_turned_surface_and_relief_roughens_a_solid() {
+        // a vertical solid stem of radius 4 cm at 5 m: its echoes' reflectance falls toward the silhouette with
+        // `lambertian`, and with a 2 mm relief their ranges scatter about the smooth surface by about that much
+        let mut cloud = PointCloud::new(vec![[0.0, 5.0, 0.0]]);
+        cloud.attrs.insert("classification".into(), Attr::U8(vec![5]));
+        let mut p = params();
+        p.resolution_deg = 0.02;
+        p.min_zenith_deg = 89.0;
+        p.max_zenith_deg = 91.0;
+        p.reflectance = Reflectance::Constant(1.0);
+        p.solids = vec![Solid { a: [0.0, 5.0, -0.5], b: [0.0, 5.0, 0.5], r: 0.04, point: 0 }];
+        let refl = |s: &Shots| match &s.echo_attrs["reflectance"] { Attr::F32(v) => v.clone(), _ => unreachable!() };
+        // impact across the stem as a share of its radius, and the range error against the smooth surface
+        let impact = |s: &Shots, c: usize| (s.direction[c][0] / s.direction[c][1] * 5.0 / 0.04).abs();
+        let front = |s: &Shots, c: usize| {
+            let b = s.direction[c][0] / s.direction[c][1] * 5.0;
+            s.echo_range[s.echo_start[c]] * s.direction[c][1] - (5.0 - (0.04f64.powi(2) - b * b).max(0.0).sqrt())
+        };
+        let s = scan_beam(&cloud, &p).unwrap();
+        assert!(refl(&s).iter().all(|&r| r.abs() < 1e-4), "full energy without lambertian");
+        p.lambertian = true;
+        let s = scan_beam(&cloud, &p).unwrap();
+        let rf = refl(&s);
+        for c in (0..s.n_shots()).filter(|&c| s.echo_count[c] > 0) {
+            let i = impact(&s, c);
+            let want = 10.0 * (1.0 - i * i).max(1e-6).sqrt().log10();
+            if i < 0.9 {
+                assert!((f64::from(rf[s.echo_start[c]]) - want).abs() < 0.2, "{i} {} {want}", rf[s.echo_start[c]]);
+            }
+        }
+        let rms = |s: &Shots| {
+            let e: Vec<f64> = (0..s.n_shots()).filter(|&c| s.echo_count[c] > 0 && impact(s, c) < 0.5).map(|c| front(s, c)).collect();
+            (e.iter().map(|v| v * v).sum::<f64>() / e.len() as f64).sqrt()
+        };
+        assert!(rms(&s) < 1e-4, "{}", rms(&s));
+        p.roughness = 0.002;
+        p.roughness_length = 0.03;
+        let a = scan_beam(&cloud, &p).unwrap();
+        assert!(rms(&a) > 0.0012 && rms(&a) < 0.004, "{}", rms(&a));
+        // the relief is the scene's: another scan seed sees the same surface
+        p.seed = 9;
+        let b = scan_beam(&cloud, &p).unwrap();
+        assert_eq!(a.echo_range, b.echo_range);
+        p.roughness_length = 0.0;
+        assert!(scan_beam(&cloud, &p).is_err());
+    }
+
+    #[test]
     fn pulses_come_in_lines_with_their_times() {
         let cloud = PointCloud::new(wall(10.0, -1.0, 1.0, -1.0, 1.0, 0.01));
         let mut p = params();
@@ -967,6 +1120,19 @@ mod tests {
         let sd = (dy.iter().map(|v| v * v).sum::<f64>() / dy.len() as f64).sqrt();
         assert!(sd > 0.0005 && sd < 0.009, "{sd}");
         assert!(export(&s, &Export { offset_length: 0.0, ..Export::default() }).is_err());
+        // a spread cut deletes the echoes that straddle the step, whatever their fraction
+        let spread = |s: &Shots| match &s.echo_attrs["range_spread"] { Attr::F32(v) => v.iter().filter(|&&f| f > 0.05).count(), _ => unreachable!() };
+        let s2 = scan_beam(&cloud, &BeamScan { echo_separation: 0.5, ..p.clone() }).unwrap();
+        assert!(spread(&s2) > 0);
+        let x = export(&s2, &Export { max_spread: 0.05, ..Export::default() }).unwrap();
+        assert_eq!(spread(&x), 0);
+        assert!(x.echo_range.len() < s2.echo_range.len());
+        // a reflectance error of 2 dB, kept in the export
+        let x = export(&s, &Export { refl_noise: 2.0, seed: 3, ..Export::default() }).unwrap();
+        let (a, b) = match (&s.echo_attrs["reflectance"], &x.echo_attrs["reflectance"]) { (Attr::F32(a), Attr::F32(b)) => (a.clone(), b.clone()), _ => unreachable!() };
+        let d: Vec<f64> = a.iter().zip(&b).map(|(a, b)| f64::from(b - a)).collect();
+        let sd = (d.iter().map(|v| v * v).sum::<f64>() / d.len() as f64).sqrt();
+        assert!((sd - 2.0).abs() < 0.15, "{sd}");
     }
 
     #[test]

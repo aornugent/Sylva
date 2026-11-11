@@ -202,7 +202,7 @@ fn synthetic_plot_terrain<'py>(py: Python<'py>, modes: PyReadonlyArray2<f64>, sl
 }
 
 #[pyfunction]
-fn synthetic_scan_beam<'py>(py: Python<'py>, xyz: PyReadonlyArray2<f64>, attrs: Option<&Bound<'_, PyDict>>, origin: (f64, f64, f64), resolution_deg: f64, min_zenith_deg: f64, max_zenith_deg: f64, max_echoes: usize, echo_separation: f64, range_noise: f64, range_noise_slope: f64, beam_divergence: f64, exit_diameter: f64, footprint_samples: usize, mixed_pixels: bool, target_radius: Option<f64>, oriented: bool, detection_threshold: f64, reflectance_map: Vec<(i64, f64)>, reflectance_default: f64, reflectance_attr: Option<String>, reflectance_constant: Option<f64>, max_range: f64, seed: u64, solid_a: Option<PyReadonlyArray2<f64>>, solid_b: Option<PyReadonlyArray2<f64>>, solid_r: Option<PyReadonlyArray1<f64>>, solid_point: Option<PyReadonlyArray1<i64>>, azimuth: (f64, f64), timing: (f64, f64)) -> PyResult<Bound<'py, PyDict>> {
+fn synthetic_scan_beam<'py>(py: Python<'py>, xyz: PyReadonlyArray2<f64>, attrs: Option<&Bound<'_, PyDict>>, origin: (f64, f64, f64), resolution_deg: f64, min_zenith_deg: f64, max_zenith_deg: f64, max_echoes: usize, echo_separation: f64, range_noise: f64, range_noise_slope: f64, beam_divergence: f64, exit_diameter: f64, footprint_samples: usize, mixed_pixels: bool, target_radius: Option<f64>, oriented: bool, detection_threshold: f64, reflectance_map: Vec<(i64, f64)>, reflectance_default: f64, reflectance_attr: Option<String>, reflectance_constant: Option<f64>, max_range: f64, seed: u64, solid_a: Option<PyReadonlyArray2<f64>>, solid_b: Option<PyReadonlyArray2<f64>>, solid_r: Option<PyReadonlyArray1<f64>>, solid_point: Option<PyReadonlyArray1<i64>>, azimuth: (f64, f64), timing: (f64, f64), lambertian: bool, roughness: (f64, f64, u64)) -> PyResult<Bound<'py, PyDict>> {
     let cloud = cloud_from_py(xyz, attrs)?;
     let mut p = BeamScan::new([origin.0, origin.1, origin.2]);
     if let (Some(sa), Some(sb), Some(sr), Some(sp)) = (solid_a, solid_b, solid_r, solid_point) {
@@ -235,17 +235,19 @@ fn synthetic_scan_beam<'py>(py: Python<'py>, xyz: PyReadonlyArray2<f64>, attrs: 
     p.seed = seed;
     (p.min_azimuth_deg, p.max_azimuth_deg) = azimuth;
     (p.pulse_interval, p.line_period) = timing;
+    p.lambertian = lambertian;
+    (p.roughness, p.roughness_length, p.roughness_seed) = roughness;
     let s = py.detach(|| scan::scan_beam(&cloud, &p)).map_err(err)?;
     shots_to_py(py, &s)
 }
 
 /// What a scanner's export holds of a beam scan (sylva_rs::synthetic::scan::export).
 #[pyfunction]
-#[pyo3(signature = (shots, min_fraction=0.0, fraction_width=0.0, min_reflectance=f64::NEG_INFINITY, echoes_only=false, range_a=0.0, range_b=0.0, yaw_mrad=0.0, offset_sd=0.0, offset_length=0.5, seed=0))]
+#[pyo3(signature = (shots, min_fraction=0.0, fraction_width=0.0, min_reflectance=f64::NEG_INFINITY, max_spread=f64::INFINITY, spread_width=0.0, refl_noise=0.0, echoes_only=false, range_a=0.0, range_b=0.0, yaw_mrad=0.0, offset_sd=0.0, offset_length=0.5, seed=0))]
 #[allow(clippy::too_many_arguments)]
-fn synthetic_export<'py>(py: Python<'py>, shots: &Bound<'_, PyDict>, min_fraction: f64, fraction_width: f64, min_reflectance: f64, echoes_only: bool, range_a: f64, range_b: f64, yaw_mrad: f64, offset_sd: f64, offset_length: f64, seed: u64) -> PyResult<Bound<'py, PyDict>> {
+fn synthetic_export<'py>(py: Python<'py>, shots: &Bound<'_, PyDict>, min_fraction: f64, fraction_width: f64, min_reflectance: f64, max_spread: f64, spread_width: f64, refl_noise: f64, echoes_only: bool, range_a: f64, range_b: f64, yaw_mrad: f64, offset_sd: f64, offset_length: f64, seed: u64) -> PyResult<Bound<'py, PyDict>> {
     let s = shots_from_py(shots)?;
-    let p = scan::Export { min_fraction, fraction_width, min_reflectance, echoes_only, range_a, range_b, yaw_mrad, offset_sd, offset_length, seed };
+    let p = scan::Export { min_fraction, fraction_width, min_reflectance, max_spread, spread_width, refl_noise, echoes_only, range_a, range_b, yaw_mrad, offset_sd, offset_length, seed };
     let x = py.detach(|| scan::export(&s, &p)).map_err(err)?;
     shots_to_py(py, &x)
 }
