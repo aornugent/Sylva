@@ -322,7 +322,7 @@ pub fn ownership(g: &Grid, kappa: &[f64], sigma: &[f64], ground: &[bool], sinks:
                 .enumerate()
                 .map(|(q, &v)| {
                     let (i, j) = (q % sub.n[0], (q / sub.n[0]) % sub.n[1]);
-                    if vs.contains(&v) {
+                    if sink_of[v] != u32::MAX && (sink_of[v] == s as u32 || vs.contains(&v)) {
                         1.0
                     } else if ground[v] || sink_of[v] != u32::MAX || i == 0 || j == 0 || i + 1 == sub.n[0] || j + 1 == sub.n[1] {
                         0.0
