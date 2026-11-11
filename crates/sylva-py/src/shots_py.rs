@@ -1405,6 +1405,36 @@ fn shots_moment_offsets<'py>(py: Python<'py>, p: PyReadonlyArray2<f64>, n: PyRea
     Ok(d)
 }
 
+/// One evidence term per (hypothesis, scan) (sylva_rs::shots::evidence): the weighted ML beta-binomial of `k`
+/// refuting cells out of `n` informative ones (`binomial` holds rho at 0, per-cell counting). Returns `mu`, `rho`,
+/// `loglik`.
+#[pyfunction]
+#[pyo3(signature = (k, n, w, binomial=false))]
+fn shots_evidence_fit<'py>(py: Python<'py>, k: PyReadonlyArray1<u32>, n: PyReadonlyArray1<u32>, w: PyReadonlyArray1<f64>, binomial: bool) -> PyResult<Bound<'py, PyDict>> {
+    let (k, n, w) = (k.as_array().to_vec(), n.as_array().to_vec(), w.as_array().to_vec());
+    if n.len() != k.len() || w.len() != k.len() {
+        return Err(PyValueError::new_err("k, n and w must have one value per row"));
+    }
+    let f = py.detach(|| sylva_rs::shots::evidence::fit(&k, &n, &w, binomial));
+    let d = PyDict::new(py);
+    d.set_item("mu", f.mu)?;
+    d.set_item("rho", f.rho)?;
+    d.set_item("loglik", f.loglik)?;
+    Ok(d)
+}
+
+/// Per row, `ln P(k | n)` (without the binomial coefficient) under a beta-binomial with per-row `mu` and `rho`
+/// (sylva_rs::shots::evidence::ln_pmf). A scan's evidence term is the difference of two of these.
+#[pyfunction]
+fn shots_evidence_lnpmf<'py>(py: Python<'py>, k: PyReadonlyArray1<u32>, n: PyReadonlyArray1<u32>, mu: PyReadonlyArray1<f64>, rho: PyReadonlyArray1<f64>) -> PyResult<Bound<'py, PyArray1<f64>>> {
+    let (k, n, mu, rho) = (k.as_array(), n.as_array(), mu.as_array(), rho.as_array());
+    if [n.len(), mu.len(), rho.len()].iter().any(|&x| x != k.len()) {
+        return Err(PyValueError::new_err("k, n, mu and rho must have one value per row"));
+    }
+    let v: Vec<f64> = (0..k.len()).map(|i| sylva_rs::shots::evidence::ln_pmf(k[i], n[i], mu[i], rho[i])).collect();
+    Ok(v.into_pyarray(py))
+}
+
 pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     for f in [
         wrap_pyfunction!(shots_shot_of_echo, m)?,
@@ -1441,6 +1471,8 @@ pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
         wrap_pyfunction!(shots_amodal_scan, m)?,
         wrap_pyfunction!(shots_amodal_lift, m)?,
         wrap_pyfunction!(shots_field_solve, m)?,
+        wrap_pyfunction!(shots_evidence_fit, m)?,
+        wrap_pyfunction!(shots_evidence_lnpmf, m)?,
     ] {
         m.add_function(f)?;
     }

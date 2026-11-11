@@ -11,6 +11,7 @@
 pub mod amodal;
 pub mod completion;
 pub mod elements;
+pub mod evidence;
 pub mod fields;
 pub mod identities;
 pub mod lattice;
