@@ -10,6 +10,7 @@
 
 pub mod completion;
 pub mod elements;
+pub mod fields;
 pub mod identities;
 pub mod lattice;
 pub mod moments;

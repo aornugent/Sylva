@@ -1108,6 +1108,88 @@ fn shots_moment_octree<'py>(py: Python<'py>, p: PyReadonlyArray2<f64>, n: PyRead
     Ok(d)
 }
 
+fn field_grid(lo: Vec<f64>, h: f64, n: Vec<usize>) -> PyResult<sylva_rs::shots::fields::Grid> {
+    let n: [usize; 3] = n.try_into().map_err(|_| PyValueError::new_err("n needs 3 values"))?;
+    if !(h > 0.0) {
+        return Err(PyValueError::new_err("h must be positive"));
+    }
+    Ok(sylva_rs::shots::fields::Grid { lo: point3(lo, "lo")?, h, n })
+}
+
+/// One scan's ray counts on the voxel box `lo`, `h`, `dims` (sylva_rs::shots::fields::ray_counts): pulse directions
+/// `direction` (m, 3, scanner frame; world = `rot` . d), first-echo `range` (NaN or 0: no return). Returns `counts`
+/// (voxels, 4: hit, pass, occluded, no return; x fastest) and `secs`.
+#[pyfunction]
+#[allow(clippy::too_many_arguments)]
+fn shots_field_counts<'py>(py: Python<'py>, direction: PyReadonlyArray2<f64>, range: PyReadonlyArray1<f32>, rot: PyReadonlyArray2<f64>, origin: Vec<f64>, lo: Vec<f64>, h: f64, dims: Vec<usize>) -> PyResult<Bound<'py, PyDict>> {
+    let g = field_grid(lo, h, dims)?;
+    let dir = xyz_from_py(direction)?;
+    let r = range.as_array().to_vec();
+    let rot = xyz_from_py(rot)?;
+    if r.len() != dir.len() || rot.len() != 3 {
+        return Err(PyValueError::new_err("range and direction differ in length, or rot isn't 3 x 3"));
+    }
+    let (origin, rot) = (point3(origin, "origin")?, [rot[0], rot[1], rot[2]]);
+    let (c, secs) = py.detach(|| {
+        let t0 = std::time::Instant::now();
+        let c = sylva_rs::shots::fields::ray_counts(&g, &origin, &rot, &dir, &r);
+        (c, t0.elapsed().as_secs_f64())
+    });
+    let d = PyDict::new(py);
+    let flat: Vec<u32> = c.into_iter().flatten().collect();
+    d.set_item("counts", flat.into_pyarray(py).reshape([g.len(), 4])?)?;
+    d.set_item("secs", secs)?;
+    Ok(d)
+}
+
+/// Leaf area and visible wood per voxel from surfels `p`, `n` (m, 3) of scans `scan` on a 3 cm moment octree
+/// (sylva_rs::shots::fields::node_inputs). Returns `leaf` (m²), `wood_r` (m, 0 without wood), `wood_n` and `secs`.
+#[pyfunction]
+#[pyo3(signature = (p, n, scan, lo, h, dims, min_n=10.0, wood_ratio=0.5, r_max=0.3))]
+#[allow(clippy::too_many_arguments)]
+fn shots_field_nodes<'py>(py: Python<'py>, p: PyReadonlyArray2<f64>, n: PyReadonlyArray2<f64>, scan: PyReadonlyArray1<i32>, lo: Vec<f64>, h: f64, dims: Vec<usize>, min_n: f64, wood_ratio: f64, r_max: f64) -> PyResult<Bound<'py, PyDict>> {
+    let g = field_grid(lo, h, dims)?;
+    let (p, nn, scan) = (xyz_from_py(p)?, xyz_from_py(n)?, scan.as_array().to_vec());
+    if nn.len() != p.len() || scan.len() != p.len() {
+        return Err(PyValueError::new_err("surfel arrays differ in length"));
+    }
+    let ((leaf, wr, wn), secs) = py.detach(|| {
+        let t0 = std::time::Instant::now();
+        let o = sylva_rs::shots::fields::node_inputs(&g, &p, &nn, &scan, min_n, wood_ratio, r_max);
+        (o, t0.elapsed().as_secs_f64())
+    });
+    let d = PyDict::new(py);
+    d.set_item("leaf", leaf.into_pyarray(py))?;
+    d.set_item("wood_r", wr.into_pyarray(py))?;
+    d.set_item("wood_n", wn.into_pyarray(py))?;
+    d.set_item("secs", secs)?;
+    Ok(d)
+}
+
+/// `−∇·(κ∇φ) + σφ = s` on the voxel box (sylva_rs::shots::fields::solve): per voxel `kappa` (m), `sigma` (1/m),
+/// `s`, and `fixed` (NaN free, else Dirichlet). Returns `phi`, `iters`, `residual`, `secs`.
+#[pyfunction]
+#[pyo3(signature = (kappa, sigma, s, fixed, lo, h, dims, tol=1e-8, max_iter=5000))]
+#[allow(clippy::too_many_arguments)]
+fn shots_field_solve<'py>(py: Python<'py>, kappa: PyReadonlyArray1<f64>, sigma: PyReadonlyArray1<f64>, s: PyReadonlyArray1<f64>, fixed: PyReadonlyArray1<f64>, lo: Vec<f64>, h: f64, dims: Vec<usize>, tol: f64, max_iter: usize) -> PyResult<Bound<'py, PyDict>> {
+    let g = field_grid(lo, h, dims)?;
+    let (k, sg, s, f) = (kappa.as_array().to_vec(), sigma.as_array().to_vec(), s.as_array().to_vec(), fixed.as_array().to_vec());
+    if [k.len(), sg.len(), s.len(), f.len()].iter().any(|&x| x != g.len()) {
+        return Err(PyValueError::new_err("per-voxel arrays must have one value per voxel"));
+    }
+    let ((phi, it, res), secs) = py.detach(|| {
+        let t0 = std::time::Instant::now();
+        let o = sylva_rs::shots::fields::solve(&g, &k, &sg, &s, &f, tol, max_iter);
+        (o, t0.elapsed().as_secs_f64())
+    });
+    let d = PyDict::new(py);
+    d.set_item("phi", phi.into_pyarray(py))?;
+    d.set_item("iters", it)?;
+    d.set_item("residual", res)?;
+    d.set_item("secs", secs)?;
+    Ok(d)
+}
+
 /// Per-scan offsets by alternation on moments (sylva_rs::shots::moments::offsets): for each query point `q` (k, 3)
 /// the per-scan moments of the level-`level` node holding it (with `nbhd`, it and its 26 neighbours), scans with at
 /// least `min_n` surfels there. Returns flat per (query, scan) `query`, `scan`, `t` (m, 3; the shift that brings the
@@ -1220,6 +1302,9 @@ pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
         wrap_pyfunction!(shots_scan_normals, m)?,
         wrap_pyfunction!(shots_moment_octree, m)?,
         wrap_pyfunction!(shots_moment_offsets, m)?,
+        wrap_pyfunction!(shots_field_counts, m)?,
+        wrap_pyfunction!(shots_field_nodes, m)?,
+        wrap_pyfunction!(shots_field_solve, m)?,
     ] {
         m.add_function(f)?;
     }
