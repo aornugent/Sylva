@@ -10,7 +10,11 @@
 //!   against it cell by cell: every cell whose centre ray passes through the
 //!   cylinder's *core* (within `R - footprint/2`, at least `R/2`, of the
 //!   axis, inside its length) is one sample, so the footprint's cells share
-//!   the outcome. A sample is *support* (the first echo lies in the
+//!   the outcome. With a `margin` > 0 the gate widens to `R + footprint/2 +
+//!   margin` and only cells whose first echo lies beyond the closest
+//!   approach (possible refutes) are kept, each with its miss vector, so a
+//!   caller can soften or shift the refute test (3dtrees research 128,
+//!   `fields-aniso.md`). A sample is *support* (the first echo lies in the
 //!   cylinder's depth span, widened by `tol`), *refute* (it lies beyond: the
 //!   pulse went through), *occluded* (nearer) or *unknown* (an empty cell:
 //!   no echo, or one deleted in export). Each sample keeps its chord through
@@ -56,6 +60,12 @@ pub struct Sample {
     pub miss: f64,
     pub t_in: f64,
     pub depth: f64,
+    /// The footprint (m) at the closest approach, the sine of the ray's angle to the axis, the first echo's range
+    /// beyond the closest approach (m), and the miss vector (world, m: the ray's closest point minus the axis's).
+    pub fp: f64,
+    pub sin: f64,
+    pub excess: f64,
+    pub m: Point,
 }
 
 /// A scan's range image: the cell -> pulse index (`u32::MAX` empty), with the lattice and the scan's pose
@@ -92,20 +102,24 @@ impl<'a> ShadowMap<'a> {
 
     /// Every core cell of each cylinder against this map. `footprint(t)` is the beam's width at range t; `tol`
     /// widens the depth span for range noise and registration; at most `max_cells` cells across a cylinder's
-    /// image either way are visited.
-    pub fn test(&self, cyls: &[Cyl], footprint: impl Fn(f64) -> f64, tol: f64, max_cells: f64) -> Vec<Sample> {
+    /// image either way are visited. `margin` > 0 widens the gate as the module docs say. Cylinders run in
+    /// parallel; samples come back in cylinder order.
+    pub fn test(&self, cyls: &[Cyl], footprint: impl Fn(f64) -> f64 + Sync, tol: f64, max_cells: f64, margin: f64) -> Vec<Sample> {
+        use rayon::prelude::*;
         let lat = self.lat;
         let (zs, az) = (lat.zenith_step.abs().to_radians(), lat.azimuth_step.abs().to_radians());
-        let mut out = Vec::new();
-        for (ci, cy) in cyls.iter().enumerate() {
+        let wide = margin > 0.0;
+        let per: Vec<Vec<Sample>> = cyls.par_iter().enumerate().map(|(ci, cy)| {
+            let mut out = Vec::new();
             let c = self.to_scanner(&cy.p);
             let u = self.rot_t(&cy.u);
             let dist = norm(&c);
             if !(dist > 0.1) || !(cy.r > 0.0) {
-                continue;
+                return out;
             }
-            let Some((l0, c0)) = lat.cell_of(&c) else { continue };
-            let alpha = (cy.half * cy.half + cy.r * cy.r).sqrt() / dist;
+            let Some((l0, c0)) = lat.cell_of(&c) else { return out };
+            let rg = if wide { cy.r + 0.5 * footprint(dist) + margin } else { cy.r };
+            let alpha = (cy.half * cy.half + rg * rg).sqrt() / dist;
             let sin_z = (lat.cell_angles(l0, c0).0.to_radians().sin()).abs().max(0.05);
             let dl = (alpha / (az * sin_z)).min(max_cells).ceil() as i64 + 1;
             let dc = (alpha / zs).min(max_cells).ceil() as i64 + 1;
@@ -127,12 +141,13 @@ impl<'a> ShadowMap<'a> {
                     let miss2 = (bb - ab * ab / aa).max(0.0);
                     let tm = -ab / aa;
                     let fp = footprint(tm.max(0.0));
-                    let core = (cy.r - 0.5 * fp).max(0.5 * cy.r);
+                    let core = if wide { cy.r + 0.5 * fp + margin } else { (cy.r - 0.5 * fp).max(0.5 * cy.r) };
                     if miss2 > core * core {
                         continue;
                     }
-                    // the infinite cylinder of radius R, then the slab |s| <= half along the axis
-                    let hw = ((cy.r * cy.r - miss2) / aa).sqrt();
+                    // the infinite cylinder of radius R (a ray outside it spans its closest approach only), then the
+                    // slab |s| <= half along the axis
+                    let hw = ((cy.r * cy.r - miss2).max(0.0) / aa).sqrt();
                     let (mut t0, mut t1) = (tm - hw, tm + hw);
                     if vu.abs() > 1e-9 {
                         let (s0, s1) = ((cu - cy.half) / vu, (cu + cy.half) / vu);
@@ -143,10 +158,14 @@ impl<'a> ShadowMap<'a> {
                     }
                     // the ray's point at its closest approach must lie inside the length (a core ray, not a cap)
                     let s_m = tm * vu - cu;
-                    if t1 <= t0 || t0 <= 0.0 || s_m.abs() > cy.half {
+                    if t1 < t0 || t0 <= 0.0 || s_m.abs() > cy.half {
                         continue;
                     }
                     let j = self.cell[l as usize * lat.n_cols + k as usize];
+                    let depth = if j == u32::MAX { f64::NAN } else { self.range[j as usize] as f64 };
+                    if wide && !(depth > tm + tol) {
+                        continue;
+                    }
                     let (o, d) = if j == u32::MAX {
                         (outcome::UNKNOWN, f64::NAN)
                     } else {
@@ -160,11 +179,20 @@ impl<'a> ShadowMap<'a> {
                         };
                         (o, d)
                     };
-                    out.push(Sample { cyl: ci as u32, outcome: o, chord: t1 - t0, miss: miss2.sqrt(), t_in: t0, depth: d });
+                    // the miss vector in the scanner frame, then rotated to the world
+                    let q = [tm * v[0] - c[0], tm * v[1] - c[1], tm * v[2] - c[2]];
+                    let qu = dot(&q, &u);
+                    let ms = [q[0] - qu * u[0], q[1] - qu * u[1], q[2] - qu * u[2]];
+                    let m = [0, 1, 2].map(|a| self.rot[a][0] * ms[0] + self.rot[a][1] * ms[1] + self.rot[a][2] * ms[2]);
+                    out.push(Sample {
+                        cyl: ci as u32, outcome: o, chord: t1 - t0, miss: miss2.sqrt(), t_in: t0, depth: d,
+                        fp, sin: aa.sqrt(), excess: depth - tm, m,
+                    });
                 }
             }
-        }
-        out
+            out
+        }).collect();
+        per.into_iter().flatten().collect()
     }
 }
 
@@ -335,7 +363,7 @@ mod tests {
         let on = Cyl { p: [0.0, 8.0, 0.0], u: [0.0, 0.0, 1.0], half: 0.05, r: 0.03 };
         let off = Cyl { p: [0.15, 8.0, 0.0], u: [0.0, 0.0, 1.0], half: 0.05, r: 0.03 };
         let behind = Cyl { p: [0.0, 12.0, 0.0], u: [0.0, 0.0, 1.0], half: 0.05, r: 0.03 };
-        let s = map.test(&[on, off, behind], fp, 0.015, 60.0);
+        let s = map.test(&[on, off, behind], fp, 0.015, 60.0, 0.0);
         let count = |c: u32, o: u8| s.iter().filter(|x| x.cyl == c && x.outcome == o).count();
         assert!(count(0, outcome::SUPPORT) > 20 && count(0, outcome::REFUTE) == 0, "{} {}", count(0, 0), count(0, 1));
         assert!(count(1, outcome::REFUTE) > 20 && count(1, outcome::SUPPORT) == 0);
@@ -343,5 +371,26 @@ mod tests {
         // the chord through the middle is about the diameter
         let cmax = s.iter().filter(|x| x.cyl == 0).map(|x| x.chord).fold(0.0, f64::max);
         assert!((cmax - 0.06).abs() < 0.01, "{cmax}");
+    }
+
+    #[test]
+    fn a_wide_gate_keeps_the_hard_refutes_and_their_miss_vectors() {
+        let (lat, rng) = scene(0.03, 8.0);
+        let map = ShadowMap::new(&lat, &rng, ID, [0.0; 3]);
+        let fp = |t: f64| 0.007 + 0.35e-3 * t;
+        let off = Cyl { p: [0.15, 8.0, 0.0], u: [0.0, 0.0, 1.0], half: 0.05, r: 0.02 };
+        let hard = map.test(&[off], fp, 0.015, 60.0, 0.0);
+        let wide = map.test(&[off], fp, 0.015, 60.0, 0.02);
+        let n_hard = hard.iter().filter(|x| x.outcome == outcome::REFUTE).count();
+        let core = |x: &Sample| (0.02 - 0.5 * x.fp).max(0.01);
+        let n_core = wide.iter().filter(|x| x.outcome == outcome::REFUTE && x.miss <= core(x)).count();
+        assert!(n_hard > 5 && n_core == n_hard, "{n_hard} {n_core}");
+        assert!(wide.len() > 2 * n_hard);
+        for x in &wide {
+            // the miss vector is across the (vertical) axis, as long as the miss, and within the gate
+            let mm = (x.m[0] * x.m[0] + x.m[1] * x.m[1] + x.m[2] * x.m[2]).sqrt();
+            assert!(x.m[2].abs() < 1e-9 && (mm - x.miss).abs() < 1e-9 && x.miss <= 0.02 + 0.5 * x.fp + 0.02 + 1e-12);
+            assert!(x.excess > 0.015);
+        }
     }
 }

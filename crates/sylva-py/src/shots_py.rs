@@ -269,14 +269,15 @@ fn shots_tracts<'py>(py: Python<'py>, p: PyReadonlyArray2<f64>, u: PyReadonlyArr
 /// `width_cells`, `stripe`, and the single-scan features (`jitter`, `multi`,
 /// `refl`, `empty`, `arc`, `fa`, `cells`); the query cylinders' samples
 /// against this scan (`s_cyl`, `s_outcome` 0 support 1 refute 2 occluded 3
-/// unknown, `s_chord`, `s_miss`, `s_t_in`, `s_depth`); the lattice round trip
+/// unknown, `s_chord`, `s_miss`, `s_t_in`, `s_depth`, `s_fp`, `s_sin`, `s_excess`, `s_m` (k, 3, world); with
+/// `margin` > 0, the widened gate's possible refutes only, as opacity's docs say); the lattice round trip
 /// on every 997th pulse (`roundtrip_line`, `roundtrip_col`: cell_of minus the
 /// cell); optionally (`image`) every pulse's `pulse_line`, `pulse_col`; and
 /// the seconds each step took.
 #[pyfunction]
-#[pyo3(signature = (time, direction, range, n_echo, refl, rot, origin, lo, hi, cyl_p, cyl_u, cyl_half, cyl_r, tol=0.015, voxel=0.06, pad=3, window=5, max_step=6.0, max_cells=60.0, image=false))]
+#[pyo3(signature = (time, direction, range, n_echo, refl, rot, origin, lo, hi, cyl_p, cyl_u, cyl_half, cyl_r, tol=0.015, voxel=0.06, pad=3, window=5, max_step=6.0, max_cells=60.0, image=false, margin=0.0))]
 #[allow(clippy::too_many_arguments)]
-fn shots_scan_opacity<'py>(py: Python<'py>, time: PyReadonlyArray1<f64>, direction: PyReadonlyArray2<f64>, range: PyReadonlyArray1<f32>, n_echo: PyReadonlyArray1<u8>, refl: PyReadonlyArray1<f32>, rot: PyReadonlyArray2<f64>, origin: Vec<f64>, lo: Vec<f64>, hi: Vec<f64>, cyl_p: PyReadonlyArray2<f64>, cyl_u: PyReadonlyArray2<f64>, cyl_half: PyReadonlyArray1<f64>, cyl_r: PyReadonlyArray1<f64>, tol: f64, voxel: f64, pad: i64, window: usize, max_step: f64, max_cells: f64, image: bool) -> PyResult<Bound<'py, PyDict>> {
+fn shots_scan_opacity<'py>(py: Python<'py>, time: PyReadonlyArray1<f64>, direction: PyReadonlyArray2<f64>, range: PyReadonlyArray1<f32>, n_echo: PyReadonlyArray1<u8>, refl: PyReadonlyArray1<f32>, rot: PyReadonlyArray2<f64>, origin: Vec<f64>, lo: Vec<f64>, hi: Vec<f64>, cyl_p: PyReadonlyArray2<f64>, cyl_u: PyReadonlyArray2<f64>, cyl_half: PyReadonlyArray1<f64>, cyl_r: PyReadonlyArray1<f64>, tol: f64, voxel: f64, pad: i64, window: usize, max_step: f64, max_cells: f64, image: bool, margin: f64) -> PyResult<Bound<'py, PyDict>> {
     use sylva_rs::shots::opacity::{features, Cyl, ShadowMap};
     use sylva_rs::shots::stripes::{stripes, StripeParams};
     use sylva_rs::shots::tracts::segments;
@@ -306,7 +307,7 @@ fn shots_scan_opacity<'py>(py: Python<'py>, time: PyReadonlyArray1<f64>, directi
         let feats = features(&map, &sl, &segs, &ne, &rf, voxel, pad);
         let c3 = std::time::Instant::now();
         let beam = prm.beam.clone();
-        let samples = map.test(&cyls, |x| beam.footprint(x), tol, max_cells);
+        let samples = map.test(&cyls, |x| beam.footprint(x), tol, max_cells, margin);
         let c4 = std::time::Instant::now();
         let mut rt = (Vec::new(), Vec::new());
         for i in (0..dir.len()).step_by(997) {
@@ -359,6 +360,10 @@ fn shots_scan_opacity<'py>(py: Python<'py>, time: PyReadonlyArray1<f64>, directi
     col!(samples, "s_miss", |x| x.miss);
     col!(samples, "s_t_in", |x| x.t_in);
     col!(samples, "s_depth", |x| x.depth);
+    col!(samples, "s_fp", |x| x.fp as f32);
+    col!(samples, "s_sin", |x| x.sin as f32);
+    col!(samples, "s_excess", |x| x.excess as f32);
+    d.set_item("s_m", xyz_to_py(py, &samples.iter().map(|x| x.m).collect::<Vec<_>>()))?;
     d.set_item("roundtrip_line", rt.0.into_pyarray(py))?;
     d.set_item("roundtrip_col", rt.1.into_pyarray(py))?;
     d.set_item("n_slices", sl.len())?;
@@ -1118,7 +1123,8 @@ fn field_grid(lo: Vec<f64>, h: f64, n: Vec<usize>) -> PyResult<sylva_rs::shots::
 
 /// One scan's ray counts on the voxel box `lo`, `h`, `dims` (sylva_rs::shots::fields::ray_counts): pulse directions
 /// `direction` (m, 3, scanner frame; world = `rot` . d), first-echo `range` (NaN or 0: no return). Returns `counts`
-/// (voxels, 4: hit, pass, occluded, no return; x fastest) and `secs`.
+/// (voxels, 4: hit, pass, occluded, no return; x fastest), `pass_t` (voxels, 6: the pass rays' Σ ωωᵀ, xx yy zz xy
+/// xz yz) and `secs`.
 #[pyfunction]
 #[allow(clippy::too_many_arguments)]
 fn shots_field_counts<'py>(py: Python<'py>, direction: PyReadonlyArray2<f64>, range: PyReadonlyArray1<f32>, rot: PyReadonlyArray2<f64>, origin: Vec<f64>, lo: Vec<f64>, h: f64, dims: Vec<usize>) -> PyResult<Bound<'py, PyDict>> {
@@ -1136,45 +1142,53 @@ fn shots_field_counts<'py>(py: Python<'py>, direction: PyReadonlyArray2<f64>, ra
         (c, t0.elapsed().as_secs_f64())
     });
     let d = PyDict::new(py);
-    let flat: Vec<u32> = c.into_iter().flatten().collect();
+    let flat: Vec<u32> = c.iter().flat_map(|x| x.0).collect();
+    let tens: Vec<f64> = c.iter().flat_map(|x| x.1).collect();
     d.set_item("counts", flat.into_pyarray(py).reshape([g.len(), 4])?)?;
+    d.set_item("pass_t", tens.into_pyarray(py).reshape([g.len(), 6])?)?;
     d.set_item("secs", secs)?;
     Ok(d)
 }
 
 /// Leaf area and visible wood per voxel from surfels `p`, `n` (m, 3) of scans `scan` on a 3 cm moment octree
-/// (sylva_rs::shots::fields::node_inputs). Returns `leaf` (m²), `wood_r` (m, 0 without wood), `wood_n` and `secs`.
+/// (sylva_rs::shots::fields::node_inputs). Returns `leaf` (m²), `wood_r` (m, 0 without wood), `wood_n`, the soft
+/// wood `soft_sum`, `soft_max`, `soft_t` (voxels, 6) and `secs`.
 #[pyfunction]
-#[pyo3(signature = (p, n, scan, lo, h, dims, min_n=10.0, wood_ratio=0.5, r_max=0.3))]
+#[pyo3(signature = (p, n, scan, lo, h, dims, min_n=10.0, wood_ratio=0.5, r_max=0.3, soft_c=0.85, soft_s=0.05))]
 #[allow(clippy::too_many_arguments)]
-fn shots_field_nodes<'py>(py: Python<'py>, p: PyReadonlyArray2<f64>, n: PyReadonlyArray2<f64>, scan: PyReadonlyArray1<i32>, lo: Vec<f64>, h: f64, dims: Vec<usize>, min_n: f64, wood_ratio: f64, r_max: f64) -> PyResult<Bound<'py, PyDict>> {
+fn shots_field_nodes<'py>(py: Python<'py>, p: PyReadonlyArray2<f64>, n: PyReadonlyArray2<f64>, scan: PyReadonlyArray1<i32>, lo: Vec<f64>, h: f64, dims: Vec<usize>, min_n: f64, wood_ratio: f64, r_max: f64, soft_c: f64, soft_s: f64) -> PyResult<Bound<'py, PyDict>> {
     let g = field_grid(lo, h, dims)?;
     let (p, nn, scan) = (xyz_from_py(p)?, xyz_from_py(n)?, scan.as_array().to_vec());
     if nn.len() != p.len() || scan.len() != p.len() {
         return Err(PyValueError::new_err("surfel arrays differ in length"));
     }
-    let ((leaf, wr, wn), secs) = py.detach(|| {
+    let (o, secs) = py.detach(|| {
         let t0 = std::time::Instant::now();
-        let o = sylva_rs::shots::fields::node_inputs(&g, &p, &nn, &scan, min_n, wood_ratio, r_max);
+        let o = sylva_rs::shots::fields::node_inputs(&g, &p, &nn, &scan, min_n, wood_ratio, r_max, soft_c, soft_s);
         (o, t0.elapsed().as_secs_f64())
     });
     let d = PyDict::new(py);
-    d.set_item("leaf", leaf.into_pyarray(py))?;
-    d.set_item("wood_r", wr.into_pyarray(py))?;
-    d.set_item("wood_n", wn.into_pyarray(py))?;
+    let nv = g.len();
+    d.set_item("leaf", o.leaf.into_pyarray(py))?;
+    d.set_item("wood_r", o.wood_r.into_pyarray(py))?;
+    d.set_item("wood_n", o.wood_n.into_pyarray(py))?;
+    d.set_item("soft_sum", o.soft_sum.into_pyarray(py))?;
+    d.set_item("soft_max", o.soft_max.into_pyarray(py))?;
+    d.set_item("soft_t", o.soft_t.into_iter().flatten().collect::<Vec<f64>>().into_pyarray(py).reshape([nv, 6])?)?;
     d.set_item("secs", secs)?;
     Ok(d)
 }
 
-/// `−∇·(κ∇φ) + σφ = s` on the voxel box (sylva_rs::shots::fields::solve): per voxel `kappa` (m), `sigma` (1/m),
-/// `s`, and `fixed` (NaN free, else Dirichlet). Returns `phi`, `iters`, `residual`, `secs`.
+/// `−∇·(κ∇φ) + σφ = s` on the voxel box (sylva_rs::shots::fields::solve): per voxel `kappa` (m; or 3 per voxel,
+/// κ_xx κ_yy κ_zz, voxel-major), `sigma` (1/m), `s`, and `fixed` (NaN free, else Dirichlet). Returns `phi`, `iters`,
+/// `residual`, `secs`.
 #[pyfunction]
 #[pyo3(signature = (kappa, sigma, s, fixed, lo, h, dims, tol=1e-8, max_iter=5000))]
 #[allow(clippy::too_many_arguments)]
 fn shots_field_solve<'py>(py: Python<'py>, kappa: PyReadonlyArray1<f64>, sigma: PyReadonlyArray1<f64>, s: PyReadonlyArray1<f64>, fixed: PyReadonlyArray1<f64>, lo: Vec<f64>, h: f64, dims: Vec<usize>, tol: f64, max_iter: usize) -> PyResult<Bound<'py, PyDict>> {
     let g = field_grid(lo, h, dims)?;
     let (k, sg, s, f) = (kappa.as_array().to_vec(), sigma.as_array().to_vec(), s.as_array().to_vec(), fixed.as_array().to_vec());
-    if [k.len(), sg.len(), s.len(), f.len()].iter().any(|&x| x != g.len()) {
+    if [sg.len(), s.len(), f.len()].iter().any(|&x| x != g.len()) || (k.len() != g.len() && k.len() != 3 * g.len()) {
         return Err(PyValueError::new_err("per-voxel arrays must have one value per voxel"));
     }
     let ((phi, it, res), secs) = py.detach(|| {
