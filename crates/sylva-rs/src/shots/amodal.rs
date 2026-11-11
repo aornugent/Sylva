@@ -34,7 +34,10 @@
 //!   `ratio`).
 //! - **lifted moments:** the moment octree of every scan but one, queried at
 //!   points (a 9 cm neighbourhood): surfel count, collapse ratio, R*, the normal
-//!   tensor's smallest eigenvalue λ₃ (sum 1) and its null direction.
+//!   tensor's two smaller eigenvalues λ₂, λ₃ (sum 1) and its null direction.
+//! - **occluders:** the world points of the first echoes behind an occluded
+//!   label (an end's near window cells) and behind a path's occluder cells, so
+//!   the octree can say what stands in front.
 
 use super::moments::{key, per_scan, Key, Octree};
 use super::opacity::{outcome, Cyl, ShadowMap};
@@ -145,25 +148,33 @@ fn classify(d: Option<f64>, rho: f64, r: f64, tol: f64) -> u8 {
     }
 }
 
-/// The T-junction label of an end at `e` with unit image direction `u`, as the module docs say.
-pub fn end_label(img: &impl Depth, e: &Pt, u: [f64; 2], prm: &AmodalParams) -> EndLabel {
+/// The T-junction window of an end at `e` with unit image direction `u`: its cells on the image, each once.
+fn window_cells(img: &impl Depth, e: &Pt, u: [f64; 2], prm: &AmodalParams) -> Vec<(i64, i64)> {
     let w = (0.5 * e.r / e.rho / e.sc).round().clamp(0.0, 2.0) as i64;
     let perp = [-u[1], u[0]];
     let mut seen = HashSet::new();
-    let mut o = EndLabel::default();
+    let mut out = Vec::new();
     for k in 1..=prm.window as i64 {
         for j in -w..=w {
             let x = [(k as f64 * u[0] + j as f64 * perp[0]) * e.sc, (k as f64 * u[1] + j as f64 * perp[1]) * e.sc];
             let (l, c) = ((e.l + x[0] / e.sl).round() as i64, (e.c + x[1] / e.sc).round() as i64);
-            if !img.inside(l, c) || !seen.insert((l, c)) {
-                continue;
+            if img.inside(l, c) && seen.insert((l, c)) {
+                out.push((l, c));
             }
-            match classify(img.depth(l, c), e.rho, e.r, prm.margin) {
-                outcome::OCCLUDED => o.near += 1,
-                outcome::REFUTE => o.far += 1,
-                outcome::UNKNOWN => o.empty += 1,
-                _ => o.same += 1,
-            }
+        }
+    }
+    out
+}
+
+/// The T-junction label of an end at `e` with unit image direction `u`, as the module docs say.
+pub fn end_label(img: &impl Depth, e: &Pt, u: [f64; 2], prm: &AmodalParams) -> EndLabel {
+    let mut o = EndLabel::default();
+    for (l, c) in window_cells(img, e, u, prm) {
+        match classify(img.depth(l, c), e.rho, e.r, prm.margin) {
+            outcome::OCCLUDED => o.near += 1,
+            outcome::REFUTE => o.far += 1,
+            outcome::UNKNOWN => o.empty += 1,
+            _ => o.same += 1,
         }
     }
     let n = (o.near + o.far + o.empty + o.same).max(1) as f64;
@@ -180,25 +191,33 @@ pub fn end_label(img: &impl Depth, e: &Pt, u: [f64; 2], prm: &AmodalParams) -> E
     o
 }
 
-/// Every cell within half the radius of a path's samples, counted once, as the module docs say.
-pub fn score_path(img: &impl Depth, path: &[Pt], tol: f64) -> PathCount {
+/// Every cell within half the radius of a path's samples, once, with the first sample that reached it.
+fn path_cells<'a>(img: &impl Depth, path: &'a [Pt]) -> Vec<(i64, i64, &'a Pt)> {
     let mut seen = HashSet::new();
-    let mut o = PathCount::default();
+    let mut out = Vec::new();
     for s in path {
         let (wl, wc) = ((0.5 * s.r / s.rho / s.sl).floor() as i64, (0.5 * s.r / s.rho / s.sc).floor() as i64);
         let (l0, c0) = (s.l.round() as i64, s.c.round() as i64);
         for l in l0 - wl..=l0 + wl {
             for c in c0 - wc..=c0 + wc {
-                if !img.inside(l, c) || !seen.insert((l, c)) {
-                    continue;
-                }
-                match classify(img.depth(l, c), s.rho, s.r, tol) {
-                    outcome::OCCLUDED => o.occluder += 1,
-                    outcome::REFUTE => o.refute += 1,
-                    outcome::UNKNOWN => o.unknown += 1,
-                    _ => o.support += 1,
+                if img.inside(l, c) && seen.insert((l, c)) {
+                    out.push((l, c, s));
                 }
             }
+        }
+    }
+    out
+}
+
+/// Every cell within half the radius of a path's samples, counted once, as the module docs say.
+pub fn score_path(img: &impl Depth, path: &[Pt], tol: f64) -> PathCount {
+    let mut o = PathCount::default();
+    for (l, c, s) in path_cells(img, path) {
+        match classify(img.depth(l, c), s.rho, s.r, tol) {
+            outcome::OCCLUDED => o.occluder += 1,
+            outcome::REFUTE => o.refute += 1,
+            outcome::UNKNOWN => o.unknown += 1,
+            _ => o.support += 1,
         }
     }
     o
@@ -283,6 +302,38 @@ pub fn image_pairs(map: &ShadowMap, ends: &[Option<ImgEnd>], pairs: &[(usize, us
     }).collect()
 }
 
+/// The world point of a cell's first echo: the cell centre's direction at its range.
+fn echo_point(map: &ShadowMap, l: i64, c: i64) -> Option<Point> {
+    let d = map.depth(l, c)?;
+    let v = map.lat.cell_direction(l as f64, c as f64);
+    Some([0, 1, 2].map(|a| (map.rot[a][0] * v[0] + map.rot[a][1] * v[1] + map.rot[a][2] * v[2]) * d + map.origin[a]))
+}
+
+/// What stands in front, as world points of first echoes (3dtrees research 128, `occluder.md`): per end, its
+/// window's near cells; per pair, the occluder cells of its Hermite image path. Each list is (owner, point), owner
+/// the end's or the pair's index; pairs `image_pairs` drops have none.
+pub fn occluders(map: &ShadowMap, ends: &[Option<ImgEnd>], pairs: &[(usize, usize)], prm: &AmodalParams) -> (Vec<(u32, Point)>, Vec<(u32, Point)>) {
+    let at_end = ends.par_iter().enumerate().flat_map_iter(|(i, e)| {
+        let pts: Vec<Point> = e.map_or_else(Vec::new, |e| window_cells(map, &e.at, e.u, prm).into_iter()
+            .filter(|&(l, c)| classify(map.depth(l, c), e.at.rho, e.at.r, prm.margin) == outcome::OCCLUDED)
+            .filter_map(|(l, c)| echo_point(map, l, c)).collect());
+        pts.into_iter().map(move |p| (i as u32, p))
+    }).collect();
+    let on_path = pairs.par_iter().enumerate().flat_map_iter(|(k, &(i, j))| {
+        let pts: Vec<Point> = match (ends[i], ends[j]) {
+            (Some(a), Some(b)) if (a.at.l - b.at.l).abs() <= 0.5 * map.lat.n_lines as f64 => {
+                let path = image_path(&a.at, a.u, &b.at, b.u, false);
+                path_cells(map, &path).into_iter()
+                    .filter(|&(l, c, s)| classify(map.depth(l, c), s.rho, s.r, prm.tol) == outcome::OCCLUDED)
+                    .filter_map(|(l, c, _)| echo_point(map, l, c)).collect()
+            }
+            _ => Vec::new(),
+        };
+        pts.into_iter().map(move |p| (k as u32, p))
+    }).collect();
+    (at_end, on_path)
+}
+
 /// The 3 cm nodes one scan's surfels call wood, as the module docs say.
 pub fn wood_keys(p: &[Point], n: &[Point], min_n: f64, ratio: f64, r_max: f64) -> HashSet<Key> {
     let vv = |x: &[Point]| x.iter().map(|a| Vector3::new(a[0], a[1], a[2])).collect::<Vec<_>>();
@@ -321,12 +372,14 @@ pub fn wood_support(map: &ShadowMap, dir: &[Point], cyls: &[Cyl], wood: &HashSet
     out
 }
 
-/// The fused moments at one point: surfels in the 9 cm neighbourhood, collapse ratio, R*, λ₃ and the null direction.
+/// The fused moments at one point: surfels in the 9 cm neighbourhood, collapse ratio, R*, the normal tensor's λ₂ and
+/// λ₃ and its null direction.
 #[derive(Debug, Clone, Copy)]
 pub struct Lift {
     pub n: f64,
     pub ratio: f64,
     pub r: f64,
+    pub lam2: f64,
     pub lam3: f64,
     pub u: Point,
 }
@@ -340,7 +393,7 @@ pub fn lift(p: &[Point], n: &[Point], scan: &[i32], exclude: i32, q: &[Point], m
     let o = Octree::new(&per_scan(&vv(p), &vv(n), &sc, 0.03), 0.03, 1);
     q.par_iter().map(|x| {
         let (m, _) = o.query(0, &Vector3::new(x[0], x[1], x[2]), true);
-        let nan = Lift { n: m.n, ratio: f64::NAN, r: f64::NAN, lam3: f64::NAN, u: [f64::NAN; 3] };
+        let nan = Lift { n: m.n, ratio: f64::NAN, r: f64::NAN, lam2: f64::NAN, lam3: f64::NAN, u: [f64::NAN; 3] };
         if m.n < min_n {
             return nan;
         }
@@ -349,7 +402,7 @@ pub fn lift(p: &[Point], n: &[Point], scan: &[i32], exclude: i32, q: &[Point], m
         if !(s0 > 0.0) {
             return nan;
         }
-        Lift { n: m.n, ratio: sp / s0, r, lam3: lam[2], u: [u[0], u[1], u[2]] }
+        Lift { n: m.n, ratio: sp / s0, r, lam2: lam[1], lam3: lam[2], u: [u[0], u[1], u[2]] }
     }).collect()
 }
 

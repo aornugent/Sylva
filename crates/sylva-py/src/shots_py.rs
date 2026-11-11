@@ -264,8 +264,50 @@ fn shots_amodal_scan<'py>(py: Python<'py>, time: PyReadonlyArray1<f64>, directio
     Ok(d)
 }
 
+/// What stands in front in one scan's range image (sylva_rs::shots::amodal::occluders), for 3dtrees research 128's
+/// occluder test. Takes the pulses, ends and pairs as `shots_amodal_scan` does. Returns per end `e_class`; the near
+/// cells of each end's T-junction window as `w_end` (end index) and `w_p` (k, 3: their first echoes' world points);
+/// the occluder cells of each pair's Hermite image path as `o_pair` and `o_p`.
+#[pyfunction]
+#[pyo3(signature = (time, direction, range, rot, origin, end_p, end_d, end_r, pair_a, pair_b, margin=0.05, window=4, tol=0.03))]
+#[allow(clippy::too_many_arguments)]
+fn shots_amodal_occluders<'py>(py: Python<'py>, time: PyReadonlyArray1<f64>, direction: PyReadonlyArray2<f64>, range: PyReadonlyArray1<f32>, rot: PyReadonlyArray2<f64>, origin: Vec<f64>, end_p: PyReadonlyArray2<f64>, end_d: PyReadonlyArray2<f64>, end_r: PyReadonlyArray1<f64>, pair_a: PyReadonlyArray1<u32>, pair_b: PyReadonlyArray1<u32>, margin: f64, window: usize, tol: f64) -> PyResult<Bound<'py, PyDict>> {
+    use sylva_rs::shots::amodal::{image_ends, occluders, AmodalParams};
+    use sylva_rs::shots::opacity::ShadowMap;
+    let dir = xyz_from_py(direction)?;
+    let t = time.as_array().to_vec();
+    let r = range.as_array().to_vec();
+    let rot = xyz_from_py(rot)?;
+    if t.len() != dir.len() || r.len() != dir.len() || rot.len() != 3 {
+        return Err(PyValueError::new_err("per-pulse arrays differ in length, or rot isn't 3 x 3"));
+    }
+    let origin = point3(origin, "origin")?;
+    let rot = [rot[0], rot[1], rot[2]];
+    let (ep, ed, er) = (xyz_from_py(end_p)?, xyz_from_py(end_d)?, end_r.as_array().to_vec());
+    let ends: Vec<(sylva_rs::Point, sylva_rs::Point, f64)> = (0..ep.len()).map(|i| (ep[i], ed[i], er[i])).collect();
+    let pairs: Vec<(usize, usize)> = pair_a.as_array().iter().zip(pair_b.as_array().iter()).map(|(&a, &b)| (a as usize, b as usize)).collect();
+    if pairs.iter().any(|&(a, b)| a >= ends.len() || b >= ends.len()) {
+        return Err(PyValueError::new_err("a pair names an end that doesn't exist"));
+    }
+    let prm = AmodalParams { margin, window, tol, ..AmodalParams::default() };
+    let (ie, (w, o)) = py.detach(|| {
+        let lat = sylva_rs::shots::lattice::scan_lattice(&t, &dir);
+        let map = ShadowMap::new(&lat, &r, rot, origin);
+        let ie = image_ends(&map, &ends, &prm);
+        let occ = occluders(&map, &ie, &pairs, &prm);
+        (ie, occ)
+    });
+    let d = PyDict::new(py);
+    d.set_item("e_class", ie.iter().map(|x| x.map_or(3u8, |e| e.label.class)).collect::<Vec<_>>().into_pyarray(py))?;
+    for (owner, pts, v) in [("w_end", "w_p", w), ("o_pair", "o_p", o)] {
+        d.set_item(owner, v.iter().map(|x| x.0).collect::<Vec<_>>().into_pyarray(py))?;
+        d.set_item(pts, xyz_to_py(py, &v.iter().map(|x| x.1).collect::<Vec<_>>()))?;
+    }
+    Ok(d)
+}
+
 /// The moment octree of every scan but `exclude` (sylva_rs::shots::amodal::lift), from surfels `p`, `n` of scans
-/// `scan`, queried at `q` with a 9 cm neighbourhood. Returns per point `n`, `ratio`, `r`, `lam3`, `u` (NaN where
+/// `scan`, queried at `q` with a 9 cm neighbourhood. Returns per point `n`, `ratio`, `r`, `lam2`, `lam3`, `u` (NaN where
 /// fewer than `min_n` surfels) and `secs`.
 #[pyfunction]
 #[pyo3(signature = (p, n, scan, exclude, q, min_n=10.0, r_max=0.3))]
@@ -284,6 +326,7 @@ fn shots_amodal_lift<'py>(py: Python<'py>, p: PyReadonlyArray2<f64>, n: PyReadon
     d.set_item("n", o.iter().map(|x| x.n).collect::<Vec<_>>().into_pyarray(py))?;
     d.set_item("ratio", o.iter().map(|x| x.ratio).collect::<Vec<_>>().into_pyarray(py))?;
     d.set_item("r", o.iter().map(|x| x.r).collect::<Vec<_>>().into_pyarray(py))?;
+    d.set_item("lam2", o.iter().map(|x| x.lam2).collect::<Vec<_>>().into_pyarray(py))?;
     d.set_item("lam3", o.iter().map(|x| x.lam3).collect::<Vec<_>>().into_pyarray(py))?;
     d.set_item("u", xyz_to_py(py, &o.iter().map(|x| x.u).collect::<Vec<_>>()))?;
     d.set_item("secs", secs)?;
@@ -1440,6 +1483,7 @@ pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
         wrap_pyfunction!(shots_field_nodes, m)?,
         wrap_pyfunction!(shots_amodal_scan, m)?,
         wrap_pyfunction!(shots_amodal_lift, m)?,
+        wrap_pyfunction!(shots_amodal_occluders, m)?,
         wrap_pyfunction!(shots_field_solve, m)?,
     ] {
         m.add_function(f)?;
