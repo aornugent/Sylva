@@ -30,9 +30,22 @@ fn cell_of(zen: f64, az: f64) -> usize {
     iz * NA + ia
 }
 
-/// A pool of `threads` threads (0: one per core).
-pub(crate) fn pool(threads: usize) -> Result<rayon::ThreadPool> {
-    rayon::ThreadPoolBuilder::new().num_threads(threads).build().map_err(|e| Error::invalid(format!("thread pool: {e}")))
+/// A pool of `threads` threads (0: one per core), built once per calling thread and size (a fit
+/// calls the likelihood thousands of times; a pool per caller keeps
+/// concurrent fits, such as trees fitted in parallel, from sharing one).
+pub(crate) fn pool(threads: usize) -> Result<std::rc::Rc<rayon::ThreadPool>> {
+    use std::{cell::RefCell, collections::HashMap, rc::Rc};
+    thread_local! {
+        static POOLS: RefCell<HashMap<usize, Rc<rayon::ThreadPool>>> = RefCell::new(HashMap::new());
+    }
+    POOLS.with(|m| {
+        if let Some(p) = m.borrow().get(&threads) {
+            return Ok(p.clone());
+        }
+        let p = Rc::new(rayon::ThreadPoolBuilder::new().num_threads(threads).build().map_err(|e| Error::invalid(format!("thread pool: {e}")))?);
+        m.borrow_mut().insert(threads, p.clone());
+        Ok(p)
+    })
 }
 
 /// One scan's pulses, indexed by direction: what [`evidence`](crate::qsm::evidence::evidence) reads. About

@@ -62,6 +62,7 @@
 //!   within [`CONNECT`] by a row of its dropped parent's radius (the stem RCT drew there, redrawn from the column);
 //!   else it starts a base of its own, so its member keeps its rows.
 use super::*;
+use crate::transform::norm;
 use crate::trees::fit_circle;
 
 /// The wood radius a stop's echo character is judged at (m): a stem, not a twig.
@@ -434,7 +435,7 @@ pub fn rebase(scans: &[&ScanIndex], rows: &Rows, member: &[i64], centre: &Point,
             if a[2].min(b[2]) >= z_h {
                 return (0.0, false);
             }
-            let len = norm3(&sub(&b, &a));
+            let len = norm(&sub(&b, &a));
             let k = (len / PIECE_LEN).ceil().max(1.0) as usize;
             let at = |f: f64| -> Point { std::array::from_fn(|d| a[d] + f * (b[d] - a[d])) };
             // its pieces in the slabs (their middles), as `support_tree` cuts a row
@@ -483,7 +484,7 @@ fn join(rows: &Rows, member: &[i64], centre: &Point, p: &BaseParams, secs: &[Sec
         let ab = sub(b, a);
         let t = (dot(&sub(x, a), &ab) / dot(&ab, &ab).max(1e-12)).clamp(0.0, 1.0);
         let q: Point = std::array::from_fn(|i| a[i] + t * ab[i]);
-        norm3(&sub(x, &q)) <= rr
+        norm(&sub(x, &q)) <= rr
     };
     let mut ok: Vec<bool> = (0..nc).map(|k| {
         let inside = cols[k].sections.iter().filter(|&&i| {
@@ -573,7 +574,7 @@ fn join(rows: &Rows, member: &[i64], centre: &Point, p: &BaseParams, secs: &[Sec
         let z = top[col_of(fate[&i]).unwrap()].0[2];
         let v = subtree(i).iter().map(|&j| {
             let f = if j == i { (b[j][2] - z) / (b[j][2] - a[j][2]) } else { 1.0 };
-            f * r[j] * r[j] * norm3(&sub(&b[j], &a[j]))
+            f * r[j] * r[j] * norm(&sub(&b[j], &a[j]))
         }).sum::<f64>();
         (i, v)
     }).collect();
@@ -672,7 +673,7 @@ fn join(rows: &Rows, member: &[i64], centre: &Point, p: &BaseParams, secs: &[Sec
                     // its parent was dropped: its member's nearest row end within HANG; else it is joined by a row of
                     // its dropped parent's radius from such an end within CONNECT (the stem RCT drew there, redrawn
                     // from the column); else it starts a base of its own, and its member then keeps its rows
-                    let near = |within: f64| (0..reb.a.len()).filter(|&k| reb.member[k] == member[i] && reb.b[k][2] <= a[i][2] + HANG_UP).map(|k| (k, norm3(&sub(&reb.b[k], &a[i]))))
+                    let near = |within: f64| (0..reb.a.len()).filter(|&k| reb.member[k] == member[i] && reb.b[k][2] <= a[i][2] + HANG_UP).map(|k| (k, norm(&sub(&reb.b[k], &a[i]))))
                         .filter(|q| q.1 <= within).min_by(|x, y| x.1.total_cmp(&y.1)).map(|q| q.0);
                     hung += 1;
                     match near(HANG) {
@@ -719,7 +720,7 @@ fn join(rows: &Rows, member: &[i64], centre: &Point, p: &BaseParams, secs: &[Sec
                             slabs.iter().max().map_or(0.0, |&q| centre[2] + p.z_lo + f64::from(q + 1) * p.dz));
             let (lm, lt) = replaced.iter().map(|&j| {
                 let (lo_j, hi_j) = (a[j][2].min(b[j][2]), hi(j));
-                let l = norm3(&sub(&b[j], &a[j])) * (hi_j.min(z1) - lo_j.max(z0)).max(0.0) / (hi_j - lo_j).max(1e-9);
+                let l = norm(&sub(&b[j], &a[j])) * (hi_j.min(z1) - lo_j.max(z0)).max(0.0) / (hi_j - lo_j).max(1e-9);
                 (l * measured[j], l)
             }).fold((0.0, 0.0), |x, y| (x.0 + y.0, x.1 + y.1));
             let ms = if lt > 0.0 { lm / lt } else { 0.0 };
@@ -787,10 +788,6 @@ fn join(rows: &Rows, member: &[i64], centre: &Point, p: &BaseParams, secs: &[Sec
         }
         reverted.extend(two);
     }
-}
-
-fn norm3(v: &Point) -> f64 {
-    dot(v, v).sqrt()
 }
 
 #[cfg(test)]

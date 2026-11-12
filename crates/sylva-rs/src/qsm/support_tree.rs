@@ -183,8 +183,8 @@ use nalgebra::{Matrix3, Matrix4, Matrix5, SymmetricEigen, Vector3, Vector4, Vect
 use rayon::prelude::*;
 
 use crate::error::{Error, Result};
-use crate::qsm::scan_index::ScanIndex;
-use crate::qsm::joint::{log_ndtr_value, pool, window, Echoes, JointParams};
+use crate::qsm::scan_index::{pool, ScanIndex};
+use crate::qsm::joint::{log_ndtr_value, window, Echoes, JointParams};
 use crate::qsm::joint_fit::{ForkShare, Frame, PriorParams, Rows};
 use crate::transform::{cross, dot, sub};
 use crate::trees::{fit_circle_ransac, RansacCircleParams};

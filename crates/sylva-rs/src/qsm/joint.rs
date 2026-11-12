@@ -33,6 +33,8 @@ use std::ops::{Add, Div, Mul, Neg, Sub};
 use rayon::prelude::*;
 
 use crate::error::{Error, Result};
+use crate::qsm::scan_index::pool;
+use crate::transform::cross;
 use crate::Point;
 
 /// A value with its gradient and Hessian in four variables.
@@ -774,10 +776,6 @@ pub fn frames(a: &[Point], b: &[Point]) -> Vec<(Point, Point, Point, f64)> {
     }).collect()
 }
 
-fn cross(a: &Point, b: &Point) -> Point {
-    [a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0]]
-}
-
 /// The [`JointPairs`] of cylinders `a[i] -> b[i]`, each with its tube of
 /// radius `window[i]` (see [`crate::qsm::scan_index::pairs`]), measured from
 /// those axes: each pulse's signed impact and range of closest approach, how
@@ -856,24 +854,6 @@ pub fn deleted(range: &[f32], number: &[u8], returns: u8) -> Vec<(f64, f64)> {
         let hi = range.iter().zip(number).filter(|&(_, &n)| n > m).map(|(&r, _)| r as f64).fold(f64::INFINITY, f64::min);
         (lo, hi)
     }).collect()
-}
-
-/// A pool of `threads` threads, built once per calling thread and size (a fit
-/// calls the likelihood thousands of times; a pool per caller keeps
-/// concurrent fits, such as trees fitted in parallel, from sharing one).
-pub(crate) fn pool(threads: usize) -> Result<std::rc::Rc<rayon::ThreadPool>> {
-    use std::{cell::RefCell, collections::HashMap, rc::Rc};
-    thread_local! {
-        static POOLS: RefCell<HashMap<usize, Rc<rayon::ThreadPool>>> = RefCell::new(HashMap::new());
-    }
-    POOLS.with(|m| {
-        if let Some(p) = m.borrow().get(&threads) {
-            return Ok(p.clone());
-        }
-        let p = Rc::new(rayon::ThreadPoolBuilder::new().num_threads(threads).build().map_err(|e| Error::invalid(format!("thread pool: {e}")))?);
-        m.borrow_mut().insert(threads, p.clone());
-        Ok(p)
-    })
 }
 
 #[cfg(test)]
