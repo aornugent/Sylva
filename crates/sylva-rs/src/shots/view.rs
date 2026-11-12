@@ -112,6 +112,19 @@ pub struct ErrorModel {
     /// edge, when the background lies within the echo separation). With the selection term, the edge mechanism.
     pub ghost: f64,
     pub ghost_depth: f64,
+    /// Per-element misfit, a declared latent: the section and axis depart from a straight round stick by an sd of
+    /// `misfit[0] + misfit[1] R` (m), blurring its fill and spreading its depth. Fourier terms past a₀ aren't
+    /// identifiable here (synthesis §3), so a scale stands in for them. This is a prior any reconstruction may
+    /// override.
+    pub misfit: [f64; 2],
+    /// Term C: each view's located silhouette edges score the section's support function, and the fill band under
+    /// 0.5 leaves A's cells. A stick's edge is where its fill falls to `edge_fill`, the selection latent on fill:
+    /// 0.2 by maximum likelihood on the simulated stand's true sticks (with ghosts then 0; research 130 slice 3).
+    pub edges: bool,
+    pub edge_fill: f64,
+    /// Centre each (scan, block) offset on its medial estimate from the view's normals (synthesis §13), instead of
+    /// zero.
+    pub medial_offset: bool,
 }
 
 impl Default for ErrorModel {
@@ -132,8 +145,12 @@ impl Default for ErrorModel {
             p_drop: 0.02,
             p_outlier: 0.01,
             rho: 0.3,
-            ghost: 0.3,
+            ghost: 0.0,
             ghost_depth: 0.5,
+            misfit: [0.002, 0.1],
+            edges: true,
+            edge_fill: 0.2,
+            medial_offset: false,
         }
     }
 }
@@ -163,6 +180,11 @@ impl ErrorModel {
         } else {
             2
         }
+    }
+
+    /// A stick's misfit sd (m) at radius r.
+    pub fn misfit_sd(&self, r: f64) -> f64 {
+        self.misfit[0] + self.misfit[1] * r
     }
 
     /// How far behind its surface an echo of class `k` at `range` reads (m).

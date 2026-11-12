@@ -79,6 +79,9 @@ struct Layer {
     f: f64,
     cos: f64,
     stick: u32,
+    /// Where the cell's ray passes the axis: across it (signed, m, positive on `u × (c − o)`'s side) and along it.
+    x: f64,
+    s: f64,
 }
 
 /// What one scan says about one stick. `cells`: cells where it is the nearest layer at fill > 0.5; `support`:
@@ -107,7 +110,8 @@ fn t_pdf(x: f64, nu: f64) -> f64 {
     (c - 0.5 * (nu + 1.0) * (1.0 + x * x / nu).ln()).exp()
 }
 
-/// One stick's layers in one view: (cell, layer).
+/// One stick's layers in one view: (cell, layer). With edges on, cells out to 3 fill sds and two cells past the
+/// section come too (their fill may be ~0), so term C sees what lies beyond each edge.
 fn render(v: &View, s: &Stick, id: u32, em: &ErrorModel) -> Vec<(usize, Layer)> {
     let mut out = Vec::new();
     let ax = sub(&s.b, &s.a);
@@ -129,6 +133,8 @@ fn render(v: &View, s: &Stick, id: u32, em: &ErrorModel) -> Vec<(usize, Layer)> 
     let cu = dot(&c, &u);
     let bv = [0, 1, 2].map(|k| -(c[k] - cu * u[k]));
     let bb = dot(&bv, &bv);
+    let side = crate::transform::normalize(&crate::transform::cross(&u, &c));
+    let sm = em.misfit_sd(s.r);
     let (li, ki) = (l0.round() as i64, k0.round() as i64);
     for l in (li - dl).max(0)..=(li + dl).min(v.n_lines as i64 - 1) {
         for k in (ki - dc).max(0)..=(ki + dc).min(v.n_cols as i64 - 1) {
@@ -141,15 +147,17 @@ fn render(v: &View, s: &Stick, id: u32, em: &ErrorModel) -> Vec<(usize, Layer)> 
             }
             let ab = dot(&a, &bv);
             let tm = -ab / aa;
-            if tm <= 0.0 || (tm * wu - cu).abs() > half {
+            let along = tm * wu - cu;
+            if tm <= 0.0 || along.abs() > half {
                 continue;
             }
             let d = (bb - ab * ab / aa).max(0.0).sqrt();
-            let sd = 0.25 * em.footprint(tm);
+            let sd = (0.0625 * em.footprint(tm).powi(2) + sm * sm).sqrt();
             let f = phi((s.r - d) / sd) - phi((-s.r - d) / sd);
-            if f < 0.01 {
+            if f < 0.01 && !(em.edges && d < s.r + 3.0 * sd + 2.0 * em.step * tm) {
                 continue;
             }
+            let x = dot(&[0, 1, 2].map(|j| tm * w[j] - c[j] - along * u[j]), &side);
             let sin = aa.sqrt();
             let depth = |x: f64| tm - (s.r * s.r - x * x).max(0.0).sqrt() / sin;
             let x2 = (d + sd).min(s.r);
@@ -159,10 +167,12 @@ fn render(v: &View, s: &Stick, id: u32, em: &ErrorModel) -> Vec<(usize, Layer)> 
                 l as usize * v.n_cols + k as usize,
                 Layer {
                     t: 0.5 * (depth(x1) + depth(x2)),
-                    spread: (depth(x2) - depth(x1)) / 12f64.sqrt(),
+                    spread: ((depth(x2) - depth(x1)).powi(2) / 12.0 + sm * sm).sqrt(),
                     f,
                     cos: ((1.0 - (xm / s.r).powi(2)).max(0.0).sqrt() * sin).max(0.05),
                     stick: id,
+                    x,
+                    s: along,
                 },
             ));
         }
@@ -170,12 +180,20 @@ fn render(v: &View, s: &Stick, id: u32, em: &ErrorModel) -> Vec<(usize, Layer)> 
     out
 }
 
-/// The k-buffer of one view: per touched cell, its layers nearest first.
-fn kbuffer(v: &View, sticks: &[Stick], em: &ErrorModel) -> HashMap<usize, Vec<Layer>> {
-    let per: Vec<Vec<(usize, Layer)>> = sticks.par_iter().enumerate().map(|(i, s)| render(v, s, i as u32, em)).collect();
+/// Every stick rendered into one view.
+fn render_all(v: &View, sticks: &[Stick], em: &ErrorModel) -> Vec<Vec<(usize, Layer)>> {
+    sticks.par_iter().enumerate().map(|(i, s)| render(v, s, i as u32, em)).collect()
+}
+
+/// The k-buffer of one view: per touched cell, its layers nearest first. With edges on, the fill band under 0.5
+/// is term C's, not A's.
+fn kbuffer(per: &[Vec<(usize, Layer)>], em: &ErrorModel) -> HashMap<usize, Vec<Layer>> {
+    let min_f = if em.edges { 0.5 } else { 0.01 };
     let mut buf: HashMap<usize, Vec<Layer>> = HashMap::new();
-    for (cell, ly) in per.into_iter().flatten() {
-        buf.entry(cell).or_default().push(ly);
+    for &(cell, ly) in per.iter().flatten() {
+        if ly.f >= min_f {
+            buf.entry(cell).or_default().push(ly);
+        }
     }
     for ls in buf.values_mut() {
         ls.sort_by(|a, b| a.t.total_cmp(&b.t));
@@ -228,10 +246,12 @@ pub struct Prediction {
     pub sd: f64,
     pub surface: u8,
     pub obs: f64,
+    /// The stick's misfit sd (m), included in `sd`.
+    pub misfit: f64,
 }
 
 pub fn predict(v: &View, sticks: &[Stick], em: &ErrorModel, sc: &Scene) -> Vec<Prediction> {
-    let buf = kbuffer(v, sticks, em);
+    let buf = kbuffer(&render_all(v, sticks, em), &ErrorModel { edges: false, ..*em });
     let cls = classes(v, &buf, sticks, em);
     let mut out: Vec<Prediction> = buf
         .iter()
@@ -243,6 +263,7 @@ pub fn predict(v: &View, sticks: &[Stick], em: &ErrorModel, sc: &Scene) -> Vec<P
                 cell, stick: ly.stick, fill: ly.f, kept: sel(em, sc.wood_db, ly.f * ly.cos), surface: k,
                 depth: ly.t + em.depth_bias(k, ly.t),
                 sd: (em.sigma_e[k as usize].powi(2) + ly.spread.powi(2) + 0.5 * same * same).sqrt(),
+                misfit: em.misfit_sd(sticks[ly.stick as usize].r),
                 obs: if v.state[cell] == state::ECHO { v.range[cell] as f64 } else { f64::NAN },
             }
         })
@@ -296,7 +317,8 @@ fn cell_ll(obs: f64, layers: &[(Layer, u8)], ground: Option<(f64, f64)>, delta: 
 /// `only = Some(i)`, the energy change of adding stick i to the others, `E(all) − E(all but i)`, over the groups
 /// it touches; rows are then empty.
 pub fn energy(views: &[&View], sticks: &[Stick], em: &ErrorModel, sc: &Scene, only: Option<usize>) -> (f64, Vec<Row>) {
-    let bufs: Vec<HashMap<usize, Vec<Layer>>> = views.iter().map(|v| kbuffer(v, sticks, em)).collect();
+    let rendered: Vec<Vec<Vec<(usize, Layer)>>> = views.iter().map(|v| render_all(v, sticks, em)).collect();
+    let bufs: Vec<HashMap<usize, Vec<Layer>>> = rendered.iter().map(|r| kbuffer(r, em)).collect();
     let classes: Vec<Vec<u8>> = views.iter().zip(&bufs).map(|(v, buf)| classes(v, buf, sticks, em)).collect();
     let epochs: HashSet<u32> = views.iter().map(|v| v.epoch).collect();
     // each stick's design effect per view, from its fill-weighted footprints
@@ -338,6 +360,38 @@ pub fn energy(views: &[&View], sticks: &[Stick], em: &ErrorModel, sc: &Scene, on
     };
     let mut total = 0.0;
     let mut rows: HashMap<(u32, u32), Row> = HashMap::new();
+    // term C per (view, stick), tempered as A; it doesn't see the offset (it lies across the beam)
+    let c_terms: Vec<Vec<f64>> = if em.edges {
+        let zt = phi_inv(1.0 - em.edge_fill);
+        views
+            .iter()
+            .enumerate()
+            .map(|(si, v)| {
+                (0..sticks.len())
+                    .into_par_iter()
+                    .map(|h| {
+                        let k = classes[si][h];
+                        temper[si][h] * edge_ll(v, &rendered[si][h], &sticks[h], k, zt, sd_of(em, k, epochs.len() > 1), em)
+                    })
+                    .collect()
+            })
+            .collect()
+    } else {
+        vec![vec![0.0; sticks.len()]; views.len()]
+    };
+    for (si, cs) in c_terms.iter().enumerate() {
+        for (h, &c) in cs.iter().enumerate() {
+            match only {
+                Some(i) if i != h => {}
+                _ => total -= c,
+            }
+            if only.is_none() && c != 0.0 {
+                rows.entry((h as u32, si as u32))
+                    .or_insert(Row { stick: h as u32, scan: si as u32, cells: 0, support: 0, across: 0.0, surface: classes[si][h], energy: 0.0 })
+                    .energy -= c;
+            }
+        }
+    }
     for &(skip, sign) in &configs {
         // per group: the weighted log-likelihood at each offset node, the empty scene's, and its sticks' shares
         struct Acc {
@@ -346,6 +400,8 @@ pub fn energy(views: &[&View], sticks: &[Stick], em: &ErrorModel, sc: &Scene, on
             members: HashMap<u32, (f64, [f64; NODES])>,
         }
         let mut groups: HashMap<Key, Acc> = HashMap::new();
+        let centres: HashMap<Key, (f64, f64)> =
+            if em.medial_offset { medial(views, &bufs, sticks, &classes, em, epochs.len() > 1, &|ls: &[Layer]| ls.iter().find(|l| Some(l.stick) != skip).copied(), &|si, ls| key_of(si, ls, skip)) } else { HashMap::new() };
         for (si, (v, buf)) in views.iter().zip(&bufs).enumerate() {
             let cells: Vec<(usize, &Vec<Layer>)> = buf.iter().map(|(&c, ls)| (c, ls)).collect();
             let terms: Vec<Option<(Key, u32, f64, [f64; NODES])>> = cells
@@ -361,8 +417,8 @@ pub fn energy(views: &[&View], sticks: &[Stick], em: &ErrorModel, sc: &Scene, on
                     let w = v.direction((cell / v.n_cols) as f64, (cell % v.n_cols) as f64);
                     let ground = (sc.ground_z.is_finite() && w[2] < -1e-6).then(|| ((sc.ground_z - v.origin[2]) / w[2], -w[2]));
                     let wt = temper[si][front.stick as usize] / em.multiplicity(if obs.is_finite() { obs } else { front.t });
-                    let sd = sd_of(em, classes[si][front.stick as usize], epochs.len() > 1);
-                    let ll: [f64; NODES] = std::array::from_fn(|g| wt * cell_ll(obs, &layers, ground, node(g) * sd, em, sc));
+                    let (c0, sd) = centres.get(&key).copied().unwrap_or((0.0, sd_of(em, classes[si][front.stick as usize], epochs.len() > 1)));
+                    let ll: [f64; NODES] = std::array::from_fn(|g| wt * cell_ll(obs, &layers, ground, c0 + node(g) * sd, em, sc));
                     Some((key, front.stick, wt * cell_ll(obs, &[], ground, 0.0, em, sc), ll))
                 })
                 .collect();
@@ -383,6 +439,9 @@ pub fn energy(views: &[&View], sticks: &[Stick], em: &ErrorModel, sc: &Scene, on
                         across: 2.0 * sticks[front as usize].r / em.footprint(ly.t),
                         surface: classes[si][front as usize], energy: 0.0,
                     });
+                    if row.across == 0.0 {
+                        row.across = 2.0 * sticks[front as usize].r / em.footprint(ly.t);
+                    }
                     if ly.f > 0.5 {
                         row.cells += 1;
                         let sd = (em.sigma_e[row.surface as usize].powi(2) + ly.spread * ly.spread).sqrt();
@@ -415,6 +474,119 @@ pub fn energy(views: &[&View], sticks: &[Stick], em: &ErrorModel, sc: &Scene, on
     let mut rows: Vec<Row> = rows.into_values().collect();
     rows.sort_by_key(|r| (r.stick, r.scan));
     (total, rows)
+}
+
+/// Term C for one stick in one view: the log likelihood ratio of its located silhouette edges against an edge
+/// placed evenly across the rendered band.
+///
+/// Its cells are cut into strips along the axis, a cell wide. In each strip with echoes on the stick, each side's
+/// outermost such echo and the next cell out locate the edge:
+/// - **sharp** (the next cell's echo lies behind): the edge lies between the two;
+/// - **unknown** (the next cell is empty, its echo deleted): censored, the edge lies beyond the last echo (Tobit);
+/// - **occluded** (the next cell's echo lies in front): no information.
+///
+/// The stick's edge lies `R + z_τ sd` from the axis, where sd is the fill's (footprint and misfit) and z_τ puts
+/// the fill at `edge_fill` (τ). Its spread is the misfit, the offset across the beam and a third of the fill sd.
+/// Each strip counts `cell / footprint` (neighbouring strips share footprints).
+fn edge_ll(v: &View, cells: &[(usize, Layer)], s: &Stick, k: u8, zt: f64, sd_lat: f64, em: &ErrorModel) -> f64 {
+    const ON: u8 = 0;
+    const EMPTY: u8 = 1;
+    const FRONT: u8 = 2;
+    const BEHIND: u8 = 3;
+    let sm = em.misfit_sd(s.r);
+    let mut strips: HashMap<i64, Vec<(f64, u8, f64)>> = HashMap::new();
+    for &(cell, ly) in cells {
+        let cw = em.step * ly.t;
+        let obs = v.range[cell] as f64;
+        let sd = (em.sigma_e[k as usize].powi(2) + ly.spread.powi(2)).sqrt();
+        let st = if v.state[cell] != state::ECHO {
+            EMPTY
+        } else if obs < ly.t - 3.0 * sd - 0.03 {
+            FRONT
+        } else if (obs - ly.t - em.depth_bias(k, ly.t)).abs() < 3.0 * sd + 0.01 {
+            ON
+        } else {
+            BEHIND
+        };
+        strips.entry((ly.s / cw).floor() as i64).or_default().push((ly.x, st, ly.t));
+    }
+    let mut ll = 0.0;
+    for cs in strips.values() {
+        let Some(t) = cs.iter().find(|c| c.1 == ON).map(|c| c.2) else { continue };
+        let fp = em.footprint(t);
+        let sdf = (0.0625 * fp * fp + sm * sm).sqrt();
+        let xe = s.r + zt * sdf;
+        let se = (sm * sm + sd_lat * sd_lat + (sdf / 3.0).powi(2)).sqrt();
+        let w = (em.step * t / fp).min(1.0);
+        for side in [1.0, -1.0] {
+            let x_in = cs.iter().filter(|c| c.1 == ON).map(|c| side * c.0).fold(f64::NEG_INFINITY, f64::max);
+            let far = cs.iter().map(|c| side * c.0).fold(0.0, f64::max);
+            let Some(&(xo, st, _)) = cs.iter().filter(|c| side * c.0 > x_in).min_by(|a, b| (side * a.0).total_cmp(&(side * b.0))) else { continue };
+            let x_out = side * xo;
+            if far <= 0.0 || x_in < 0.0 {
+                continue;
+            }
+            let (p, bg) = match st {
+                BEHIND => (phi((xe - x_in) / se) - phi((xe - x_out) / se), (x_out - x_in) / far),
+                EMPTY => (phi((xe - x_in) / se), (far - x_in) / far),
+                _ => continue,
+            };
+            ll += w * (p.max(1e-12).ln() - bg.max(1e-6).ln());
+        }
+    }
+    ll
+}
+
+/// Each group's offset centred on its medial estimate (synthesis §13): for the echoes on a cell's nearest stick,
+/// with a normal, the medial point `p − R n` lies on the axis when the scan has no offset, so its mean distance
+/// behind the axis along the beam estimates the offset. Returned with the spread left once that estimate (its
+/// standard error) is combined with the scan's prior spread.
+fn medial(views: &[&View], bufs: &[HashMap<usize, Vec<Layer>>], sticks: &[Stick], classes: &[Vec<u8>], em: &ErrorModel, epochs: bool,
+          front_of: &dyn Fn(&[Layer]) -> Option<Layer>, key_of: &dyn Fn(usize, &[Layer]) -> Option<Key>) -> HashMap<Key, (f64, f64)> {
+    let mut acc: HashMap<Key, (f64, f64, f64, f64)> = HashMap::new();
+    for (si, (v, buf)) in views.iter().zip(bufs).enumerate() {
+        for (&cell, ls) in buf {
+            let (Some(ly), Some(key)) = (front_of(ls), key_of(si, ls)) else { continue };
+            let obs = v.range[cell] as f64;
+            let n = v.normal[cell].map(|x| x as f64);
+            if v.state[cell] != state::ECHO || !n[0].is_finite() || (obs - ly.t).abs() > 0.02 {
+                continue;
+            }
+            let st = &sticks[ly.stick as usize];
+            let w = v.direction((cell / v.n_cols) as f64, (cell % v.n_cols) as f64);
+            let ax = sub(&st.b, &st.a);
+            let u = ax.map(|x| x / norm(&ax));
+            let m = [0, 1, 2].map(|j| v.origin[j] + w[j] * obs - st.r * n[j] - st.a[j]);
+            let mu = dot(&m, &u);
+            let wu = dot(&w, &u);
+            let wp = [0, 1, 2].map(|j| w[j] - wu * u[j]);
+            let d = dot(&[0, 1, 2].map(|j| m[j] - mu * u[j]), &wp) / norm(&wp);
+            let e = acc.entry(key).or_insert((0.0, 0.0, 0.0, sd_of(em, classes[si][ly.stick as usize], epochs)));
+            let wt = 1.0 / em.multiplicity(obs);
+            e.0 += wt * d;
+            e.1 += wt * d * d;
+            e.2 += wt;
+        }
+    }
+    acc.into_iter()
+        .filter(|(_, a)| a.2 >= 1.0)
+        .map(|(k, (s1, s2, n, prior))| {
+            let mean = s1 / n;
+            let se2 = ((s2 / n - mean * mean).max(1e-8) / n).max(2.5e-7);
+            let g = prior * prior / (prior * prior + se2);
+            (k, (g * mean, (g * se2).sqrt()))
+        })
+        .collect()
+}
+
+/// Φ⁻¹(p), by bisection.
+fn phi_inv(p: f64) -> f64 {
+    let (mut lo, mut hi) = (-8.0, 8.0);
+    for _ in 0..60 {
+        let m = 0.5 * (lo + hi);
+        if phi(m) < p { lo = m } else { hi = m }
+    }
+    0.5 * (lo + hi)
 }
 
 /// Offset node g, in sds: −4 … 4.
@@ -468,7 +640,7 @@ mod tests {
         let e = |s: Stick| energy(&[&v], &[s], &em, &sc, None).0;
         let truth = e(stick(0.0, y_pole, r_pole));
         assert!(truth < -3.0, "{truth}");
-        for wrong in [stick(0.0, y_pole, 0.015), stick(0.0, y_pole, 0.06), stick(0.03, y_pole, r_pole), stick(0.0, y_pole - 0.02, r_pole)] {
+        for wrong in [stick(0.0, y_pole, 0.021), stick(0.0, y_pole, 0.015), stick(0.0, y_pole, 0.06), stick(0.03, y_pole, r_pole), stick(0.0, y_pole - 0.02, r_pole)] {
             assert!(e(wrong) > truth + 1.0, "{} vs {truth}", e(wrong));
         }
         assert!(e(stick(0.2, 6.0, 0.03)) > 1.0);
