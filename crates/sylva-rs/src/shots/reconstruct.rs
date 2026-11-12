@@ -66,18 +66,18 @@ pub struct Reconstruction {
     pub report: MissReport,
 }
 
-fn zen_az(d: &Point) -> (f64, f64) {
+pub(crate) fn zen_az(d: &Point) -> (f64, f64) {
     let z = (d[2] / (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt()).clamp(-1.0, 1.0).acos().to_degrees();
     let a = d[0].atan2(d[1]).to_degrees().rem_euclid(360.0);
     (z, a)
 }
 
-fn dir(zen: f64, az: f64) -> Point {
+pub(crate) fn dir(zen: f64, az: f64) -> Point {
     let (z, a) = (zen.to_radians(), az.to_radians());
     [z.sin() * a.sin(), z.sin() * a.cos(), z.cos()]
 }
 
-fn median(v: &mut [f64]) -> f64 {
+pub(crate) fn median(v: &mut [f64]) -> f64 {
     if v.is_empty() {
         return f64::NAN;
     }
@@ -86,7 +86,7 @@ fn median(v: &mut [f64]) -> f64 {
     *x
 }
 
-fn quantile(v: &mut [f64], q: f64) -> f64 {
+pub(crate) fn quantile(v: &mut [f64], q: f64) -> f64 {
     if v.is_empty() {
         return f64::NAN;
     }
@@ -150,6 +150,41 @@ pub fn scan_lines(zenith_deg: &[f64], time: Option<&[f64]>) -> ScanLines {
     ScanLines { starts, sweep }
 }
 
+/// The pulse interval (s) of pulses in acquisition order split into lines:
+/// the adjacent-pulse cluster of within-line time steps, then refined with
+/// every within-line step counted in whole intervals. `None` without any.
+pub(crate) fn pulse_interval(t: &[f64], starts: &[usize]) -> Option<f64> {
+    let mut dt: Vec<f64> = Vec::with_capacity(t.len());
+    for w in starts.windows(2) {
+        for i in w[0] + 1..w[1] {
+            dt.push(t[i] - t[i - 1]);
+        }
+    }
+    if dt.is_empty() {
+        return None;
+    }
+    let q05 = quantile(&mut dt.clone(), 0.05);
+    let cluster: Vec<f64> = dt.iter().cloned().filter(|&d| d > 0.0 && d < 1.5 * q05).collect();
+    let mut interval = cluster.iter().sum::<f64>() / cluster.len().max(1) as f64;
+    if !(interval > 0.0) {
+        return None;
+    }
+    for _ in 0..2 {
+        let (mut num, mut den) = (0.0, 0.0);
+        for &d in &dt {
+            let k = (d / interval).round();
+            if (1.0..=50.0).contains(&k) {
+                num += d;
+                den += k;
+            }
+        }
+        if den > 0.0 {
+            interval = num / den;
+        }
+    }
+    Some(interval)
+}
+
 /// Recover the unrecorded pulses of one scan.
 ///
 /// `time_ns` and `direction` describe every recorded pulse in stream order
@@ -191,36 +226,9 @@ pub fn reconstruct_misses(time_ns: &[u64], direction: &[Point], zenith_range: Op
     };
     let (mut sweep_start, mut sweep_end) = if sweep > 0.0 { (lo, hi) } else { (hi, lo) };
 
-    // Pulse interval: the adjacent-pulse cluster of within-line time steps,
-    // then refined with every within-line step counted in whole intervals.
-    let mut dt: Vec<f64> = Vec::with_capacity(n);
-    for w in starts.windows(2) {
-        for i in w[0] + 1..w[1] {
-            dt.push(t[i] - t[i - 1]);
-        }
-    }
-    if dt.is_empty() {
+    let Some(interval) = pulse_interval(&t, &starts) else {
         return out;
-    }
-    let q05 = quantile(&mut dt.clone(), 0.05);
-    let cluster: Vec<f64> = dt.iter().cloned().filter(|&d| d > 0.0 && d < 1.5 * q05).collect();
-    let mut interval = cluster.iter().sum::<f64>() / cluster.len().max(1) as f64;
-    if !(interval > 0.0) {
-        return out;
-    }
-    for _ in 0..2 {
-        let (mut num, mut den) = (0.0, 0.0);
-        for &d in &dt {
-            let k = (d / interval).round();
-            if (1.0..=50.0).contains(&k) {
-                num += d;
-                den += k;
-            }
-        }
-        if den > 0.0 {
-            interval = num / den;
-        }
-    }
+    };
     // Angular step per pulse: the within-line zenith change per interval.
     let mut steps: Vec<f64> = Vec::with_capacity(n);
     for w in starts.windows(2) {
