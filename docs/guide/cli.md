@@ -46,7 +46,7 @@ sylva qsm-plot plot_norm_segmented.laz --cylinders --meshes
 | `qsm-plot` | `<input>_trees.csv`; `--cylinders` / `--meshes` alone give `<input>_cylinders/` and `<input>_meshes/` |
 | `shots` | `<input>.parquet` |
 | `voxel` | `<input>.vox` |
-| `coreg` | `<project>_coreg/` (`transforms.json`, `report.txt`, one `.dat` per scan) |
+| `coreg` | `<project>_coreg/`, or `coreg/` beside the first file for a list of scans (`transforms.json`, `report.txt`, one `.dat` per scan) |
 
 `convert`, `reproject` and `transform` are the exceptions: the output format
 comes from its extension, so they need one. So are the `als-*` commands,
@@ -115,7 +115,9 @@ To put a whole survey in one frame with a `transforms.json` or a folder of
 
 Classifies ground (`classification` 2), builds a DTM at `--resolution` (m),
 and writes the cloud with a `height` attribute. `--dtm` also writes the
-terrain (`.tif`, otherwise `.asc`).
+terrain (`.tif`, otherwise `.asc`). Write `.asc` when the DTM goes back
+into a `--dtm` option (`voxel`, `als-chm`, `als-normalize`, `als-trees`):
+those read ESRI ASCII grids only.
 
 ### `trees`
 
@@ -123,9 +125,10 @@ terrain (`.tif`, otherwise `.asc`).
 
 Runs detection, segmentation, heights, pruning and crown metrics on a
 height-normalised cloud and writes one CSV row per tree: `tree_id`, `x`,
-`y`, `dbh`, `height`, quality columns and the crown metrics. The CSV goes to
-stdout without `-o`. `--segment` writes the cloud with a `tree_id`
-attribute. `--voxel` is the thinning of the segmentation graph: the
+`y`, `dbh`, `height`, quality columns and the crown metrics. Without `-o` the
+CSV is written beside the input as `<input>_trees.csv`; `-o -` prints it to
+stdout. The header is written even when no tree is found. `--segment`
+writes the cloud with a `tree_id` attribute and every attribute of the input. `--voxel` is the thinning of the segmentation graph: the
 benchmarks run at 0.05 m, which halves the graph of a 2 cm plot and is
 what a plot of a few hundred million points needs to fit in memory.
 `--min-slenderness 10` drops stems wider than 0.2 m that are less than ten
@@ -143,14 +146,19 @@ of a height-normalised cloud and prints the canopy cover above 2 m.
 
 ### `pad`
 
-`sylva pad INPUT [--voxel 0.5]`: prints a `height,pad` CSV of the
-contact-frequency profile on stdout, and the PAI on stderr.
+`sylva pad INPUT [--voxel 0.5] [--min-height M]`: prints a `height,pad` CSV
+of the contact-frequency profile on stdout, and the PAI on stderr. Points at
+or below `--min-height` (m above ground; one voxel by default) are left out
+as ground, so the bottom layer and the PAI hold canopy only: with the ground
+returns in, nearly every column is "intercepted" in the lowest layer and
+bare ground alone reads as a PAI of several units. `--min-height 0` counts
+every point above the ground surface.
 
 ### `qsm`
 
-`sylva qsm INPUT OUTPUT [--bin-length 0.3]`: builds a cylinder model of one
+`sylva qsm INPUT OUTPUT [--bin-length 0.1]`: builds a cylinder model of one
 tree (ideally its wood points), writes the cylinders as CSV and prints the
-summary.
+summary. The shell width is that of `qsm.build_qsm` and `qsm-plot`.
 
 ### `qsm-plot`
 
@@ -190,7 +198,7 @@ memory stays small) or a ray cloud.
 |---|---|---|
 | `--voxel` | 0.1 | voxel size (m) |
 | `--bounds X0 Y0 Z0 X1 Y1 Z1` | echo extent | grid corners |
-| `--dtm` | none | ESRI ASCII terrain grid; gives ground echoes and `distance_from_ground` |
+| `--dtm` | none | ESRI ASCII terrain grid (`.asc`; a `.tif` is refused, since Sylva writes GeoTIFF but does not read it); gives ground echoes and `distance_from_ground` |
 | `--ground-class` | none | class code of ground echoes |
 | `--ground-distance` | 0.2 | echoes this close above the DTM are ground (m) |
 | `--leaf-classes`, `--wood-classes` | none | class codes for leaf and wood echoes |
@@ -214,7 +222,7 @@ See [Ray-traced voxels](voxels.md) for what the options do.
 
 `sylva coreg INPUT... [-o DIR] [options]`: registers the scan positions of a
 survey from the trees, with no targets or initial alignment
-(:mod:`sylva.coreg`). `INPUT` is a RiSCAN PRO project or
+([`sylva.coreg`](../api/coreg.md)). `INPUT` is a RiSCAN PRO project or
 a scanner `.PROJ` directory, or a list of scan files. For a project, tilted
 scans are levelled with the scanner's attitude (or, failing that, the rotation
 of the SOP), the scanner's GNSS fixes skip pairs too far apart, and its
@@ -244,6 +252,7 @@ same tree seen from both scans, a check that needs no ground truth) and a
 | `--workers` | 0 | scans and pairs processed at once; 0 picks from cores and memory |
 | `--merged PATH` | none | also write the merged, registered cloud |
 | `--voxel` | 0.02 | thinning of the merged cloud (m) |
+| `--quiet` | off | print only the final summary |
 
 ### Airborne tiles: `als-catalog`, `als-ground`, `als-dtm`, `als-chm`, `als-normalize`
 
@@ -255,10 +264,12 @@ sylva als-catalog tiles/ [--pattern '*.la[sz]'] [--recursive] [--tolerance 1] [-
 sylva als-ground tiles/ ground/ [--method csf|pmf] [--resolution 0.5] [--last-returns]
 sylva als-dtm ground/ dtm.tif [--resolution 1] [--method lowest|tin|natural|idw]
 sylva als-chm ground/ chm.tif [--resolution 0.5] [--dtm-resolution 1] [--dtm DTM.asc] [--normalized]
+             [--min-height 0] [--keep-noise]
 sylva als-normalize ground/ normalised/ [--dtm-resolution 1] [--dtm DTM.asc] [--replace-z]
 ```
 
-`als-catalog` prints the catalogue report: extent, points, density, formats,
+`als-catalog` (a directory, or the files themselves) prints the catalogue
+report: extent, points, density, formats,
 CRS and every problem found (missing or unreadable files, mixed CRS or point
 formats, overlapping tiles, holes); with `--strict` it exits with status 1 if
 there is any. `als-ground` writes the tiles with ground classified;
@@ -280,7 +291,7 @@ or with z replaced by it (`--replace-z`, the elevation kept as
 raster per metric or a CSV table of plots; see [Area-based ALS
 metrics](als_metrics.md#command-line).
 
-### Plots in tiles: `tiles-from-scans`, `tiles-thin`, `tiles-filter`, `tiles-features`, `tiles-stems`
+### Plots in tiles: `tiles-from-scans`, `tiles-thin`, `tiles-filter`, `tiles-features`, `tiles-stems`, `tiles-plot`
 
 These build and process a plot kept as square tiles, one tile at a time,
 with results identical to those on the whole cloud (see [Plots in
@@ -288,12 +299,12 @@ tiles](tiles.md)). Ground, DTM and heights use `als-ground`, `als-dtm` and
 `als-normalize` above on the same tiles.
 
 ```bash
-sylva tiles-from-scans scans/*.laz tiles/ [--tile-size 10] [--voxel 0.02] [--transforms sop.npy]
+sylva tiles-from-scans scans/*.laz tiles/ [--tile-size 10] [--voxel SIZE] [--transforms sop.npy]
                        [--bounds XMIN YMIN XMAX YMAX] [--format laz] [--scale 0.001] [--epsg CODE]
 sylva tiles-thin tiles/ thinned/ --voxel 0.05
 sylva tiles-filter tiles/ clean/ [--method sor|ror] [--k 8] [--std-ratio 2] [--radius 0.1]
                    [--min-neighbors 4] [--classify]
-sylva tiles-features tiles/ features/ [--feature normals|shape] [--k 12]
+sylva tiles-features tiles/ features/ [--feature normals|shape] [--k 12|20]
 sylva tiles-stems normalised/ stems.csv [--height-attribute height] [--min-arc 0]
 ```
 
@@ -354,9 +365,9 @@ buffer is 30 m by default, and it takes `--pattern`, `--chunk-size` and
 
 ```bash
 sylva als-change 2019/ 2024/ change/ [--surface chm|dsm|dtm] [--resolution 1]
-                 [--align [--stable-classes 2,6] [--block-size 100] [--model field]]
+                 [--align [--stable-classes 2] [--block-size 100] [--model field|blocks|constant]]
                  [--harmonise [--density-cell 10]] [--first-returns] [--confidence 0.95]
-                 [--gaps [--gap-height 2] [--gap-min-area 10]] [--years 5] [--format asc|tif]
+                 [--gaps [--gap-height 2] [--gap-min-area 10]] [--years N] [--format asc|tif]
 sylva als-tree-change 2019/ 2024/ trees.csv [--resolution 0.5] [--method dalponte2016]
                  [--window 5 | --window-linear INTERCEPT SLOPE MIN MAX] [--hmin 2]
                  [--align] [--harmonise] [--max-distance 1.5] [--grid DIR --grid-resolution 50]

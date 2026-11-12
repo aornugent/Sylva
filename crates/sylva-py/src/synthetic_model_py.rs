@@ -3,6 +3,12 @@
 // Free software under the GNU General Public License v3.0 or later;
 // see the LICENSE file. There is no warranty, to the extent permitted by law.
 //! Bindings for the realistic synthetic trees, plots and beam scanner.
+//!
+//! Backs sylva.synthetic.model (and the beam scanner used by
+//! sylva.synthetic) with sylva_rs::synthetic::{tree, plot, scan}. Scalar
+//! parameters come in as Python numbers and strings, clouds as `(N, 3)`
+//! arrays plus a dict of attribute arrays; results are dicts of new arrays
+//! and numbers. Unknown archetype, LAD or preset names raise ValueError.
 #![allow(clippy::type_complexity, clippy::too_many_arguments)]
 
 use numpy::{IntoPyArray, PyArray1, PyArray2, PyArrayMethods, PyReadonlyArray1, PyReadonlyArray2};
@@ -16,7 +22,7 @@ use sylva_rs::synthetic::tree::{self, Archetype, Leaf, TreeSpec};
 use sylva_rs::voxel::Lad;
 use sylva_rs::Point;
 
-use crate::{cloud_from_py, cloud_to_py, err, shots_to_py};
+use crate::{cloud_from_py, cloud_to_py, err};
 
 fn rows<'py, const N: usize>(py: Python<'py>, r: &[[f64; N]]) -> Bound<'py, PyArray2<f64>> {
     let flat: Vec<f64> = r.iter().flat_map(|v| v.iter().copied()).collect();
@@ -234,7 +240,7 @@ fn synthetic_scan_beam<'py>(py: Python<'py>, xyz: PyReadonlyArray2<f64>, attrs: 
     p.max_range = max_range;
     p.seed = seed;
     let s = py.detach(|| scan::scan_beam(&cloud, &p)).map_err(err)?;
-    shots_to_py(py, &s)
+    crate::shots_into_py(py, s)
 }
 
 #[pyfunction]
@@ -249,6 +255,7 @@ fn synthetic_scanner_preset<'py>(py: Python<'py>, name: &str) -> PyResult<Bound<
     Ok(d)
 }
 
+/// Adds this file's functions to the `_core` module.
 pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     for f in [
         wrap_pyfunction!(synthetic_tree_model, m)?,

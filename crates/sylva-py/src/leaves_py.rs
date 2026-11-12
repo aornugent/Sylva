@@ -305,7 +305,7 @@ fn add_leaves<'py>(py: Python<'py>, origin: PyReadonlyArray1<f64>, voxel_size: f
         Some(g) => lm::LeafArea::Grid(g),
         None => lm::LeafArea::Total(total_area),
     };
-    let mesh = py.detach(|| lm::add_leaves(area, &seeds, &angles, &model.cylinders, &opts)).map_err(err)?;
+    let mesh = crate::detach_interruptible(py, || lm::add_leaves(area, &seeds, &angles, &model.cylinders, &opts))?.map_err(err)?;
     let d = PyDict::new(py);
     d.set_item("vertices", xyz_to_py(py, &mesh.vertices))?;
     d.set_item("faces", faces_to_py(py, &mesh.faces)?)?;
@@ -342,6 +342,7 @@ fn write_tree_obj(path: PathBuf, cylinders: PyReadonlyArray2<f64>, vertices: PyR
     lm::write_tree_obj(path, &q, sides, contiguous, &xyz_from_py(vertices)?, &faces_from_py(faces)?).map_err(err)
 }
 
+/// Adds this file's functions to the `_core` module.
 pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     for f in [
         wrap_pyfunction!(classify_leaf_wood, m)?,

@@ -41,7 +41,7 @@ the fallback and the beam-section estimate agree within 3 % in PAI.
 |---|---|
 | `fpl` | intercepted beam section / effective free path length, minus the [Pimont et al. (2018)](../references.md) bias term, with the beam footprint of [Pimont et al. (2019)](../references.md) |
 | `ppl` | exact maximum-likelihood solve of `Σ_hits s L / (e^{λL} − 1) = Σ_misses s L` over the beams of each voxel (capped at 20) |
-| `transmittance` | `−ln(1 − intercepted / entering)` beam section |
+| `transmittance` | `−ln(1 − intercepted / entering) / mean chord`: the optical depth of the voxel from its beam-section transmittance, over the mean length of the pulses' paths across it (`path_length / num_beams`, m) |
 | `bailey` | [Bailey & Mahaffee (2017)](../references.md) eq. 10 per class, with `G` from triangle facets between neighbouring echoes |
 
 Area density is `λ / G`, with the same bias-corrected λ as `attenuation_fpl`
@@ -81,11 +81,11 @@ voxel while tracing.
 
 With `occlusion=True` every voxel is observed (a pulse went through or ended
 in it), occluded (only pulses that had already stopped reached it) or
-unreached.
+unobserved (no pulse was aimed at it).
 
 ```python
 g = voxels.ray_voxelize(shots, 0.25, bounds, dtm=dtm, occlusion=True)
-prof = g.occlusion_profile(min_height=0.5)   # per layer: observed / occluded / unreached, mean pulses
+prof = g.occlusion_profile(min_height=0.5)   # per layer: observed / occluded / unobserved, mean pulses
 prof["total"]                                # the whole canopy space
 m = g.observed_map()                         # (ny, nx): observed share of each column
 t = voxels.tree_sampling(g, cloud, labels)   # per tree
@@ -110,7 +110,7 @@ below, not of the scan. `Shots.from_ray_cloud` warns about this case.
 
 ## Block tracing
 
-A whole-grid trace holds about 0.23 kB of accumulators per voxel, so the
+A whole-grid trace holds about 0.25 kB of accumulators per voxel, so the
 grid, not the number of pulses, sets the memory: a 100 x 100 x 108 m plot at
 0.1 m is 1.08 billion voxels, some 240 GB. With `block_size` the grid is cut
 into blocks of that many voxels and traced a few blocks at a time, in passes

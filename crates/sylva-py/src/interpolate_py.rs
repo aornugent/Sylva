@@ -3,6 +3,12 @@
 // Free software under the GNU General Public License v3.0 or later;
 // see the LICENSE file. There is no warranty, to the extent permitted by law.
 //! Bindings for sylva_rs::geo::interpolate.
+//!
+//! Backs sylva.geo.interpolate: nearest, majority and IDW transfer of values
+//! between point sets, gridding points to a raster and sampling a raster at
+//! points. Points are `(N, 3)` float64 arrays; a raster is `data` with
+//! `xmin`, `ymin`, `resolution`, returned as a dict. Bad shapes and unknown
+//! method names raise ValueError, the latter via `crate::err`.
 
 use std::borrow::Cow;
 
@@ -21,7 +27,8 @@ fn points<'a>(xyz: &'a PyReadonlyArray2<'_, f64>) -> PyResult<Cow<'a, [Point]>> 
     if xyz.shape()[1] != 3 {
         return Err(PyValueError::new_err(format!("xyz must have shape (N, 3), got (N, {})", xyz.shape()[1])));
     }
-    if let Ok(flat) = xyz.as_slice() {
+    // Not for a Fortran-ordered array, which `as_slice` would also hand over.
+    if let (true, Ok(flat)) = (xyz.is_c_contiguous(), xyz.as_slice()) {
         // SAFETY: `[f64; 3]` has the size of three f64 and the alignment of
         // one, and the slice holds whole rows of three.
         let rows = unsafe { std::slice::from_raw_parts(flat.as_ptr() as *const Point, flat.len() / 3) };
@@ -75,6 +82,7 @@ fn interp_sample_raster<'py>(py: Python<'py>, data: PyReadonlyArray2<f64>, xmin:
     Ok(py.detach(|| interpolate::sample_raster(&r, &p, m)).into_pyarray(py))
 }
 
+/// Adds this file's functions to the `_core` module.
 pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(interp_nearest_indices, m)?)?;
     m.add_function(wrap_pyfunction!(interp_majority_indices, m)?)?;

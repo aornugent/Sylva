@@ -25,6 +25,11 @@ fn points<'a>(xyz: &'a PyReadonlyArray2<'_, f64>) -> PyResult<&'a [Point]> {
     if xyz.shape()[1] != 3 {
         return Err(PyValueError::new_err(format!("xyz must have shape (N, 3), got (N, {})", xyz.shape()[1])));
     }
+    // `as_slice` also succeeds for a Fortran-ordered array, whose memory is
+    // not rows of three.
+    if !xyz.is_c_contiguous() {
+        return Err(PyValueError::new_err("xyz must be C-contiguous"));
+    }
     let flat = xyz.as_slice().map_err(|_| PyValueError::new_err("xyz must be C-contiguous"))?;
     Ok(flat.as_chunks::<3>().0)
 }
@@ -152,6 +157,7 @@ fn mask_near<'py>(py: Python<'py>, xyz: PyReadonlyArray2<'py, f64>, other: PyRea
     Ok(py.detach(|| masks::near_mask(p, o, distance, horizontal)).map_err(err)?.into_pyarray(py))
 }
 
+/// Adds this file's functions to the `_core` module.
 pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(mask_polygon_index, m)?)?;
     m.add_function(wrap_pyfunction!(read_polygons, m)?)?;

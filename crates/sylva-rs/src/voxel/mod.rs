@@ -63,6 +63,7 @@ pub enum WeightMethod {
 }
 
 impl WeightMethod {
+    /// A method from its rayvoxel name: `equal`, `full`, `first`, `relative` or `strongest`.
     pub fn parse(s: &str) -> Result<Self> {
         Ok(match s {
             "equal" => WeightMethod::Equal,
@@ -78,13 +79,23 @@ impl WeightMethod {
 /// Attenuation coefficient estimator.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Attenuation {
+    /// Free path length: the maximum-likelihood estimate of Pimont et al. (2018) over the
+    /// path actually travelled, with their bias correction and the beam footprint of Pimont et al. (2019).
     Fpl,
+    /// Potential path length: the exact maximum-likelihood solve over the full voxel chords
+    /// (mean-chord form of Pimont et al. 2018 where the exact solve is unavailable).
     Ppl,
+    /// `−ln(1 − intercepted / entering) / mean chord` (m⁻¹): the Beer–Lambert attenuation that
+    /// gives the voxel's beam-section transmittance over the mean length of the pulses' paths
+    /// across it (`path_length / num_beams`, m).
     Transmittance,
+    /// Bailey & Mahaffee (2017) eq. 10 per class, from the mean gap probability over the mean
+    /// path; needs leaf and wood echoes and the inclination distributions.
     Bailey,
 }
 
 impl Attenuation {
+    /// A method from its name (`fpl`, `ppl`, `transmittance`, `bailey`; case-insensitive).
     pub fn parse(s: &str) -> Result<Self> {
         Ok(match s.trim().to_ascii_lowercase().as_str() {
             "fpl" => Attenuation::Fpl,
@@ -95,6 +106,7 @@ impl Attenuation {
         })
     }
 
+    /// The lower-case name used in column names (`pad_fpl`, `attenuation_ppl`, ...).
     pub fn name(&self) -> &'static str {
         match self {
             Attenuation::Fpl => "fpl",
@@ -115,11 +127,14 @@ pub struct BeamSpec {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+/// Options of a ray-traced voxelisation (the defaults are rayvoxel's).
 pub struct VoxelParams {
+    /// Voxel edge (m).
     pub voxel_size: f64,
     /// Grid corners; `None` fits the grid to the (non-ground and ground) echoes.
     /// The max corner is snapped up to a whole number of voxels.
     pub bounds: Option<(Point, Point)>,
+    /// How a pulse's energy is shared between its echoes.
     pub weighting: WeightMethod,
     /// Also trace each pulse beyond its last echo to map occluded space.
     pub occlusion: bool,
@@ -140,10 +155,13 @@ pub struct VoxelParams {
     /// Analytic leaf angle distribution for `pad_g_corrected` and as the
     /// fallback `G` when no inclination distribution is available.
     pub lad: Lad,
+    /// Attenuation estimators to compute (at least one); the first is the one behind `pad_g_corrected`.
     pub attenuation: Vec<Attenuation>,
     /// Estimate inclination angle distributions from echo normals.
     pub inclination: bool,
+    /// Bins of the inclination histograms over 0–90 degrees.
     pub n_iad_bins: usize,
+    /// Neighbours in the PCA that gives each echo its normal.
     pub knn_normal: usize,
     /// Longest edge of a Bailey triangle facet (m).
     pub triangle_lmax: f64,
@@ -179,14 +197,18 @@ impl Default for VoxelParams {
 pub mod foliage {
     /// Not vegetation: a hit, but in no plant / leaf / wood count.
     pub const EXCLUDED: u8 = 0;
+    /// Vegetation of no particular class: counts as plant only.
     pub const PLANT: u8 = 1;
+    /// Leaf: counts as plant and leaf.
     pub const LEAF: u8 = 2;
+    /// Wood: counts as plant and wood.
     pub const WOOD: u8 = 3;
 }
 
 /// Pulses plus optional per-echo annotations (all of length `shots.n_echoes()`).
 #[derive(Debug, Clone, Copy)]
 pub struct VoxelInputs<'a> {
+    /// The pulses to trace.
     pub shots: &'a Shots,
     /// Ground echoes: the pulse is traced up to them but they are never hits.
     pub ground: Option<&'a [bool]>,
@@ -202,6 +224,7 @@ pub struct VoxelInputs<'a> {
 }
 
 impl<'a> VoxelInputs<'a> {
+    /// Pulses with no annotations: every echo is a non-ground plant echo.
     pub fn new(shots: &'a Shots) -> Self {
         VoxelInputs { shots, ground: None, foliage: None, intensity: None, tree_id: None, dtm: None }
     }
@@ -211,31 +234,63 @@ impl<'a> VoxelInputs<'a> {
 #[repr(usize)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum F {
-    /// Σ beam fraction entering the voxel (observed traversals).
+    /// Σ beam fraction entering the voxel (observed traversals, count). A pulse enters a voxel
+    /// once, with the fraction it still carries on the way in: one that leaves an echo in the
+    /// voxel and travels on is not counted again for the part that goes on.
     NumBeamsWeighted,
     /// Potential path length: Σ full voxel chord.
     PathLength,
+    /// Σ squared voxel chord (m²), for the spread of the chord lengths.
     PathLengthSq,
     /// Σ fraction × free path (entry → echo, or the full chord on a miss).
     FreePathLength,
+    /// The part of `FreePathLength` from segments ending in a plant-class echo.
     FreePathLengthPlant,
+    /// The part of `FreePathLength` from segments ending in a leaf echo.
     FreePathLengthLeaf,
+    /// The part of `FreePathLength` from segments ending in a wood echo.
     FreePathLengthWood,
+    /// Σ fraction × effective free path `−ln(1 − λ₁ z) / λ₁` (m), the finite-leaf
+    /// correction of Pimont et al. (2018) with `λ₁ = average_leaf_area / (4 voxel volume)`.
     EffectiveFreePathLength,
+    /// Σ path (m) of the rays traced beyond a pulse's last echo (occlusion rays, unit weight).
     PathLengthOccluded,
+    /// Σ fraction × angle of the beam from the vertical (rad, 0 to π/2: 0 for a beam travelling
+    /// straight up or straight down, π/2 for a horizontal one); over `NumBeamsWeighted` the
+    /// mean zenith at which `G` is evaluated.
     SumOfAngles,
+    /// Σ fraction × sin of the beam azimuth (clockwise from +y), for the circular mean.
     SumSinAzimuth,
+    /// Σ fraction × cos of the beam azimuth, for the circular mean.
     SumCosAzimuth,
+    /// Σ fraction × distance from the scanner to the voxel centre (m).
     SumOfLaserDistances,
+    /// Σ full chord (m) of the voxel for every echo in it: the hit term of the mean-chord PPL estimator.
     SumHitDelta,
+    /// Σ full chord (m) of every pulse that passed through the voxel without ending in it,
+    /// whatever it ends in further on (an echo, the ground, or nothing): the miss term of
+    /// the mean-chord PPL estimator. This is a larger set of pulses than `NumMissRays`
+    /// counts, which leaves out those that end in a ground echo or in no echo at all, so
+    /// `SumMissDelta / NumMissRays` is not a mean chord.
     SumMissDelta,
+    /// Σ fraction × free path (m) of pulses with no echo, or whose segment ends in a ground echo.
     PathLengthUnbound,
+    /// Σ fraction × beam cross-section (m²) at the voxel centre, for beams entering it
+    /// (each pulse once, as for `NumBeamsWeighted`).
     BsEntering,
+    /// Σ echo share × beam cross-section (m²) of the echoes in the voxel.
     BsIntercepted,
+    /// Σ fraction × beam cross-section (m²) of the beams that passed right through the voxel.
     BsPotential,
+    /// Σ fraction × beam cross-section × free path (m³).
     BsFreePath,
+    /// Σ fraction × beam cross-section × effective free path (m³): the denominator of the FPL estimate.
     BsEffectiveFreePath,
+    /// Σ echo share × beam cross-section × effective free path from the voxel entry to the echo (m³),
+    /// over the echoes in the voxel: the Pimont et al. (2018) bias term.
     BsEffFreePathHits,
+    /// Σ fraction of the pulse leaving the voxel × beam cross-section × chord (m³, or m without
+    /// beam metrics): the miss side of the exact PPL solve. Only filled when `Ppl` is requested.
     PplMissWl,
     /// Σ echo share of the pulse over the echoes in the voxel: hits on the
     /// same footing as the share-weighted path lengths. `NumHits` counts
@@ -244,7 +299,9 @@ pub enum F {
 }
 
 impl F {
+    /// Number of `f32` accumulators.
     pub const COUNT: usize = 24;
+    /// Every accumulator in slot order (`F::X as usize` indexes it).
     pub const ALL: [F; F::COUNT] = [
         F::NumBeamsWeighted, F::PathLength, F::PathLengthSq, F::FreePathLength, F::FreePathLengthPlant,
         F::FreePathLengthLeaf, F::FreePathLengthWood, F::EffectiveFreePathLength, F::PathLengthOccluded,
@@ -253,6 +310,7 @@ impl F {
         F::BsFreePath, F::BsEffectiveFreePath, F::BsEffFreePathHits, F::PplMissWl, F::HitsWeighted,
     ];
 
+    /// The rayvoxel output column name.
     pub fn name(&self) -> &'static str {
         match self {
             F::NumBeamsWeighted => "num_beams_weighted",
@@ -291,23 +349,37 @@ impl F {
 #[repr(usize)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum I {
+    /// Echoes in the voxel, one per echo (ground echoes and echoes carrying no share of the pulse excluded).
     NumHits,
+    /// Pulses entering the voxel.
     NumBeams,
+    /// Occlusion rays (traced beyond a pulse's last echo) through the voxel; column `num_beams_occluded`.
     NumRaysOccluded,
+    /// Pulse segments crossing the voxel that end in a ground echo or in no echo at all (rayvoxel's unbounded rays).
     NumUnboundRays,
+    /// Pulses (count) that crossed the voxel without ending in it, on their way to a non-ground
+    /// echo beyond. Pulses that cross it on their way to a ground echo or to no echo at all are
+    /// not counted here (they are rayvoxel's unbounded rays, see `NumUnboundRays`), although
+    /// their chords are in `SumMissDelta`.
     NumMissRays,
+    /// Echoes in the voxel with the leaf class.
     NumHitLeaf,
+    /// Echoes in the voxel with the wood class.
     NumHitWood,
+    /// Echoes in the voxel of any vegetation class (plant, leaf or wood).
     NumHitPlant,
 }
 
 impl I {
+    /// Number of `i32` counters.
     pub const COUNT: usize = 8;
+    /// Every counter in slot order.
     pub const ALL: [I; I::COUNT] = [
         I::NumHits, I::NumBeams, I::NumRaysOccluded, I::NumUnboundRays, I::NumMissRays, I::NumHitLeaf,
         I::NumHitWood, I::NumHitPlant,
     ];
 
+    /// The rayvoxel output column name.
     pub fn name(&self) -> &'static str {
         match self {
             I::NumHits => "num_hits",
@@ -339,12 +411,17 @@ pub enum VoxelState {
 /// Dense voxel statistics; flat index is `i + nx (j + ny k)`.
 #[derive(Debug, Clone)]
 pub struct RayVoxels {
+    /// Minimum corner of the grid (m).
     pub origin: Point,
+    /// Voxel edge (m).
     pub voxel_size: f64,
     /// `[nx, ny, nz]`.
     pub shape: [usize; 3],
+    /// The options the grid was traced with.
     pub params: VoxelParams,
+    /// Whether any echo carried the leaf class (enables the leaf columns).
     pub has_leaf: bool,
+    /// Whether any echo carried the wood class (enables the wood columns).
     pub has_wood: bool,
     /// One vector per [`F`]; empty when that group is switched off (reads as 0).
     pub f: Vec<Vec<f32>>,
@@ -360,20 +437,24 @@ pub struct RayVoxels {
     pub wood_volume: Option<Vec<f32>>,
     /// Tree with the most echoes in each voxel (−1 = none).
     pub predominant_tree: Option<Vec<i32>>,
+    /// Inclination distributions by tree id; empty unless `inclination` or `Bailey` was requested.
     pub tree_iad: BTreeMap<i32, TreeIad>,
 }
 
 impl RayVoxels {
+    /// Voxels in the grid.
     pub fn n_voxels(&self) -> usize {
         self.shape[0] * self.shape[1] * self.shape[2]
     }
 
     #[inline]
+    /// An `f32` accumulator of the voxel at flat index `idx` (0 when that group was not traced).
     pub fn get_f(&self, field: F, idx: usize) -> f32 {
         self.f[field as usize].get(idx).copied().unwrap_or(0.0)
     }
 
     #[inline]
+    /// An `i32` counter of the voxel at flat index `idx`.
     pub fn get_i(&self, field: I, idx: usize) -> i32 {
         self.i[field as usize][idx]
     }
@@ -385,6 +466,7 @@ impl RayVoxels {
         [idx % nx, (idx / nx) % ny, idx / (nx * ny)]
     }
 
+    /// Centre of the voxel at flat index `idx` (m).
     pub fn center(&self, idx: usize) -> Point {
         let ijk = self.unravel(idx);
         [
@@ -394,6 +476,8 @@ impl RayVoxels {
         ]
     }
 
+    /// What the rays saw of the voxel: filled if it holds an echo, else empty if a beam
+    /// entered it, else occluded if only occlusion rays did, else unobserved.
     pub fn state(&self, idx: usize) -> VoxelState {
         if self.get_i(I::NumHits, idx) > 0 {
             VoxelState::Filled
@@ -425,6 +509,19 @@ fn check_len<T>(name: &str, v: Option<&[T]>, n: usize) -> Result<()> {
     match v {
         Some(a) if a.len() != n => Err(Error::invalid(format!("{name} has {} values for {n} echoes", a.len()))),
         _ => Ok(()),
+    }
+}
+
+/// Refuse pulses with an echo whose range is NaN or infinite. Such an echo
+/// has no position: it cannot be placed in a voxel, and the pulse cannot be
+/// traced to it.
+pub(crate) fn check_ranges(shots: &Shots) -> Result<()> {
+    match shots.echo_range.iter().position(|r| !r.is_finite()) {
+        Some(e) => Err(Error::invalid(format!(
+            "echo {e} has a range of {} m; echo ranges must be finite (drop these echoes, or their pulses, before voxelising)",
+            shots.echo_range[e]
+        ))),
+        None => Ok(()),
     }
 }
 
@@ -487,12 +584,16 @@ impl Voxelizer {
         refine::update_peaks(peaks, &shots.echo_xyz(), &self.engine.geom);
     }
 
+    /// Trace one batch of pulses into the grid. The annotations must have one value per
+    /// echo, every echo range (m) must be finite, and `Relative` / `Strongest` weighting
+    /// needs intensities.
     pub fn add(&mut self, inputs: &VoxelInputs) -> Result<()> {
         let ne = inputs.shots.n_echoes();
         check_len("ground", inputs.ground, ne)?;
         check_len("foliage", inputs.foliage, ne)?;
         check_len("intensity", inputs.intensity, ne)?;
         check_len("tree_id", inputs.tree_id, ne)?;
+        check_ranges(inputs.shots)?;
         if matches!(self.engine.params.weighting, WeightMethod::Relative | WeightMethod::Strongest) && inputs.intensity.is_none() {
             return Err(Error::invalid("relative / strongest weighting needs echo intensities"));
         }
@@ -506,6 +607,8 @@ impl Voxelizer {
         Ok(())
     }
 
+    /// The finished grid: neighbour priors applied, inclination distributions built. The
+    /// Bailey method needs both leaf and wood echoes among the batches added.
     pub fn finish(self) -> Result<RayVoxels> {
         let bailey = self.engine.params.attenuation.contains(&Attenuation::Bailey);
         if bailey && !(self.has_leaf && self.has_wood) {
@@ -591,14 +694,18 @@ pub fn voxelize(inputs: &VoxelInputs, params: &VoxelParams) -> Result<RayVoxels>
 pub struct EchoLabels {
     /// Attribute holding the class codes below.
     pub class_attr: String,
+    /// Class code meaning ground; `None` tells ground by height over the DTM instead.
     pub ground_class: Option<i64>,
     /// Without a `ground_class`: echoes at most this far above the DTM are ground.
     pub ground_distance: f64,
     /// Codes that mean leaf / wood. With either given, other codes below 3
     /// are excluded and the rest are plant (as rayvoxel).
     pub leaf_classes: Vec<i64>,
+    /// Codes that mean wood (see `leaf_classes`).
     pub wood_classes: Vec<i64>,
+    /// Attribute holding each echo's tree id, for the inclination distributions.
     pub tree_attr: String,
+    /// Attribute holding each echo's intensity, for `Relative` / `Strongest` weighting.
     pub intensity_attr: String,
 }
 
@@ -611,13 +718,20 @@ impl Default for EchoLabels {
 /// Owned per-echo annotations.
 #[derive(Debug, Clone, Default)]
 pub struct EchoAnnotations {
+    /// Ground flag per echo; `None` when no ground rule applied.
     pub ground: Option<Vec<bool>>,
+    /// Class code per echo (see [`foliage`]); `None` when no leaf or wood classes were given.
     pub foliage: Option<Vec<u8>>,
+    /// Intensity per echo, when the attribute exists.
     pub intensity: Option<Vec<f64>>,
+    /// Tree id per echo, when the attribute exists.
     pub tree_id: Option<Vec<i32>>,
 }
 
 impl EchoLabels {
+    /// The per-echo annotations of `shots` from its echo attributes (and the DTM for
+    /// ground by height); an absent attribute leaves its annotation `None`, except
+    /// the class attribute, which is required when a rule needs it.
     pub fn annotate(&self, shots: &Shots, dtm: Option<&Raster>) -> Result<EchoAnnotations> {
         let class = shots.echo_attrs.get(&self.class_attr).map(|a| a.to_f64());
         let need_class = || class.as_ref().ok_or_else(|| Error::invalid(format!("the shots have no {:?} echo attribute", self.class_attr)));
@@ -652,6 +766,7 @@ impl EchoLabels {
 }
 
 impl EchoAnnotations {
+    /// Borrow these annotations, `shots` and the DTM as the inputs of a trace.
     pub fn inputs<'a>(&'a self, shots: &'a Shots, dtm: Option<&'a Raster>) -> VoxelInputs<'a> {
         VoxelInputs { shots, ground: self.ground.as_deref(), foliage: self.foliage.as_deref(), intensity: self.intensity.as_deref(), tree_id: self.tree_id.as_deref(), dtm }
     }
