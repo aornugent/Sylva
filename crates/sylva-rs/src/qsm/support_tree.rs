@@ -6,7 +6,7 @@
 //! each scan measures it, and one solve over the tree (3dtrees research 93
 //! §10, §16, §17): the fast path of the joint model, with flags that send the
 //! pieces it can't summarise (several stems, a hull) to
-//! [`crate::qsm::joint_tree`].
+//! the exact likelihood (`routed.rs`).
 //!
 //! Within one (piece, scan) group the pulses are nearly parallel, so they
 //! reduce to a profile across the row: impact `b` (along the group's `n`,

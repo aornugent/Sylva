@@ -11,13 +11,11 @@ foliage (Beer-Lambert) compete to stop it. A Gaussian Markov prior over the
 tree ties the rows together: the taper's steps, soft Leonardo at forks, a
 random walk of the centre and of foliage (3dtrees research 74).
 
-:func:`joint_tree` is the whole fit of one tree: the tree's rows and its
-neighbours' cylinders in, a fitted row per stem out, with existence and the
-split of clumps into stems. :func:`joint_table` and :func:`joint_fit` are its
-parts, for research: the pairs, and the fit of a table. :func:`support_tree`
-is its fast path: each row's pieces' support function per scan, bounds and
-existence where a circle isn't determined, and one solve over the tree, with
-flags for the pieces that need :func:`joint_tree`.
+:func:`support_tree` fits one tree: each row's pieces' support function per
+scan, bounds and existence where a circle isn't determined, the pieces with
+several stems fitted by the exact likelihood, and one solve over the tree.
+:func:`joint_table` gives the pairs the likelihood reads, and
+:func:`rebase` re-sections a plant's base for it.
 
 The parameters are a :class:`JointParams`, whose fields are:
 
@@ -72,7 +70,7 @@ _DEFAULTS = _core.qsm_joint_defaults()
 
 @dataclasses.dataclass(frozen=True)
 class JointParams:
-    """The settings of :func:`joint_tree`; the defaults are calibrated on TERN's RIEGL VZ-400i exports (Alice Mulga).
+    """The settings of :func:`support_tree`; the defaults are calibrated on TERN's RIEGL VZ-400i exports (Alice Mulga).
 
     A plain record: ``dataclasses.asdict(params)`` is JSON-serialisable and, with ``version``, is what a cache of
     joint fits should key on. The likelihood's and the prior's fields are described in this module's documentation.
@@ -120,87 +118,9 @@ class JointParams:
     exist: float = _DEFAULTS["exist"]
     exist_off: float = _DEFAULTS["exist_off"]
     dh: float = _DEFAULTS["dh"]
-    #: Newton iterations per continuation stage at most, and the stopping tolerance.
-    iters: int = _DEFAULTS["iters"]
-    tol: float = _DEFAULTS["tol"]
-    #: Rounds of ownership (each stop to the row whose surface explains it) and fitting.
-    sweeps: int = _DEFAULTS["sweeps"]
-    #: A row is tried as a clump when its prior radius is at least this (m).
-    split_min_r: float = _DEFAULTS["split_min_r"]
-    #: A circle found in a clump's stops is a stem when at most this share of the pulses crossing its core went
-    #: through it, and at least ``split_min_votes`` stops lie on it.
-    split_through: float = _DEFAULTS["split_through"]
-    split_min_votes: int = _DEFAULTS["split_min_votes"]
-    #: A row's radius interval is where its own log likelihood is within ``drop`` of its best.
-    drop: float = _DEFAULTS["drop"]
     #: Which pulses :func:`support_tree` fits on a routed piece of more pairs than its budget (a hash of each pulse's
     #: direction and this): 0 in production; a bench varies it to measure the thinning's noise.
     thin_seed: int = _DEFAULTS["thin_seed"]
-
-
-#: Why a row's radius is what it is: :func:`joint_tree`'s ``reason``.
-JointReason = IntEnum("JointReason", _core.qsm_joint_reasons())
-
-
-def joint_tree(scans, a, b, r_prior, parent, context=None, params: JointParams = JointParams(), split=None,
-               threads: int = 0) -> dict:
-    """Fits the joint model to one tree: its rows in, a fitted row per stem out.
-
-    Each row's pairs are taken in a tube around it, sized from its prior radius. A row may be a clump: the solid
-    stems its stops show (circles whose core stops the pulses crossing it) replace it as child rows, parallel to it,
-    when they explain its own pulses better than it does whole, by more than a BIC price (``split_gain``). The neighbours' cylinders (``context``) are held
-    at their claims and keep the stops their surfaces explain. Then rounds of ownership and fitting, and per row
-    the evidence that it is wood: its log likelihood at its fit against its best without wood (foliage refitted),
-    less a BIC price for the three wood unknowns, as ``p_wood``.
-
-    Parameters
-    ----------
-    scans
-        :class:`ScanIndex` of each scan to use.
-    a, b, r_prior, parent
-        The tree's rows: ``(n, 3)`` axes, ``(n,)`` prior radii and parents (int; each before its child, -1 at a
-        base).
-    context
-        ``(a, b, r)`` of the neighbours' cylinders, or None.
-    params
-        :class:`JointParams`.
-    split
-        ``(n,)`` bool: the rows to split wherever they show solid stems (default: each row of at least
-        ``params.split_min_r``, split only where the evidence says so).
-    threads
-        Threads to use (0: one per core).
-
-    Returns
-    -------
-    dict, per child row (``(m,)`` unless noted):
-
-    - ``src``: the input row it came from; ``parent``: its parent among the child rows (-1 at a base);
-    - ``a``, ``b`` ``(m, 3)``: its fitted axis, world coordinates; ``r``, ``sd_log_r``;
-    - ``lo``, ``hi``, ``flat``: the radius interval from its own profile (to 0.125 in log R), and whether the
-      rays don't bound it;
-    - ``lam``: foliage (1/m); ``log_odds`` and ``p_wood``, the evidence that it is wood; ``reason``
-      (:class:`JointReason`);
-    - ``rho_local``, ``rho_pooled``: the share of its log R precision from its own rays, and its variance's
-      reduction from the prior's; ``n_pairs``: its pairs after ownership;
-    - ``grad`` ``(m, 4)``, ``hess`` ``(m, 4, 4)``: its likelihood message at the fit, in its state (offsets
-      along ``e1``, ``e2`` ``(m, 3)``, log R, log lambda);
-
-    per input row ``split_gain`` ``(n,)``: the log evidence for its solid stems over it whole, less the price (NaN
-    where none was weighed; near 0 is contested); and per tree ``u`` (the volume share the rays don't determine),
-    ``objective``, ``converged`` and ``echoes``: the rows' owned stops classified by the softmax of their wood and
-    leaf terms at their row's fit, keyed and laid out as :func:`support_tree`'s (``node`` a child row).
-    """
-    if not all(isinstance(s, ScanIndex) for s in scans):
-        raise TypeError("joint_tree: scans must be ScanIndex")
-    if not isinstance(params, JointParams):
-        raise TypeError("joint_tree: params must be JointParams")
-    f64 = lambda x: np.ascontiguousarray(x, np.float64)  # noqa: E731
-    ca, cb, cr = (np.zeros((0, 3)), np.zeros((0, 3)), np.zeros(0)) if context is None else context
-    ca, cb = f64(ca).reshape(-1, 3), f64(cb).reshape(-1, 3)
-    split = None if split is None else np.ascontiguousarray(split, bool)
-    return _core.qsm_joint_tree([s._core for s in scans], f64(a), f64(b), f64(r_prior),
-                                np.ascontiguousarray(parent, np.int64), ca, cb, f64(cr), dataclasses.asdict(params),
-                                split, int(threads))
 
 
 #: Why a piece's own support summary was left out of :func:`support_tree`'s tree (bits of its ``flags``): ``RUNS``
@@ -247,11 +167,10 @@ SupportDiag = IntFlag("SupportDiag", _core.qsm_support_diags())
 #: tree, or pinned to its own bound) and ``CAPPED`` (on the site's cap). Its tree's volume is split by them.
 SupportBasis = IntEnum("SupportBasis", _core.qsm_support_bases())
 
-#: How a classified echo (``echoes`` of :func:`support_tree` and :func:`joint_tree`) got its ``p_wood``:
+#: How a classified echo (``echoes`` of :func:`support_tree`) got its ``p_wood``:
 #: ``MEASURED``, ``BOUNDED``, ``POROUS`` and ``ROUTED`` (a routed piece with no exact fit accepted) by whether it lies
 #: on its piece's circle's front arc (the piece's own, or the tree's) times its echo character's weight, off the arc
-#: 0; ``EXACT`` by the exact likelihood's wood and leaf terms at its stem's fit (a routed piece's, or every one of
-#: :func:`joint_tree`'s).
+#: 0; ``EXACT`` by the exact likelihood's wood and leaf terms at its stem's fit (a routed piece's).
 EchoPath = IntEnum("EchoPath", _core.qsm_echo_paths())
 
 
@@ -282,7 +201,7 @@ def tree_context(a, b, cyl_offsets, trees, reach: float) -> list:
 
 def support_tree(scans, a, b, r_prior, parent, context=None, params: JointParams = JointParams(),
                  threads: int = 0) -> dict:
-    """Fits one tree from the support function of each row's cross-section: the fast path of :func:`joint_tree`.
+    """Fits one tree from the support function of each row's cross-section: the joint model, fast.
 
     A row longer than 30 cm is cut into equal pieces at most that long, and each piece is a node of the tree (its
     parent the piece before it, or the last of its parent row's), so a bent row is a chain of straight pieces. Per
@@ -309,7 +228,7 @@ def support_tree(scans, a, b, r_prior, parent, context=None, params: JointParams
     oversampling and weighted by ``exist_scale``, and a chain along the branches (wood doesn't stop and restart:
     ``exist``, ``exist_off``) gives ``p_wood``. The tree is one solve: the unflagged pieces' summaries as Gaussian
     measurements, the bounds as censored ones on log R (expectation propagation, one site per piece by
-    quadrature), and a prior after :func:`joint_tree`'s (the base's level, the taper's steps, at a fork the child's
+    quadrature), and a prior (the base's level, the taper's steps, at a fork the child's
     share of the subtree wood length rather than of the prior area as a heavy-tailed Student-t term, so a small
     shoot measured fat can't inflate its parent, the centre's continuity along a branch and the lean's random walk
     between a row's pieces, the centre's anchor and a weak anchor of the lean; no tip anchor). A posterior is then held
@@ -488,66 +407,6 @@ def joint_table(scans, a, b, window, threads: int = 0) -> dict[str, np.ndarray]:
     a, b = np.ascontiguousarray(a, np.float64), np.ascontiguousarray(b, np.float64)
     window = np.ascontiguousarray(np.broadcast_to(np.asarray(window, np.float64), (len(a),)))
     return _core.qsm_joint_table([s._core for s in scans], a, b, window, int(threads))
-
-
-def joint_fit(table, a, b, r_prior, parent, n_scans: int, params, *, r_max=None,
-              schedule=(0.3, 0.15, 0.08, 0.04), iters: int = 100, tol: float = 1e-8,
-              theta0=None, threads: int = 0) -> dict:
-    """Fits the joint model to a :func:`joint_table` (its MAP and Laplace summary).
-
-    Parameters
-    ----------
-    table
-        :func:`joint_table`'s pairs (or a subset of them, ``q`` changed).
-    a, b, r_prior, parent
-        The rows: ``(n, 3)`` axes, ``(n,)`` prior radii and parents (int64;
-        each before its child, -1 at a base).
-    n_scans
-        Number of scans the table's ``scan`` indexes.
-    params
-        :class:`JointParams` (its likelihood's and prior's fields).
-    r_max
-        ``(n,)`` largest radius each row can take, the tube its pairs were
-        taken in (default: unbounded).
-    schedule
-        Surface roughness of the continuation's stages before the physical one
-        (``params["rough"]``); those not above it are skipped.
-    iters, tol
-        Newton iterations per stage at most, and the stopping rule: the Newton
-        decrement, or the objective's gain over ten iterations, below
-        ``tol (1 + |objective|)`` (the likelihood is piecewise smooth).
-    theta0
-        ``(n, 4)`` starting states (default: the axes, prior radii and foliage).
-    threads
-        Threads to use (0: one per core).
-
-    Returns
-    -------
-    dict:
-
-    - ``theta`` ``(n, 4)``: each row's MAP offsets (m, along the row's frame),
-      ``log R`` and ``log lambda``; ``sd`` ``(n, 4)`` their Laplace sds;
-    - ``nu`` ``(n_scans * branches, 2)``: each (scan, branch)'s offset;
-    - ``rho_local``: the share of ``log R``'s posterior precision from the
-      row's own rays; ``rho_pooled``: its variance's reduction from the prior's;
-    - ``grad`` ``(n, 4)``, ``hess`` ``(n, 4, 4)``: each row's likelihood
-      message at the MAP;
-    - ``profile`` ``(n, 21)``: each row's own log likelihood with ``log R``
-      moved by ``profile_grid``, the rest held;
-    - ``objective``, ``iterations`` (per stage), ``converged`` (every stage met
-      the stopping rule) and ``exact`` (the sds come from the true Hessian,
-      else from the saddle-free one).
-    """
-    a, b = np.ascontiguousarray(a, np.float64), np.ascontiguousarray(b, np.float64)
-    r_prior = np.ascontiguousarray(r_prior, np.float64)
-    r_max = np.full(len(a), np.inf) if r_max is None else np.ascontiguousarray(r_max, np.float64)
-    parent = np.ascontiguousarray(parent, np.int64)
-    if theta0 is not None:
-        theta0 = np.ascontiguousarray(theta0, np.float64)
-    if not isinstance(params, JointParams):
-        raise TypeError("joint_fit: params must be JointParams")
-    return _core.qsm_joint_fit(table, a, b, r_prior, r_max, parent, int(n_scans), dataclasses.asdict(params), [float(s) for s in schedule],
-                               int(iters), float(tol), theta0, int(threads))
 
 
 def rebase(scans, a, b, r_prior, parent, member, centre, context=None, params: JointParams = JointParams(),

@@ -33,11 +33,11 @@ from .plot import (  # noqa: F401
 )
 from .evidence import EvidenceParams, Reason, contradicted, evidence  # noqa: F401
 from .scan_index import ScanIndex, pairs  # noqa: F401
-from .joint import EchoPath, JointParams, JointReason, SupportBasis, SupportDiag, SupportFlag, SupportRefusal, joint_fit, joint_table, joint_tree, rebase, support_tree, tree_context  # noqa: F401
-from .support import contest, surface_distance, surface_support  # noqa: F401
+from .joint import EchoPath, JointParams, SupportBasis, SupportDiag, SupportFlag, SupportRefusal, joint_table, rebase, support_tree, tree_context  # noqa: F401
+from .support import contest  # noqa: F401
 from .wood import (  # noqa: F401
     wood_points,
 )
 
-__all__ = ["evidence", "pairs", "joint_table", "joint_fit", "joint_tree", "rebase", "support_tree", "tree_context", "EchoPath", "JointParams", "JointReason", "SupportBasis", "SupportDiag", "SupportFlag", "SupportRefusal", "EvidenceParams", "Reason", "ScanIndex", "contradicted", "surface_support", "surface_distance", "contest", "QSM", "PlotQSMs", "build_plot", "fit_cylinder", "fit_cylinder_ransac", "skeletonize", "build_qsm", "wood_points",
+__all__ = ["evidence", "pairs", "joint_table", "rebase", "support_tree", "tree_context", "EchoPath", "JointParams", "SupportBasis", "SupportDiag", "SupportFlag", "SupportRefusal", "EvidenceParams", "Reason", "ScanIndex", "contradicted", "contest", "QSM", "PlotQSMs", "build_plot", "fit_cylinder", "fit_cylinder_ransac", "skeletonize", "build_qsm", "wood_points",
            "write_obj", "write_ply_mesh", "Buttress", "buttress_mesh", "TreeMesh"]

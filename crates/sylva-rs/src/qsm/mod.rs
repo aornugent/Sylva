@@ -15,7 +15,6 @@ pub mod cylinder;
 pub mod evidence;
 pub mod joint;
 pub mod joint_fit;
-pub mod joint_tree;
 pub mod metrics;
 pub mod model;
 pub mod ops;

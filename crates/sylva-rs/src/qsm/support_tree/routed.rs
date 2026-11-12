@@ -56,9 +56,8 @@ use nalgebra::{Matrix2, Matrix3, Matrix4, Matrix5, SymmetricEigen, Vector5};
 use super::{fate, marginalise, measure, median, p_wood, profile_runs, refusal, solve_row, spacing, unseen, weights, Bound, Circle, Fate, Group, Side, Sight, Stats, CAP_SD, DEPTH_TOL, HULL_BEHIND, HULL_SHARE, RUN_HITS, SEEN_MIN};
 use crate::error::Result;
 use crate::qsm::scan_index::ScanIndex;
-use crate::qsm::joint::{frames, joint_table, joint_wood_share, path, window, Echoes, JointPairs, JointParams, Owner, Pulse};
-use crate::qsm::joint_fit::{FitOptions, Frame, PriorParams};
-use crate::qsm::joint_tree::{fit_stems, shifted, surface_dist};
+use crate::qsm::joint::{frames, joint_loglik, joint_table, joint_wood_share, path, window, Echoes, JointPairs, JointParams, Owner, Pulse};
+use crate::qsm::joint_fit::{joint_fit, Fit, FitOptions, Frame, PriorParams, Rows};
 use crate::transform::{cross, dot, norm, sub};
 use crate::Point;
 
@@ -498,7 +497,7 @@ fn exact_thinned(scans: &[&ScanIndex], a0: &Point, frame: Frame, seeds: &[Seed],
     let mut evals = [0u64; 2];
     type State = Vec<(usize, [f64; 2], f64)>;
     // the ladder: each k's fit, while BIC rose
-    let mut ladder: Vec<(f64, State, crate::qsm::joint_tree::StemFit)> = Vec::new();
+    let mut ladder: Vec<(f64, State, StemFit)> = Vec::new();
     for k in 1..=seeds.len() {
         let st: State = ladder.last().map_or(Vec::new(), |b| b.1.clone()).into_iter().chain([(k - 1, [0.0, 0.0], seeds[k - 1].r)]).collect();
         let moved: Vec<(Point, Point)> = st.iter().map(|&(j, d, _)| {
@@ -530,7 +529,7 @@ fn exact_thinned(scans: &[&ScanIndex], a0: &Point, frame: Frame, seeds: &[Seed],
     let refused = move |why: u8| Ok(Fitted::Refused { why, n_pairs: n_all as u32, evals });
     let bic1 = ladder.first().map_or(f64::NAN, |b| b.0);
     // each stem's message, as a measurement of the piece's [c1, c2, t1, t2, R]
-    let messages = |st: &State, sf: &crate::qsm::joint_tree::StemFit| -> Vec<Circle> { st.iter().enumerate().map(|(q, &(j, d, r))| {
+    let messages = |st: &State, sf: &StemFit| -> Vec<Circle> { st.iter().enumerate().map(|(q, &(j, d, r))| {
         let s = &seeds[j];
         let (_, f1, f2) = sfr[j];
         let up: Point = std::array::from_fn(|i| u[i] + s.t[0] * e1[i] + s.t[1] * e2[i]);
@@ -620,7 +619,7 @@ fn exact_thinned(scans: &[&ScanIndex], a0: &Point, frame: Frame, seeds: &[Seed],
     let radii: Vec<f64> = st.iter().map(|s| s.2).collect();
     let meet = |i: usize| -> (Pulse, usize) {
         let v: Vec<Pulse> = st.iter().map(|&(j, d, _)| shifted(&remeasure(&t.pulses[i], ray(i), &axes[j].0, sfr[j]), d)).collect();
-        let q = crate::qsm::joint_tree::first_met(&v, &radii, like.footprint(t.pulses[i].t));
+        let q = first_met(&v, &radii, like.footprint(t.pulses[i].t));
         (v[q], q)
     };
     // the context's stops there, each to the stem it meets first
@@ -648,6 +647,92 @@ fn exact_thinned(scans: &[&ScanIndex], a0: &Point, frame: Frame, seeds: &[Seed],
     };
     Ok(Fitted::Accepted(Exact { stems, lam: sf.theta.iter().map(|t| t[3].exp()).collect(), gain: if k > 1 { bic - bic1 } else { f64::NAN }, n_pairs: n_all as u32, evals, echoes,
         shadow, tube, n_ctx }))
+}
+
+/// How far a stop lies from the circle of state `s` (offsets and log R in its row's frame) in the cross-section (m).
+pub(crate) fn surface_dist(pu: &Pulse, s: [f64; 4]) -> f64 {
+    let (y, _) = cross_section(pu);
+    ((y[0] - s[0]).hypot(y[1] - s[1]) - s[2].exp()).abs()
+}
+
+/// A pair measured from its row's axis moved by `d` across it: the same pulse
+/// and chord (so the same foliage exposure), seen from a parallel axis.
+pub(crate) fn shifted(pu: &Pulse, d: [f64; 2]) -> Pulse {
+    Pulse { b: pu.b - (d[0] * pu.jb[0] + d[1] * pu.jb[1]), t: pu.t + (d[0] * pu.jt[0] + d[1] * pu.jt[1]), ..*pu }
+}
+
+/// Which of several circles a pair meets first, from its view from each
+/// circle's centre (`views`, each measured from that circle's axis), their
+/// radii and its footprint `w`: of those its footprint touches, the one whose
+/// front it reaches first; if none, the one whose silhouette it passes
+/// nearest. Solid stems don't overlap, so a pulse's fate is the first one's.
+pub(crate) fn first_met(views: &[Pulse], radii: &[f64], w: f64) -> usize {
+    let mut best = (false, f64::INFINITY, 0);
+    for (i, (s, &r)) in views.iter().zip(radii).enumerate() {
+        let touch = s.b.abs() < r + 0.5 * w;
+        let key = if touch { s.t - (r * r - s.b * s.b).max(0.0).sqrt() / s.sin.max(1e-9) } else { s.b.abs() - r };
+        if (touch && !best.0) || (touch == best.0 && key < best.1) {
+            best = (touch, key, i);
+        }
+    }
+    best.2
+}
+
+/// Stems fitted to one set of pairs (see [`fit_stems`]).
+pub(crate) struct StemFit {
+    /// The pairs' log likelihood at the fit, each seen from the fitted stem it meets first.
+    pub ll: f64,
+    pub fit: Fit,
+    /// Each fitted stem's offset from its own axis (along that axis's frame) and radius, and the state its pairs
+    /// were scored at (seen from it).
+    pub stems: Vec<([f64; 2], f64)>,
+    pub theta: Vec<[f64; 4]>,
+}
+
+/// Stems fitted to one set of pairs, the pair `i` at range `range[i]` (for its footprint) and from `scan[i]`:
+/// `see(j, i, d)` is the pair measured from stem `j`'s axis (`axes[j]`, prior radius `radii[j]`) moved by `d`
+/// across it, along that axis's frame. Each pair is seen from the stem it meets first ([`first_met`]), each stem a
+/// row of its own with its own foliage, fitted by [`joint_fit`] with `opts` from the axes; then each pair is seen
+/// again from the fitted stem it meets first, and scored there: the seeded exact fit of a routed piece, each stem
+/// on its own leaning axis (3dtrees research 93 §18). The fit's `evals` count that last pass too.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn fit_stems(range: &[f64], see: &(dyn Fn(usize, usize, [f64; 2]) -> Pulse + Sync), axes: &[(Point, Point)], radii: &[f64], scan: &[u32], n_scans: usize, p: &JointParams, prior: &PriorParams, opts: &FitOptions) -> Result<StemFit> {
+    let m = axes.len();
+    let (sa, sb): (Vec<Point>, Vec<Point>) = axes.iter().copied().unzip();
+    let sw: Vec<f64> = radii.iter().map(|&r| window(r)).collect();
+    let parent = vec![-1i64; m];
+    // each pair seen from the stem (moved by its offset, at its radius) it meets first
+    let assign = |st: &[([f64; 2], f64)]| -> (Vec<Pulse>, Vec<Owner>) {
+        let rs: Vec<f64> = st.iter().map(|s| s.1).collect();
+        range.iter().enumerate().map(|(i, &t)| {
+            let views: Vec<Pulse> = (0..m).map(|j| see(j, i, st[j].0)).collect();
+            let k = first_met(&views, &rs, p.footprint(t));
+            (views[k], Owner { row: k as u32, nu: u32::MAX })
+        }).unzip()
+    };
+    let (sp, own) = assign(&radii.iter().map(|&r| ([0.0, 0.0], r)).collect::<Vec<_>>());
+    let row: Vec<u32> = own.iter().map(|o| o.row).collect();
+    let rows = Rows { a: &sa, b: &sb, r_prior: radii, r_max: &sw, parent: &parent };
+    let mut f = joint_fit(&sp, &row, scan, &rows, n_scans, p, prior, opts, None)?;
+    let fitted: Vec<([f64; 2], f64)> = f.theta.iter().map(|t| ([t[0], t[1]], t[2].exp())).collect();
+    let (sp, own) = assign(&fitted);
+    let theta: Vec<[f64; 4]> = f.theta.iter().map(|t| [0.0, 0.0, t[2], t[3]]).collect();
+    let ll = joint_loglik(&sp, &own, &theta, &[], p, opts.threads)?.iter().sum();
+    f.evals[0] += sp.len() as u64;
+    Ok(StemFit { ll, fit: f, stems: fitted, theta })
+}
+
+
+/// A stop's place in its row's cross-section (frame `e1, e2`, from the axis)
+/// and the unit direction its pulse travelled across the axis: its closest
+/// approach lies `b` along the normal (`jb`), the stop `(x - t) sin` further
+/// along that direction (`jt sin`).
+fn cross_section(pu: &Pulse) -> ([f64; 2], [f64; 2]) {
+    let v = [pu.jt[0] * pu.sin, pu.jt[1] * pu.sin];
+    let l = (v[0] * v[0] + v[1] * v[1]).sqrt().max(1e-12);
+    let v = [v[0] / l, v[1] / l];
+    let s = (pu.x - pu.t) * pu.sin;
+    ([pu.b * pu.jb[0] + s * v[0], pu.b * pu.jb[1] + s * v[1]], v)
 }
 
 #[cfg(test)]
@@ -747,5 +832,31 @@ mod tests {
             let ratio = ih[(i, i)] / ia[(i, i)];
             assert!(ratio > 0.7 && ratio < 1.4, "info[{i}]: thinned {} against all {}", ih[(i, i)], ia[(i, i)]);
         }
+    }
+
+    #[test]
+    fn a_shifted_pair_is_the_pair_seen_from_the_moved_axis() {
+        let (scan, a, b) = crate::qsm::scan_index::tests::scene(0.05, true);
+        let t = joint_table(&[&scan], &[a], &[b], &[window(0.08)], 2).unwrap();
+        let p = JointParams { tau: 0.17, edge: 0.25, hide: 0.0, ..JointParams::default() };
+        let d = [0.012, -0.007];
+        let moved: Vec<Pulse> = t.pulses.iter().map(|pu| shifted(pu, d)).collect();
+        let own: Vec<Owner> = t.pulses.iter().map(|_| Owner { row: 0, nu: u32::MAX }).collect();
+        let at = joint_loglik(&t.pulses, &own, &[[d[0], d[1], 0.05f64.ln(), 0.0]], &[], &p, 2).unwrap();
+        let from = joint_loglik(&moved, &own, &[[0.0, 0.0, 0.05f64.ln(), 0.0]], &[], &p, 2).unwrap();
+        // equal but for the footprint, taken at the moved range of closest approach (divergence x the shift)
+        let worst = at.iter().zip(&from).map(|(x, y)| (x - y).abs()).fold(0.0, f64::max);
+        assert!(worst < 0.01, "worst {worst}");
+        // a pulse aimed at the stem meets it before a circle behind it; a pulse aimed between two meets the nearer
+        let first_circle = |pu: &Pulse, circles: &[(f64, f64, f64)]| {
+            let views: Vec<Pulse> = circles.iter().map(|&(cx, cy, _)| shifted(pu, [cx, cy])).collect();
+            first_met(&views, &circles.iter().map(|c| c.2).collect::<Vec<_>>(), p.footprint(pu.t))
+        };
+        let hit = t.pulses.iter().find(|pu| pu.stop && pu.b.abs() < 0.01).unwrap();
+        let v = [hit.jt[0] * hit.sin, hit.jt[1] * hit.sin];
+        let l = (v[0] * v[0] + v[1] * v[1]).sqrt();
+        let behind = (0.12 * v[0] / l, 0.12 * v[1] / l, 0.03);
+        assert_eq!(first_circle(hit, &[behind, (0.0, 0.0, 0.05)]), 1);
+        assert_eq!(first_circle(hit, &[(0.0, 0.0, 0.05), behind]), 0);
     }
 }

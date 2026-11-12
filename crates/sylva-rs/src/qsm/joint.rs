@@ -507,32 +507,6 @@ fn pair_terms<N: Num>(pu: &Pulse, s: [N; 4], p: &JointParams) -> (N, Option<(N, 
     (l - sel, terms)
 }
 
-/// How far a stop lies from the wood surface the row's state `s` predicts for
-/// it, in sds of the range kernel; infinite where the footprint misses the
-/// circle. Who owns a stop seen by several rows (research 74 §5's outer step).
-/// The chance wood of radius `r` can make an echo in a footprint `w` wide at
-/// all (it gives at most the share `2 r / w`, and an echo needs `tau`).
-pub(crate) fn capacity(r: f64, w: f64, p: &JointParams) -> f64 {
-    log_ndtr_mills((2.0 * r / w - p.tau) / CAPACITY_SD).0.exp()
-}
-
-pub(crate) fn surface_residual(pu: &Pulse, s: [f64; 4], p: &JointParams) -> f64 {
-    let [d1, d2, eta, _] = s;
-    let r = eta.exp();
-    let bp = pu.b - (d1 * pu.jb[0] + d2 * pu.jb[1]);
-    let tp = pu.t + (d1 * pu.jt[0] + d2 * pu.jt[1]);
-    let w = p.footprint(pu.t);
-    if bp.abs() >= r + w / 2.0 {
-        return f64::INFINITY;
-    }
-    let (y1, y2) = ((bp - w / 2.0).max(-r), (bp + w / 2.0).min(r));
-    let width = (y2 - y1).max(0.0);
-    let e = SLIVER * w;
-    let hbar = (<f64 as Num>::h_int(y2, r) - <f64 as Num>::h_int(y1, r)) / (width + (-width / e).exp() * e);
-    let xw = (tp - hbar / pu.sin).clamp(pu.c0, pu.c1);
-    (pu.x - xw).abs() / (r * r * p.rough * p.rough + p.sigma_r * p.sigma_r).sqrt()
-}
-
 /// Where each pair's state comes from: its row's `[delta1, delta2, eta,
 /// ell]` and, unless `nu` is `u32::MAX`, its scan's nuisance offset added to
 /// the delta.

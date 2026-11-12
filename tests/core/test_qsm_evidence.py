@@ -5,9 +5,7 @@ import numpy as np
 import pytest
 
 from sylva import Shots
-from sylva import PointCloud
-from sylva.qsm import (EvidenceParams, JointParams, JointReason, Reason, ScanIndex, contradicted, evidence, joint_fit,
-                       joint_table, joint_tree, pairs)
+from sylva.qsm import EvidenceParams, Reason, ScanIndex, contradicted, evidence, joint_table, pairs
 
 
 def fan(tmp_path, r=0.05, misses=True):
@@ -156,51 +154,7 @@ def test_a_cylinder_without_length_gets_no_evidence(tmp_path):
     assert e["mu"][1] == evidence([scan], a, b)["mu"][0]
 
 
-JOINT = JointParams(tau=0.17, edge=0.25, hide=0.0, mu_fork=0.0, centre_rel=0.3, scan_abs=0.0, scan_rel=0.0)
-
-
-def test_the_joint_fit_brings_a_fat_claim_down_to_the_stem(tmp_path):
+def test_the_joint_table_holds_each_pairs_stop_or_pass(tmp_path):
     scan, a, b = fan(tmp_path)
     t = joint_table([scan], a, b, window=0.15)
     assert len(t["b"]) > 200 and t["stop"].any() and (~t["stop"]).any() and t["jb"].shape == (len(t["b"]), 2)
-    f = joint_fit(t, a, b, r_prior=[0.08], parent=[-1], n_scans=1, params=JOINT, r_max=[0.15])
-    assert f["converged"] and f["exact"] and np.exp(f["theta"][0, 2]) == pytest.approx(0.05, abs=0.003)
-    assert f["profile"].shape == (1, 21) and f["hess"].shape == (1, 4, 4) and f["rho_local"][0] > 0.9
-    with pytest.raises(ValueError, match="sig_eta"):
-        joint_fit(t, a, b, r_prior=[0.08], parent=[-1], n_scans=1, params=dataclasses.replace(JOINT, sig_eta=0.0))
-    with pytest.raises(ValueError, match="version"):
-        joint_fit(t, a, b, r_prior=[0.08], parent=[-1], n_scans=1, params=dataclasses.replace(JOINT, version=0))
-    with pytest.raises(TypeError):
-        joint_fit(t, a, b, r_prior=[0.08], parent=[-1], n_scans=1, params=dataclasses.asdict(JOINT))
-
-
-def test_a_clump_of_stems_comes_out_as_its_stems(tmp_path):
-    # three solid stems inside one envelope claim, scanned from three sides: each becomes a row of its own
-    import sylva.synthetic as syn
-    stems = np.array([[0.0, 0.0, 0.045], [0.075, 0.025, 0.04], [0.02, 0.085, 0.035]])
-    cloud = PointCloud(np.c_[stems[:, :2], np.full(3, 0.8)], {"classification": np.full(3, 5, np.uint8)})
-    solids = dict(a=np.c_[stems[:, :2], np.zeros(3)], b=np.c_[stems[:, :2], np.full(3, 1.6)], r=stems[:, 2],
-                  point=np.arange(3))
-    scans = []
-    for k, (x, y) in enumerate([(8.0, -1.0), (-5.5, 7.0), (1.5, -9.5)]):
-        shots = syn.scan(cloud, origin=(x, y, 1.5), resolution_deg=0.04, scanner="vz400i", mixed_pixels=True,
-                         target_radius=0.01, min_zenith_deg=80.0, max_zenith_deg=100.0, seed=k, solids=solids)
-        shots.save(tmp_path / f"s{k}.parquet")
-        scans.append(ScanIndex(tmp_path / f"s{k}.parquet", threads=2))
-    centre = stems[:, :2].mean(0)
-    a, b = np.array([[*centre, 0.5], [*centre, 0.8]]), np.array([[*centre, 0.8], [*centre, 1.1]])
-    params = JointParams(tau=0.17, edge=0.25, hide=0.0, mu_fork=0.0, centre_rel=0.3, scan_rel=0.05)
-    f = joint_tree(scans, a, b, [0.093, 0.093], [-1, 0], params=params)  # the core's own rule: by the evidence
-    assert list(f["src"]) == [0, 0, 0, 1, 1, 1] and list(f["parent"][3:]) != [-1, -1, -1]
-    assert (f["split_gain"] > 100).all()  # the stems beat the envelope by far on the same pulses
-    for row in (0, 1):
-        mine = f["src"] == row
-        centres = f["a"][mine, :2]
-        for x, y, r in stems:
-            k = np.argmin(np.hypot(*(centres - [x, y]).T))
-            assert np.hypot(*(centres[k] - [x, y])) < 0.01 and abs(np.log(f["r"][mine][k] / r)) < 0.12
-    assert (f["p_wood"] > 0.99).all() and (f["reason"] == JointReason.MEASURED).all() and f["converged"]
-    whole = joint_tree(scans, a, b, [0.093, 0.093], [-1, 0], params=params, split=[False, False])
-    assert list(whole["src"]) == [0, 1] and (whole["r"] > 0.06).all()  # as claimed, the envelope stays (~ the stems' area)
-    with pytest.raises(ValueError, match="version"):
-        joint_tree(scans, a, b, [0.093, 0.093], [-1, 0], params=dataclasses.replace(params, version=0))
