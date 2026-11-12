@@ -12,6 +12,7 @@
 //! gives the scene the Python package always gave, to the bit.
 
 pub mod als;
+pub mod mesh;
 pub mod plot;
 pub mod scan;
 pub mod tree;

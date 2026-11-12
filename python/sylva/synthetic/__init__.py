@@ -143,7 +143,8 @@ def scan(cloud: PointCloud, origin=(10.0, 10.0, 1.5), resolution_deg: float = 0.
          reflectance=None, target_radius: float | None = None, oriented: bool | None = None,
          detection_threshold: float | None = None, max_range: float | None = None,
          seed: int = 0, solids: dict | None = None, azimuth_deg=(0.0, 360.0),
-         timing=(0.825e-6, 6.593e-3), lambertian: bool = False, roughness=(0.0, 0.03, 0)) -> Shots:
+         timing=(0.825e-6, 6.593e-3), lambertian: bool = False, roughness=(0.0, 0.03, 0),
+         mesh: dict | None = None) -> Shots:
     """A pseudo terrestrial scan of ``cloud`` from ``origin``.
 
     Pulses are fired on a regular zenith / azimuth grid. The points falling in
@@ -259,6 +260,13 @@ def scan(cloud: PointCloud, origin=(10.0, 10.0, 1.5), resolution_deg: float = 0.
         ``(sd, wavelength, seed)`` (m, m, int): a smooth random relief on the
         small solids' surfaces, the same for every scan with the same seed
         (beam model only).
+    mesh
+        Opaque two-sided triangles in the scene (beam model only):
+        ``dict(v=(n, 3), f=(m, 3), point=(m,))`` and optionally vertex normals
+        ``n=(n, 3)``, interpolated for the cosine of incidence. Each face's
+        echoes take the attributes and reflectance of the cloud's point
+        ``point``, which stands for its faces only. Echoes also carry
+        ``range_true``, the range before noise.
 
     Returns
     -------
@@ -274,7 +282,7 @@ def scan(cloud: PointCloud, origin=(10.0, 10.0, 1.5), resolution_deg: float = 0.
     """
     o = tuple(float(v) for v in origin)
     beam = (scanner, min_zenith_deg, range_noise, beam_divergence, exit_diameter, footprint_samples,
-            mixed_pixels, reflectance, target_radius, oriented, detection_threshold, max_range, solids)
+            mixed_pixels, reflectance, target_radius, oriented, detection_threshold, max_range, solids, mesh)
     if all(v is None for v in beam):
         d = _core.synthetic_scan(cloud.xyz, cloud.attrs, o, float(resolution_deg),
                                  float(max_zenith_deg), int(max_echoes), float(echo_separation))
@@ -310,7 +318,7 @@ def scan(cloud: PointCloud, origin=(10.0, 10.0, 1.5), resolution_deg: float = 0.
         0.0 if detection_threshold is None else float(detection_threshold), refl_map, 0.4, refl_attr,
         refl_const, float("inf") if max_range is None else float(max_range), int(seed),
         *_solids(solids), tuple(float(v) for v in azimuth_deg), tuple(float(v) for v in timing),
-        bool(lambertian), (float(roughness[0]), float(roughness[1]), int(roughness[2])))
+        bool(lambertian), (float(roughness[0]), float(roughness[1]), int(roughness[2])), *_mesh(mesh))
     return Shots._from_core(d)
 
 
@@ -341,6 +349,17 @@ def export(shots: Shots, *, min_fraction: float = 0.0, fraction_width: float = 0
                                bool(echoes_only), float(range_a), float(range_b), float(yaw_mrad), float(offset_sd),
                                float(offset_length), int(seed))
     return Shots._from_core(d)
+
+
+def _mesh(mesh):
+    """The mesh's arrays for the core (four Nones without)."""
+    if mesh is None:
+        return None, None, None, None
+    n = mesh.get("n")
+    return (np.ascontiguousarray(mesh["v"], np.float64).reshape(-1, 3),
+            None if n is None else np.ascontiguousarray(n, np.float64).reshape(-1, 3),
+            np.ascontiguousarray(mesh["f"], np.uint32).reshape(-1, 3),
+            np.ascontiguousarray(mesh["point"], np.uint32).ravel())
 
 
 def _solids(solids):

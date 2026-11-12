@@ -60,6 +60,13 @@
 //! surface along its normal, so the hit moves along the sub-beam by the
 //! height over the cosine of incidence (at least 0.3).
 //!
+//! A triangle [`Mesh`] can stand beside both: opaque two-sided triangles in
+//! a bounding volume hierarchy, met at their surface, with the vertex
+//! normals interpolated for the cosine when given. Each echo also carries
+//! `range_true`, its range before noise, and `hit_nx`, `hit_ny`, `hit_nz`,
+//! the surface normal of its strongest hit, turned to face the beam (along
+//! the beam back for a sphere).
+//!
 //! [`export`] then turns a scan into what a scanner's export holds: weak
 //! and partial echoes deleted, pulses without an echo dropped, and the
 //! scan's systematic errors (a range law, a turn of its directions, a
@@ -69,6 +76,8 @@ use std::f64::consts::PI;
 
 use rayon::prelude::*;
 
+pub use super::mesh::Mesh;
+use super::mesh::Bvh;
 use crate::error::{Error, Result};
 use crate::util::nprandom::Generator;
 use crate::pointcloud::Attr;
@@ -136,11 +145,14 @@ pub struct BeamScan {
     pub roughness: f64,
     pub roughness_length: f64,
     pub roughness_seed: u64,
+    /// Opaque triangles in the scene besides its points and solids (see
+    /// [`Mesh`]). The points its faces name stand for them only.
+    pub mesh: Mesh,
 }
 
 impl BeamScan {
     pub fn new(origin: Point) -> BeamScan {
-        BeamScan { origin, resolution_deg: 0.25, min_zenith_deg: 0.0, max_zenith_deg: 130.0, max_echoes: 2, echo_separation: 0.5, range_noise: 0.0, range_noise_slope: 0.0, divergence_mrad: 0.0, exit_diameter: 0.0, footprint_samples: 1, mixed_pixels: true, target_radius: None, oriented: true, detection_threshold: 0.0, reflectance: Reflectance::default(), max_range: f64::INFINITY, seed: 0, min_azimuth_deg: 0.0, max_azimuth_deg: 360.0, pulse_interval: 0.825e-6, line_period: 6.593e-3, solids: Vec::new(), lambertian: false, roughness: 0.0, roughness_length: 0.03, roughness_seed: 0 }
+        BeamScan { origin, resolution_deg: 0.25, min_zenith_deg: 0.0, max_zenith_deg: 130.0, max_echoes: 2, echo_separation: 0.5, range_noise: 0.0, range_noise_slope: 0.0, divergence_mrad: 0.0, exit_diameter: 0.0, footprint_samples: 1, mixed_pixels: true, target_radius: None, oriented: true, detection_threshold: 0.0, reflectance: Reflectance::default(), max_range: f64::INFINITY, seed: 0, min_azimuth_deg: 0.0, max_azimuth_deg: 360.0, pulse_interval: 0.825e-6, line_period: 6.593e-3, solids: Vec::new(), lambertian: false, roughness: 0.0, roughness_length: 0.03, roughness_seed: 0, mesh: Mesh::default() }
     }
 }
 
@@ -539,6 +551,7 @@ struct Echo {
     fraction: f64,
     spread: f64,
     point: usize,
+    normal: Point,
 }
 
 /// Scan `cloud` with a finite beam (see the module documentation).
@@ -553,6 +566,11 @@ pub fn scan_beam(cloud: &PointCloud, p: &BeamScan) -> Result<Shots> {
         }
         stands_for_solid[s.point] = true;
     }
+    p.mesh.check(cloud.len())?;
+    for &i in &p.mesh.point {
+        stands_for_solid[i as usize] = true;
+    }
+    let bvh = Bvh::new(&p.mesh);
     let targets: Vec<usize> = (0..cloud.len()).filter(|&i| !stands_for_solid[i] && cloud.xyz[i].iter().all(|v| v.is_finite()) && rho[i] > 0.0).collect();
     let r = match p.target_radius {
         Some(r) => r,
@@ -620,16 +638,18 @@ pub fn scan_beam(cloud: &PointCloud, p: &BeamScan) -> Result<Shots> {
             // spreads as it goes, so it is sampled by several sub-rays, each
             // offset across the exit aperture and tilted within the
             // divergence. Each returns the first surface it meets, if any.
-            let mut hits: Vec<(f64, usize, f64)> = offsets.iter().filter_map(|off| {
+            let mut hits: Vec<(f64, usize, f64, Point)> = offsets.iter().filter_map(|off| {
                 let lat: Point = std::array::from_fn(|k| off[0] * e1[k] + off[1] * e2[k]);
                 let os: Point = std::array::from_fn(|k| o[k] + half_exit * lat[k]);
                 let ds: Point = std::array::from_fn(|k| d[k] + half_div * lat[k]);
                 let nn = (ds[0] * ds[0] + ds[1] * ds[1] + ds[2] * ds[2]).sqrt();
                 let ds = [ds[0] / nn, ds[1] / nn, ds[2] / nn];
                 let dot = |n: &Point| (ds[0] * n[0] + ds[1] * n[1] + ds[2] * n[2]).abs();
-                // (range, point, cosine of incidence)
+                // the surface normal turned to face the sub-beam
+                let facing = |n: Point| if n == [0.0; 3] { [-ds[0], -ds[1], -ds[2]] } else if ds[0] * n[0] + ds[1] * n[1] + ds[2] * n[2] > 0.0 { [-n[0], -n[1], -n[2]] } else { n };
+                // (range, point, cosine of incidence, normal)
                 let patch = grid.cast(&os, &ds, 0.1, p.max_range, |i| patch_hit(&cloud.xyz[i], &normals[i], r2, &os, &ds))
-                    .map(|(t, i)| (t, i, if normals[i] == [0.0; 3] { 1.0 } else { dot(&normals[i]) }));
+                    .map(|(t, i)| (t, i, if normals[i] == [0.0; 3] { 1.0 } else { dot(&normals[i]) }, facing(normals[i])));
                 let mut solid = solid_grid.cast(&os, &ds, 0.1, p.max_range, |i| solid_hit(&p.solids[i], &os, &ds)).map(|(t, i)| (t, i, true));
                 for &i in &big {
                     if let Some((t, _)) = solid_hit(&p.solids[i], &os, &ds).filter(|h| h.0 > 0.1 && h.0 < p.max_range) {
@@ -641,17 +661,19 @@ pub fn scan_beam(cloud: &PointCloud, p: &BeamScan) -> Result<Shots> {
                 let solid = solid.map(|(t, i, small)| {
                     let s = &p.solids[i];
                     let x: Point = std::array::from_fn(|k| os[k] + t * ds[k]);
-                    let c = dot(&solid_normal(s, &x));
+                    let sn = solid_normal(s, &x);
+                    let c = dot(&sn);
                     let t = match (&relief, small) {
                         (Some(rl), true) => t - rl.at(&x) / c.max(0.3),
                         _ => t,
                     };
-                    (t, s.point, c)
+                    (t, s.point, c, facing(sn))
                 });
-                match (patch, solid) {
-                    (Some(x), Some(y)) => Some(if y.0 < x.0 { y } else { x }),
-                    (x, y) => x.or(y),
-                }
+                let tri = bvh.cast(&os, &ds, 0.1, p.max_range).map(|(t, f, u, v)| {
+                    let n = p.mesh.normal(f, u, v);
+                    (t, p.mesh.point[f] as usize, dot(&n), facing(n))
+                });
+                [patch, solid, tri].into_iter().flatten().min_by(|x, y| x.0.total_cmp(&y.0))
             }).collect();
             // Sub-rays that came back from nearly the same distance are one
             // echo: a real scanner cannot separate returns closer together
@@ -680,7 +702,7 @@ pub fn scan_beam(cloud: &PointCloud, p: &BeamScan) -> Result<Shots> {
                 // the brightest sub-ray's own range.
                 let range = if p.mixed_pixels && energy > 0.0 { group.iter().zip(&w).map(|(h, w)| h.0 * w).sum::<f64>() / energy } else { group[best].0 };
                 if energy >= p.detection_threshold && energy > 0.0 {
-                    echoes.push(Echo { range, energy, fraction: share * group.len() as f64, spread: group[group.len() - 1].0 - group[0].0, point: group[best].1 });
+                    echoes.push(Echo { range, energy, fraction: share * group.len() as f64, spread: group[group.len() - 1].0 - group[0].0, point: group[best].1, normal: group[best].3 });
                 }
                 g0 = g1;
             }
@@ -709,6 +731,10 @@ pub fn scan_beam(cloud: &PointCloud, p: &BeamScan) -> Result<Shots> {
     echo_attrs.insert("reflectance".into(), Attr::F32(flat.iter().map(|e| (10.0 * e.0.energy.log10()) as f32).collect()));
     echo_attrs.insert("footprint_fraction".into(), Attr::F32(flat.iter().map(|e| e.0.fraction as f32).collect()));
     echo_attrs.insert("range_spread".into(), Attr::F32(flat.iter().map(|e| e.0.spread as f32).collect()));
+    echo_attrs.insert("range_true".into(), Attr::F64(flat.iter().map(|e| e.0.range).collect()));
+    for (k, name) in ["hit_nx", "hit_ny", "hit_nz"].iter().enumerate() {
+        echo_attrs.insert((*name).into(), Attr::F32(flat.iter().map(|e| e.0.normal[k] as f32).collect()));
+    }
     echo_attrs.insert("gps_time".into(), Attr::F64(count.iter().zip(&time).flat_map(|(&c, &t)| std::iter::repeat_n(t, c as usize)).collect()));
     Ok(Shots { origin: vec![o; n_pulses], direction, echo_start, echo_count: count, echo_range: flat.iter().map(|e| e.1).collect(), echo_attrs })
 }
@@ -904,6 +930,52 @@ mod tests {
                 assert!((r * s.direction[c][1] - 10.0).abs() < 0.01, "{r}");
             }
         }
+    }
+
+    #[test]
+    fn a_mesh_wall_and_a_mesh_tube_are_met_at_their_surface() {
+        // a wall at y = 10 of two triangles, and in front of it a 12-sided tube of radius 5 cm about x = 0, y = 8,
+        // smooth-shaded by its vertex normals
+        let mut m = Mesh { v: vec![[-1.0, 10.0, -1.0], [1.0, 10.0, -1.0], [1.0, 10.0, 1.0], [-1.0, 10.0, 1.0]], f: vec![[0, 1, 2], [0, 2, 3]], ..Mesh::default() };
+        let k = 12;
+        m.n = vec![[0.0, -1.0, 0.0]; 4];
+        for z in [-1.0, 1.0] {
+            for j in 0..k {
+                let a = 2.0 * PI * j as f64 / k as f64;
+                m.v.push([0.05 * a.cos(), 8.0 + 0.05 * a.sin(), z]);
+                m.n.push([a.cos(), a.sin(), 0.0]);
+            }
+        }
+        for j in 0..k as u32 {
+            let (a, b) = (4 + j, 4 + (j + 1) % k as u32);
+            m.f.push([a, b, b + k as u32]);
+            m.f.push([a, b + k as u32, a + k as u32]);
+        }
+        m.point = (0..m.f.len()).map(|f| u32::from(f >= 2)).collect();
+        let cloud = PointCloud::new(vec![[0.0, 10.0, 0.0], [0.0, 8.0, 0.0]]);
+        let mut p = params();
+        p.mesh = m;
+        let s = scan_beam(&cloud, &p).unwrap();
+        let truth = s.echo_attrs.get("range_true").unwrap();
+        let (mut wall, mut tube) = (0, 0);
+        for c in 0..s.n_shots() {
+            for e in 0..s.echo_count[c] as usize {
+                let i = s.echo_start[c] + e;
+                let (r, d) = (s.echo_range[i], s.direction[c]);
+                assert!((truth.get_f64(i) - r).abs() < 1e-12);
+                let (x, y) = (r * d[0], r * d[1]);
+                if (y - 10.0).abs() < 0.01 {
+                    wall += 1;
+                } else {
+                    assert!((x.hypot(y - 8.0) - 0.05).abs() < 0.002, "{x} {y}");
+                    // the interpolated normal is the tube's radial one
+                    let n = [s.echo_attrs["hit_nx"].get_f64(i), s.echo_attrs["hit_ny"].get_f64(i)];
+                    assert!((n[0] * x + n[1] * (y - 8.0)) / x.hypot(y - 8.0) > 0.99, "{n:?}");
+                    tube += 1;
+                }
+            }
+        }
+        assert!(wall > 1000 && tube > 20, "{wall} {tube}");
     }
 
     #[test]

@@ -202,9 +202,21 @@ fn synthetic_plot_terrain<'py>(py: Python<'py>, modes: PyReadonlyArray2<f64>, sl
 }
 
 #[pyfunction]
-fn synthetic_scan_beam<'py>(py: Python<'py>, xyz: PyReadonlyArray2<f64>, attrs: Option<&Bound<'_, PyDict>>, origin: (f64, f64, f64), resolution_deg: f64, min_zenith_deg: f64, max_zenith_deg: f64, max_echoes: usize, echo_separation: f64, range_noise: f64, range_noise_slope: f64, beam_divergence: f64, exit_diameter: f64, footprint_samples: usize, mixed_pixels: bool, target_radius: Option<f64>, oriented: bool, detection_threshold: f64, reflectance_map: Vec<(i64, f64)>, reflectance_default: f64, reflectance_attr: Option<String>, reflectance_constant: Option<f64>, max_range: f64, seed: u64, solid_a: Option<PyReadonlyArray2<f64>>, solid_b: Option<PyReadonlyArray2<f64>>, solid_r: Option<PyReadonlyArray1<f64>>, solid_point: Option<PyReadonlyArray1<i64>>, azimuth: (f64, f64), timing: (f64, f64), lambertian: bool, roughness: (f64, f64, u64)) -> PyResult<Bound<'py, PyDict>> {
+fn synthetic_scan_beam<'py>(py: Python<'py>, xyz: PyReadonlyArray2<f64>, attrs: Option<&Bound<'_, PyDict>>, origin: (f64, f64, f64), resolution_deg: f64, min_zenith_deg: f64, max_zenith_deg: f64, max_echoes: usize, echo_separation: f64, range_noise: f64, range_noise_slope: f64, beam_divergence: f64, exit_diameter: f64, footprint_samples: usize, mixed_pixels: bool, target_radius: Option<f64>, oriented: bool, detection_threshold: f64, reflectance_map: Vec<(i64, f64)>, reflectance_default: f64, reflectance_attr: Option<String>, reflectance_constant: Option<f64>, max_range: f64, seed: u64, solid_a: Option<PyReadonlyArray2<f64>>, solid_b: Option<PyReadonlyArray2<f64>>, solid_r: Option<PyReadonlyArray1<f64>>, solid_point: Option<PyReadonlyArray1<i64>>, azimuth: (f64, f64), timing: (f64, f64), lambertian: bool, roughness: (f64, f64, u64), mesh_v: Option<PyReadonlyArray2<f64>>, mesh_n: Option<PyReadonlyArray2<f64>>, mesh_f: Option<PyReadonlyArray2<u32>>, mesh_point: Option<PyReadonlyArray1<u32>>) -> PyResult<Bound<'py, PyDict>> {
     let cloud = cloud_from_py(xyz, attrs)?;
     let mut p = BeamScan::new([origin.0, origin.1, origin.2]);
+    if let (Some(v), Some(f), Some(pt)) = (mesh_v, mesh_f, mesh_point) {
+        let (v, f, pt) = (v.as_array(), f.as_array(), pt.as_array());
+        if v.ncols() != 3 || f.ncols() != 3 {
+            return Err(PyValueError::new_err("mesh: v (n, 3), f (m, 3), point (m,)"));
+        }
+        p.mesh.v = v.rows().into_iter().map(|r| [r[0], r[1], r[2]]).collect();
+        p.mesh.f = f.rows().into_iter().map(|r| [r[0], r[1], r[2]]).collect();
+        p.mesh.point = pt.to_vec();
+        if let Some(n) = mesh_n {
+            p.mesh.n = n.as_array().rows().into_iter().map(|r| [r[0], r[1], r[2]]).collect();
+        }
+    }
     if let (Some(sa), Some(sb), Some(sr), Some(sp)) = (solid_a, solid_b, solid_r, solid_point) {
         let (sa, sb, sr, sp) = (sa.as_array(), sb.as_array(), sr.as_array(), sp.as_array());
         if sa.ncols() != 3 || sb.ncols() != 3 || sb.nrows() != sa.nrows() || sr.len() != sa.nrows() || sp.len() != sa.nrows() || sp.iter().any(|&i| i < 0) {
