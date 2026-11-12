@@ -183,7 +183,7 @@ use nalgebra::{Matrix3, Matrix4, Matrix5, SymmetricEigen, Vector3, Vector4, Vect
 use rayon::prelude::*;
 
 use crate::error::{Error, Result};
-use crate::qsm::evidence::ScanIndex;
+use crate::qsm::scan_index::ScanIndex;
 use crate::qsm::joint::{log_ndtr_value, path, pool, window, Echoes, JointParams};
 use crate::qsm::joint_fit::{ForkShare, Frame, PriorParams, Rows};
 use crate::transform::{cross, dot, sub};
@@ -2905,7 +2905,7 @@ mod tests {
     #[test]
     fn a_scanned_stem_is_measured_from_one_scan() {
         // the evidence tests' fan: a 5 cm stem at 5 m, claimed at 8 cm 1 cm off its axis
-        let (scan, a, b) = crate::qsm::evidence::tests::scene(0.05, true);
+        let (scan, a, b) = crate::qsm::scan_index::tests::scene(0.05, true);
         let (a1, b1) = ([a[0] + 0.01, a[1], a[2]], [b[0] + 0.01, b[1], b[2]]);
         let rows = Rows { a: &[a1], b: &[b1], r_prior: &[0.08], r_max: &[], parent: &[-1] };
         let t = support_tree(&[&scan], &rows, &[], &like(), &PriorParams::default(), 2).unwrap();
@@ -3351,7 +3351,7 @@ mod tests {
     #[test]
     fn a_routed_piece_is_fitted_exactly_from_its_seeds() {
         // the fan's 5 cm stem; a 30 cm piece claimed 1 cm off it, its circle a hull of 8 cm on the claim
-        let (scan, a, b) = crate::qsm::evidence::tests::scene(0.05, true);
+        let (scan, a, b) = crate::qsm::scan_index::tests::scene(0.05, true);
         let (a0, b0) = ([a[0] + 0.01, a[1], -0.15], [b[0] + 0.01, b[1], 0.15]);
         let fr = frames(&[a0], &[b0])[0];
         let (_, e1, e2, _) = fr;
@@ -3400,7 +3400,7 @@ mod tests {
     #[test]
     fn a_refused_fit_says_why() {
         // the fan's 5 cm stem, a piece claimed on it and seeded there
-        let (scan, a, b) = crate::qsm::evidence::tests::scene(0.05, true);
+        let (scan, a, b) = crate::qsm::scan_index::tests::scene(0.05, true);
         let (a0, b0) = ([a[0], a[1], -0.15], [b[0], b[1], 0.15]);
         let fr = frames(&[a0], &[b0])[0];
         let seed = [routed::Seed { c: [0.0, 0.0], t: [0.0, 0.0], r: 0.05, t_var: [0.01, 0.01] }];
@@ -3469,7 +3469,7 @@ mod tests {
     fn a_leaning_stem_is_seeded_and_fitted_on_its_own_axis() {
         // the fan's 5 cm stem, upright; the piece claimed leaning 0.3 m per m across it, 4 cm off: a seed takes the
         // stem's lean from its runs, not the claim's, and the fit lies on the stem at both ends of the piece
-        let (scan, a, b) = crate::qsm::evidence::tests::scene(0.05, true);
+        let (scan, a, b) = crate::qsm::scan_index::tests::scene(0.05, true);
         let lean = 0.3;
         let (a0, b0) = ([a[0] + 0.04 - 0.15 * lean, a[1], -0.15], [b[0] + 0.04 + 0.15 * lean, b[1], 0.15]);
         let fr = frames(&[a0], &[b0])[0];
@@ -3504,7 +3504,7 @@ mod tests {
 
     #[test]
     fn the_echoes_are_keyed_by_their_file_row() {
-        let (scan, a, b) = crate::qsm::evidence::tests::scene(0.05, true);
+        let (scan, a, b) = crate::qsm::scan_index::tests::scene(0.05, true);
         let n = scan.n_pulses();
         let mut rows: Vec<u32> = (0..n as u32).map(|k| scan.file_row(k)).collect();
         rows.sort_unstable();
@@ -3524,7 +3524,7 @@ mod tests {
         // a 5 cm circle at the piece's centre: a stop on its front arc is wood by its echo (unknown reflectance:
         // fully), one well behind it went through and isn't; the path says what became of the piece's summary,
         // the porous piece's too (its p_wood no longer scales it)
-        let (scan, _, _) = crate::qsm::evidence::tests::scene(0.05, true);
+        let (scan, _, _) = crate::qsm::scan_index::tests::scene(0.05, true);
         let p = like();
         let rec = |b: f64, depth: f64, pulse: u32| Rec { b, s: 0.0, depth, xy: [f64::NAN; 2], w: 0.005, refl: f64::NAN, single: true, blocked: false, lost: false, pulse, echo: 0 };
         let stops = vec![Group { scan: 0, n: [1.0, 0.0], v: [0.0, 1.0], recs: vec![rec(0.0, -0.05, 0), rec(0.0, 0.10, 1)] }];
@@ -3542,7 +3542,7 @@ mod tests {
 
     #[test]
     fn inputs_are_checked() {
-        let (scan, a, b) = crate::qsm::evidence::tests::scene(0.05, true);
+        let (scan, a, b) = crate::qsm::scan_index::tests::scene(0.05, true);
         let bad = Rows { a: &[a], b: &[b], r_prior: &[0.08], r_max: &[], parent: &[0] };
         assert!(support_tree(&[&scan], &bad, &[], &like(), &PriorParams::default(), 1).is_err());
         let flat = Rows { a: &[a], b: &[a], r_prior: &[0.08], r_max: &[], parent: &[-1] };
@@ -3627,7 +3627,7 @@ mod tests {
     fn a_circle_at_the_tubes_edge_is_not_a_measurement() {
         // the fan's 5 cm stem, claimed 1 cm off it as itself (the circle well inside its 15.5 cm tube) and as a 5 mm
         // twig 10 cm long (the stem reaches past its 6.5 cm tube: a twig captured by a neighbouring mass, research 106)
-        let (scan, _, _) = crate::qsm::evidence::tests::scene(0.05, true);
+        let (scan, _, _) = crate::qsm::scan_index::tests::scene(0.05, true);
         let piece = |r: f64, len: f64| {
             let rows = Rows { a: &[[0.01, 5.0, -0.5 * len]], b: &[[0.01, 5.0, 0.5 * len]], r_prior: &[r], r_max: &[], parent: &[-1] };
             support_tree(&[&scan], &rows, &[], &like(), &PriorParams::default(), 2).unwrap()

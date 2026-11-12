@@ -20,6 +20,7 @@ pub mod metrics;
 pub mod model;
 pub mod ops;
 pub mod plot;
+pub mod scan_index;
 pub mod support;
 pub mod support_tree;
 pub mod weighted;

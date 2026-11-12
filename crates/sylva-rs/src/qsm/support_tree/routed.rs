@@ -55,7 +55,7 @@ use nalgebra::{Matrix2, Matrix3, Matrix4, Matrix5, SymmetricEigen, Vector5};
 
 use super::{fate, marginalise, measure, median, p_wood, profile_runs, refusal, solve_row, spacing, unseen, weights, Bound, Circle, Fate, Group, Side, Sight, Stats, CAP_SD, DEPTH_TOL, HULL_BEHIND, HULL_SHARE, RUN_HITS, SEEN_MIN};
 use crate::error::Result;
-use crate::qsm::evidence::ScanIndex;
+use crate::qsm::scan_index::ScanIndex;
 use crate::qsm::joint::{frames, joint_table, joint_wood_share, path, window, Echoes, JointPairs, JointParams, Owner, Pulse};
 use crate::qsm::joint_fit::{FitOptions, Frame, PriorParams};
 use crate::qsm::joint_tree::{fit_stems, shifted, surface_dist};
@@ -680,8 +680,8 @@ mod tests {
         // would cross the stem's plane 2-15 cm left of its axis): seen whole, both edges and the front decide R; behind
         // the screen, one edge and the front leave it trading against the centre
         let like = JointParams { tau: 0.17, edge: 0.25, hide: 0.0, ..JointParams::default() };
-        let (whole, a, b) = crate::qsm::evidence::tests::scene(0.05, true);
-        let (screened, _, _) = crate::qsm::evidence::tests::scene_screened(0.05, (-0.15, -0.02));
+        let (whole, a, b) = crate::qsm::scan_index::tests::scene(0.05, true);
+        let (screened, _, _) = crate::qsm::scan_index::tests::scene_screened(0.05, (-0.15, -0.02));
         let (a0, b0) = ([a[0], a[1], -0.15], [b[0], b[1], 0.15]);
         let frame = frames(&[a0], &[b0])[0];
         let fr = (frame.0, frame.1, frame.2);
@@ -732,7 +732,7 @@ mod tests {
     fn the_message_is_scaled_to_all_the_pairs() {
         // the fan's 5 cm stem, fitted from every pulse and from every other one: the thinned fit's message, scaled
         // by n_all / n, carries about the information of the whole set's
-        let (scan, a, b) = crate::qsm::evidence::tests::scene(0.05, true);
+        let (scan, a, b) = crate::qsm::scan_index::tests::scene(0.05, true);
         let (a0, b0) = ([a[0], a[1], -0.15], [b[0], b[1], 0.15]);
         let fr = frames(&[a0], &[b0])[0];
         let seed = [Seed { c: [0.0, 0.0], t: [0.0, 0.0], r: 0.05, t_var: [0.01, 0.01] }];

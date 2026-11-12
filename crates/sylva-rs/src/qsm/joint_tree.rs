@@ -37,7 +37,7 @@
 use std::collections::HashMap;
 
 use crate::error::{Error, Result};
-use crate::qsm::evidence::ScanIndex;
+use crate::qsm::scan_index::ScanIndex;
 use crate::qsm::joint::{capacity, frames, joint_loglik, joint_table, joint_wood_share, path, surface_residual, window, Echoes, JointPairs, JointParams, Owner, Pulse};
 use crate::qsm::joint_fit::{joint_fit, profile_grid, Fit, FitOptions, PriorParams, Rows};
 use crate::Point;
@@ -692,8 +692,8 @@ mod tests {
 
     #[test]
     fn a_scanned_stem_is_one_measured_row() {
-        // the evidence tests' fan: a 5 cm stem at 5 m, claimed at 8 cm 1 cm off its axis, a neighbour 30 cm away
-        let (scan, a, b) = crate::qsm::evidence::tests::scene(0.05, true);
+        // the scan index tests' fan: a 5 cm stem at 5 m, claimed at 8 cm 1 cm off its axis, a neighbour 30 cm away
+        let (scan, a, b) = crate::qsm::scan_index::tests::scene(0.05, true);
         let (a1, b1) = ([a[0] + 0.01, a[1], a[2]], [b[0] + 0.01, b[1], b[2]]);
         let rows = Rows { a: &[a1], b: &[b1], r_prior: &[0.08], r_max: &[], parent: &[-1] };
         let params = TreeParams { like: JointParams { tau: 0.17, edge: 0.25, hide: 0.0, ..JointParams::default() }, prior: PriorParams { scan_abs: 0.0, scan_rel: 0.0, centre_rel: 0.3, ..PriorParams::default() }, ..TreeParams::default() };
@@ -719,7 +719,7 @@ mod tests {
 
     #[test]
     fn a_shifted_pair_is_the_pair_seen_from_the_moved_axis() {
-        let (scan, a, b) = crate::qsm::evidence::tests::scene(0.05, true);
+        let (scan, a, b) = crate::qsm::scan_index::tests::scene(0.05, true);
         let t = joint_table(&[&scan], &[a], &[b], &[window(0.08)], 2).unwrap();
         let p = JointParams { tau: 0.17, edge: 0.25, hide: 0.0, ..JointParams::default() };
         let d = [0.012, -0.007];
@@ -743,7 +743,7 @@ mod tests {
     fn a_row_beside_a_neighbours_stem_is_no_wood() {
         // a 3 cm claim 12 cm beside the stem, which a neighbour's cylinder holds: the stem's stops are the
         // neighbour's, and the row's own pulses pass
-        let (scan, a, b) = crate::qsm::evidence::tests::scene(0.05, true);
+        let (scan, a, b) = crate::qsm::scan_index::tests::scene(0.05, true);
         let rows = Rows { a: &[[a[0] + 0.12, a[1], a[2]]], b: &[[b[0] + 0.12, b[1], b[2]]], r_prior: &[0.03], r_max: &[], parent: &[-1] };
         let params = TreeParams { like: JointParams { tau: 0.17, edge: 0.25, hide: 0.0, ..JointParams::default() }, prior: PriorParams { centre_rel: 0.3, ..PriorParams::default() }, ..TreeParams::default() };
         let f = joint_tree(&[&scan], &rows, &[a], &[b], &[0.05], &params, None, 2).unwrap();

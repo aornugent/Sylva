@@ -65,7 +65,7 @@ from enum import IntEnum, IntFlag
 import numpy as np
 
 from .. import _core
-from .evidence import ScanIndex
+from .scan_index import ScanIndex
 
 _DEFAULTS = _core.qsm_joint_defaults()
 

@@ -978,8 +978,8 @@ mod tests {
 
     #[test]
     fn a_fat_claim_on_a_scanned_stem_comes_down_to_it() {
-        // the evidence tests' fan: a 5 cm stem at 5 m, claimed at 8 cm 1 cm off its axis
-        let (scan, a, b) = crate::qsm::evidence::tests::scene(0.05, true);
+        // the scan index tests' fan: a 5 cm stem at 5 m, claimed at 8 cm 1 cm off its axis
+        let (scan, a, b) = crate::qsm::scan_index::tests::scene(0.05, true);
         let (a1, b1) = ([a[0] + 0.01, a[1], a[2]], [b[0] + 0.01, b[1], b[2]]);
         let t = joint_table(&[&scan], &[a1], &[b1], &[0.15], 2).unwrap();
         let rows = Rows { a: &[a1], b: &[b1], r_prior: &[0.08], r_max: &[0.15], parent: &[-1] };
@@ -1007,7 +1007,7 @@ mod tests {
     #[test]
     fn a_branch_nuisance_is_one_world_offset_along_a_bent_branch() {
         // a stem bent past the frames' reference switch (|u_z| 0.9), so its two rows' frames turn
-        let (scan, a, b) = crate::qsm::evidence::tests::scene(0.05, true);
+        let (scan, a, b) = crate::qsm::scan_index::tests::scene(0.05, true);
         let mid: Point = std::array::from_fn(|i| 0.5 * (a[i] + b[i]));
         let h = 0.5 * (b[2] - a[2]);
         let top = [mid[0] + 0.6 * h, mid[1], mid[2] + 0.8 * h];

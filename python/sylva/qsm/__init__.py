@@ -31,7 +31,8 @@ from .plot import (  # noqa: F401
     PlotQSMs,
     build_plot,
 )
-from .evidence import EvidenceParams, Reason, ScanIndex, contradicted, evidence, pairs  # noqa: F401
+from .evidence import EvidenceParams, Reason, contradicted, evidence  # noqa: F401
+from .scan_index import ScanIndex, pairs  # noqa: F401
 from .joint import EchoPath, JointParams, JointReason, SupportBasis, SupportDiag, SupportFlag, SupportRefusal, joint_fit, joint_table, joint_tree, rebase, support_tree, tree_context  # noqa: F401
 from .support import contest, surface_distance, surface_support  # noqa: F401
 from .wood import (  # noqa: F401

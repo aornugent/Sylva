@@ -7,7 +7,7 @@
 //! fits it.
 //!
 //! Each row of the table is a pulse that reached the tube around a cylinder
-//! (see [`crate::qsm::evidence::pairs`]), measured once from a starting axis:
+//! (see [`crate::qsm::scan_index::pairs`]), measured once from a starting axis:
 //! signed impact `b`, range of closest approach `t`, `sin` of its angle to
 //! the axis, how both move with an offset of the axis (`jb`, `jt`), the
 //! disc's chord `[c0, c1]` along the pulse, and its fate there (a stop at
@@ -752,7 +752,7 @@ fn cross(a: &Point, b: &Point) -> Point {
 }
 
 /// The [`JointPairs`] of cylinders `a[i] -> b[i]`, each with its tube of
-/// radius `window[i]` (see [`crate::qsm::evidence::pairs`]), measured from
+/// radius `window[i]` (see [`crate::qsm::scan_index::pairs`]), measured from
 /// those axes: each pulse's signed impact and range of closest approach, how
 /// both move with an offset of the axis, its chord through the tube, and its
 /// fate there (the first echo inside the chord is a stop; otherwise the pulse
@@ -760,9 +760,9 @@ fn cross(a: &Point, b: &Point) -> Point {
 /// says the export deleted an echo of the pulse that could lie in the chord
 /// before its first recorded one (see [`deleted`]; research 74 §19). A pulse
 /// along the axis, which has no impact, is left out.
-pub fn joint_table(scans: &[&crate::qsm::evidence::ScanIndex], a: &[Point], b: &[Point], window: &[f64], threads: usize) -> Result<JointPairs> {
+pub fn joint_table(scans: &[&crate::qsm::scan_index::ScanIndex], a: &[Point], b: &[Point], window: &[f64], threads: usize) -> Result<JointPairs> {
     use crate::transform::dot;
-    let pp = crate::qsm::evidence::pairs(scans, a, b, window, threads)?;
+    let pp = crate::qsm::scan_index::pairs(scans, a, b, window, threads)?;
     let fr = frames(a, b);
     let mut out = JointPairs::default();
     for c in 0..a.len() {
@@ -909,7 +909,7 @@ mod tests {
     #[test]
     fn the_table_measures_each_pulse_from_the_axis() {
         // the evidence tests' fan: a 5 cm stem at 5 m with a wall at 8 m behind it
-        let (scan, a, b) = crate::qsm::evidence::tests::scene(0.05, true);
+        let (scan, a, b) = crate::qsm::scan_index::tests::scene(0.05, true);
         let t = joint_table(&[&scan], &[a], &[b], &[0.15], 2).unwrap();
         let m = t.pulses.len();
         assert!(m > 200 && t.row.iter().all(|&r| r == 0) && t.scan.len() == m && t.n_echo.len() == m);
