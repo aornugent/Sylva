@@ -184,10 +184,76 @@ fn kbuffer(v: &View, sticks: &[Stick], em: &ErrorModel) -> HashMap<usize, Vec<La
     buf
 }
 
+/// The probability an echo of energy share `e` (fill × cos) off a surface of `db` survives the export.
+fn sel(em: &ErrorModel, db: f64, e: f64) -> f64 {
+    (1.0 - em.p_drop) * phi((db + 10.0 * e.max(1e-12).log10() - em.cut_db) / em.refl_noise_db)
+}
+
+/// Each stick's surface class in one view: its own, or the median class of the view's echoes on its front.
+fn classes(v: &View, buf: &HashMap<usize, Vec<Layer>>, sticks: &[Stick], em: &ErrorModel) -> Vec<u8> {
+    let mut ex: Vec<Vec<f64>> = vec![Vec::new(); sticks.len()];
+    for (&cell, ls) in buf {
+        let ly = ls[0];
+        let r = v.range[cell] as f64;
+        if ly.f > 0.5 && v.state[cell] == state::ECHO && (r - ly.t).abs() < 0.03 && v.excess[cell].is_finite() {
+            ex[ly.stick as usize].push(v.excess[cell] as f64);
+        }
+    }
+    sticks
+        .iter()
+        .zip(ex.iter_mut())
+        .map(|(s, e)| {
+            if s.surface >= 0 {
+                (s.surface as u8).min(2)
+            } else if e.is_empty() {
+                1
+            } else {
+                e.sort_by(f64::total_cmp);
+                em.surface(e[e.len() / 2])
+            }
+        })
+        .collect()
+}
+
+/// What the sticks predict in one view, per touched cell: its nearest layer (stick, depth, spread, fill), that
+/// stick's class, the chance its echo is kept (the selection term on its fill), the echo's predicted depth (bias
+/// added) and sd (noise, spread and one scan's offset spread), and the observed first echo (NaN for none). For
+/// held-out checks: the cell arrays term A scores, without the scene.
+pub struct Prediction {
+    pub cell: usize,
+    pub stick: u32,
+    pub fill: f64,
+    pub kept: f64,
+    pub depth: f64,
+    pub sd: f64,
+    pub surface: u8,
+    pub obs: f64,
+}
+
+pub fn predict(v: &View, sticks: &[Stick], em: &ErrorModel, sc: &Scene) -> Vec<Prediction> {
+    let buf = kbuffer(v, sticks, em);
+    let cls = classes(v, &buf, sticks, em);
+    let mut out: Vec<Prediction> = buf
+        .iter()
+        .map(|(&cell, ls)| {
+            let ly = ls[0];
+            let k = cls[ly.stick as usize];
+            let [same, _] = em.sigma_l[k as usize];
+            Prediction {
+                cell, stick: ly.stick, fill: ly.f, kept: sel(em, sc.wood_db, ly.f * ly.cos), surface: k,
+                depth: ly.t + em.depth_bias(k, ly.t),
+                sd: (em.sigma_e[k as usize].powi(2) + ly.spread.powi(2) + 0.5 * same * same).sqrt(),
+                obs: if v.state[cell] == state::ECHO { v.range[cell] as f64 } else { f64::NAN },
+            }
+        })
+        .collect();
+    out.sort_by_key(|p| p.cell);
+    out
+}
+
 /// One cell's log-likelihood: its first echo `obs` (NaN for none) against its layers (each with its stick's
 /// surface class), the ground at `ground` = (range, cos) and the field, with every layer shifted by `delta`.
 fn cell_ll(obs: f64, layers: &[(Layer, u8)], ground: Option<(f64, f64)>, delta: f64, em: &ErrorModel, sc: &Scene) -> f64 {
-    let sel = |db: f64, e: f64| (1.0 - em.p_drop) * phi((db + 10.0 * e.max(1e-12).log10() - em.cut_db) / em.refl_noise_db);
     let t_end = ground.map_or(sc.t_max, |g| g.0);
     let (mut beam, mut none_kept, mut none_before_obs, mut dens) = (1.0, 1.0, 1.0, 0.0);
     for &(ly, k) in layers {
@@ -196,11 +262,13 @@ fn cell_ll(obs: f64, layers: &[(Layer, u8)], ground: Option<(f64, f64)>, delta: 
         }
         let e = ly.f * beam;
         beam *= 1.0 - ly.f;
-        let s = sel(sc.wood_db, e * ly.cos);
+        let s = sel(em, sc.wood_db, e * ly.cos);
         if obs.is_finite() {
             let sd = (em.sigma_e[k as usize].powi(2) + ly.spread * ly.spread).sqrt();
             let mu = ly.t + em.depth_bias(k, ly.t) + delta;
-            dens += (-sc.kappa * ly.t).exp() * none_kept * s * t_pdf((obs - mu) / sd, em.nu_e) / sd;
+            let g = em.ghost * (1.0 - ly.f);
+            let ghost = if obs > mu && obs < mu + em.ghost_depth { g / em.ghost_depth } else { 0.0 };
+            dens += (-sc.kappa * ly.t).exp() * none_kept * s * ((1.0 - g) * t_pdf((obs - mu) / sd, em.nu_e) / sd + ghost);
             if ly.t < obs {
                 none_before_obs *= 1.0 - s;
             }
@@ -208,7 +276,7 @@ fn cell_ll(obs: f64, layers: &[(Layer, u8)], ground: Option<(f64, f64)>, delta: 
         none_kept *= 1.0 - s;
     }
     if let Some((tg, cg)) = ground {
-        let s = sel(sc.ground_db, beam * cg);
+        let s = sel(em, sc.ground_db, beam * cg);
         if obs.is_finite() {
             let sd = em.sigma_e[2];
             dens += (-sc.kappa * tg).exp() * none_kept * s * t_pdf((obs - tg) / sd, em.nu_e) / sd;
@@ -229,35 +297,7 @@ fn cell_ll(obs: f64, layers: &[(Layer, u8)], ground: Option<(f64, f64)>, delta: 
 /// it touches; rows are then empty.
 pub fn energy(views: &[&View], sticks: &[Stick], em: &ErrorModel, sc: &Scene, only: Option<usize>) -> (f64, Vec<Row>) {
     let bufs: Vec<HashMap<usize, Vec<Layer>>> = views.iter().map(|v| kbuffer(v, sticks, em)).collect();
-    // each stick's surface class per view
-    let classes: Vec<Vec<u8>> = views
-        .iter()
-        .zip(&bufs)
-        .map(|(v, buf)| {
-            let mut ex: Vec<Vec<f64>> = vec![Vec::new(); sticks.len()];
-            for (&cell, ls) in buf {
-                let ly = ls[0];
-                let r = v.range[cell] as f64;
-                if ly.f > 0.5 && v.state[cell] == state::ECHO && (r - ly.t).abs() < 0.03 && v.excess[cell].is_finite() {
-                    ex[ly.stick as usize].push(v.excess[cell] as f64);
-                }
-            }
-            sticks
-                .iter()
-                .zip(ex.iter_mut())
-                .map(|(s, e)| {
-                    if s.surface >= 0 {
-                        (s.surface as u8).min(2)
-                    } else if e.is_empty() {
-                        1
-                    } else {
-                        e.sort_by(f64::total_cmp);
-                        em.surface(e[e.len() / 2])
-                    }
-                })
-                .collect()
-        })
-        .collect();
+    let classes: Vec<Vec<u8>> = views.iter().zip(&bufs).map(|(v, buf)| classes(v, buf, sticks, em)).collect();
     let epochs: HashSet<u32> = views.iter().map(|v| v.epoch).collect();
     // each stick's design effect per view, from its fill-weighted footprints
     let temper: Vec<Vec<f64>> = bufs

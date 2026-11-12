@@ -107,6 +107,11 @@ pub struct ErrorModel {
     /// Overdispersion: a group's `n` footprints count as `n / (1 + (n − 1) ρ)` independent ones (the
     /// beta-binomial design effect of research 128's evidence term, ρ 0.1-0.6 there).
     pub rho: f64,
+    /// Mixed pixels: a partial layer's echo (fill f) is a ghost with probability `ghost (1 − f)`, its range spread
+    /// evenly over the `ghost_depth` (m) behind the layer (the energy-weighted range of a footprint straddling the
+    /// edge, when the background lies within the echo separation). With the selection term, the edge mechanism.
+    pub ghost: f64,
+    pub ghost_depth: f64,
 }
 
 impl Default for ErrorModel {
@@ -127,6 +132,8 @@ impl Default for ErrorModel {
             p_drop: 0.02,
             p_outlier: 0.01,
             rho: 0.3,
+            ghost: 0.3,
+            ghost_depth: 0.5,
         }
     }
 }
@@ -189,6 +196,9 @@ pub struct View {
     /// Run length (cells) along and across.
     pub run: Vec<[u16; 2]>,
     pub ends: Vec<u8>,
+    /// The surface each echo cell belongs to: connected through neighbours (4-connected) within `jump`, numbered
+    /// from 0 in cell order (`u32::MAX` for no echo). Its boundary is where the ends are.
+    pub surface_id: Vec<u32>,
 }
 
 fn rot_t(r: &[[f64; 3]; 3], d: &Point) -> Point {
@@ -260,12 +270,13 @@ impl View {
         drop(sat);
         let mut v = View {
             lat, c0, n_lines: nl, n_cols: nc, rot, origin, epoch, state: state_, range: rng, pulse,
-            normal: Vec::new(), cos_inc: Vec::new(), excess: Vec::new(), run: Vec::new(), ends: Vec::new(),
+            normal: Vec::new(), cos_inc: Vec::new(), excess: Vec::new(), run: Vec::new(), ends: Vec::new(), surface_id: Vec::new(),
         };
         let fits: Vec<([f32; 3], f32)> = (0..n).into_par_iter().map(|k| v.fit(k, direction, p)).collect();
         (v.normal, v.cos_inc) = fits.into_iter().unzip();
         v.excess = (0..n).into_par_iter().map(|k| v.excess_at(k, direction, p)).collect();
         v.runs(p.jump);
+        v.segment(p.jump);
         v
     }
 
@@ -379,6 +390,59 @@ impl View {
         (25.0 / n.max(1) as f64).sqrt() as f32
     }
 
+    /// Surfaces: union-find over echo neighbours within `jump`.
+    fn segment(&mut self, jump: f64) {
+        let (nl, nc) = (self.n_lines, self.n_cols);
+        let mut parent: Vec<u32> = (0..(nl * nc) as u32).collect();
+        fn find(p: &mut [u32], mut i: u32) -> u32 {
+            while p[i as usize] != i {
+                p[i as usize] = p[p[i as usize] as usize];
+                i = p[i as usize];
+            }
+            i
+        }
+        let near = |a: usize, b: usize| self.state[a] == state::ECHO && self.state[b] == state::ECHO && ((self.range[a] - self.range[b]).abs() as f64) <= jump;
+        for k in 0..nl * nc {
+            for j in [(k % nc + 1 < nc).then(|| k + 1), (k + nc < nl * nc).then(|| k + nc)].into_iter().flatten() {
+                if near(k, j) {
+                    let (a, b) = (find(&mut parent, k as u32), find(&mut parent, j as u32));
+                    if a != b {
+                        parent[a.max(b) as usize] = a.min(b);
+                    }
+                }
+            }
+        }
+        let mut id = vec![u32::MAX; nl * nc];
+        let mut next = 0u32;
+        for k in 0..nl * nc {
+            if self.state[k] != state::ECHO {
+                continue;
+            }
+            let r = find(&mut parent, k as u32) as usize;
+            if id[r] == u32::MAX {
+                id[r] = next;
+                next += 1;
+            }
+            id[k] = id[r];
+        }
+        self.surface_id = id;
+    }
+
+    /// The surfels of this scan's echo cells with a normal whose echo lies inside the box `lo`-`hi` (world positions
+    /// along the cell centre's ray, and normals), for the moments.
+    pub fn surfels(&self, lo: &Point, hi: &Point) -> (Vec<Point>, Vec<Point>) {
+        let inside = |p: &Point| (0..3).all(|a| p[a] >= lo[a] && p[a] < hi[a]);
+        (0..self.state.len())
+            .filter(|&k| self.cos_inc[k].is_finite())
+            .filter_map(|k| {
+                let d = self.direction((k / self.n_cols) as f64, (k % self.n_cols) as f64);
+                let r = self.range[k] as f64;
+                let p = [0, 1, 2].map(|a| self.origin[a] + d[a] * r);
+                inside(&p).then(|| (p, self.normal[k].map(|x| x as f64)))
+            })
+            .unzip()
+    }
+
     /// Runs and their ends along both axes.
     fn runs(&mut self, jump: f64) {
         let (nl, nc) = (self.n_lines, self.n_cols);
@@ -467,5 +531,8 @@ mod tests {
         assert_eq!((v.ends[cell(39, 100)] >> 6) & 3, end::OCCLUDED);
         // beside the hole, the wall is less continuous
         assert!(v.excess[cell(95, 203)] > 1.1);
+        // the pole and the wall are two surfaces; the wall stays one around its hole
+        assert_ne!(v.surface_id[cell(50, 100)], v.surface_id[cell(39, 100)]);
+        assert_eq!(v.surface_id[cell(150, 100)], v.surface_id[cell(95, 203)]);
     }
 }
