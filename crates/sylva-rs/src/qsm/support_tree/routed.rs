@@ -474,7 +474,7 @@ fn exact_thinned(scans: &[&ScanIndex], a0: &Point, frame: Frame, seeds: &[Seed],
     let idx: Vec<usize> = (0..t.pulses.len()).filter(|&i| keep[i] && in_window(i)).collect();
     let n_all = idx.len();
     let thin = thinning(n_all, min_thin);
-    let fit_idx: Vec<usize> = idx.iter().copied().filter(|&i| kept(ray(i).1, thin, like.thin_seed)).collect();
+    let fit_idx: Vec<usize> = idx.iter().copied().filter(|&i| kept(ray(i).1, thin, like.thin_seed as u64)).collect();
     let n = fit_idx.len();
     if n == 0 {
         return Ok(Fitted::Refused);

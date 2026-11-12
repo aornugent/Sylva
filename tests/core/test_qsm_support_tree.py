@@ -145,8 +145,6 @@ def test_a_clump_of_stems_is_flagged_as_runs(tmp_path):
     assert len(set(zip(p["src"].tolist(), p["stem"].tolist()))) == len(p["src"])
     # the runs' spans don't bound the stems measured in them, so they aren't reported as their bounds
     inside_own_bounds(f)
-    with pytest.raises(ValueError, match="thin_seed"):
-        support_tree(scans, a, b, [0.093, 0.093], [-1, 0], params=dataclasses.replace(PARAMS, thin_seed=0.5))
     with pytest.raises(ValueError, match="parent"):
         support_tree(scans, a, b, [0.093, 0.093], [0, 0], params=PARAMS)
     with pytest.raises(TypeError):

@@ -311,52 +311,13 @@ impl Mul<f64> for D {
     }
 }
 
-/// A setting's value as it crosses to Python: a real, or an integer.
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub enum Value {
-    Real(f64),
-    Int(u64),
-}
-
-/// A field type of a settings record made by [`params!`].
-pub trait Setting: Copy {
-    /// The value as a [`Value`].
-    fn value(self) -> Value;
-    /// The value of a [`Value`]; `None` where this type can't hold it (a real for an integer field).
-    fn from_value(n: Value) -> Option<Self>;
-}
-
-impl Setting for f64 {
-    fn value(self) -> Value {
-        Value::Real(self)
-    }
-    fn from_value(n: Value) -> Option<Self> {
-        Some(match n {
-            Value::Real(x) => x,
-            Value::Int(i) => i as f64,
-        })
-    }
-}
-
-impl Setting for u64 {
-    fn value(self) -> Value {
-        Value::Int(self)
-    }
-    fn from_value(n: Value) -> Option<Self> {
-        match n {
-            Value::Int(i) => Some(i),
-            Value::Real(_) => None,
-        }
-    }
-}
-
-/// A settings record written once: the struct, each field with its default
-/// (`name: type = default`), its [`Default`], and its fields by name
+/// A settings record written once: the struct, each field a real with its
+/// default (`name: f64 = default`), its [`Default`], and its fields by name
 /// (`FIELDS`, `get`, `set`), which is how they cross to Python.
 macro_rules! params {
-    ($(#[$m:meta])* pub struct $T:ident { $($(#[$fm:meta])* pub $f:ident: $t:ty = $v:expr,)* }) => {
+    ($(#[$m:meta])* pub struct $T:ident { $($(#[$fm:meta])* pub $f:ident: f64 = $v:expr,)* }) => {
         $(#[$m])*
-        pub struct $T { $($(#[$fm])* pub $f: $t,)* }
+        pub struct $T { $($(#[$fm])* pub $f: f64,)* }
 
         impl Default for $T {
             fn default() -> Self {
@@ -369,21 +330,20 @@ macro_rules! params {
             pub const FIELDS: &'static [&'static str] = &[$(stringify!($f)),*];
 
             /// The field `name`'s value; `None` if there is no such field.
-            pub fn get(&self, name: &str) -> Option<$crate::qsm::joint::Value> {
-                use $crate::qsm::joint::Setting;
+            pub fn get(&self, name: &str) -> Option<f64> {
                 match name {
-                    $(stringify!($f) => Some(self.$f.value()),)*
+                    $(stringify!($f) => Some(self.$f),)*
                     _ => None,
                 }
             }
 
-            /// Sets the field `name`; false if there is no such field or its type can't hold `v`.
-            pub fn set(&mut self, name: &str, v: $crate::qsm::joint::Value) -> bool {
-                use $crate::qsm::joint::Setting;
+            /// Sets the field `name`; false if there is no such field.
+            pub fn set(&mut self, name: &str, v: f64) -> bool {
                 match name {
-                    $(stringify!($f) => <$t>::from_value(v).map(|x| self.$f = x).is_some(),)*
-                    _ => false,
+                    $(stringify!($f) => self.$f = v,)*
+                    _ => return false,
                 }
+                true
             }
         }
     };
@@ -439,9 +399,9 @@ params! {
         /// no sway explains (3dtrees research 93 §15.6). Read by [`crate::qsm::support_tree`] only.
         pub model_sd: f64 = 0.004,
         /// Which pulses a routed piece of more pairs than its budget fits ([`crate::qsm::support_tree`]'s thinning, a
-        /// hash of each pulse's direction and this): 0 in production; the bench varies it to measure the thinning's noise
-        /// (3dtrees research 93 §19). Read by [`crate::qsm::support_tree`] only.
-        pub thin_seed: u64 = 0,
+        /// hash of each pulse's direction and this, a whole number): 0 in production; the bench varies it to measure the
+        /// thinning's noise (3dtrees research 93 §19). Read by [`crate::qsm::support_tree`] only.
+        pub thin_seed: f64 = 0.0,
     }
 }
 

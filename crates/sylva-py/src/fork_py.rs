@@ -17,7 +17,7 @@ use sylva_rs::io;
 use sylva_rs::qsm::{self, support_tree};
 use sylva_rs::qsm::evidence::{self, Beam, EvidenceParams};
 use sylva_rs::qsm::scan_index::{self, ScanIndex};
-use sylva_rs::qsm::joint::{self, Echoes, JointParams, Owner, Pulse, Value};
+use sylva_rs::qsm::joint::{self, Echoes, JointParams, Owner, Pulse};
 use sylva_rs::qsm::joint_fit::{PriorParams, Rows};
 use sylva_rs::synthetic::scan::{self as synth, BeamScan, Reflectance, Solid};
 
@@ -177,24 +177,16 @@ fn qsm_pairs<'py>(py: Python<'py>, scans: Vec<Bound<'py, PyScanIndex>>, a: PyRea
     Ok(d)
 }
 
-/// A joint params value as Python holds it.
-fn value_to_py<'py>(py: Python<'py>, v: Value) -> PyResult<Bound<'py, PyAny>> {
-    Ok(match v {
-        Value::Real(x) => x.into_pyobject(py)?.into_any(),
-        Value::Int(i) => i.into_pyobject(py)?.into_any(),
-    })
-}
-
 /// The default settings of `qsm_support_tree`, flat: the likelihood's fields, then the prior's.
 #[pyfunction]
 fn qsm_joint_defaults(py: Python<'_>) -> PyResult<Bound<'_, PyDict>> {
     let (like, prior) = (JointParams::default(), PriorParams::default());
     let d = PyDict::new(py);
     for &k in JointParams::FIELDS {
-        d.set_item(k, value_to_py(py, like.get(k).unwrap())?)?;
+        d.set_item(k, like.get(k))?;
     }
     for &k in PriorParams::FIELDS {
-        d.set_item(k, value_to_py(py, prior.get(k).unwrap())?)?;
+        d.set_item(k, prior.get(k))?;
     }
     Ok(d)
 }
@@ -203,13 +195,9 @@ fn qsm_joint_defaults(py: Python<'_>) -> PyResult<Bound<'_, PyDict>> {
 fn joint_params(d: &Bound<'_, PyDict>) -> PyResult<(JointParams, PriorParams)> {
     let (mut like, mut prior) = (JointParams::default(), PriorParams::default());
     for (k, v) in d.iter() {
-        let k: String = k.extract()?;
-        let v = match v.extract::<u64>() {
-            Ok(i) => Value::Int(i),
-            Err(_) => Value::Real(v.extract()?),
-        };
+        let (k, v): (String, f64) = (k.extract()?, v.extract()?);
         if !(like.set(&k, v) || prior.set(&k, v)) {
-            return Err(PyValueError::new_err(format!("joint params: {k:?} is not a field, or not of its type")));
+            return Err(PyValueError::new_err(format!("joint params: {k:?} is not a field")));
         }
     }
     if d.len() != JointParams::FIELDS.len() + PriorParams::FIELDS.len() {
