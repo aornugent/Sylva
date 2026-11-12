@@ -390,8 +390,9 @@ params! {
         pub refl_thin: f64 = -3.0,
         /// The share of the pulses aimed at a core that stop there, on wood (opaque but for the soft edge) and on
         /// foliage, and the weight of a scan's existence log odds (its pulses are correlated beyond the beam's
-        /// oversampling): existence's evidence, fitted on `joint_tree`'s wood and NO_WOOD rows (3dtrees research 93 §17
-        /// review). Read by [`crate::qsm::support_tree`] only.
+        /// oversampling): existence's evidence, fitted on the wood and NO_WOOD rows of the former per-tree fit
+        /// `joint_tree` (at `archive/sylva-develop-2026-11-12`; 3dtrees research 93 §17 review). Read by
+        /// [`crate::qsm::support_tree`] only.
         pub stop_wood: f64 = 0.99,
         pub stop_leaf: f64 = 0.1,
         pub exist_scale: f64 = 0.2,

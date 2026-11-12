@@ -119,7 +119,7 @@ def test_thin_stems_far_away_are_bounded_around_their_truth(tmp_path):
 
 
 def test_a_clump_of_stems_is_flagged_as_runs(tmp_path):
-    # three solid stems inside one envelope claim (as joint_tree's clump test): the profiles show them apart
+    # three solid stems inside one envelope claim: the profiles show them apart
     stems = np.array([[0.0, 0.0, 0.045], [0.075, 0.025, 0.04], [0.02, 0.085, 0.035]])
     scans = scanned(tmp_path, np.c_[stems[:, :2], np.zeros(3)], np.c_[stems[:, :2], np.full(3, 1.6)], stems[:, 2],
                     [(8.0, -1.0), (-5.5, 7.0), (1.5, -9.5)])

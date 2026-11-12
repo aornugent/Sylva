@@ -8,6 +8,10 @@
 //! pieces it can't summarise (several stems, a hull) to
 //! the exact likelihood (`routed.rs`).
 //!
+//! This documentation owns the rules, each threshold a constant beside its
+//! reason; `sylva.qsm.support_tree`'s docstring summarises them and owns what
+//! each output means.
+//!
 //! Within one (piece, scan) group the pulses are nearly parallel, so they
 //! reduce to a profile across the row: impact `b` (along the group's `n`,
 //! across the beam) and, where a pulse stopped, depth (along `v`, the beam's
@@ -73,8 +77,9 @@
 //!   [`JointParams::stop_wood`] of them, foliage [`JointParams::stop_leaf`]:
 //!   a stop counts for wood, a pass against it, the passes' net at most one
 //!   sure echo), divided by the beam's oversampling `(w / spacing)^2` (research
-//!   93 §15.6) and weighted by [`JointParams::exist_scale`] (fitted on
-//!   `joint_tree`'s wood and NO_WOOD rows, research 93 §17 review: a scan's
+//!   93 §15.6) and weighted by [`JointParams::exist_scale`] (fitted on the
+//!   wood and NO_WOOD rows of the former per-tree fit `joint_tree`, at
+//!   `archive/sylva-develop-2026-11-12`; research 93 §17 review: a scan's
 //!   pulses are more correlated than the oversampling says). A chain along the branches (wood doesn't stop and restart,
 //!   [`PriorParams::exist`] and [`PriorParams::exist_off`]) turns the pieces'
 //!   log odds into `p_wood`, exactly by sum-product.
@@ -474,67 +479,40 @@ const EP_NODES: usize = 64;
 /// sites a few steps in, not settled (each round is one elimination).
 const FIRST_ROUNDS: usize = 5;
 
-/// One tree's fit, per row or per piece (the tree's nodes).
+/// One tree's fit, per row or per piece (the tree's nodes): each field one entry per node, meaning what the key of
+/// the same name in `sylva.qsm.support_tree`'s returns means (its docstring owns them). The radius `r` is held inside
+/// the bounds `r_lo`, `r_hi` but where [`diag::PINNED`] says otherwise; `flags` are [`flag`] bits, `diag` [`diag`]
+/// bits, `basis` a [`basis`] code.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Fit {
-    /// The fitted axis (world coordinates: the claim moved by the centre and turned by the lean) and radius, with
-    /// the posterior sd of log R widened by its basis's factor ([`WIDEN`]). A routed (RUNS or HULL) piece's follow its
-    /// exact fit's continuing stem, or where it has none accepted, the prior's cut by its bounds. A row's: the line
-    /// from its first piece's start to its last's end, its pieces' root mean square R, and the sd of that R's log,
-    /// linearised from the chain's joint covariance with each piece's log R widened by its own basis's factor (a row of
-    /// mixed bases piece by piece, not by its own `basis`).
     pub a: Vec<Point>,
     pub b: Vec<Point>,
     pub r: Vec<f64>,
     pub sd_log_r: Vec<f64>,
-    /// The centre at the middle and the lean (per m along the axis), along `e1, e2`.
     pub centre: Vec<[f64; 2]>,
     pub lean: Vec<[f64; 2]>,
     pub e1: Vec<Point>,
     pub e2: Vec<Point>,
-    /// The bounds on R that entered the tree, NaN where none did: a piece's where no circle of its own does (a
-    /// routed piece's without its detection bound, which can span several stems; a point circle's piece's upper
-    /// alone), so its radius is held in them but where they cross or the veto narrows it ([`diag::PINNED`]); a row's,
-    /// its pieces' root mean square as its R is (a piece without a lower bound at 0, without an upper unbounded): the
-    /// tightest lower bound from detection (a woody run's span) and upper (passes beside or through).
     pub r_lo: Vec<f64>,
     pub r_hi: Vec<f64>,
-    /// The chance of wood under the branches' chain, from each piece's existence evidence (a row's: its pieces' mean,
-    /// the share of it that is wood).
     pub p_wood: Vec<f64>,
-    /// [`flag`] bits (a row's: its pieces'): 0, its own circle entered the tree; RUNS or HULL, its exact fit did,
-    /// where `k_stems` > 0 (else its bounds); BOUNDS or POROUS, its bounds.
     pub flags: Vec<u8>,
-    /// The groups (scans) that gave measurements (a row's: the most).
     pub n_scans: Vec<u32>,
-    /// The stems a routed piece's exact fit chose that entered the tree (0: none, or its fit refused; 3dtrees research
-    /// 93 §18; a row's: the most).
     pub k_stems: Vec<u32>,
-    /// The fit's diagnostics ([`diag`] bits; a row's: its pieces'), and three numbers: `data_share`, the share of log
-    /// R's posterior precision its own data give (its measurement's, R's information with the centre and lean
-    /// unknown, and its bounds' EP site; 0-1, NaN where that site's precision came out negative); `contested`, the
-    /// share of its stops claimed by context or another node (NaN with none); `deleted`, the share of its pulses
-    /// with echoes the export deleted (an exact stem's: its piece's). A row's: its pieces' means. The solve's
-    /// `converged` is the tree's.
     pub diag: Vec<u16>,
     pub data_share: Vec<f64>,
     pub contested: Vec<f64>,
     pub deleted: Vec<f64>,
-    /// The site's D/H cap on R (`PriorParams::dh` times the reach from its start to the tips over 2; NaN without a
-    /// cap, or where a circle, its own or its row's point circle, measures it; a row's: its first piece's, the widest).
     pub r_cap: Vec<f64>,
-    /// The ray veto's audit of its fitted circle: the pulses that pass through it, and their share of its stops and
-    /// passes (NaN with none; a row's: its pieces' summed). [`diag::REFUTED`] says where they refute it.
     pub n_pass: Vec<u32>,
     pub pass_share: Vec<f64>,
-    /// How its radius is known ([`basis`]).
     pub basis: Vec<u8>,
 }
 
 /// A tree's volume (m^3), over its pieces (the served wood: a routed piece's further stems aside): the point, from
 /// each piece's posterior R (the drawn geometry's: per-piece medians); the mean and the 5th and 95th percentiles of
 /// [`VOLUME_DRAWS`] draws from the tree's joint posterior (the solve's exact covariance, each node's sd widened by
-/// [`WIDEN`] for its basis, each draw held inside its piece's bounds): the mean is the volume of record (3dtrees
+/// [`WIDEN`] for its basis, each draw held inside its piece's bounds, a fixed seed): the mean is the volume of record (3dtrees
 /// ticket 109: a sum of medians can lie under its own q05); and the mean split by each piece's [`basis`], `by_basis`
 /// indexed as [`WIDEN`] is, from MEASURED (the draws' mean of its pieces' volume, so the parts add to the mean).
 #[derive(Debug, Clone, Copy, Default, PartialEq)]

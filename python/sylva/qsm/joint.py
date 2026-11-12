@@ -146,78 +146,22 @@ def support_tree(scans, a, b, r_prior, parent, context=None, params: JointParams
                  threads: int = 0) -> dict:
     """Fits one tree from the support function of each row's cross-section: the joint model, fast.
 
-    A row longer than 30 cm is cut into equal pieces at most that long, and each piece is a node of the tree (its
-    parent the piece before it, or the last of its parent row's), so a bent row is a chain of straight pieces. Per
-    (piece, scan), the pulses in a tube around it (wide enough for it to lean) reduce to a profile across it: where
-    they stopped, at what depth, and where they passed. Opaque wood's profile measures its section's support
-    function, linear in a circle's centre and radius: the silhouette's edges (each by maximum likelihood on its
-    hit/pass transition, the footprint and ``tau``/``edge`` of ``params``; an edge with stops beyond it is censored
-    and left out, and one with nothing recorded beyond it was seen against the sky and ends half a pulse spacing
-    past its outermost hit), the front's depth, and the lean along the piece. A stop counts as wood by its echo
-    character (``refl_*``: the chance of wood against leaf by its reflectance and return position, wood narrower
-    than the footprint reading darker). Per piece, weighted least squares over its scans gives the centre at its
-    middle, the lean and the radius with their covariance; a stop is a hit only on the first such circle's front
-    arc (the second pass). Where no circle is determined, each scan still bounds R, slice by slice along the piece:
-    its woody stops' span is no wider than the silhouette, the nearest passes either side of them (or, in a slice
-    with no woody stop, either side of the woody centre; a pass a pulse that met nothing in the tube) no narrower,
-    and wood that was hit fills at least ``tau``
-    of the footprint; a side with nothing recorded gives no bound. Passes alone bound it too, the ray veto (3dtrees
-    research 106): its R is at most the widest circle about the claim's axis that fewer than 10 pulses, or under a
-    quarter of its stops and passes, pass through. With ``dh``, the site's largest stem D/H caps it after the solve, on
-    that node alone (a stem-scale rule, so it doesn't carry down the tree): R is at most ``dh`` times its reach to the
-    tips (the longest path from its start) over 2, its point and its volume's draws clipped there, never below what
-    its own rays hold it above. Each piece also has an existence log odds from
-    its core's stops and passes (echo character, and opacity: a stop for wood, a pass against it), over the beam's
-    oversampling and weighted by ``exist_scale``, and a chain along the branches (wood doesn't stop and restart:
-    ``exist``, ``exist_off``) gives ``p_wood``. The tree is one solve: the unflagged pieces' summaries as Gaussian
-    measurements, the bounds as censored ones on log R (expectation propagation, one site per piece by
-    quadrature), and a prior (the base's level, the taper's steps, at a fork the child's
-    share of the subtree wood length rather than of the prior area as a heavy-tailed Student-t term, so a small
-    shoot measured fat can't inflate its parent, the centre's continuity along a branch and the lean's random walk
-    between a row's pieces, the centre's anchor and a weak anchor of the lean; no tip anchor). A posterior is then held
-    inside its own bounds (between the tightest lower and upper, the upper where they cross), and says where it sits
-    on them (``PINNED``). Then the site's cap, then the veto: a piece with no circle of its own whose posterior
-    circle the veto refutes is narrowed until it isn't, or moved onto its own wood beside the claim's axis where
-    narrowing would cut it below its lower bound (``MOVED``; ``support_tree.rs``'s module documentation says how).
+    A row longer than 30 cm is cut into pieces, each a node of the tree, so a bent row is a chain of straight pieces.
+    Per (piece, scan) the pulses in a tube about it reduce to a profile across it, whose edges and front measure a
+    leaning circle; a stop counts as wood by its echo character (``refl_*``). Where no circle is determined, each
+    scan still bounds R (its woody stops' span, the passes beside them, and the capacity floor ``tau``), and passes
+    alone bound it too (the ray veto). A row none of whose pieces has a circle of its own gets one from its own stops
+    (point evidence, as 3dtrees' refit fitted RCT's points), unless the veto refutes it. A piece with several stems
+    or a hull (``RUNS``, ``HULL``) is fitted by the exact likelihood: seeds from its runs, then 1, 2, ... stems while
+    BIC rises, each stem's likelihood message measuring the piece; a fit may be refused, and the piece is then
+    bounded. One solve over the tree combines the measurements, the bounds (by expectation propagation) and a
+    Gaussian Markov prior along the branches; each radius is then held inside its own bounds, capped by ``dh`` where
+    nothing measures it, and narrowed, or moved onto its own wood, where the veto refutes it. Each piece's existence
+    evidence gives ``p_wood`` along the branches, every stop is classified, and the tree's volume comes with an
+    interval from draws of its joint posterior, each node's sd widened by its basis's calibrated factor.
 
-    Point evidence (3dtrees ticket 109): a row none of whose pieces has a circle of its own gets one from the stops
-    in its pieces' tubes nearer its claimed axis than any other the tree or its context claims, placed across its
-    axis, as the refit fitted RCT's points (RANSAC, least squares on its inliers, and the refit's tests: at least 12
-    stops on a claim of at least 1 cm, half of them on it, filling 120 degrees of it, its centre near the axis, at
-    most twice the claim and twice the site's cap, and short of the edge of its pieces' tubes). Unless the ray veto
-    refutes it (on a tangle it can be another tree's), it measures each of the row's n pieces' R and centre (each
-    coordinate) with sd 0.136 R sqrt(n) (0.136 in log R, the refit circles' noise, shared by the n pieces), its
-    pieces' upper bounds beside it (the lower bound and capacity floor its own stops gave it replaces), and isn't
-    capped (``POINTS``).
-
-    A ``RUNS`` or ``HULL`` piece is fitted by the exact likelihood, seeded from its runs (3dtrees research 93 §18):
-    each scan's runs, found slice by slice along the piece, measured as circles with their own centre, lean and
-    radius (as a piece's own circle is), scored by every scan's woody stops on their front arcs, hulls dropped,
-    strongest first and at most 4. Its pulses are taken once about the claim's axis (the measured and bounded pieces
-    of a first solve own the stops they explain better), each seed seeing them from its own leaning axis; every other
-    pulse is fitted (fewer on a piece of more than 8,000, so at most about 4,000 are), and 1, 2, ... stems, each from its seed, by Newton (each
-    pulse seen from the stem it meets first, each stem its own foliage) while the fits converge and BIC on the same
-    pulses rises. Each stem's likelihood message (foliage integrated out), its information scaled to all the pulses
-    and discounted by their correlation (``exist_scale``), with ``model_sd`` added to its variances, measures the
-    piece's centre and R in the tree, the lean its seed's: of the stems starting near its parent's end (within the
-    larger radius and 2 cm), the one whose message says most of its radius continues the piece (the nearest where
-    none is that near); another continues a stem of a routed parent piece that ends where it starts, or else is a
-    node beside it (its parent's child by a fork term on its share of the stems' area). A fit is refused where there is no seed or no pulse left, Newton didn't converge, a stem
-    isn't finite or its message says nothing of its radius, or its one stem is narrower than the piece's detection
-    bound; the piece is then the prior cut by its upper bound and capacity floor. An accepted stem whose sides, as
-    its scans see them (the pulses that reach each edge's neighbourhood and its front, against those that echo
-    further in front), leave its radius trading against its centre (``SHADOWED``, 3dtrees research 93 §20) says
-    nothing along that ridge, and its own bounds enter with it: its radius is the prior's cut by them.
-
-    Every stop is classified (``echoes``): by whether it lies on its piece's circle's front arc (its own, or the
-    tree's) times its echo character's weight, or on a routed piece with an exact fit by the exact likelihood's wood
-    and leaf terms at its stem's fit.
-
-    The tree's volume is its pieces' (a routed piece's further stems aside): at their posterior R (the drawing's,
-    ``point``), and as the mean (the volume of record, split by how each piece is known, :class:`SupportBasis`) and an
-    interval from 1,000 draws of the tree's joint posterior (the solve's exact covariance, each node's sd widened by
-    its basis's factor, each draw held inside its piece's bounds; a fixed seed). The factors are Sylva's calibration
-    (``WIDEN`` in ``support_tree.rs``, learned per basis against Alice Mulga's refit circles), not a setting.
+    The rules, each threshold with its reason, are written once, in ``support_tree.rs``'s module documentation
+    (``support_tree/routed.rs``'s for the exact fits); this docstring owns what each output means.
 
     Parameters
     ----------
@@ -247,16 +191,17 @@ def support_tree(scans, a, b, r_prior, parent, context=None, params: JointParams
       lean; a row's runs from its first piece's start to its last's end); ``r``, ``sd_log_r``: the radius, held inside
       its own bounds, and its posterior sd in log, the solve's widened by its basis's factor (a row's: its pieces' root
       mean square R, so its volume is theirs, and the sd of its log from the chain's joint covariance, each piece
-      widened by its own basis's factor);
+      widened by its own basis's factor); a routed piece's follow its exact fit's continuing stem, or where none was
+      accepted, the prior's cut by its bounds;
     - ``centre``, ``lean`` ``(n, 2)``: the centre at the middle (m) and the lean (m per m of axis) along ``e1``,
       ``e2`` ``(n, 3)``;
     - ``r_lo``, ``r_hi``: the tightest lower bound on R from detection and upper bound from passes (beside a woody
-      run, or through the claim: the veto), of those that entered the tree, else NaN (they enter where no circle of its own does, a
-      routed piece's without its detection bound, a point circle's piece's upper alone), so ``r`` lies inside them
-      but where ``PINNED`` says the rays contradict themselves (bounds that cross, or a veto that refutes every
-      circle as wide as the lower bound); a row's: its pieces' root mean square, as its ``r`` is (a piece without a
-      lower bound at 0, without an upper unbounded); ``r_cap``, the site's cap on it (NaN without ``dh``, or where a
-      circle measures it; a row's: its first piece's);
+      run, or through the claim: the veto), of those that entered the tree, else NaN (they enter where no circle of
+      its own does, a routed piece's without its detection bound, which can span several stems; a point circle's
+      piece's upper alone), so ``r`` lies inside them but where ``PINNED`` says the rays contradict themselves
+      (bounds that cross, or a veto that refutes every circle as wide as the lower bound); a row's: its pieces' root
+      mean square, as its ``r`` is (a piece without a lower bound at 0, without an upper unbounded); ``r_cap``, the
+      site's cap on it (NaN without ``dh``, or where a circle measures it; a row's: its pieces' widest);
     - ``n_pass``, ``pass_share``: the ray veto's audit of its fitted circle, the pulses passing through it and their
       share of its stops and passes (NaN with none; a row's: its pieces' summed), ``REFUTED`` where they refute it;
     - ``basis`` (:class:`SupportBasis`): how its radius is known;
@@ -401,8 +346,9 @@ def rebase(scans, a, b, r_prior, parent, member, centre, context=None, params: J
     Returns a dict: the rows ``a``, ``b`` ``(m, 3)``, ``r_prior``, ``parent`` (a row of the same member, -1 at its
     base: every member's rows hang from one base, parents first), ``member`` and ``column`` (-1 for a skeleton row);
     ``columns``, per column ``e_col``, ``e_rct`` and ``measured`` (its root column's, with its forks), ``chosen``,
-    ``owner`` (-1: none), ``r`` (its median), ``believable``, ``joined``, ``grafted``; and ``counts`` of the rows rising through a column's top near it (``entries``: ``joined``, ``grafted``, ``kept``),
-    rows ``dropped`` and ``hung``, and members ``reverted`` to their rows.
+    ``owner`` (-1: none), ``r`` (its median), ``believable``, ``joined``, ``grafted``; and ``counts`` of the rows
+    rising through a column's top near it (``entries``: ``joined``, ``grafted``, ``kept``), rows ``dropped`` and
+    ``hung``, and members ``reverted`` to their rows.
     """
     if not all(isinstance(s, ScanIndex) for s in scans):
         raise TypeError("rebase: scans must be ScanIndex")
