@@ -394,21 +394,6 @@ fn qsm_support_tree<'py>(py: Python<'py>, scans: Vec<Bound<'py, PyScanIndex>>, a
     Ok(d)
 }
 
-/// A base's sections and columns as a dict of arrays (see `sylva.qsm.rebase`).
-fn sections_to_py<'py>(py: Python<'py>, d: &Bound<'py, PyDict>, secs: &[support_tree::base::Section], cols: &[support_tree::base::Column]) -> PyResult<()> {
-    use support_tree::base::Section;
-    let f = |g: fn(&Section) -> f64| secs.iter().map(g).collect::<Vec<f64>>();
-    for (k, v) in [("z", f(|s| s.z)), ("x", f(|s| s.c[0])), ("y", f(|s| s.c[1])), ("r", f(|s| s.r)), ("hits", f(|s| s.hits)), ("evidence", f(|s| s.evidence))] {
-        d.set_item(k, v.into_pyarray(py))?;
-    }
-    d.set_item("slab", secs.iter().map(|s| s.slab).collect::<Vec<u32>>().into_pyarray(py))?;
-    d.set_item("fitted", secs.iter().map(|s| s.fitted).collect::<Vec<bool>>().into_pyarray(py))?;
-    d.set_item("column", secs.iter().map(|s| s.column).collect::<Vec<i32>>().into_pyarray(py))?;
-    d.set_item("col_parent", cols.iter().map(|c| c.parent).collect::<Vec<i32>>().into_pyarray(py))?;
-    d.set_item("col_at", cols.iter().map(|c| c.at).collect::<Vec<i32>>().into_pyarray(py))?;
-    Ok(())
-}
-
 /// A plant's base re-sectioned from the rays (see `sylva.qsm.rebase`).
 #[pyfunction]
 #[pyo3(signature = (scans, a, b, r_prior, parent, member, centre, ctx_a, ctx_b, ctx_r, params, z_lo=0.1, z_hi=1.5, dz=0.1, reach=0.6, link=0.02, keep=0.8, threads=0))]
@@ -435,9 +420,6 @@ fn qsm_rebase<'py>(py: Python<'py>, scans: Vec<Bound<'py, PyScanIndex>>, a: PyRe
     d.set_item("parent", f.parent.into_pyarray(py))?;
     d.set_item("member", f.member.into_pyarray(py))?;
     d.set_item("column", f.column.into_pyarray(py))?;
-    let s = PyDict::new(py);
-    sections_to_py(py, &s, &f.sections, &f.columns)?;
-    d.set_item("sections", s)?;
     let c = PyDict::new(py);
     let g = |h: fn(&support_tree::base::ColumnOut) -> f64| f.out.iter().map(h).collect::<Vec<f64>>();
     for (k, v) in [("e_col", g(|c| c.e_col)), ("e_rct", g(|c| c.e_rct)), ("measured", g(|c| c.measured)), ("r", g(|c| c.r))] {

@@ -400,12 +400,8 @@ def rebase(scans, a, b, r_prior, parent, member, centre, context=None, params: J
 
     Returns a dict: the rows ``a``, ``b`` ``(m, 3)``, ``r_prior``, ``parent`` (a row of the same member, -1 at its
     base: every member's rows hang from one base, parents first), ``member`` and ``column`` (-1 for a skeleton row);
-    ``sections``, per section ``slab``, ``z``, ``x``, ``y``, ``r``, ``fitted``, ``hits``, ``evidence``, ``column``
-    (-1: none), and per column
-    ``col_parent``, ``col_at``; ``columns``, per column ``e_col``, ``e_rct`` and ``measured`` (its root column's,
-    with its forks), ``chosen``, ``owner`` (-1: none), ``r`` (its median), ``believable``, ``joined``, ``grafted``;
-    and
-    ``counts`` of the rows rising through a column's top near it (``entries``: ``joined``, ``grafted``, ``kept``),
+    ``columns``, per column ``e_col``, ``e_rct`` and ``measured`` (its root column's, with its forks), ``chosen``,
+    ``owner`` (-1: none), ``r`` (its median), ``believable``, ``joined``, ``grafted``; and ``counts`` of the rows rising through a column's top near it (``entries``: ``joined``, ``grafted``, ``kept``),
     rows ``dropped`` and ``hung``, and members ``reverted`` to their rows.
     """
     if not all(isinstance(s, ScanIndex) for s in scans):

@@ -376,7 +376,7 @@ pub struct ColumnOut {
 
 /// A plant's rows with its base re-sectioned ([`rebase`]): each row's axis, prior radius, parent (a row of the same
 /// member, -1 at its base), member and column (-1: a skeleton row); every member's rows hang from one base, parents
-/// first. With them the columns' sections and what became of each column, and counts of what the join did.
+/// first. With them what became of each column, and counts of what the join did.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Rebased {
     pub a: Vec<Point>,
@@ -385,8 +385,6 @@ pub struct Rebased {
     pub parent: Vec<i64>,
     pub member: Vec<i64>,
     pub column: Vec<i32>,
-    pub sections: Vec<Section>,
-    pub columns: Vec<Column>,
     pub out: Vec<ColumnOut>,
     /// entries; their fates: joined, grafted, kept; rows dropped; rows hung; members kept as they were (two bases)
     pub counts: [u32; 7],
@@ -621,7 +619,7 @@ fn join(rows: &Rows, member: &[i64], centre: &Point, p: &BaseParams, secs: &[Sec
             z_cut.get(&member[j]).is_some_and(|&z| hi(j) <= z) && !fate.get(&j).is_some_and(|f| col_of(*f).is_some())
                 && (replaced[j] || inside(j) || air[j])
         }).collect();
-        let mut reb = Rebased { sections: secs.to_vec(), columns: cols.clone(), ..Default::default() };
+        let mut reb = Rebased::default();
         let push = |reb: &mut Rebased, x: Point, y: Point, rr: f64, par: i64, m: i64, c: i32| {
             reb.a.push(x);
             reb.b.push(y);
