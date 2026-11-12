@@ -44,7 +44,9 @@ The parameters are a :class:`JointParams`, whose fields are:
   (existence along a branch: a base piece is wood with ``exist``, one after a
   piece that isn't with ``exist_off``), ``dh`` (the site's largest stem D/H:
   no radius the rays don't measure is wider than ``dh`` times its reach to the
-  tips over 2; 0 for no cap);
+  tips over 2; 0 for no cap), ``thin_seed`` (which pulses a routed piece of
+  more pairs than its budget fits: a hash of each pulse's direction and this;
+  0 in production, a bench varies it to measure the thinning's noise);
 - the prior: ``lam_prior`` and ``lam_sd`` (foliage's median, 1/m, and log
   sd), ``sig_ell`` (its random walk), ``sig_eta`` (the taper's random walk per
   sqrt(m)), ``mu_fork`` and ``sig_fork`` (soft Leonardo's log area ratio and
@@ -65,62 +67,15 @@ import numpy as np
 from .. import _core
 from .scan_index import ScanIndex
 
-_DEFAULTS = _core.qsm_joint_defaults()
+# written once, in the core: its fields, their types and their defaults
+JointParams = dataclasses.make_dataclass(
+    "JointParams", [(k, type(v), dataclasses.field(default=v)) for k, v in _core.qsm_joint_defaults().items()],
+    frozen=True, module=__name__)
+JointParams.__doc__ = """The settings of :func:`support_tree` and :func:`rebase`, with the core's defaults.
 
-
-@dataclasses.dataclass(frozen=True)
-class JointParams:
-    """The settings of :func:`support_tree`; the defaults are calibrated on TERN's RIEGL VZ-400i exports (Alice Mulga).
-
-    A plain record: ``dataclasses.asdict(params)`` is JSON-serialisable and, with ``version``, is what a cache of
-    joint fits should key on. The likelihood's and the prior's fields are described in this module's documentation.
-    """
-
-    #: Bumped by Sylva whenever the fit changes for the same settings; a record of another version is an error.
-    version: int = _DEFAULTS["version"]
-    exit: float = _DEFAULTS["exit"]
-    divergence: float = _DEFAULTS["divergence"]
-    sigma_r: float = _DEFAULTS["sigma_r"]
-    rough: float = _DEFAULTS["rough"]
-    tau: float = _DEFAULTS["tau"]
-    edge: float = _DEFAULTS["edge"]
-    eps: float = _DEFAULTS["eps"]
-    eps_min: float = _DEFAULTS["eps_min"]
-    mp_len: float = _DEFAULTS["mp_len"]
-    hide: float = _DEFAULTS["hide"]
-    refl_wood: float = _DEFAULTS["refl_wood"]
-    refl_wood_sd: float = _DEFAULTS["refl_wood_sd"]
-    refl_leaf: float = _DEFAULTS["refl_leaf"]
-    refl_leaf_sd: float = _DEFAULTS["refl_leaf_sd"]
-    refl_multi: float = _DEFAULTS["refl_multi"]
-    refl_multi_sd: float = _DEFAULTS["refl_multi_sd"]
-    refl_thin: float = _DEFAULTS["refl_thin"]
-    stop_wood: float = _DEFAULTS["stop_wood"]
-    stop_leaf: float = _DEFAULTS["stop_leaf"]
-    exist_scale: float = _DEFAULTS["exist_scale"]
-    model_sd: float = _DEFAULTS["model_sd"]
-    lam_prior: float = _DEFAULTS["lam_prior"]
-    lam_sd: float = _DEFAULTS["lam_sd"]
-    sig_ell: float = _DEFAULTS["sig_ell"]
-    sig_eta: float = _DEFAULTS["sig_eta"]
-    mu_fork: float = _DEFAULTS["mu_fork"]
-    sig_fork: float = _DEFAULTS["sig_fork"]
-    sig_root: float = _DEFAULTS["sig_root"]
-    r_tip: float = _DEFAULTS["r_tip"]
-    sig_tip: float = _DEFAULTS["sig_tip"]
-    sig_delta: float = _DEFAULTS["sig_delta"]
-    centre_rel: float = _DEFAULTS["centre_rel"]
-    centre_abs: float = _DEFAULTS["centre_abs"]
-    scan_abs: float = _DEFAULTS["scan_abs"]
-    scan_rel: float = _DEFAULTS["scan_rel"]
-    lean_sd: float = _DEFAULTS["lean_sd"]
-    lean_bend: float = _DEFAULTS["lean_bend"]
-    exist: float = _DEFAULTS["exist"]
-    exist_off: float = _DEFAULTS["exist_off"]
-    dh: float = _DEFAULTS["dh"]
-    #: Which pulses :func:`support_tree` fits on a routed piece of more pairs than its budget (a hash of each pulse's
-    #: direction and this): 0 in production; a bench varies it to measure the thinning's noise.
-    thin_seed: int = _DEFAULTS["thin_seed"]
+Calibrated on TERN's RIEGL VZ-400i exports (Alice Mulga). The fields are described in
+:mod:`sylva.qsm.joint`'s documentation; ``dataclasses.asdict(params)`` is what crosses to the core.
+"""
 
 
 #: Why a piece's own support summary was left out of :func:`support_tree`'s tree (bits of its ``flags``): ``RUNS``

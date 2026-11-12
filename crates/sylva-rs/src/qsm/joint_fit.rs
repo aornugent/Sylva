@@ -38,53 +38,50 @@
 use nalgebra::{DMatrix, DVector, Matrix2, Matrix3, Matrix4, SymmetricEigen};
 
 use crate::error::{Error, Result};
-use crate::qsm::joint::{frames, joint_blocks, joint_loglik, JointParams, Owner, Pulse};
+use crate::qsm::joint::{frames, joint_blocks, joint_loglik, params, JointParams, Owner, Pulse};
 use crate::Point;
 
-/// The prior's widths and anchors (all sds; see the module documentation).
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub struct PriorParams {
-    /// Foliage: prior median (1/m) and log sd; its random walk along the tree.
-    pub lam_prior: f64,
-    pub lam_sd: f64,
-    pub sig_ell: f64,
-    /// The taper's random walk per sqrt(m) of row length; soft Leonardo (log
-    /// area ratio at a fork and its sd); the level at a base.
-    pub sig_eta: f64,
-    pub mu_fork: f64,
-    pub sig_fork: f64,
-    pub sig_root: f64,
-    /// A tip's radius (m; 0: no anchor) and its log sd, at rows without
-    /// children.
-    pub r_tip: f64,
-    pub sig_tip: f64,
-    /// The centre: its random walk (m per sqrt(m)) and its anchor on the
-    /// starting axis, `centre_rel r_prior + centre_abs`.
-    pub sig_delta: f64,
-    pub centre_rel: f64,
-    pub centre_abs: f64,
-    /// The per-scan nuisance, `scan_abs + scan_rel r` (both 0: none).
-    pub scan_abs: f64,
-    pub scan_rel: f64,
-    /// The lean's anchor (m per m) and its random walk between a row's pieces (per sqrt(m); 3dtrees research 93
-    /// §13.1: rows of 67-98 cm whose centres drift 8-24 cm). Read by [`crate::qsm::support_tree`] only.
-    pub lean_sd: f64,
-    pub lean_bend: f64,
-    /// Existence along a branch: a base piece is wood with `exist`, one after a piece that isn't with `exist_off`
-    /// (wood doesn't stop and restart). Read by [`crate::qsm::support_tree`] only.
-    pub exist: f64,
-    pub exist_off: f64,
-    /// The site's largest stem D/H: no radius the rays don't measure is wider than `dh` times its reach to the tips
-    /// over 2 (0: no cap; Alice Mulga's census 0.035, 3dtrees research 62). Read by [`crate::qsm::support_tree`] only.
-    pub dh: f64,
-}
-
-impl Default for PriorParams {
-    /// The calibration for TERN's Alice Mulga exports (3dtrees research 74 §14): real axes and scans are freer
+params! {
+    /// The prior's widths and anchors (all sds; see the module documentation).
+    ///
+    /// The defaults are the calibration for TERN's Alice Mulga exports (3dtrees research 74 §14): real axes and scans are freer
     /// than a synthetic bench's, and RCT's taper is no guide to the rays' radii there (§21: rows fitted alone
     /// disagree with its steps by ~1 in log R, which `sig_eta` 0.05 priced at ~10^6 log units).
-    fn default() -> Self {
-        PriorParams { lam_prior: 1.0, lam_sd: 2.0, sig_ell: 1.0, sig_eta: 0.5, mu_fork: 0.10, sig_fork: 0.17, sig_root: 0.5, r_tip: 0.0, sig_tip: 0.3, sig_delta: 0.02, centre_rel: 1.0, centre_abs: 0.003, scan_abs: 0.002, scan_rel: 0.3, lean_sd: 0.5, lean_bend: 0.3, exist: 0.65, exist_off: 0.5, dh: 0.0 }
+    #[derive(Debug, Clone, Copy, PartialEq)]
+    pub struct PriorParams {
+        /// Foliage: prior median (1/m) and log sd; its random walk along the tree.
+        pub lam_prior: f64 = 1.0,
+        pub lam_sd: f64 = 2.0,
+        pub sig_ell: f64 = 1.0,
+        /// The taper's random walk per sqrt(m) of row length; soft Leonardo (log
+        /// area ratio at a fork and its sd); the level at a base.
+        pub sig_eta: f64 = 0.5,
+        pub mu_fork: f64 = 0.10,
+        pub sig_fork: f64 = 0.17,
+        pub sig_root: f64 = 0.5,
+        /// A tip's radius (m; 0: no anchor) and its log sd, at rows without
+        /// children.
+        pub r_tip: f64 = 0.0,
+        pub sig_tip: f64 = 0.3,
+        /// The centre: its random walk (m per sqrt(m)) and its anchor on the
+        /// starting axis, `centre_rel r_prior + centre_abs`.
+        pub sig_delta: f64 = 0.02,
+        pub centre_rel: f64 = 1.0,
+        pub centre_abs: f64 = 0.003,
+        /// The per-scan nuisance, `scan_abs + scan_rel r` (both 0: none).
+        pub scan_abs: f64 = 0.002,
+        pub scan_rel: f64 = 0.3,
+        /// The lean's anchor (m per m) and its random walk between a row's pieces (per sqrt(m); 3dtrees research 93
+        /// §13.1: rows of 67-98 cm whose centres drift 8-24 cm). Read by [`crate::qsm::support_tree`] only.
+        pub lean_sd: f64 = 0.5,
+        pub lean_bend: f64 = 0.3,
+        /// Existence along a branch: a base piece is wood with `exist`, one after a piece that isn't with `exist_off`
+        /// (wood doesn't stop and restart). Read by [`crate::qsm::support_tree`] only.
+        pub exist: f64 = 0.65,
+        pub exist_off: f64 = 0.5,
+        /// The site's largest stem D/H: no radius the rays don't measure is wider than `dh` times its reach to the tips
+        /// over 2 (0: no cap; Alice Mulga's census 0.035, 3dtrees research 62). Read by [`crate::qsm::support_tree`] only.
+        pub dh: f64 = 0.0,
     }
 }
 

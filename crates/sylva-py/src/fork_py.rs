@@ -17,7 +17,7 @@ use sylva_rs::io;
 use sylva_rs::qsm::{self, support_tree};
 use sylva_rs::qsm::evidence::{self, Beam, EvidenceParams};
 use sylva_rs::qsm::scan_index::{self, ScanIndex};
-use sylva_rs::qsm::joint::{self, Echoes, JointParams, Owner, Pulse};
+use sylva_rs::qsm::joint::{self, Echoes, JointParams, Owner, Pulse, Value};
 use sylva_rs::qsm::joint_fit::{PriorParams, Rows};
 
 use crate::{err, xyz_from_py, xyz_to_py};
@@ -176,12 +176,45 @@ fn qsm_pairs<'py>(py: Python<'py>, scans: Vec<Bound<'py, PyScanIndex>>, a: PyRea
     Ok(d)
 }
 
-fn joint_params(params: &Bound<'_, PyDict>) -> PyResult<JointParams> {
-    let get = |k: &str| -> PyResult<f64> { params.get_item(k)?.ok_or_else(|| PyValueError::new_err(format!("joint params: no {k:?}")))?.extract() };
-    Ok(JointParams { exit: get("exit")?, divergence: get("divergence")?, sigma_r: get("sigma_r")?, rough: get("rough")?, tau: get("tau")?, edge: get("edge")?, eps: get("eps")?, eps_min: get("eps_min")?, mp_len: get("mp_len")?, hide: get("hide")?,
-        refl_wood: get("refl_wood")?, refl_wood_sd: get("refl_wood_sd")?, refl_leaf: get("refl_leaf")?, refl_leaf_sd: get("refl_leaf_sd")?, refl_multi: get("refl_multi")?, refl_multi_sd: get("refl_multi_sd")?,
-        refl_thin: get("refl_thin")?, stop_wood: get("stop_wood")?, stop_leaf: get("stop_leaf")?, exist_scale: get("exist_scale")?, model_sd: get("model_sd")?,
-        thin_seed: params.get_item("thin_seed")?.ok_or_else(|| PyValueError::new_err("joint params: no \"thin_seed\""))?.extract()? })
+/// A joint params value as Python holds it.
+fn value_to_py<'py>(py: Python<'py>, v: Value) -> PyResult<Bound<'py, PyAny>> {
+    Ok(match v {
+        Value::Real(x) => x.into_pyobject(py)?.into_any(),
+        Value::Int(i) => i.into_pyobject(py)?.into_any(),
+    })
+}
+
+/// The default settings of `qsm_support_tree`, flat: the likelihood's fields, then the prior's.
+#[pyfunction]
+fn qsm_joint_defaults(py: Python<'_>) -> PyResult<Bound<'_, PyDict>> {
+    let (like, prior) = (JointParams::default(), PriorParams::default());
+    let d = PyDict::new(py);
+    for &k in JointParams::FIELDS {
+        d.set_item(k, value_to_py(py, like.get(k).unwrap())?)?;
+    }
+    for &k in PriorParams::FIELDS {
+        d.set_item(k, value_to_py(py, prior.get(k).unwrap())?)?;
+    }
+    Ok(d)
+}
+
+/// The settings `qsm_joint_defaults` lays out, each field given once (`dataclasses.asdict(JointParams)`).
+fn joint_params(d: &Bound<'_, PyDict>) -> PyResult<(JointParams, PriorParams)> {
+    let (mut like, mut prior) = (JointParams::default(), PriorParams::default());
+    for (k, v) in d.iter() {
+        let k: String = k.extract()?;
+        let v = match v.extract::<u64>() {
+            Ok(i) => Value::Int(i),
+            Err(_) => Value::Real(v.extract()?),
+        };
+        if !(like.set(&k, v) || prior.set(&k, v)) {
+            return Err(PyValueError::new_err(format!("joint params: {k:?} is not a field, or not of its type")));
+        }
+    }
+    if d.len() != JointParams::FIELDS.len() + PriorParams::FIELDS.len() {
+        return Err(PyValueError::new_err("joint params: every field once"));
+    }
+    Ok((like, prior))
 }
 
 fn rows<const K: usize>(a: PyReadonlyArray2<f64>, what: &str) -> PyResult<Vec<[f64; K]>> {
@@ -217,7 +250,7 @@ fn pulses_from(table: &Bound<'_, PyDict>) -> PyResult<Vec<Pulse>> {
 #[pyfunction]
 #[pyo3(signature = (table, state, params, threads=0))]
 fn qsm_joint_loglik<'py>(py: Python<'py>, table: Bound<'py, PyDict>, state: PyReadonlyArray2<f64>, params: Bound<'py, PyDict>, threads: usize) -> PyResult<Bound<'py, PyArray1<f64>>> {
-    let (pulses, state, p) = (pulses_from(&table)?, rows::<4>(state, "state")?, tree_params(&params)?.0);
+    let (pulses, state, p) = (pulses_from(&table)?, rows::<4>(state, "state")?, joint_params(&params)?.0);
     if state.len() != pulses.len() {
         return Err(PyValueError::new_err("joint: one state per pair"));
     }
@@ -252,43 +285,6 @@ fn qsm_joint_table<'py>(py: Python<'py>, scans: Vec<Bound<'py, PyScanIndex>>, a:
     d.set_item("pulse", t.pulse.into_pyarray(py))?;
     d.set_item("n_echo", t.n_echo.into_pyarray(py))?;
     Ok(d)
-}
-
-const JOINT_LIKE: [&str; 21] = ["exit", "divergence", "sigma_r", "rough", "tau", "edge", "eps", "eps_min", "mp_len", "hide", "refl_wood", "refl_wood_sd", "refl_leaf", "refl_leaf_sd", "refl_multi", "refl_multi_sd", "refl_thin", "stop_wood", "stop_leaf", "exist_scale", "model_sd"];
-const JOINT_PRIOR: [&str; 19] = ["lam_prior", "lam_sd", "sig_ell", "sig_eta", "mu_fork", "sig_fork", "sig_root", "r_tip", "sig_tip", "sig_delta", "centre_rel", "centre_abs", "scan_abs", "scan_rel", "lean_sd", "lean_bend", "exist", "exist_off", "dh"];
-const JOINT_TREE: [&str; 2] = ["version", "thin_seed"];
-/// Bumped whenever `support_tree` changes for the same settings.
-const JOINT_VERSION: u32 = 11;
-
-/// The default settings of `qsm_support_tree`, flat.
-#[pyfunction]
-fn qsm_joint_defaults(py: Python<'_>) -> PyResult<Bound<'_, PyDict>> {
-    let (l, p) = (JointParams::default(), PriorParams::default());
-    let d = PyDict::new(py);
-    for (k, v) in JOINT_LIKE.iter().zip([l.exit, l.divergence, l.sigma_r, l.rough, l.tau, l.edge, l.eps, l.eps_min, l.mp_len, l.hide, l.refl_wood, l.refl_wood_sd, l.refl_leaf, l.refl_leaf_sd, l.refl_multi, l.refl_multi_sd, l.refl_thin, l.stop_wood, l.stop_leaf, l.exist_scale, l.model_sd]) {
-        d.set_item(k, v)?;
-    }
-    for (k, v) in JOINT_PRIOR.iter().zip([p.lam_prior, p.lam_sd, p.sig_ell, p.sig_eta, p.mu_fork, p.sig_fork, p.sig_root, p.r_tip, p.sig_tip, p.sig_delta, p.centre_rel, p.centre_abs, p.scan_abs, p.scan_rel, p.lean_sd, p.lean_bend, p.exist, p.exist_off, p.dh]) {
-        d.set_item(k, v)?;
-    }
-    d.set_item("version", JOINT_VERSION)?;
-    d.set_item("thin_seed", l.thin_seed)?;
-    Ok(d)
-}
-
-fn tree_params(d: &Bound<'_, PyDict>) -> PyResult<(JointParams, PriorParams)> {
-    let what = "joint params";
-    let f = |k: &str| -> PyResult<f64> { dict_item(d, k, what)?.extract() };
-    let u = |k: &str| -> PyResult<usize> { dict_item(d, k, what)?.extract() };
-    if u("version")? != JOINT_VERSION as usize {
-        return Err(PyValueError::new_err(format!("joint params: version {} is not this Sylva's ({})", u("version")?, JOINT_VERSION)));
-    }
-    if d.len() != JOINT_LIKE.len() + JOINT_PRIOR.len() + JOINT_TREE.len() {
-        return Err(PyValueError::new_err("joint params: unexpected fields"));
-    }
-    let prior = PriorParams { lam_prior: f("lam_prior")?, lam_sd: f("lam_sd")?, sig_ell: f("sig_ell")?, sig_eta: f("sig_eta")?, mu_fork: f("mu_fork")?, sig_fork: f("sig_fork")?, sig_root: f("sig_root")?, r_tip: f("r_tip")?, sig_tip: f("sig_tip")?, sig_delta: f("sig_delta")?, centre_rel: f("centre_rel")?, centre_abs: f("centre_abs")?, scan_abs: f("scan_abs")?, scan_rel: f("scan_rel")?,
-        lean_sd: f("lean_sd")?, lean_bend: f("lean_bend")?, exist: f("exist")?, exist_off: f("exist_off")?, dh: f("dh")? };
-    Ok((joint_params(d)?, prior))
 }
 
 /// A tree's classified echoes as a dict of `(m,)` arrays.
@@ -397,7 +393,7 @@ fn qsm_support_tree<'py>(py: Python<'py>, scans: Vec<Bound<'py, PyScanIndex>>, a
     }
     let context: Vec<_> = ca.into_iter().zip(cb).zip(cr).map(|((a, b), r)| (a, b, r)).collect();
     let (r_prior, parent) = (r_prior.as_array().to_vec(), parent.as_array().to_vec());
-    let p = tree_params(&params)?;
+    let p = joint_params(&params)?;
     let refs: Vec<&ScanIndex> = scans.iter().map(|s| &s.get().inner).collect();
     let f = py.detach(|| {
         let rows = Rows { a: &a, b: &b, r_prior: &r_prior, r_max: &[], parent: &parent };
@@ -452,7 +448,7 @@ fn qsm_rebase<'py>(py: Python<'py>, scans: Vec<Bound<'py, PyScanIndex>>, a: PyRe
     }
     let context: Vec<_> = ca.into_iter().zip(cb).zip(cr).map(|((a, b), r)| (a, b, r)).collect();
     let (r_prior, parent, member) = (r_prior.as_array().to_vec(), parent.as_array().to_vec(), member.as_array().to_vec());
-    let p = tree_params(&params)?;
+    let p = joint_params(&params)?;
     let bp = support_tree::base::BaseParams { z_lo, z_hi, dz, reach, link, keep };
     let refs: Vec<&ScanIndex> = scans.iter().map(|s| &s.get().inner).collect();
     let f = py.detach(|| {

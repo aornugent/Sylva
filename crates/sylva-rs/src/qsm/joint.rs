@@ -309,65 +309,137 @@ impl Mul<f64> for D {
     }
 }
 
-/// The scanner and export constants of the likelihood (a plot calibration).
+/// A setting's value as it crosses to Python: a real, or an integer.
 #[derive(Debug, Clone, Copy, PartialEq)]
-pub struct JointParams {
-    /// Beam diameter at the aperture (m) and full divergence (rad).
-    pub exit: f64,
-    pub divergence: f64,
-    /// Range noise (m), and surface roughness as a share of the radius.
-    pub sigma_r: f64,
-    pub rough: f64,
-    /// Energy share of the footprint an echo needs, and the sd of the
-    /// detection edge as a share of the footprint's width.
-    pub tau: f64,
-    pub edge: f64,
-    /// Mixed-pixel share: `eps_min + eps (1 - f)`, f the footprint's share on the wood, landing up to
-    /// `mp_len` m behind the surface.
-    pub eps: f64,
-    pub eps_min: f64,
-    pub mp_len: f64,
-    /// The share of stops whose echo the export deleted, among pulses that
-    /// lost an echo where it could lie (research 74 §19; 0: a recorded pass is
-    /// a pass).
-    pub hide: f64,
-    /// Echo character (3dtrees research 93 §11.2): the reflectance (dB) of a single return from bark that fills
-    /// the footprint and from leaf, mean and sd; a return that shares its pulse is `refl_multi` dB brighter (it
-    /// is negative) with `refl_multi_sd` more spread, in quadrature. Read by [`crate::qsm::support_tree`] only.
-    pub refl_wood: f64,
-    pub refl_wood_sd: f64,
-    pub refl_leaf: f64,
-    pub refl_leaf_sd: f64,
-    pub refl_multi: f64,
-    pub refl_multi_sd: f64,
-    /// Thin wood reads darker than bark that fills the footprint even above the footprint's width (3dtrees
-    /// research 93 §16: rows under 2 cm at -17.8 dB p50 against -15.9): wood's mean shifts by `refl_thin` dB at
-    /// R <= 1 cm, by none from 3 cm, linearly in log R between. Read by [`crate::qsm::support_tree`] only.
-    pub refl_thin: f64,
-    /// The share of the pulses aimed at a core that stop there, on wood (opaque but for the soft edge) and on
-    /// foliage, and the weight of a scan's existence log odds (its pulses are correlated beyond the beam's
-    /// oversampling): existence's evidence, fitted on `joint_tree`'s wood and NO_WOOD rows (3dtrees research 93 §17
-    /// review). Read by [`crate::qsm::support_tree`] only.
-    pub stop_wood: f64,
-    pub stop_leaf: f64,
-    pub exist_scale: f64,
-    /// The floor on each support measurement's sd (m): non-round sections and a ~4 mm offset between scans that
-    /// no sway explains (3dtrees research 93 §15.6). Read by [`crate::qsm::support_tree`] only.
-    pub model_sd: f64,
-    /// Which pulses a routed piece of more pairs than its budget fits ([`crate::qsm::support_tree`]'s thinning, a
-    /// hash of each pulse's direction and this): 0 in production; the bench varies it to measure the thinning's noise
-    /// (3dtrees research 93 §19). Read by [`crate::qsm::support_tree`] only.
-    pub thin_seed: u64,
+pub enum Value {
+    Real(f64),
+    Int(u64),
 }
 
-impl Default for JointParams {
-    /// The calibration for TERN's RIEGL VZ-400i exports (3dtrees research 74 §§13-19 and 93 §§11.2, 17: Alice Mulga).
-    fn default() -> Self {
-        JointParams {
-            exit: 0.007, divergence: 0.35e-3, sigma_r: 0.005, rough: 0.03, tau: 0.11, edge: 0.5, eps: 0.1, eps_min: 0.01, mp_len: 0.5, hide: 0.09,
-            refl_wood: -15.45, refl_wood_sd: 1.0, refl_leaf: -19.7, refl_leaf_sd: 1.4, refl_multi: -3.0, refl_multi_sd: 1.2,
-            refl_thin: -3.0, stop_wood: 0.99, stop_leaf: 0.1, exist_scale: 0.2, model_sd: 0.004, thin_seed: 0,
+/// A field type of a settings record made by [`params!`].
+pub trait Setting: Copy {
+    /// The value as a [`Value`].
+    fn value(self) -> Value;
+    /// The value of a [`Value`]; `None` where this type can't hold it (a real for an integer field).
+    fn from_value(n: Value) -> Option<Self>;
+}
+
+impl Setting for f64 {
+    fn value(self) -> Value {
+        Value::Real(self)
+    }
+    fn from_value(n: Value) -> Option<Self> {
+        Some(match n {
+            Value::Real(x) => x,
+            Value::Int(i) => i as f64,
+        })
+    }
+}
+
+impl Setting for u64 {
+    fn value(self) -> Value {
+        Value::Int(self)
+    }
+    fn from_value(n: Value) -> Option<Self> {
+        match n {
+            Value::Int(i) => Some(i),
+            Value::Real(_) => None,
         }
+    }
+}
+
+/// A settings record written once: the struct, each field with its default
+/// (`name: type = default`), its [`Default`], and its fields by name
+/// (`FIELDS`, `get`, `set`), which is how they cross to Python.
+macro_rules! params {
+    ($(#[$m:meta])* pub struct $T:ident { $($(#[$fm:meta])* pub $f:ident: $t:ty = $v:expr,)* }) => {
+        $(#[$m])*
+        pub struct $T { $($(#[$fm])* pub $f: $t,)* }
+
+        impl Default for $T {
+            fn default() -> Self {
+                $T { $($f: $v,)* }
+            }
+        }
+
+        impl $T {
+            /// The fields' names, in order.
+            pub const FIELDS: &'static [&'static str] = &[$(stringify!($f)),*];
+
+            /// The field `name`'s value; `None` if there is no such field.
+            pub fn get(&self, name: &str) -> Option<$crate::qsm::joint::Value> {
+                use $crate::qsm::joint::Setting;
+                match name {
+                    $(stringify!($f) => Some(self.$f.value()),)*
+                    _ => None,
+                }
+            }
+
+            /// Sets the field `name`; false if there is no such field or its type can't hold `v`.
+            pub fn set(&mut self, name: &str, v: $crate::qsm::joint::Value) -> bool {
+                use $crate::qsm::joint::Setting;
+                match name {
+                    $(stringify!($f) => <$t>::from_value(v).map(|x| self.$f = x).is_some(),)*
+                    _ => false,
+                }
+            }
+        }
+    };
+}
+pub(crate) use params;
+
+params! {
+    /// The scanner and export constants of the likelihood (a plot calibration).
+    ///
+    /// The defaults are the calibration for TERN's RIEGL VZ-400i exports (3dtrees research 74 §§13-19 and 93 §§11.2, 17: Alice Mulga).
+    #[derive(Debug, Clone, Copy, PartialEq)]
+    pub struct JointParams {
+        /// Beam diameter at the aperture (m) and full divergence (rad).
+        pub exit: f64 = 0.007,
+        pub divergence: f64 = 0.35e-3,
+        /// Range noise (m), and surface roughness as a share of the radius.
+        pub sigma_r: f64 = 0.005,
+        pub rough: f64 = 0.03,
+        /// Energy share of the footprint an echo needs, and the sd of the
+        /// detection edge as a share of the footprint's width.
+        pub tau: f64 = 0.11,
+        pub edge: f64 = 0.5,
+        /// Mixed-pixel share: `eps_min + eps (1 - f)`, f the footprint's share on the wood, landing up to
+        /// `mp_len` m behind the surface.
+        pub eps: f64 = 0.1,
+        pub eps_min: f64 = 0.01,
+        pub mp_len: f64 = 0.5,
+        /// The share of stops whose echo the export deleted, among pulses that
+        /// lost an echo where it could lie (research 74 §19; 0: a recorded pass is
+        /// a pass).
+        pub hide: f64 = 0.09,
+        /// Echo character (3dtrees research 93 §11.2): the reflectance (dB) of a single return from bark that fills
+        /// the footprint and from leaf, mean and sd; a return that shares its pulse is `refl_multi` dB brighter (it
+        /// is negative) with `refl_multi_sd` more spread, in quadrature. Read by [`crate::qsm::support_tree`] only.
+        pub refl_wood: f64 = -15.45,
+        pub refl_wood_sd: f64 = 1.0,
+        pub refl_leaf: f64 = -19.7,
+        pub refl_leaf_sd: f64 = 1.4,
+        pub refl_multi: f64 = -3.0,
+        pub refl_multi_sd: f64 = 1.2,
+        /// Thin wood reads darker than bark that fills the footprint even above the footprint's width (3dtrees
+        /// research 93 §16: rows under 2 cm at -17.8 dB p50 against -15.9): wood's mean shifts by `refl_thin` dB at
+        /// R <= 1 cm, by none from 3 cm, linearly in log R between. Read by [`crate::qsm::support_tree`] only.
+        pub refl_thin: f64 = -3.0,
+        /// The share of the pulses aimed at a core that stop there, on wood (opaque but for the soft edge) and on
+        /// foliage, and the weight of a scan's existence log odds (its pulses are correlated beyond the beam's
+        /// oversampling): existence's evidence, fitted on `joint_tree`'s wood and NO_WOOD rows (3dtrees research 93 §17
+        /// review). Read by [`crate::qsm::support_tree`] only.
+        pub stop_wood: f64 = 0.99,
+        pub stop_leaf: f64 = 0.1,
+        pub exist_scale: f64 = 0.2,
+        /// The floor on each support measurement's sd (m): non-round sections and a ~4 mm offset between scans that
+        /// no sway explains (3dtrees research 93 §15.6). Read by [`crate::qsm::support_tree`] only.
+        pub model_sd: f64 = 0.004,
+        /// Which pulses a routed piece of more pairs than its budget fits ([`crate::qsm::support_tree`]'s thinning, a
+        /// hash of each pulse's direction and this): 0 in production; the bench varies it to measure the thinning's noise
+        /// (3dtrees research 93 §19). Read by [`crate::qsm::support_tree`] only.
+        pub thin_seed: u64 = 0,
     }
 }
 
