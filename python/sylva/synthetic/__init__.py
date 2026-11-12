@@ -291,7 +291,7 @@ def scan(cloud: PointCloud, origin=(10.0, 10.0, 1.5), resolution_deg: float = 0.
         refl_map = [(int(k), float(v)) for k, v in reflectance.items()]
     else:
         refl_const = float(reflectance)
-    d = _core.synthetic_scan_beam(
+    d = (_core.synthetic_scan_beam if solids is None else _core.synthetic_scan_beam_solids)(
         cloud.xyz, cloud.attrs, o, float(resolution_deg), pick(min_zenith_deg, "min_zenith_deg", 0.0),
         pick(zenith_given, "max_zenith_deg", max_zenith_deg), int(max_echoes), float(echo_separation),
         noise[0], noise[1], div, exit_d, int(footprint_samples),
@@ -304,9 +304,9 @@ def scan(cloud: PointCloud, origin=(10.0, 10.0, 1.5), resolution_deg: float = 0.
 
 
 def _solids(solids):
-    """The solids' arrays for the core (four Nones without)."""
+    """The solids' arrays for the core (none without)."""
     if solids is None:
-        return None, None, None, None
+        return ()
     a = np.ascontiguousarray(solids["a"], np.float64).reshape(-1, 3)
     b = np.ascontiguousarray(solids["b"], np.float64).reshape(-1, 3)
     return (a, b, np.ascontiguousarray(solids["r"], np.float64).ravel(),

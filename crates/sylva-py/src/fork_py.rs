@@ -4,7 +4,7 @@
 // see the LICENSE file. There is no warranty, to the extent permitted by law.
 //! Bindings 3dtrees' fork adds (CHANGELOG-3dtrees.md): the scan index, the
 //! joint model and `support_tree`, the evidence reduction, the trees' context
-//! and contest, and the ray-cloud tiles. Kept apart from upstream's binding
+//! and contest, the ray-cloud tiles, and the beam scan with solids. Kept apart from upstream's binding
 //! files, so a merge from upstream meets them in one line of `lib.rs`.
 
 use std::path::PathBuf;
@@ -19,8 +19,9 @@ use sylva_rs::qsm::evidence::{self, Beam, EvidenceParams};
 use sylva_rs::qsm::scan_index::{self, ScanIndex};
 use sylva_rs::qsm::joint::{self, Echoes, JointParams, Owner, Pulse, Value};
 use sylva_rs::qsm::joint_fit::{PriorParams, Rows};
+use sylva_rs::synthetic::scan::{self as synth, BeamScan, Reflectance, Solid};
 
-use crate::{err, xyz_from_py, xyz_to_py};
+use crate::{cloud_from_py, err, xyz_from_py, xyz_to_py};
 
 /// One scan's pulses indexed by direction, read from a single-position Shots
 /// file and held on the Rust side.
@@ -473,6 +474,45 @@ fn tile_ray_clouds<'py>(py: Python<'py>, files: Vec<PathBuf>, out: PathBuf, widt
         .collect::<PyResult<_>>()?;
     Ok((tiles, n_terrain))
 }
+/// Upstream's `synthetic_scan_beam`, its arguments in its order, with solid capped cylinders `a -> b` of radius `r`
+/// in the scene, each echoing as the cloud's point `point` (see `sylva.synthetic.scan`).
+#[pyfunction]
+#[allow(clippy::too_many_arguments)]
+fn synthetic_scan_beam_solids<'py>(py: Python<'py>, xyz: PyReadonlyArray2<f64>, attrs: Option<&Bound<'_, PyDict>>, origin: (f64, f64, f64), resolution_deg: f64, min_zenith_deg: f64, max_zenith_deg: f64, max_echoes: usize, echo_separation: f64, range_noise: f64, range_noise_slope: f64, beam_divergence: f64, exit_diameter: f64, footprint_samples: usize, mixed_pixels: bool, target_radius: Option<f64>, oriented: bool, detection_threshold: f64, reflectance_map: Vec<(i64, f64)>, reflectance_default: f64, reflectance_attr: Option<String>, reflectance_constant: Option<f64>, max_range: f64, seed: u64, solid_a: PyReadonlyArray2<f64>, solid_b: PyReadonlyArray2<f64>, solid_r: PyReadonlyArray1<f64>, solid_point: PyReadonlyArray1<i64>) -> PyResult<Bound<'py, PyDict>> {
+    let cloud = cloud_from_py(xyz, attrs)?;
+    let (sa, sb, sr, sp) = (solid_a.as_array(), solid_b.as_array(), solid_r.as_array(), solid_point.as_array());
+    if sa.ncols() != 3 || sb.ncols() != 3 || sb.nrows() != sa.nrows() || sr.len() != sa.nrows() || sp.len() != sa.nrows() || sp.iter().any(|&i| i < 0) {
+        return Err(PyValueError::new_err("solids: a and b (n, 3), r and point (n,), point indices of the cloud"));
+    }
+    let p = BeamScan {
+        solids: (0..sa.nrows()).map(|i| Solid { a: [sa[[i, 0]], sa[[i, 1]], sa[[i, 2]]], b: [sb[[i, 0]], sb[[i, 1]], sb[[i, 2]]], r: sr[i], point: sp[i] as usize }).collect(),
+        resolution_deg,
+        min_zenith_deg,
+        max_zenith_deg,
+        max_echoes,
+        echo_separation,
+        range_noise,
+        range_noise_slope,
+        divergence_mrad: beam_divergence,
+        exit_diameter,
+        footprint_samples,
+        mixed_pixels,
+        target_radius,
+        oriented,
+        detection_threshold,
+        reflectance: match (reflectance_attr, reflectance_constant) {
+            (Some(a), _) => Reflectance::Attribute(a),
+            (None, Some(c)) => Reflectance::Constant(c),
+            (None, None) => Reflectance::ByClass(reflectance_map, reflectance_default),
+        },
+        max_range,
+        seed,
+        ..BeamScan::new([origin.0, origin.1, origin.2])
+    };
+    let s = py.detach(|| synth::scan_beam(&cloud, &p)).map_err(err)?;
+    crate::shots_into_py(py, s)
+}
+
 /// Adds this file's functions to the `_core` module.
 pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyScanIndex>()?;
@@ -492,6 +532,7 @@ pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
         wrap_pyfunction!(qsm_evidence_reasons, m)?,
         wrap_pyfunction!(qsm_contest, m)?,
         wrap_pyfunction!(tile_ray_clouds, m)?,
+        wrap_pyfunction!(synthetic_scan_beam_solids, m)?,
     ] {
         m.add_function(f)?;
     }
