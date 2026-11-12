@@ -690,44 +690,26 @@ pub struct JointPairs {
     pub echo: Vec<u8>,
 }
 
-/// Which path classified an echo (see [`Echoes`]).
-pub mod path {
-    /// A measured piece's: on its fitted circle's front arc, times the echo's character.
-    pub const MEASURED: u8 = 0;
-    /// A bounded piece's: on its posterior circle's front arc, times the echo's character.
-    pub const BOUNDED: u8 = 1;
-    /// A porous piece's: its existence, times the echo's character.
-    pub const POROUS: u8 = 2;
-    /// The exact likelihood's: the softmax of the stop's wood and leaf terms ([`super::joint_wood_share`]).
-    pub const EXACT: u8 = 3;
-    /// A routed piece's with no exact fit accepted (none, or one that didn't converge or, as one stem, fell below
-    /// the piece's detection bound): on its posterior circle's front arc, times the echo's character.
-    pub const ROUTED: u8 = 4;
-}
-
 /// A tree's echoes classified (3dtrees research 93 §18), one record per echo, keyed as the tile sidecars are
 /// (research 94, win 1): the scan (an index into the fit's scans), the pulse's row in its Shots file and the echo's
-/// place in its pulse. Each with the chance it is wood's echo, the node it belongs to, the [`path`] that said so
-/// and how far it lies from that node's fitted surface (m), sorted by key.
+/// place in its pulse. Each with the chance it is wood's echo, the node it belongs to and how far it lies from that
+/// node's fitted surface (m), sorted by key.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Echoes {
     pub scan: Vec<u32>,
     pub pulse: Vec<u32>,
     pub echo: Vec<u8>,
     pub node: Vec<u32>,
-    pub path: Vec<u8>,
     pub p_wood: Vec<f64>,
     pub dist: Vec<f64>,
 }
 
 impl Echoes {
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) fn push(&mut self, scan: u32, pulse: u32, echo: u8, node: u32, path: u8, p_wood: f64, dist: f64) {
+    pub(crate) fn push(&mut self, scan: u32, pulse: u32, echo: u8, node: u32, p_wood: f64, dist: f64) {
         self.scan.push(scan);
         self.pulse.push(pulse);
         self.echo.push(echo);
         self.node.push(node);
-        self.path.push(path);
         self.p_wood.push(p_wood);
         self.dist.push(dist);
     }
@@ -738,7 +720,6 @@ impl Echoes {
         self.pulse.extend(other.pulse);
         self.echo.extend(other.echo);
         self.node.extend(other.node.into_iter().map(node));
-        self.path.extend(other.path);
         self.p_wood.extend(other.p_wood);
         self.dist.extend(other.dist);
     }
@@ -765,7 +746,7 @@ impl Echoes {
                 continue;
             }
             last = Some(key);
-            out.push(key.0, key.1, key.2, self.node[i], self.path[i], self.p_wood[i], self.dist[i]);
+            out.push(key.0, key.1, key.2, self.node[i], self.p_wood[i], self.dist[i]);
         }
         out
     }

@@ -293,18 +293,8 @@ fn echoes_to_py<'py>(py: Python<'py>, e: Echoes) -> PyResult<Bound<'py, PyDict>>
     d.set_item("scan", e.scan.into_pyarray(py))?;
     d.set_item("pulse", e.pulse.into_pyarray(py))?;
     d.set_item("echo", e.echo.into_pyarray(py))?;
-    d.set_item("node", e.node.into_pyarray(py))?;
-    d.set_item("path", e.path.into_pyarray(py))?;
     d.set_item("p_wood", e.p_wood.into_pyarray(py))?;
-    d.set_item("dist", e.dist.into_pyarray(py))?;
     Ok(d)
-}
-
-/// The names of the `path` codes of the classified echoes.
-#[pyfunction]
-fn qsm_echo_paths() -> Vec<(&'static str, u8)> {
-    use joint::path::*;
-    vec![("MEASURED", MEASURED), ("BOUNDED", BOUNDED), ("POROUS", POROUS), ("EXACT", EXACT), ("ROUTED", ROUTED)]
 }
 
 /// The names of the `flags` bits of `qsm_support_tree`.
@@ -312,13 +302,6 @@ fn qsm_echo_paths() -> Vec<(&'static str, u8)> {
 fn qsm_support_flags() -> Vec<(&'static str, u8)> {
     use support_tree::flag::*;
     vec![("RUNS", RUNS), ("HULL", HULL), ("BOUNDS", BOUNDS), ("POROUS", POROUS)]
-}
-
-/// The names of the `refused` bits of `qsm_support_tree`.
-#[pyfunction]
-fn qsm_support_refusals() -> Vec<(&'static str, u8)> {
-    use support_tree::refusal::*;
-    vec![("NO_SEED", NO_SEED), ("NO_PULSES", NO_PULSES), ("UNCONVERGED", UNCONVERGED), ("NON_FINITE", NON_FINITE), ("BOUND", BOUND), ("UNINFORMED", UNINFORMED)]
 }
 
 /// The names of the `diag` bits of `qsm_support_tree`.
@@ -346,23 +329,14 @@ fn support_fit<'py>(py: Python<'py>, f: support_tree::Fit) -> PyResult<Bound<'py
     d.set_item("e1", xyz(&f.e1)?)?;
     d.set_item("e2", xyz(&f.e2)?)?;
     d.set_item("centre", two(&f.centre)?)?;
-    d.set_item("sd_centre", two(&f.sd_centre)?)?;
     d.set_item("lean", two(&f.lean)?)?;
-    d.set_item("sd_lean", two(&f.sd_lean)?)?;
-    for (k, v) in [("r", f.r), ("sd_log_r", f.sd_log_r), ("r_row", f.r_row), ("sd_r_row", f.sd_r_row), ("chi2", f.chi2), ("chi2_front", f.chi2_front), ("r_lo", f.r_lo), ("r_hi", f.r_hi), ("r_floor", f.r_floor), ("log_odds", f.log_odds), ("p_wood", f.p_wood), ("lam", f.lam), ("data_share", f.data_share), ("contested", f.contested), ("deleted", f.deleted), ("r_cap", f.r_cap), ("pass_share", f.pass_share), ("r_points", f.r_points)] {
+    for (k, v) in [("r", f.r), ("sd_log_r", f.sd_log_r), ("r_lo", f.r_lo), ("r_hi", f.r_hi), ("p_wood", f.p_wood), ("data_share", f.data_share), ("contested", f.contested), ("deleted", f.deleted), ("r_cap", f.r_cap), ("pass_share", f.pass_share)] {
         d.set_item(k, v.into_pyarray(py))?;
     }
     d.set_item("diag", f.diag.into_pyarray(py))?;
     d.set_item("flags", f.flags.into_pyarray(py))?;
-    d.set_item("n_runs", f.n_runs.into_pyarray(py))?;
     d.set_item("n_scans", f.n_scans.into_pyarray(py))?;
-    d.set_item("n_pairs", f.n_pairs.into_pyarray(py))?;
     d.set_item("k_stems", f.k_stems.into_pyarray(py))?;
-    d.set_item("split_gain", f.split_gain.into_pyarray(py))?;
-    d.set_item("n_exact", f.n_exact.into_pyarray(py))?;
-    d.set_item("evals_value", f.evals_value.into_pyarray(py))?;
-    d.set_item("evals_deriv", f.evals_deriv.into_pyarray(py))?;
-    d.set_item("refused", f.refused.into_pyarray(py))?;
     d.set_item("n_pass", f.n_pass.into_pyarray(py))?;
     d.set_item("basis", f.basis.into_pyarray(py))?;
     Ok(d)
@@ -406,7 +380,6 @@ fn qsm_support_tree<'py>(py: Python<'py>, scans: Vec<Bound<'py, PyScanIndex>>, a
     pieces.set_item("stem", f.piece_stem.into_pyarray(py))?;
     d.set_item("pieces", pieces)?;
     d.set_item("converged", f.converged)?;
-    d.set_item("rounds", f.rounds)?;
     d.set_item("echoes", echoes_to_py(py, f.echoes)?)?;
     let v = f.volume;
     let volume = PyDict::new(py);
@@ -524,10 +497,8 @@ pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     for f in [
         wrap_pyfunction!(qsm_rebase, m)?,
         wrap_pyfunction!(qsm_support_flags, m)?,
-        wrap_pyfunction!(qsm_support_refusals, m)?,
         wrap_pyfunction!(qsm_support_diags, m)?,
         wrap_pyfunction!(qsm_support_bases, m)?,
-        wrap_pyfunction!(qsm_echo_paths, m)?,
         wrap_pyfunction!(qsm_support_tree, m)?,
         wrap_pyfunction!(qsm_tree_context, m)?,
         wrap_pyfunction!(qsm_joint_defaults, m)?,
