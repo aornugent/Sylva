@@ -182,9 +182,7 @@ def support_tree(scans, a, b, r_prior, parent, context=None, params: JointParams
 
     Returns
     -------
-    dict, per row (``(n,)`` unless noted), with the same per node under ``pieces``: the pieces, then the routed
-    pieces' further stems, with each node's ``row``, the piece it came from (``src``: itself for a piece) and its stem
-    there (``stem``: 0 for a piece's own):
+    dict, per row (``(n,)`` unless noted):
 
     - ``a``, ``b`` ``(n, 3)``: the fitted axis, world coordinates (the claim moved by the centre and turned by the
       lean; a row's runs from its first piece's start to its last's end); ``r``, ``sd_log_r``: the radius, held inside

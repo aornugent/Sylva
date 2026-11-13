@@ -523,16 +523,10 @@ pub struct Volume {
     pub by_basis: [f64; 5],
 }
 
-/// The fit of one tree: per row (in the input's order) and per node, with each node's row; the nodes are the pieces,
-/// then the routed pieces' further stems, each with the piece it came from (`piece_src`) and its stem there
-/// (`piece_stem`, 0 for a piece's own). And its echoes classified.
+/// The fit of one tree: per row, in the input's order; and its echoes classified.
 #[derive(Debug, Clone, PartialEq)]
 pub struct SupportTree {
     pub rows: Fit,
-    pub pieces: Fit,
-    pub piece_row: Vec<u32>,
-    pub piece_src: Vec<u32>,
-    pub piece_stem: Vec<u32>,
     /// Whether the censored solve settled within [`EP_ROUNDS`].
     pub converged: bool,
     pub echoes: Echoes,
@@ -1893,6 +1887,11 @@ fn segment_distance(p1: &Point, q1: &Point, p2: &Point, q2: &Point) -> f64 {
 /// widths from `prior` and the footprint, detection threshold, range noise and echo character from `like`. Runs on
 /// `threads` threads (0: one per core).
 pub fn support_tree(scans: &[&ScanIndex], rows: &Rows, context: &[(Point, Point, f64)], like: &JointParams, prior: &PriorParams, threads: usize) -> Result<SupportTree> {
+    Ok(fit_tree(scans, rows, context, like, prior, threads)?.0)
+}
+
+/// [`support_tree`], with each node's fit (the pieces, then the routed pieces' further stems) and its row.
+fn fit_tree(scans: &[&ScanIndex], rows: &Rows, context: &[(Point, Point, f64)], like: &JointParams, prior: &PriorParams, threads: usize) -> Result<(SupportTree, Fit, Vec<usize>)> {
     let fr = rows.check("support tree")?;
     prior.check()?;
     let mut nd = Nodes::of(rows, &fr);
@@ -2034,12 +2033,9 @@ pub fn support_tree(scans: &[&ScanIndex], rows: &Rows, context: &[(Point, Point,
         tally(&sums[nd.src(k).0].seen, &x)
     }).collect();
 
+    let mut pieces = Fit::default();
     let mut out = SupportTree {
         rows: Fit::default(),
-        pieces: Fit::default(),
-        piece_row: nd.row.iter().map(|&k| k as u32).collect(),
-        piece_src: (0..nd.row.len()).map(|k| nd.src(k).0 as u32).collect(),
-        piece_stem: (0..nd.row.len()).map(|k| nd.src(k).1).collect(),
         converged,
         echoes,
         volume: Volume::default(),
@@ -2083,11 +2079,11 @@ pub fn support_tree(scans: &[&ScanIndex], rows: &Rows, context: &[(Point, Point,
             audit: audit[k],
             basis,
         };
-        out.pieces.push(&sol.x[k], &widened(&sol.cov[k], widen(basis)), nd.frame[k], nd.a[k], own);
+        pieces.push(&sol.x[k], &widened(&sol.cov[k], widen(basis)), nd.frame[k], nd.a[k], own);
     }
     for k in 0..rows.a.len() {
         let (k0, k1) = (nd.first[k], nd.first[k + 1]);
-        let p = &out.pieces;
+        let p = &pieces;
         // each piece's log R widened by its own basis's factor: a row of mixed bases piece by piece
         let k_of: Vec<f64> = p.basis[k0..k1].iter().map(|&b| widen(b)).collect();
         let (x, cov) = row_line(&sol, k0, k1, fr[k].3, nd.frame[k0].3, &k_of);
@@ -2123,8 +2119,8 @@ pub fn support_tree(scans: &[&ScanIndex], rows: &Rows, context: &[(Point, Point,
         };
         out.rows.push(&x, &cov, fr[k], rows.a[k], own);
     }
-    out.volume = volume(&nd, &sol, &held, &out.pieces.basis);
-    Ok(out)
+    out.volume = volume(&nd, &sol, &held, &pieces.basis);
+    Ok((out, pieces, nd.row))
 }
 
 /// Each node's reach: the longest path (m) from its start, along its row and the rows after it, to a tip; a further
@@ -2738,10 +2734,10 @@ mod tests {
         let (scan, a, b) = crate::qsm::scan_index::tests::scene(0.05, true);
         let (a1, b1) = ([a[0] + 0.01, a[1], a[2]], [b[0] + 0.01, b[1], b[2]]);
         let rows = Rows { a: &[a1], b: &[b1], r_prior: &[0.08], r_max: &[], parent: &[-1] };
-        let t = support_tree(&[&scan], &rows, &[], &like(), &PriorParams::default(), 2).unwrap();
-        let (f, q) = (&t.rows, &t.pieces);
+        let (t, q, row) = fit_tree(&[&scan], &rows, &[], &like(), &PriorParams::default(), 2).unwrap();
+        let (f, q) = (&t.rows, &q);
         // the 2 m row is seven pieces of the tree; the fan sees the middle three, and they are measured
-        assert_eq!(t.piece_row, vec![0; 7]);
+        assert_eq!(row, vec![0; 7]);
         let seen: Vec<usize> = (0..7).filter(|&j| q.n_scans[j] > 0).collect();
         assert_eq!(seen, vec![2, 3, 4], "scans {:?}", q.n_scans);
         assert!(seen.iter().all(|&j| q.flags[j] == 0 && (q.r[j] - 0.05).abs() < 0.0025 && q.n_scans[j] == 1), "flags {:?} r {:?}", q.flags, q.r);
@@ -2766,9 +2762,9 @@ mod tests {
         // the part the fan sees, 48 cm in two pieces: measured, the claim moved back by 1 cm, upright
         let (a2, b2) = ([a1[0], a1[1], -0.24], [b1[0], b1[1], 0.24]);
         let rows = Rows { a: &[a2], b: &[b2], r_prior: &[0.08], r_max: &[], parent: &[-1] };
-        let t = support_tree(&[&scan], &rows, &[], &like(), &PriorParams::default(), 2).unwrap();
-        let (f, q) = (&t.rows, &t.pieces);
-        assert!(t.piece_row == vec![0, 0] && f.flags[0] == 0 && q.flags == vec![0, 0], "flags {:?}", q.flags);
+        let (t, q, row) = fit_tree(&[&scan], &rows, &[], &like(), &PriorParams::default(), 2).unwrap();
+        let (f, q) = (&t.rows, &q);
+        assert!(row == vec![0, 0] && f.flags[0] == 0 && q.flags == vec![0, 0], "flags {:?}", q.flags);
         assert!((f.r[0] - 0.05).abs() < 0.0025 && f.sd_log_r[0] / widen(f.basis[0]) < 0.1, "R {}", f.r[0]);
         assert!((0.5 * (f.a[0][0] + f.b[0][0])).abs() < 0.002 && f.lean[0][1].abs() < 0.02, "x {} {} lean {:?}", f.a[0][0], f.b[0][0], f.lean[0]);
     }
@@ -3459,9 +3455,9 @@ mod tests {
             support_tree(&[&scan], &rows, &[], &like(), &PriorParams::default(), 2).unwrap()
         };
         let near = piece(0.05, 0.3);
-        assert!(near.pieces.flags[0] == 0 && near.pieces.diag[0] & diag::TUBE_EDGE == 0 && (near.pieces.r[0] - 0.05).abs() < 0.003, "{:?}", near.pieces);
+        assert!(near.rows.flags[0] == 0 && near.rows.diag[0] & diag::TUBE_EDGE == 0 && (near.rows.r[0] - 0.05).abs() < 0.003, "{:?}", near.rows);
         let far = piece(0.005, 0.1);
-        let q = &far.pieces;
+        let q = &far.rows;
         assert!(q.flags[0] == flag::BOUNDS && q.diag[0] & diag::TUBE_EDGE != 0 && q.basis[0] != basis::MEASURED,
             "flags {} diag {} basis {}", q.flags[0], q.diag[0], q.basis[0]);
         // nor is the captor's span a lower bound on it
@@ -3470,7 +3466,7 @@ mod tests {
         // point circle (inside the refit's shift and width tests) both reach its 10.5 cm tube's edge
         let rows = Rows { a: &[[0.048, 5.0, -0.05]], b: &[[0.048, 5.0, 0.05]], r_prior: &[0.025], r_max: &[], parent: &[-1] };
         let t = support_tree(&[&scan], &rows, &[], &like(), &PriorParams::default(), 2).unwrap();
-        let q = &t.pieces;
+        let q = &t.rows;
         assert!(q.flags[0] == flag::BOUNDS && q.diag[0] & diag::TUBE_EDGE != 0 && q.basis[0] != basis::POINTS,
             "flags {} diag {} basis {}", q.flags[0], q.diag[0], q.basis[0]);
         assert!(reaches_edge(&Vector5::new(0.07, 0.0, 0.0, 0.0, 0.05), 0.15, 0.115) && !reaches_edge(&Vector5::new(0.01, 0.0, 0.0, 0.0, 0.05), 0.15, 0.115));

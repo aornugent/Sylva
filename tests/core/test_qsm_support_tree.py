@@ -27,15 +27,11 @@ def scanned(tmp_path, a, b, r, scanners, zenith=(80.0, 100.0)):
 
 
 def inside_own_bounds(f):
-    """Each row and node of a fit lies inside the bounds it reports (those that entered the tree), but where PINNED
-    says the rays contradict themselves; a node measured by its own circle reports none (3dtrees research 127)."""
-    for x in (f, f["pieces"]):
-        lo, hi = np.nan_to_num(x["r_lo"]), np.nan_to_num(x["r_hi"], nan=np.inf)
-        ok = (x["r"] >= lo * (1 - 1e-9)) & (x["r"] <= hi * (1 + 1e-9)) | ((x["diag"] & SupportDiag.PINNED) > 0)
-        assert ok.all(), (x["r"], x["r_lo"], x["r_hi"], x["diag"])
-    p = f["pieces"]
-    own = p["basis"] == SupportBasis.MEASURED
-    assert np.isnan(p["r_lo"][own]).all() and np.isnan(p["r_hi"][own]).all()
+    """Each row of a fit lies inside the bounds it reports (those that entered the tree), but where PINNED says the
+    rays contradict themselves (3dtrees research 127)."""
+    lo, hi = np.nan_to_num(f["r_lo"]), np.nan_to_num(f["r_hi"], nan=np.inf)
+    ok = (f["r"] >= lo * (1 - 1e-9)) & (f["r"] <= hi * (1 + 1e-9)) | ((f["diag"] & SupportDiag.PINNED) > 0)
+    assert ok.all(), (f["r"], f["r_lo"], f["r_hi"], f["diag"])
 
 
 def test_separated_stems_upright_and_leaning_are_measured(tmp_path):
@@ -87,14 +83,11 @@ def test_a_bent_stem_is_a_chain_of_straight_pieces(tmp_path):
     a = np.c_[rho - np.sqrt(rho ** 2 - z0 ** 2), np.zeros(2), z0]
     b = np.c_[rho - np.sqrt(rho ** 2 - (z0 + 0.6) ** 2), np.zeros(2), z0 + 0.6]
     f = support_tree(scans, a, b, [1.5 * r] * 2, [-1, 0], params=PARAMS, threads=2)
-    p = f["pieces"]
-    assert (f["flags"] == 0).all() and (p["flags"] == 0).all() and list(p["row"]) == [0, 0, 0, 1, 1, 1]
-    assert np.abs(np.log(p["r"] / r)).max() < 0.05 and np.abs(np.log(f["r"] / r)).max() < 0.05
-    # each piece's middle lies on the arc, though the chord is up to 2.2 cm off it
-    for k in range(len(p["r"])):
-        mid = 0.5 * (p["a"][k] + p["b"][k])
-        assert abs(mid[0] - (rho - np.sqrt(rho ** 2 - mid[2] ** 2))) < 0.003, (k, mid)
-    assert (p["p_wood"] > 0.9).all() and (f["p_wood"] > 0.9).all()
+    assert (f["flags"] == 0).all() and np.abs(np.log(f["r"] / r)).max() < 0.05
+    # each row runs from its first piece's start to its last's end, both on the arc
+    for x in np.r_[f["a"], f["b"]]:
+        assert abs(x[0] - (rho - np.sqrt(rho ** 2 - x[2] ** 2))) < 0.004, x
+    assert (f["p_wood"] > 0.9).all()
 
 
 def test_thin_stems_far_away_are_bounded_around_their_truth(tmp_path):
@@ -127,22 +120,17 @@ def test_a_clump_of_stems_is_flagged_as_runs(tmp_path):
     a, b = np.array([[*centre, 0.5], [*centre, 0.8]]), np.array([[*centre, 0.8], [*centre, 1.1]])
     f = support_tree(scans, a, b, [0.093, 0.093], [-1, 0], params=PARAMS)
     assert ((f["flags"] & SupportFlag.RUNS) > 0).all() and f["a"].shape == (2, 3)
-    # routed, each piece is fitted exactly from its runs' seeds: its stems are nodes (the piece's own, then the
-    # further ones beside it), each within a centimetre of a stem and its radius within a quarter
-    p = f["pieces"]
-    assert (p["k_stems"][:2] >= 2).all() and len(p["r"]) == 2 + (p["k_stems"][:2] - 1).sum()
-    assert (p["src"][2:] < 2).all() and (p["stem"][2:] > 0).all() and (p["stem"][:2] == 0).all()
-    mid = 0.5 * (p["a"] + p["b"])[:, :2]
-    for s in stems:
-        d = np.hypot(*(mid - s[:2]).T)
+    # routed, each piece is fitted exactly from its runs' seeds: several stems, and the one each row serves within a
+    # centimetre of a stem and its radius within a quarter
+    assert (f["k_stems"] >= 2).all()
+    for k, m in enumerate(0.5 * (f["a"] + f["b"])[:, :2]):
+        d = np.hypot(*(stems[:, :2] - m).T)
         j = np.argmin(d)
-        assert d[j] < 0.012 and abs(np.log(p["r"][j] / s[2])) < 0.25, (s, d[j], p["r"][j])
+        assert d[j] < 0.012 and abs(np.log(f["r"][k] / stems[j, 2])) < 0.25, (k, d[j], f["r"][k])
     # every stop classified once, by the exact likelihood here, and the stems' echoes are wood
     e = f["echoes"]
     key = np.c_[e["scan"], e["pulse"], e["echo"]]
     assert len(np.unique(key, axis=0)) == len(key) and np.median(e["p_wood"]) > 0.9, np.median(e["p_wood"])
-    # each node is one (piece, stem)
-    assert len(set(zip(p["src"].tolist(), p["stem"].tolist()))) == len(p["src"])
     # the runs' spans don't bound the stems measured in them, so they aren't reported as their bounds
     inside_own_bounds(f)
     with pytest.raises(ValueError, match="parent"):

@@ -172,7 +172,7 @@ fn qsm_support_bases() -> Vec<(&'static str, u8)> {
     vec![("MEASURED", MEASURED), ("POINTS", POINTS), ("BOUNDED", BOUNDED), ("PRIOR", PRIOR), ("CAPPED", CAPPED)]
 }
 
-/// A support fit's rows or pieces as a dict of arrays.
+/// A support fit's rows as a dict of arrays.
 fn support_fit<'py>(py: Python<'py>, f: support_tree::Fit) -> PyResult<Bound<'py, PyDict>> {
     let n = f.r.len();
     let d = PyDict::new(py);
@@ -228,11 +228,6 @@ fn qsm_support_tree<'py>(py: Python<'py>, scans: Vec<Bound<'py, PyScanIndex>>, a
         support_tree::support_tree(&refs, &rows, &context, &p.0, &p.1, threads)
     }).map_err(err)?;
     let d = support_fit(py, f.rows)?;
-    let pieces = support_fit(py, f.pieces)?;
-    pieces.set_item("row", f.piece_row.into_pyarray(py))?;
-    pieces.set_item("src", f.piece_src.into_pyarray(py))?;
-    pieces.set_item("stem", f.piece_stem.into_pyarray(py))?;
-    d.set_item("pieces", pieces)?;
     d.set_item("converged", f.converged)?;
     d.set_item("echoes", echoes_to_py(py, f.echoes)?)?;
     let v = f.volume;

@@ -14,9 +14,8 @@ branch `3dtrees/125-rebase`.
   gives each node its radius, held inside its bounds and capped by the site's D/H. Each node says how its radius is
   known (`basis`) and what a reviewer should check (`diag`), and gets `p_wood` from its existence evidence. Every stop
   is classified, and the tree's volume comes with an interval. 3dtrees needs it because this is its measurement: about
-  half a CPU-second per tree, where the refit and `joint_tree` took minutes. Its outputs are only those 3dtrees reads,
-  plus `pieces`. A new function: changes no existing output. The rules are in `support_tree.rs`'s module
-  documentation.
+  half a CPU-second per tree, where the refit and `joint_tree` took minutes. Its outputs are only those 3dtrees reads.
+  A new function: changes no existing output. The rules are in `support_tree.rs`'s module documentation.
 - `qsm.ScanIndex` holds one scan's pulses binned by direction, with each echo's character and each pulse's row in its
   Shots file. `qsm.pairs` returns the pulses near each cylinder. 3dtrees needs them because every fit above reads
   pulses by cylinder, and the row joins a fit's echoes to the tile sidecars. Additive, with `ShotsFile::read_rays`.
