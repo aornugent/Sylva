@@ -492,7 +492,11 @@ fn scan_energy(v: &View, si: usize, rendered: &[Vec<(usize, Layer)>], elems: &[E
         by_elem.insert(i as u32, data.len());
         data.push(ElemData { elem: i, cells: Vec::new(), class: k, support: 0, across: 2.0 * e.r / em.footprint(norm(&sub(&mid, &v.origin))), along });
     }
-    for (&cell, ls) in &buf {
+    // cells in index order, so an element's sums run in the same order in every run (the k-buffer is a hash map)
+    let mut order: Vec<usize> = buf.keys().copied().collect();
+    order.sort_unstable();
+    for cell in order {
+        let ls = &buf[&cell];
         let front = ls[0];
         let Some(&d) = by_elem.get(&front.elem) else { continue };
         let layers: Vec<(Layer, u8)> = ls.iter().map(|l| (*l, cls[l.elem as usize])).collect();
@@ -676,54 +680,60 @@ impl<V: std::ops::Deref<Target = View> + Sync> Config<V> {
         self.refresh(&touched)
     }
 
-    /// The latents' sufficient statistics of an element against the configuration, per view (the element is
-    /// rendered for them, not added). `shift` (m, per view; empty for none) is subtracted from the depth residuals.
+    /// What an element predicts in view `s` against the configuration, per cell it fronts (as [`predict`] gives
+    /// them, the element numbered 0): it is rendered for this, not added, and only the configuration's layers in its
+    /// cells enter its k-buffer, so its front cells and class are those of the whole set.
+    pub fn predict(&self, e: Element, s: usize) -> Vec<Prediction> {
+        let (v, em) = (&*self.views[s], &self.em);
+        let mine = render(v, &e, 0, em);
+        let cells: std::collections::HashSet<usize> = mine.iter().map(|&(c, _)| c).collect();
+        let mut per: Vec<Vec<(usize, Layer)>> = (0..self.elems.len())
+            .filter(|&i| self.elems[i].is_some())
+            .map(|i| self.rendered[s][i].iter().filter(|(c, _)| cells.contains(c)).copied().collect::<Vec<_>>())
+            .filter(|l| !l.is_empty())
+            .collect();
+        for (k, l) in per.iter_mut().enumerate() {
+            l.iter_mut().for_each(|(_, ly)| ly.elem = k as u32 + 1);
+        }
+        per.insert(0, mine);
+        let buf = kbuffer(&per, MIN_FILL);
+        let k = classes(v, &buf, per.len(), em)[0];
+        let off = if em.field { em.field_along[k as usize] } else { 0.0 };
+        let mut out: Vec<Prediction> = buf.iter().filter(|(_, ls)| ls[0].elem == 0).map(|(&cell, ls)| {
+            let ly = ls[0];
+            let depth = ly.t + em.depth_bias(k, ly.t);
+            let sd = (em.sigma_e[k as usize].powi(2) + ly.spread.powi(2) + off * off).sqrt();
+            let obs = if v.state[cell] == state::ECHO { v.range[cell] as f64 } else { f64::NAN };
+            Prediction {
+                cell, elem: 0, fill: ly.f, kept: ly.op * sel(drop_of(em, v), em, self.sc.wood_db, ly.f * ly.cos), surface: k,
+                depth, sd, obs, code: cell_code(obs, depth, sd), weight: 1.0 / em.multiplicity(ly.t), footprint: em.footprint(ly.t), x: ly.x, s: ly.s,
+            }
+        }).collect();
+        out.sort_by_key(|p| p.cell);
+        out
+    }
+
+    /// The latents' sufficient statistics of an element against the configuration, per view, from its predictions
+    /// ([`Config::predict`]). `shift` (m, per view; empty for none) is subtracted from the depth residuals.
     pub fn stats(&self, e: Element, shift: &[f64]) -> Vec<Stats> {
         (0..self.views.len()).into_par_iter().map(|s| {
-            let v = &*self.views[s];
             let mut out = Stats { scan: s as u32, ..Stats::default() };
             // the misfit's from the element drawn sharp (its own misfit left out of the depths it is measured
             // from), the opacity's from the element as given
-            for (form, misfit) in [(Element { misfit: 0.0, ..e }, true), (e, false)] {
-                let mine = render(v, &form, 0, &self.em);
-                let cells: std::collections::HashSet<usize> = mine.iter().map(|&(c, _)| c).collect();
-                let mut per: Vec<Vec<(usize, Layer)>> = (0..self.elems.len())
-                    .filter(|&i| self.elems[i].is_some())
-                    .map(|i| self.rendered[s][i].iter().filter(|(c, _)| cells.contains(c)).copied().collect::<Vec<_>>())
-                    .filter(|l| !l.is_empty())
-                    .collect();
-                for (k, l) in per.iter_mut().enumerate() {
-                    l.iter_mut().for_each(|(_, ly)| ly.elem = k as u32);
+            for p in self.predict(Element { misfit: 0.0, ..e }, s) {
+                let r = p.obs - p.depth - shift.get(s).copied().unwrap_or(0.0);
+                if p.fill > 0.5 && r.abs() < 3.0 * p.sd + 0.03 {
+                    out.misfit_ss += p.weight * (r * r - p.sd * p.sd).max(0.0);
+                    out.misfit_w += p.weight;
+                    out.misfit_cells += 1;
                 }
-                let me = per.len() as u32;
-                per.push(mine.into_iter().map(|(c, ly)| (c, Layer { elem: me, ..ly })).collect());
-                let buf = kbuffer(&per, MIN_FILL);
-                let k = classes(v, &buf, per.len(), &self.em)[me as usize];
-                let off = if self.em.field { self.em.field_along[k as usize] } else { 0.0 };
-                for (&cell, ls) in &buf {
-                    let ly = ls[0];
-                    if ly.elem != me {
-                        continue;
-                    }
-                    let depth = ly.t + self.em.depth_bias(k, ly.t);
-                    let sd = (self.em.sigma_e[k as usize].powi(2) + ly.spread.powi(2) + off * off).sqrt();
-                    let obs = if v.state[cell] == state::ECHO { v.range[cell] as f64 } else { f64::NAN };
-                    let w = 1.0 / self.em.multiplicity(ly.t);
-                    if misfit {
-                        let r = obs - depth - shift.get(s).copied().unwrap_or(0.0);
-                        if ly.f > 0.5 && r.abs() < 3.0 * sd + 0.03 {
-                            out.misfit_ss += w * (r * r - sd * sd).max(0.0);
-                            out.misfit_w += w;
-                            out.misfit_cells += 1;
-                        }
-                    } else if ly.f > 0.9 {
-                        match cell_code(obs, depth, sd) {
-                            code::ON => out.on += w,
-                            code::EMPTY => out.empty += w,
-                            code::BEHIND => out.behind += w,
-                            _ => {}
-                        }
-                    }
+            }
+            for p in self.predict(e, s).into_iter().filter(|p| p.fill > 0.9) {
+                match p.code {
+                    code::ON => out.on += p.weight,
+                    code::EMPTY => out.empty += p.weight,
+                    code::BEHIND => out.behind += p.weight,
+                    _ => {}
                 }
             }
             out
