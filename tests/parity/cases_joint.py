@@ -1,48 +1,16 @@
-"""Parity cases for sylva.qsm's joint model: the per-pulse likelihood and the pair table.
+"""Parity cases for sylva.qsm's joint model: the pair table.
 
-They replace 3dtrees' numpy oracle of both (research 74 §21), which they were recorded against: a change to either is
-a recorded change, in its own commit.
+They replace 3dtrees' numpy oracle (research 74 §21), which they were recorded against: a change is a recorded
+change, in its own commit.
 """
 
-import dataclasses
 import tempfile
 from pathlib import Path
 
 import numpy as np
 
-from sylva import Shots, _core
-from sylva.qsm import JointParams, ScanIndex, joint_table
-
-BENCH = JointParams(tau=0.17, edge=0.25, hide=0.0, mu_fork=0.0, centre_rel=0.3, scan_rel=0.05)
-
-
-def _pairs(seed, m=3000):
-    """Random pairs: stops and passes in chords at 3-30 m, early echoes, deleted echoes in reach, selection."""
-    rng = np.random.default_rng(seed)
-    t = rng.uniform(3.0, 30.0, m)
-    half = rng.uniform(0.04, 0.3, m)
-    ang = rng.uniform(0, 2 * np.pi, m)
-    stop = rng.uniform(size=m) < 0.5
-    c0, c1 = t - half, t + half
-    return dict(b=rng.uniform(-0.12, 0.12, m), t=t, sin=rng.uniform(0.2, 1.0, m), jb=np.c_[np.cos(ang), np.sin(ang)],
-                jt=rng.normal(0, 1.5, (m, 2)), c0=c0, c1=c1, x=np.where(stop, rng.uniform(c0, c1), 0.0),
-                q=np.where(rng.uniform(size=m) < 0.3, rng.uniform(0.2, 1.0, m), 1.0), stop=stop,
-                early=rng.uniform(size=m) < 0.1, deleted=rng.uniform(size=m) < 0.15)
-
-
-def _states(seed, m):
-    """Per-pair states: small offsets, radii from below an echo's capacity (0.5 mm) to trunks, foliage around 1/m."""
-    rng = np.random.default_rng(seed)
-    return np.c_[rng.normal(0, 0.01, (m, 2)), np.log(rng.uniform(0.0005, 0.15, m)), rng.normal(0, 1, m)]
-
-
-def loglik():
-    pairs = _pairs(1)
-    state = _states(2, len(pairs["t"]))
-    out = {}
-    for name, p in (("default", JointParams()), ("bench", BENCH), ("rough", dataclasses.replace(BENCH, rough=0.3))):
-        out[name] = _core.qsm_joint_loglik(pairs, state, dataclasses.asdict(p), 1)
-    return out
+from sylva import Shots
+from sylva.qsm import ScanIndex, joint_table
 
 
 def _fan(path, r=0.05):
@@ -79,4 +47,4 @@ def table():
     return {k: v for k, v in t.items() if k != "scan"}
 
 
-CASES = {"loglik": loglik, "table": table}
+CASES = {"table": table}

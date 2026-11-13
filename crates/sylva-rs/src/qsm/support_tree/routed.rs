@@ -483,7 +483,7 @@ fn exact_thinned(scans: &[&ScanIndex], a0: &Point, frame: Frame, seeds: &[Seed],
     let views: Vec<Vec<Pulse>> = seeds.iter().enumerate().map(|(j, _)| fit_idx.iter().map(|&i| remeasure(&t.pulses[i], ray(i), &axes[j].0, sfr[j])).collect()).collect();
     let range: Vec<f64> = fit_idx.iter().map(|&i| t.pulses[i].t).collect();
     let scan: Vec<u32> = fit_idx.iter().map(|&i| t.scan[i]).collect();
-    let opts = FitOptions { schedule: Vec::new(), iters: EXACT_ITERS, tol: EXACT_TOL, threads: 1, local: false, profile: false };
+    let opts = FitOptions { iters: EXACT_ITERS, tol: EXACT_TOL, threads: 1 };
     // k stems while the same pulses' BIC rises: the k - 1 fitted (each its seed's axis moved by its offset, with its
     // radius) and the next seed
     type State = Vec<(usize, [f64; 2], f64)>;
@@ -696,7 +696,7 @@ pub(crate) fn fit_stems(range: &[f64], see: &(dyn Fn(usize, usize, [f64; 2]) -> 
     let (sp, own) = assign(&radii.iter().map(|&r| ([0.0, 0.0], r)).collect::<Vec<_>>());
     let row: Vec<u32> = own.iter().map(|o| o.row).collect();
     let rows = Rows { a: &sa, b: &sb, r_prior: radii, r_max: &sw, parent: &parent };
-    let f = joint_fit(&sp, &row, scan, &rows, n_scans, p, prior, opts, None)?;
+    let f = joint_fit(&sp, &row, scan, &rows, n_scans, p, prior, opts)?;
     let fitted: Vec<([f64; 2], f64)> = f.theta.iter().map(|t| ([t[0], t[1]], t[2].exp())).collect();
     let (sp, own) = assign(&fitted);
     let theta: Vec<[f64; 4]> = f.theta.iter().map(|t| [0.0, 0.0, t[2], t[3]]).collect();

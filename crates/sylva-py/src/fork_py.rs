@@ -3,8 +3,8 @@
 // Free software under the GNU General Public License v3.0 or later;
 // see the LICENSE file. There is no warranty, to the extent permitted by law.
 //! Bindings 3dtrees' fork adds (CHANGELOG-3dtrees.md): the scan index, the
-//! joint model and `support_tree`, the evidence reduction, the trees' context
-//! and contest, the ray-cloud tiles, and the beam scan with solids. Kept apart from upstream's binding
+//! joint table and `support_tree`, the trees' context and contest, the ray-cloud
+//! tiles, and the beam scan with solids. Kept apart from upstream's binding
 //! files, so a merge from upstream meets them in one line of `lib.rs`.
 
 use std::path::PathBuf;
@@ -15,9 +15,8 @@ use pyo3::prelude::*;
 use pyo3::types::PyDict;
 use sylva_rs::io;
 use sylva_rs::qsm::{self, support_tree};
-use sylva_rs::qsm::evidence::{self, Beam, EvidenceParams};
 use sylva_rs::qsm::scan_index::{self, ScanIndex};
-use sylva_rs::qsm::joint::{self, Echoes, JointParams, Owner, Pulse};
+use sylva_rs::qsm::joint::{self, Echoes, JointParams, Pulse};
 use sylva_rs::qsm::joint_fit::{PriorParams, Rows};
 use sylva_rs::synthetic::scan::{self as synth, BeamScan, Reflectance, Solid};
 
@@ -58,98 +57,6 @@ impl PyScanIndex {
         let o = self.inner.origin();
         (o[0], o[1], o[2])
     }
-}
-
-/// The fields of `EvidenceParams`, flat, with the beam's prefixed `beam_`
-/// (except `range_noise`), and the semantics `version`.
-fn evidence_params_to_py<'py>(py: Python<'py>, p: &EvidenceParams) -> PyResult<Bound<'py, PyDict>> {
-    let d = PyDict::new(py);
-    d.set_item("version", EvidenceParams::VERSION)?;
-    for (k, v) in [
-        ("beam_divergence", p.beam.divergence),
-        ("beam_exit", p.beam.exit),
-        ("range_noise", p.beam.range_noise),
-        ("floor_log", p.floor_log),
-        ("footprint_sd", p.footprint_sd),
-        ("spread_sd", p.spread_sd),
-        ("echoes_only_min_radius", p.echoes_only_min_radius),
-        ("min_footprints", p.min_footprints),
-        ("window_cap", p.window_cap),
-        ("window_min", p.window_min),
-        ("window_hi_factor", p.window_hi_factor),
-        ("window_hi_margin", p.window_hi_margin),
-        ("window_r_factor", p.window_r_factor),
-        ("window_r_margin", p.window_r_margin),
-        ("min_length", p.min_length),
-    ] {
-        d.set_item(k, v)?;
-    }
-    d.set_item("rounds", p.rounds)?;
-    Ok(d)
-}
-
-fn evidence_params_from_py(d: &Bound<'_, PyDict>) -> PyResult<EvidenceParams> {
-    let get = |k: &str| d.get_item(k)?.ok_or_else(|| PyValueError::new_err(format!("evidence params: no {k:?}")));
-    let f = |k: &str| get(k)?.extract::<f64>();
-    if get("version")?.extract::<u32>()? != EvidenceParams::VERSION {
-        return Err(PyValueError::new_err(format!("evidence params: version {} is not this Sylva's ({})", get("version")?, EvidenceParams::VERSION)));
-    }
-    let known = evidence_params_to_py(d.py(), &EvidenceParams::default())?;
-    if d.len() != known.len() || d.keys().iter().any(|k| !known.contains(&k).unwrap_or(false)) {
-        return Err(PyValueError::new_err("evidence params: unexpected fields"));
-    }
-    Ok(EvidenceParams {
-        beam: Beam { divergence: f("beam_divergence")?, exit: f("beam_exit")?, range_noise: f("range_noise")? },
-        floor_log: f("floor_log")?,
-        footprint_sd: f("footprint_sd")?,
-        spread_sd: f("spread_sd")?,
-        echoes_only_min_radius: f("echoes_only_min_radius")?,
-        min_footprints: f("min_footprints")?,
-        window_cap: f("window_cap")?,
-        window_min: f("window_min")?,
-        window_hi_factor: f("window_hi_factor")?,
-        window_hi_margin: f("window_hi_margin")?,
-        window_r_factor: f("window_r_factor")?,
-        window_r_margin: f("window_r_margin")?,
-        rounds: get("rounds")?.extract()?,
-        min_length: f("min_length")?,
-    })
-}
-
-/// The default evidence settings, as `evidence_params_to_py` lays them out.
-#[pyfunction]
-fn qsm_evidence_defaults(py: Python<'_>) -> PyResult<Bound<'_, PyDict>> {
-    evidence_params_to_py(py, &EvidenceParams::default())
-}
-
-/// The names of the `reason` codes.
-#[pyfunction]
-fn qsm_evidence_reasons() -> Vec<(&'static str, u8)> {
-    use evidence::reason::*;
-    vec![("MEASURED", MEASURED), ("NO_HITS", NO_HITS), ("CLUTTER", CLUTTER), ("FOOTPRINT", FOOTPRINT), ("ECHOES_ONLY", ECHOES_ONLY)]
-}
-
-#[pyfunction]
-fn qsm_evidence<'py>(py: Python<'py>, scans: Vec<Bound<'py, PyScanIndex>>, a: PyReadonlyArray2<f64>, b: PyReadonlyArray2<f64>, r_claim: Option<PyReadonlyArray1<f64>>, params: Bound<'py, PyDict>, threads: usize) -> PyResult<Bound<'py, PyDict>> {
-    let (a, b) = (xyz_from_py(a)?, xyz_from_py(b)?);
-    let r_claim: Option<Vec<f64>> = r_claim.map(|r| r.as_array().to_vec());
-    let p = evidence_params_from_py(&params)?;
-    let refs: Vec<&ScanIndex> = scans.iter().map(|s| &s.get().inner).collect();
-    let e = py.detach(|| evidence::evidence(&refs, &a, &b, r_claim.as_deref(), &p, threads)).map_err(err)?;
-    let d = PyDict::new(py);
-    d.set_item("mu", e.mu.into_pyarray(py))?;
-    d.set_item("tau", e.tau.into_pyarray(py))?;
-    d.set_item("lo", e.lo.into_pyarray(py))?;
-    d.set_item("hi", e.hi.into_pyarray(py))?;
-    d.set_item("n_hit", e.n_hit.into_pyarray(py))?;
-    d.set_item("n_cross", e.n_cross.into_pyarray(py))?;
-    d.set_item("n_contra", e.n_contra.into_pyarray(py))?;
-    d.set_item("reason", e.reason.into_pyarray(py))?;
-    d.set_item("n_core", e.n_core.into_pyarray(py))?;
-    d.set_item("n_pen", e.n_pen.into_pyarray(py))?;
-    d.set_item("reflectance", e.reflectance.into_pyarray(py))?;
-    d.set_item("deviation", e.deviation.into_pyarray(py))?;
-    Ok(d)
 }
 
 #[pyfunction]
@@ -204,48 +111,6 @@ fn joint_params(d: &Bound<'_, PyDict>) -> PyResult<(JointParams, PriorParams)> {
         return Err(PyValueError::new_err("joint params: every field once"));
     }
     Ok((like, prior))
-}
-
-fn rows<const K: usize>(a: PyReadonlyArray2<f64>, what: &str) -> PyResult<Vec<[f64; K]>> {
-    let a = a.as_array();
-    if a.ncols() != K {
-        return Err(PyValueError::new_err(format!("joint: {what} must be (n, {K})")));
-    }
-    Ok(a.rows().into_iter().map(|r| std::array::from_fn(|k| r[k])).collect())
-}
-
-fn dict_item<'py>(d: &Bound<'py, PyDict>, k: &str, what: &str) -> PyResult<Bound<'py, PyAny>> {
-    d.get_item(k)?.ok_or_else(|| PyValueError::new_err(format!("{what}: no {k:?}")))
-}
-
-/// The pairs of a joint table's columns: each `Pulse` field an `(m,)` array (`jb`, `jt`: `(m, 2)`; `stop`, `early`:
-/// bool).
-fn pulses_from(table: &Bound<'_, PyDict>) -> PyResult<Vec<Pulse>> {
-    let what = "joint table";
-    let col = |k: &str| -> PyResult<Vec<f64>> { Ok(dict_item(table, k, what)?.extract::<PyReadonlyArray1<f64>>()?.as_array().to_vec()) };
-    let flag = |k: &str| -> PyResult<Vec<bool>> { Ok(dict_item(table, k, what)?.extract::<PyReadonlyArray1<bool>>()?.as_array().to_vec()) };
-    let (b, t, sin, c0, c1, x, q) = (col("b")?, col("t")?, col("sin")?, col("c0")?, col("c1")?, col("x")?, col("q")?);
-    let (jb, jt) = (rows::<2>(dict_item(table, "jb", what)?.extract()?, "jb")?, rows::<2>(dict_item(table, "jt", what)?.extract()?, "jt")?);
-    let (stop, early, deleted) = (flag("stop")?, flag("early")?, flag("deleted")?);
-    let n = b.len();
-    if [t.len(), sin.len(), jb.len(), jt.len(), c0.len(), c1.len(), x.len(), q.len(), deleted.len(), stop.len(), early.len()].iter().any(|&l| l != n) {
-        return Err(PyValueError::new_err("joint table: every column must have one entry per pair"));
-    }
-    Ok((0..n).map(|i| Pulse { b: b[i], t: t[i], sin: sin[i], jb: jb[i], jt: jt[i], c0: c0[i], c1: c1[i], x: x[i], deleted: deleted[i], stop: stop[i], early: early[i], q: q[i] }).collect())
-}
-
-/// Each pair's log likelihood at its own state `state` (m, 4: two offsets, log R, log lambda), the pairs as
-/// `qsm_joint_table` gives them: the likelihood without the fit, for checking it.
-#[pyfunction]
-#[pyo3(signature = (table, state, params, threads=0))]
-fn qsm_joint_loglik<'py>(py: Python<'py>, table: Bound<'py, PyDict>, state: PyReadonlyArray2<f64>, params: Bound<'py, PyDict>, threads: usize) -> PyResult<Bound<'py, PyArray1<f64>>> {
-    let (pulses, state, p) = (pulses_from(&table)?, rows::<4>(state, "state")?, joint_params(&params)?.0);
-    if state.len() != pulses.len() {
-        return Err(PyValueError::new_err("joint: one state per pair"));
-    }
-    let owners: Vec<Owner> = (0..pulses.len() as u32).map(|row| Owner { row, nu: u32::MAX }).collect();
-    let ll = py.detach(|| joint::joint_loglik(&pulses, &owners, &state, &[], &p, threads)).map_err(err)?;
-    Ok(ll.into_pyarray(py))
 }
 
 /// The joint model's pair table of cylinders `a -> b`, each with its tube `window`: named columns (the `Pulse`
@@ -465,12 +330,8 @@ pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
         wrap_pyfunction!(qsm_support_tree, m)?,
         wrap_pyfunction!(qsm_tree_context, m)?,
         wrap_pyfunction!(qsm_joint_defaults, m)?,
-        wrap_pyfunction!(qsm_joint_loglik, m)?,
         wrap_pyfunction!(qsm_joint_table, m)?,
-        wrap_pyfunction!(qsm_evidence, m)?,
         wrap_pyfunction!(qsm_pairs, m)?,
-        wrap_pyfunction!(qsm_evidence_defaults, m)?,
-        wrap_pyfunction!(qsm_evidence_reasons, m)?,
         wrap_pyfunction!(qsm_contest, m)?,
         wrap_pyfunction!(tile_ray_clouds, m)?,
         wrap_pyfunction!(synthetic_scan_beam_solids, m)?,
