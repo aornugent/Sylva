@@ -48,13 +48,11 @@ pub(crate) fn pool(threads: usize) -> Result<std::rc::Rc<rayon::ThreadPool>> {
 }
 
 /// One scan's pulses, indexed by direction: what [`pairs`], the joint table and `support_tree` read. About
-/// 20 bytes per pulse (21 with the number of returns; 4 of them its row in the file) and 4 per echo (8 with
-/// reflectance and deviation, 1 more with return numbers), plus a 6.5 MB cell
-/// table.
+/// 20 bytes per pulse (4 of them its row in the file) and 4 per echo (8 with
+/// reflectance and deviation), plus a 6.5 MB cell table.
 #[derive(Debug, Clone)]
 pub struct ScanIndex {
     origin: Point,
-    misses: bool,
     /// Pulses in direction-cell order: cell `c` holds `cell_start[c]..cell_start[c + 1]`.
     dir: Vec<[f32; 3]>,
     /// Pulse `p`'s echoes are `range[echo_start[p]..echo_start[p + 1]]`, nearest first.
@@ -63,21 +61,14 @@ pub struct ScanIndex {
     /// Each echo's reflectance (0.01 dB) and deviation, in `range` order; empty where the store has none.
     reflectance: Vec<i16>,
     deviation: Vec<u16>,
-    /// Each pulse's number of returns as the scanner counted them (`las_number_of_returns`), in pulse order;
-    /// empty where the store has none. More than its recorded echoes: the export deleted some.
-    returns: Vec<u8>,
-    /// Each echo's return number (`las_return_number`, 1 the nearest the scanner counted), in `range` order;
-    /// empty where the store has none. A number missing below the pulse's returns is a deleted echo's.
-    return_no: Vec<u8>,
     /// Each pulse's row in its Shots file (the tile sidecars' `pulse.u32`), in pulse order.
     src: Vec<u32>,
     cell_start: Vec<u32>,
 }
 
 /// The attributes a [`ScanIndex`] keeps, where the store has them: the
-/// echoes' reflectance, deviation and return number, and their pulse's number
-/// of returns.
-const CHARACTER: [&str; 4] = ["reflectance", "deviation", "las_number_of_returns", "las_return_number"];
+/// echoes' reflectance and deviation.
+const CHARACTER: [&str; 2] = ["reflectance", "deviation"];
 
 impl ScanIndex {
     /// Index a single-position Shots file, reading only angles and ranges,
@@ -102,21 +93,18 @@ impl ScanIndex {
                 }
             }
             let mut attr = |name| names.iter().position(|&a| a == name).map(|i| std::mem::take(&mut rays.attrs[i])).unwrap_or_default();
-            let (refl, dev, nr, rn) = (attr("reflectance"), attr("deviation"), attr("las_number_of_returns"), attr("las_return_number"));
-            Self::build(origin, rays, &refl, &dev, &nr, &rn)
+            let (refl, dev) = (attr("reflectance"), attr("deviation"));
+            Self::build(origin, rays, &refl, &dev)
         })
     }
 
     /// Put the pulses in direction-cell order (a stable counting sort), with
-    /// the echoes' reflectance (dB), deviation and return number and the
-    /// pulses' number of returns (per echo in the store: each pulse's first),
-    /// if any (else empty).
-    fn build(origin: Point, rays: Rays, refl: &[f32], dev: &[f32], nr: &[f32], rn: &[f32]) -> Result<Self> {
+    /// the echoes' reflectance (dB) and deviation, if any (else empty).
+    fn build(origin: Point, rays: Rays, refl: &[f32], dev: &[f32]) -> Result<Self> {
         let n = rays.zenith.len();
         if n >= u32::MAX as usize || rays.range.len() >= u32::MAX as usize {
             return Err(Error::invalid("ScanIndex: too many pulses or echoes for one scan"));
         }
-        let misses = rays.echo_count.contains(&0);
         let cell: Vec<u32> = rays.zenith.par_iter().zip(&rays.azimuth).map(|(&z, &a)| cell_of(z as f64, a as f64) as u32).collect();
         let mut cell_start = vec![0u32; NZ * NA + 1];
         for &c in &cell {
@@ -148,9 +136,7 @@ impl ScanIndex {
         // `as` saturates: +-327 dB and deviations above 65535 are out of any scanner's range anyway
         let reflectance = echoes(refl).into_iter().map(|x| (x * 100.0).round() as i16).collect();
         let deviation = echoes(dev).into_iter().map(|x| x.round() as u16).collect();
-        let returns = if nr.is_empty() { Vec::new() } else { src.iter().map(|&p| if rays.echo_count[p as usize] > 0 { nr[from[p as usize] as usize].round() as u8 } else { 0 }).collect() };
-        let return_no = echoes(rn).into_iter().map(|x| x.round() as u8).collect();
-        Ok(ScanIndex { origin, misses, dir, echo_start, range, reflectance, deviation, returns, return_no, src, cell_start })
+        Ok(ScanIndex { origin, dir, echo_start, range, reflectance, deviation, src, cell_start })
     }
 
     /// The reflectance (dB) and deviation of echo `k` of `pulse`, NaN where
@@ -158,24 +144,6 @@ impl ScanIndex {
     pub fn character(&self, pulse: u32, k: u32) -> (f64, f64) {
         let e = self.echo_start[pulse as usize] as usize + k as usize;
         (self.reflectance.get(e).map_or(f64::NAN, |&x| x as f64 / 100.0), self.deviation.get(e).map_or(f64::NAN, |&x| x as f64))
-    }
-
-    /// Whether the export deleted some of `pulse`'s echoes: the scanner
-    /// counted more returns than the store holds (false where the store
-    /// doesn't say).
-    pub fn lost_echoes(&self, pulse: u32) -> bool {
-        let p = pulse as usize;
-        self.returns.get(p).is_some_and(|&n| n as u32 > self.echo_start[p + 1] - self.echo_start[p])
-    }
-
-    /// `pulse`'s number of returns as the scanner counted them, and the return
-    /// number of its echo `k` (0: the store doesn't say).
-    pub fn returns(&self, pulse: u32) -> u8 {
-        self.returns.get(pulse as usize).copied().unwrap_or(0)
-    }
-
-    pub fn return_number(&self, pulse: u32, k: u32) -> u8 {
-        self.return_no.get(self.echo_start[pulse as usize] as usize + k as usize).copied().unwrap_or(0)
     }
 
     /// `pulse`'s row in its Shots file: with an echo's place in the pulse, the key the tile sidecars carry
@@ -199,20 +167,13 @@ impl ScanIndex {
         self.origin
     }
 
-    /// Whether the store kept pulses without echoes (free space): whether any
-    /// pulse has none. An echoes-only export has none, and may have lost
-    /// echoes too, which this can't see.
-    pub fn misses(&self) -> bool {
-        self.misses
-    }
-
     pub fn n_pulses(&self) -> usize {
         self.dir.len()
     }
 
     /// The bytes the index holds.
     pub fn nbytes(&self) -> usize {
-        size_of_val(&self.dir[..]) + size_of_val(&self.echo_start[..]) + size_of_val(&self.range[..]) + size_of_val(&self.reflectance[..]) + size_of_val(&self.deviation[..]) + size_of_val(&self.returns[..]) + size_of_val(&self.return_no[..]) + size_of_val(&self.src[..]) + size_of_val(&self.cell_start[..])
+        size_of_val(&self.dir[..]) + size_of_val(&self.echo_start[..]) + size_of_val(&self.range[..]) + size_of_val(&self.reflectance[..]) + size_of_val(&self.deviation[..])  + size_of_val(&self.src[..]) + size_of_val(&self.cell_start[..])
     }
 
     /// Calls `f(pulse, direction, echo ranges)` for every pulse whose line
@@ -301,17 +262,11 @@ pub struct Pairs {
     pub t: Vec<f32>,
     pub s: Vec<f32>,
     pub d: Vec<f32>,
-    /// The export deleted some of the pulse's echoes (see [`ScanIndex::lost_echoes`]),
-    /// and the pulse's number of returns as the scanner counted them (0: the store doesn't say).
-    pub lost: Vec<bool>,
-    pub returns: Vec<u8>,
     pub echo_start: Vec<u64>,
     pub range: Vec<f32>,
-    /// Each echo's reflectance (dB) and deviation, NaN where the store has none,
-    /// and its return number (0 where it has none).
+    /// Each echo's reflectance (dB) and deviation, NaN where the store has none.
     pub reflectance: Vec<f32>,
     pub deviation: Vec<f32>,
-    pub return_number: Vec<u8>,
 }
 
 /// The [`Pairs`] of cylinders `a[i] -> b[i]`, each with its own tube of
@@ -383,14 +338,11 @@ pub fn pairs(scans: &[&ScanIndex], a: &[Point], b: &[Point], window: &[f64], thr
                 out.t.push(r.t);
                 out.s.push(r.s);
                 out.d.push(r.d);
-                out.lost.push(sc.lost_echoes(r.pulse));
-                out.returns.push(sc.returns(r.pulse));
                 for (k, &range) in r.echoes.iter().enumerate() {
                     let (refl, dev) = sc.character(r.pulse, k as u32);
                     out.range.push(range);
                     out.reflectance.push(refl as f32);
                     out.deviation.push(dev as f32);
-                    out.return_number.push(sc.return_number(r.pulse, k as u32));
                 }
                 out.echo_start.push(out.range.len() as u64);
             }
@@ -532,8 +484,7 @@ pub(crate) mod tests {
         let shots = shots(0.05, true);
         let (one, many) = (index(&shots, shots.n_shots()), index(&shots, 1000));
         assert_eq!((&one.dir, &one.echo_start, &one.range), (&many.dir, &many.echo_start, &many.range));
-        assert!(one.misses() && one.n_pulses() == shots.n_shots() && one.origin() == [0.0; 3]);
-        assert!(!index(&self::shots(0.05, false), 1000).misses());
+        assert!(one.n_pulses() == shots.n_shots() && one.origin() == [0.0; 3]);
     }
 
     #[test]

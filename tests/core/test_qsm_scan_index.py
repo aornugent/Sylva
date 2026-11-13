@@ -30,7 +30,7 @@ def fan(tmp_path, r=0.05, misses=True):
 
 def test_a_scan_index_reads_its_pulses(tmp_path):
     scan, a, b = fan(tmp_path)
-    assert scan.misses and scan.n_pulses > 10_000 and scan.nbytes > 16 * scan.n_pulses
+    assert scan.n_pulses > 10_000 and scan.nbytes > 16 * scan.n_pulses
 
 
 def test_pairs_hold_each_pulse_that_reached_the_disc_with_its_echoes(tmp_path):
@@ -50,45 +50,6 @@ def test_pairs_hold_each_pulse_that_reached_the_disc_with_its_echoes(tmp_path):
     q = pairs([scan], np.r_[a, a], np.r_[b, b], window=[0.15, 0.08])  # each cylinder its own tube
     n0 = q["cyl_start"][1]
     assert q["cyl_start"][2] - n0 < n0 and np.all(q["d"][n0:] < 0.08)
-
-
-def test_pairs_say_which_pulses_lost_echoes_to_the_export(tmp_path):
-    # the fan's pulses, every other one counted 2 returns by the scanner but holding 1 echo
-    scan, a, b = fan(tmp_path)
-    s = Shots.load(tmp_path / "scan_0.05_True.parquet")
-    nr = np.ones(s.n_echoes, np.uint8)
-    nr[::2] = 2
-    lossy = Shots(origin=s.origin, direction=s.direction, echo_start=s.echo_start, echo_count=s.echo_count,
-                  echo_range=s.echo_range, echo_attrs={"las_number_of_returns": nr})
-    lossy.save(tmp_path / "lossy.parquet")
-    p = pairs([ScanIndex(tmp_path / "lossy.parquet", threads=2)], a, b, window=0.15)
-    has = np.diff(p["echo_start"]) > 0
-    assert p["lost"][has].any() and not p["lost"][has].all()
-    assert set(np.unique(p["returns"][has])) == {1, 2} and (p["return_number"] == 0).all()
-    assert not pairs([scan], a, b, window=0.15)["lost"].any()  # a store without the attribute loses nothing
-
-
-def test_a_deleted_echo_is_flagged_only_where_it_could_lie(tmp_path):
-    # the fan, every pulse counted 2 returns: on the stem, the recorded echo is the 2nd (the 1st, deleted, lay
-    # before it); on the wall, the 1st (the deleted one lay beyond the wall, past the stem's tube)
-    scan, a, b = fan(tmp_path)
-    s = Shots.load(tmp_path / "scan_0.05_True.parquet")
-    stem = s.echo_range < 6.0
-    two = Shots(origin=s.origin, direction=s.direction, echo_start=s.echo_start, echo_count=s.echo_count,
-                echo_range=s.echo_range, echo_attrs={"las_number_of_returns": np.full(s.n_echoes, 2, np.uint8),
-                                                     "las_return_number": np.where(stem, 2, 1).astype(np.uint8)})
-    two.save(tmp_path / "two.parquet")
-    lossy = ScanIndex(tmp_path / "two.parquet", threads=2)
-    full, t = joint_table([scan], a, b, window=0.15), joint_table([lossy], a, b, window=0.15)
-    assert len(t["b"]) == len(full["b"]) and not full["deleted"].any()
-    assert t["deleted"][t["stop"]].all()  # the stem's stops: an earlier echo was deleted
-    assert not t["deleted"][~t["stop"]].any()  # the wall's deleted echoes lie beyond every chord: certain passes
-    # without return numbers the deleted echo could lie anywhere: every pulse with echoes is flagged, misses aren't
-    nonum = Shots(origin=s.origin, direction=s.direction, echo_start=s.echo_start, echo_count=s.echo_count,
-                  echo_range=s.echo_range, echo_attrs={"las_number_of_returns": np.full(s.n_echoes, 2, np.uint8)})
-    nonum.save(tmp_path / "nonum.parquet")
-    u = joint_table([ScanIndex(tmp_path / "nonum.parquet", threads=2)], a, b, window=0.15)
-    assert (u["deleted"] == (u["n_echo"] > 0)).all() and (u["n_echo"] == 0).any()
 
 
 def test_the_joint_table_holds_each_pairs_stop_or_pass(tmp_path):
