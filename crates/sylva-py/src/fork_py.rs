@@ -38,11 +38,6 @@ impl PyScanIndex {
     }
 
     #[getter]
-    fn misses(&self) -> bool {
-        self.inner.misses()
-    }
-
-    #[getter]
     fn n_pulses(&self) -> usize {
         self.inner.n_pulses()
     }
@@ -74,9 +69,6 @@ fn qsm_pairs<'py>(py: Python<'py>, scans: Vec<Bound<'py, PyScanIndex>>, a: PyRea
     d.set_item("t", p.t.into_pyarray(py))?;
     d.set_item("s", p.s.into_pyarray(py))?;
     d.set_item("d", p.d.into_pyarray(py))?;
-    d.set_item("lost", p.lost.into_pyarray(py))?;
-    d.set_item("returns", p.returns.into_pyarray(py))?;
-    d.set_item("return_number", p.return_number.into_pyarray(py))?;
     d.set_item("echo_start", p.echo_start.into_pyarray(py))?;
     d.set_item("range", p.range.into_pyarray(py))?;
     d.set_item("reflectance", p.reflectance.into_pyarray(py))?;
@@ -130,7 +122,6 @@ fn qsm_joint_table<'py>(py: Python<'py>, scans: Vec<Bound<'py, PyScanIndex>>, a:
     d.set_item("jt", jt.into_pyarray(py).reshape([m, 2])?)?;
     d.set_item("stop", t.pulses.iter().map(|p| p.stop).collect::<Vec<bool>>().into_pyarray(py))?;
     d.set_item("early", t.pulses.iter().map(|p| p.early).collect::<Vec<bool>>().into_pyarray(py))?;
-    d.set_item("deleted", t.pulses.iter().map(|p| p.deleted).collect::<Vec<bool>>().into_pyarray(py))?;
     d.set_item("row", t.row.into_pyarray(py))?;
     d.set_item("scan", t.scan.into_pyarray(py))?;
     d.set_item("pulse", t.pulse.into_pyarray(py))?;
@@ -181,7 +172,7 @@ fn support_fit<'py>(py: Python<'py>, f: &[support_tree::Fit]) -> PyResult<Bound<
     d.set_item("e2", xyz(|x| x.e2)?)?;
     d.set_item("centre", two(|x| x.centre)?)?;
     d.set_item("lean", two(|x| x.lean)?)?;
-    let reals: [(&str, fn(&support_tree::Fit) -> f64); 10] = [("r", |x| x.r), ("sd_log_r", |x| x.sd_log_r), ("r_lo", |x| x.r_lo), ("r_hi", |x| x.r_hi), ("p_wood", |x| x.p_wood), ("data_share", |x| x.data_share), ("contested", |x| x.contested), ("deleted", |x| x.deleted), ("r_cap", |x| x.r_cap), ("pass_share", support_tree::Fit::pass_share)];
+    let reals: [(&str, fn(&support_tree::Fit) -> f64); 9] = [("r", |x| x.r), ("sd_log_r", |x| x.sd_log_r), ("r_lo", |x| x.r_lo), ("r_hi", |x| x.r_hi), ("p_wood", |x| x.p_wood), ("data_share", |x| x.data_share), ("contested", |x| x.contested), ("r_cap", |x| x.r_cap), ("pass_share", support_tree::Fit::pass_share)];
     for (k, g) in reals {
         d.set_item(k, f.iter().map(g).collect::<Vec<f64>>().into_pyarray(py))?;
     }

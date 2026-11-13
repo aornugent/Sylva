@@ -285,8 +285,7 @@ const BAND: (f64, f64) = (0.01, 0.03);
 /// How each scan sees a fitted stem (`r`, on the seed's `axis` (its ends) with frame `fr`, moved by `d`), from every
 /// pulse of the table `t` and its echoes' depths about the stem (research 103 §20): a side (the neighbourhood of an
 /// edge, `R` to `R + W` beyond the axis across the beam, `W` [`BAND_SHARE`] of the radius within [`BAND`], or the
-/// front's middle) is seen where at least [`SEEN_MIN`] pulses reached it (an echo at or behind it, or none recorded
-/// where none was deleted), and weighs the pulses that did per m across the beam; one whose pulses all echoed
+/// front's middle) is seen where at least [`SEEN_MIN`] pulses reached it (an echo at or behind it, or none recorded), and weighs the pulses that did per m across the beam; one whose pulses all echoed
 /// further in front (a crossing branch's shadow over a fork's stem) is not seen. The directions are the
 /// piece's (`claim`: its axis' start, frame, and the table's tube about it). And the stem's bounds: below, half the
 /// span of the stops on its front arc (less [`ARC_TRIM`] at each end, from at least [`ARC_MIN`]) less the
@@ -328,7 +327,7 @@ fn look(t: &JointPairs, scans: &[&ScanIndex], axis: &(Point, Point), fr: (Point,
         let side = if bb.abs() < 0.5 * r { 2 } else if bb > r && bb <= r + band { 0 } else if bb < -r && bb >= -r - band { 1 } else { continue };
         let front = if side == 2 { -(r * r - bb * bb).max(0.0).sqrt() } else { 0.0 };
         let echoes = sc.ranges(t.pulse[i]);
-        if (echoes.is_empty() && !sc.lost_echoes(t.pulse[i])) || echoes.iter().any(|&e| at(e as f64) >= front - tol) {
+        if echoes.is_empty() || echoes.iter().any(|&e| at(e as f64) >= front - tol) {
             reached[s][side] += 1;
         }
         let dir = ray.1;
@@ -731,7 +730,7 @@ mod tests {
         let (o, d) = ([5.0, -0.03, 0.4], [-1.0, 0.0, 0.05]);
         let dn = norm(&d);
         let d: Point = d.map(|x| x / dn);
-        let base = Pulse { b: 0.0, t: 0.0, sin: 1.0, jb: [0.0; 2], jt: [0.0; 2], c0: 4.8, c1: 5.2, x: 4.97, deleted: false, stop: true, early: false, q: 1.0 };
+        let base = Pulse { b: 0.0, t: 0.0, sin: 1.0, jb: [0.0; 2], jt: [0.0; 2], c0: 4.8, c1: 5.2, x: 4.97, stop: true, early: false, q: 1.0 };
         let pu = remeasure(&base, (o, d), &a, (f.0, f.1, f.2));
         let moved: Point = std::array::from_fn(|i| a[i] + 0.02 * f.1[i]);
         let pm = remeasure(&base, (o, d), &moved, (f.0, f.1, f.2));

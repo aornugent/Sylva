@@ -66,7 +66,7 @@ def test_separated_stems_upright_and_leaning_are_measured(tmp_path):
     assert (f["sd_log_r"] < 0.2 * 2.1).all()
     # seen from three sides, every edge: no diagnostic, and the rows' own data say most of their radii
     assert (f["diag"] & (SupportDiag.ONE_SIDED | SupportDiag.SHADOWED | SupportDiag.TUBE_EDGE)).sum() == 0, f["diag"]
-    assert (f["data_share"] > 0.5).all() and (f["data_share"] <= 1).all() and (f["deleted"] == 0).all(), f["data_share"]
+    assert (f["data_share"] > 0.5).all() and (f["data_share"] <= 1).all(), f["data_share"]
 
 
 def test_a_bent_stem_is_a_chain_of_straight_pieces(tmp_path):

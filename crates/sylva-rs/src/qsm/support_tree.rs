@@ -211,7 +211,7 @@ pub mod flag {
 }
 
 /// What a reviewer or the screen should know of a node's fit (bits of [`Fit::diag`], 3dtrees research 103 §20; a
-/// row's: its pieces'), beside its three numbers (`data_share`, `contested`, `deleted`): only what no other output
+/// row's: its pieces'), beside its two numbers (`data_share`, `contested`): only what no other output
 /// says. Each threshold is a constant below with its reason.
 pub mod diag {
     /// One scan supplies almost all its pulses ([`super::ONE_SCAN`]), or every pair of the views that carry a share of
@@ -521,7 +521,6 @@ pub struct Fit {
     pub diag: u16,
     pub data_share: f64,
     pub contested: f64,
-    pub deleted: f64,
     pub r_cap: f64,
     /// The veto's stops and passes through its fitted circle: `n_pass` is the second, `pass_share`
     /// [`Fit::pass_share`].
@@ -569,7 +568,6 @@ struct Rec {
     refl: f64,
     single: bool,
     blocked: bool,
-    lost: bool,
     pulse: u32,
     echo: u8,
 }
@@ -719,15 +717,13 @@ struct Summary {
 }
 
 /// What a node's diagnostics need beyond its fit, filled where each is known: the tube its pulses were taken in (m;
-/// an exact stem's, its fit's), their median footprint (NaN: none), whether one scan or one view supplies them, the
-/// share with deleted echoes, and the stops its exact fit's context owned (in the seeds' windows, by the stem they
+/// an exact stem's, its fit's), their median footprint (NaN: none), whether one scan or one view supplies them, and the stops its exact fit's context owned (in the seeds' windows, by the stem they
 /// meet first).
 #[derive(Debug, Clone, Copy)]
 struct DiagIn {
     tube: f64,
     w: f64,
     one_sided: bool,
-    deleted: f64,
     n_ctx: u32,
     /// Its own circle reached its tube's edge, and wasn't used ([`diag::TUBE_EDGE`]).
     edge: bool,
@@ -845,7 +841,7 @@ fn groups(scans: &[&ScanIndex], a: &Point, b: &Point, frame: Frame, tube: f64, p
             vs.push(vv);
             let echo = first.map_or(u8::MAX, |i| i.min(254) as u8);
             let xy = [bimp * nn[0] + depth * vv[0], bimp * nn[1] + depth * vv[1]];
-            recs.push(Rec { b: bimp, s: s_ax - 0.5 * len, depth, xy, w: p.footprint(t), refl, single: echoes.len() == 1, blocked, lost: sc.lost_echoes(pulse), pulse, echo });
+            recs.push(Rec { b: bimp, s: s_ax - 0.5 * len, depth, xy, w: p.footprint(t), refl, single: echoes.len() == 1, blocked, pulse, echo });
         });
         if recs.is_empty() {
             continue;
@@ -1434,8 +1430,7 @@ fn summarise_piece(scans: &[&ScanIndex], a: &Point, b: &Point, frame: Frame, r_c
     let profiles: Vec<Profile> = gs.iter().map(|g| Profile::of(g, r_claim, p)).collect();
     let log_odds = profiles.iter().map(|q| q.log_odds(r_claim, p)).sum();
     let w = if n_pairs > 0 { median(&mut gs.iter().flat_map(|g| g.recs.iter().map(|r| r.w)).collect::<Vec<_>>()) } else { f64::NAN };
-    let deleted = if n_pairs > 0 { gs.iter().map(|g| g.recs.iter().filter(|r| r.lost).count()).sum::<usize>() as f64 / f64::from(n_pairs) } else { f64::NAN };
-    let diag = DiagIn { tube, w, one_sided: one_sided(&gs), deleted, n_ctx: 0, edge: false };
+    let diag = DiagIn { tube, w, one_sided: one_sided(&gs), n_ctx: 0, edge: false };
     let mut out = Summary { outcome: Outcome::Bounded, chi2_front: f64::NAN, n_runs: 0, n_scans: 0, bounds: Vec::new(), log_odds, seeds: Vec::new(), exact: None, seen: Vec::new(),
         shadowed: false, points: None, diag };
     out.outcome = outcome(&gs, r_claim, p, &mut out);
@@ -2090,7 +2085,6 @@ fn fit_tree(scans: &[&ScanIndex], rows: &Rows, context: &[(Point, Point, f64)], 
             diag,
             data_share,
             contested,
-            deleted: s.diag.deleted,
             r_lo: bound(k, Side::Lower),
             r_hi: bound(k, Side::Upper),
             r_cap: if free[k] { caps[k].exp() } else { f64::NAN },
@@ -2128,7 +2122,6 @@ fn fit_tree(scans: &[&ScanIndex], rows: &Rows, context: &[(Point, Point, f64)], 
             diag: (p.iter().fold(0, |a, q| a | q.diag) & !diag::REFUTED) | if refuted(audit) { diag::REFUTED } else { 0 },
             data_share: mean(|q| q.data_share),
             contested: mean(|q| q.contested),
-            deleted: mean(|q| q.deleted),
             r_lo: rms(|q| q.r_lo, 0.0),
             r_hi: rms(|q| q.r_hi, f64::INFINITY),
             r_cap: fold(|q| q.r_cap, f64::max),
@@ -2741,8 +2734,8 @@ mod tests {
         assert!(seen.iter().all(|&j| q[j].p_wood > 0.75) && q.iter().all(|x| x.p_wood > EXIST), "{q:?}");
         // its diagnostics: one scan, both edges seen; its own data give most of what the tree says of its measured
         // pieces' R, none of the others'
-        assert!(seen.iter().all(|&j| q[j].diag == diag::ONE_SIDED && q[j].data_share > 0.5 && q[j].data_share <= 1.0 && q[j].deleted == 0.0 && (0.0..=1.0).contains(&q[j].contested)), "{q:?}");
-        assert!((0..7).filter(|j| !seen.contains(j)).all(|j| q[j].diag == 0 && q[j].data_share == 0.0 && q[j].contested.is_nan() && q[j].deleted.is_nan()), "{q:?}");
+        assert!(seen.iter().all(|&j| q[j].diag == diag::ONE_SIDED && q[j].data_share > 0.5 && q[j].data_share <= 1.0 && (0.0..=1.0).contains(&q[j].contested)), "{q:?}");
+        assert!((0..7).filter(|j| !seen.contains(j)).all(|j| q[j].diag == 0 && q[j].data_share == 0.0 && q[j].contested.is_nan()), "{q:?}");
         assert_eq!(f[0].diag, diag::ONE_SIDED);
 
         // the part the fan sees, 48 cm in two pieces: measured, the claim moved back by 1 cm, upright
@@ -2768,7 +2761,7 @@ mod tests {
 
     fn summary(outcome: Outcome, bounds: Vec<Bound>) -> Summary {
         Summary { outcome, chi2_front: f64::NAN, n_runs: 1, n_scans: 1, bounds, log_odds: 0.0, seeds: Vec::new(), exact: None, seen: Vec::new(), shadowed: false, points: None,
-            diag: DiagIn { tube: 0.1, w: 0.005, one_sided: false, deleted: 0.0, n_ctx: 0, edge: false } }
+            diag: DiagIn { tube: 0.1, w: 0.005, one_sided: false, n_ctx: 0, edge: false } }
     }
 
     #[test]
@@ -2989,7 +2982,7 @@ mod tests {
     fn a_profile_bounds_what_it_sees_and_no_more() {
         let p = JointParams::default();
         let w = 0.005;
-        let rec = |b: f64, s: f64, depth: f64| Rec { b, s, depth, xy: [f64::NAN; 2], w, refl: f64::NAN, single: true, blocked: false, lost: false, pulse: 0, echo: 0 };
+        let rec = |b: f64, s: f64, depth: f64| Rec { b, s, depth, xy: [f64::NAN; 2], w, refl: f64::NAN, single: true, blocked: false, pulse: 0, echo: 0 };
         let group = |recs: Vec<Rec>| Group { scan: 0, n: [1.0, 0.0], v: [0.0, 1.0], recs };
         // a 2 cm stem across a grid of pulses 5 mm apart both ways: hit within its silhouette (R + w (1/2 - tau)),
         // passed beside it
@@ -3142,7 +3135,7 @@ mod tests {
     #[test]
     fn echo_character_weighs_stops() {
         let p = JointParams::default();
-        let rec = |refl: f64, single: bool| Rec { b: 0.0, s: 0.0, depth: 0.0, xy: [0.0; 2], w: 0.01, refl, single, blocked: false, lost: false, pulse: 0, echo: 0 };
+        let rec = |refl: f64, single: bool| Rec { b: 0.0, s: 0.0, depth: 0.0, xy: [0.0; 2], w: 0.01, refl, single, blocked: false, pulse: 0, echo: 0 };
         // bark-bright is wood, leaf-dark is leaf, unknown is wood (and no evidence); a multi-return echo is judged darker
         assert!(p_wood(&rec(-15.5, true), 0.05, &p) > 0.9);
         assert!(p_wood(&rec(-21.0, true), 0.05, &p) < 0.1);
@@ -3333,7 +3326,7 @@ mod tests {
         // piece's too (its p_wood no longer scales it)
         let (scan, _, _) = crate::qsm::scan_index::tests::scene(0.05, true);
         let p = like();
-        let rec = |b: f64, depth: f64, pulse: u32| Rec { b, s: 0.0, depth, xy: [f64::NAN; 2], w: 0.005, refl: f64::NAN, single: true, blocked: false, lost: false, pulse, echo: 0 };
+        let rec = |b: f64, depth: f64, pulse: u32| Rec { b, s: 0.0, depth, xy: [f64::NAN; 2], w: 0.005, refl: f64::NAN, single: true, blocked: false, pulse, echo: 0 };
         let stops = vec![Group { scan: 0, n: [1.0, 0.0], v: [0.0, 1.0], recs: vec![rec(0.0, -0.05, 0), rec(0.0, 0.10, 1)] }];
         let x = Vector5::new(0.0, 0.0, 0.0, 0.0, 0.05f64.ln());
         let circle = circle(Vector5::new(0.0, 0.0, 0.0, 0.0, 0.05), 1e-3);
@@ -3472,7 +3465,7 @@ mod tests {
         let stop = |x: f64, y: f64| {
             // a stop at world (x, y) and mid-height, as the first row's piece sees it
             let xy = [x * e1[0] + y * e1[1], x * e2[0] + y * e2[1]];
-            Rec { b: 0.0, s: 0.0, depth: 0.0, xy, w: 0.005, refl: f64::NAN, single: true, blocked: false, lost: false, pulse: 0, echo: 0 }
+            Rec { b: 0.0, s: 0.0, depth: 0.0, xy, w: 0.005, refl: f64::NAN, single: true, blocked: false, pulse: 0, echo: 0 }
         };
         let ring = |cx: f64, n: usize| (0..n).map(move |i| {
             let t = i as f64 / n as f64 * std::f64::consts::TAU;
@@ -3520,7 +3513,7 @@ mod tests {
     #[test]
     fn passes_through_a_circle_bound_it_and_audit_it() {
         let w = 0.005;
-        let rec = |b: f64, s: f64, depth: f64| Rec { b, s, depth, xy: [f64::NAN; 2], w, refl: f64::NAN, single: true, blocked: false, lost: false, pulse: 0, echo: 0 };
+        let rec = |b: f64, s: f64, depth: f64| Rec { b, s, depth, xy: [f64::NAN; 2], w, refl: f64::NAN, single: true, blocked: false, pulse: 0, echo: 0 };
         let group = |recs: Vec<Rec>| Group { scan: 0, n: [1.0, 0.0], v: [0.0, 1.0], recs };
         let circle = |r: f64| Vector5::new(0.0, 0.0, 0.0, 0.0, r);
         // a phantom: RCT claims 5 cm where a grid of pulses 5 mm apart passes, but for a 2 mm twig on the axis that
@@ -3578,7 +3571,7 @@ mod tests {
         // a 2.25 cm stem 4.5 cm behind a 5 mm claim's axis: its flanks fall behind the claim's depth window, and read
         // as passes either side of a 2 cm run they bounded it at 1.5 cm, pinning a point circle on it or a thin
         // claim in a fat base (3dtrees research 127); a pass is a pulse that met nothing in the tube
-        let rec = |b: f64, s: f64, depth: f64| Rec { b, s, depth, xy: [f64::NAN; 2], w: 0.005, refl: f64::NAN, single: true, blocked: false, lost: false, pulse: 0, echo: 0 };
+        let rec = |b: f64, s: f64, depth: f64| Rec { b, s, depth, xy: [f64::NAN; 2], w: 0.005, refl: f64::NAN, single: true, blocked: false, pulse: 0, echo: 0 };
         let mut v = Vec::new();
         for j in 0..20 {
             for i in -12..=12 {

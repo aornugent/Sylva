@@ -14,9 +14,7 @@ from sylva.qsm import ScanIndex, joint_table
 
 
 def _fan(path, r=0.05):
-    """Pulses from the origin on a grid towards a vertical cylinder of radius r at (0, 5), a wall at y = 8; every
-    other echo counted as one of two returns, the stem's as the second (the first deleted, before it), the wall's as
-    the first (the second deleted, beyond it)."""
+    """Pulses from the origin on a grid towards a vertical cylinder of radius r at (0, 5), a wall at y = 8."""
     az, el = np.meshgrid(np.arange(-0.03, 0.03, 0.0005), np.arange(-0.05, 0.05, 0.0005))
     zen, az = np.pi / 2 - el.ravel(), az.ravel()
     d = np.c_[np.sin(zen) * np.sin(az), np.sin(zen) * np.cos(az), np.cos(zen)]
@@ -27,12 +25,8 @@ def _fan(path, r=0.05):
     rng = np.where(hit, (tca - np.sqrt(np.maximum(r * r - d2, 0))) / h, 8.0 / d[:, 1])
     has = hit | (np.abs(el.ravel()) < 0.045)
     rng = rng[has]
-    lossy = np.arange(len(rng)) % 2 == 0
-    nr = np.where(lossy, 2, 1).astype(np.uint8)
-    rn = np.where(lossy & (rng < 6.0), 2, 1).astype(np.uint8)
     shots = Shots(origin=np.zeros((len(d), 3)), direction=d, echo_start=np.cumsum(np.r_[0, has[:-1]]),
-                  echo_count=has.astype(np.uint32), echo_range=rng,
-                  echo_attrs={"las_number_of_returns": nr, "las_return_number": rn})
+                  echo_count=has.astype(np.uint32), echo_range=rng)
     shots.save(path)
 
 
