@@ -10,13 +10,16 @@
 //! - **Elements:** a dict of arrays, one row per element: `a`, `b` (n, 3) and `r` (n,) are required; `opacity` (n,)
 //!   defaults to 1, `misfit` (n,) to the error model's prior `misfit[0] + misfit[1] r`, and `patch` (n,) bool to
 //!   false. A patch is a ball about `a` of radius `r` (its extent); its `b` is ignored.
+//! - **Configurations:** `L0Config(views, elements, err, scene)` holds elements and returns the energy change of each
+//!   move (`add`, `remove`, `alter`, `trial`); `l0_energy(..., only=i)` is a configuration's `trial`.
 
 use numpy::{IntoPyArray, PyArray1, PyArrayMethods, PyReadonlyArray1, PyReadonlyArray2};
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
 use sylva_rs::shots::moments::{Candidate, Moments};
-use sylva_rs::shots::rays::{energy, predict, Element, Form, Prediction, Scene};
+use std::sync::Arc;
+use sylva_rs::shots::rays::{energy, predict, Config, Element, Form, Prediction, Row, Scene};
 use sylva_rs::shots::view::{ErrorModel, View, ViewParams};
 
 use crate::xyz_from_py;
@@ -126,7 +129,7 @@ fn elements_from_py(d: &Bound<'_, PyDict>, em: &ErrorModel) -> PyResult<Vec<Elem
 /// `range` with NaN for a pulse without one), its pose `rot` (3 × 3, world = rot · scanner + origin) and `epoch`.
 #[pyclass(name = "L0View", frozen)]
 struct PyView {
-    inner: View,
+    inner: Arc<View>,
 }
 
 #[pymethods]
@@ -147,7 +150,7 @@ impl PyView {
         if inner.n_lines == 0 {
             return Err(PyValueError::new_err("no lattice: too few pulses"));
         }
-        Ok(PyView { inner })
+        Ok(PyView { inner: Arc::new(inner) })
     }
 
     #[getter]
@@ -225,8 +228,19 @@ fn l0_energy<'py>(py: Python<'py>, views: Vec<PyRef<'py, PyView>>, elements: &Bo
                   scene_: Option<&Bound<'_, PyDict>>, only: Option<usize>) -> PyResult<(f64, Bound<'py, PyDict>)> {
     let (em, sc) = (error_model(err)?, scene(scene_)?);
     let el = elements_from_py(elements, &em)?;
-    let vs: Vec<&View> = views.iter().map(|v| &v.inner).collect();
-    let (e, rows) = py.detach(|| energy(&vs, &el, &em, &sc, only));
+    let vs: Vec<&View> = views.iter().map(|v| &*v.inner).collect();
+    let (e, rows) = py.detach(|| match only {
+        // the energy of adding element i to the rest: a configuration of the rest, and the move
+        Some(i) => {
+            let rest: Vec<Element> = el.iter().enumerate().filter(|&(k, _)| k != i).map(|(_, e)| *e).collect();
+            (Config::new(vs.clone(), &rest, em, sc).trial(el[i]), Vec::new())
+        }
+        None => energy(&vs, &el, &em, &sc),
+    });
+    rows_dict(py, e, &rows)
+}
+
+fn rows_dict<'py>(py: Python<'py>, e: f64, rows: &[Row]) -> PyResult<(f64, Bound<'py, PyDict>)> {
     let d = PyDict::new(py);
     d.set_item("elem", rows.iter().map(|r| r.elem).collect::<Vec<_>>().into_pyarray(py))?;
     d.set_item("scan", rows.iter().map(|r| r.scan).collect::<Vec<_>>().into_pyarray(py))?;
@@ -247,7 +261,7 @@ fn l0_energy<'py>(py: Python<'py>, views: Vec<PyRef<'py, PyView>>, elements: &Bo
 fn l0_elements<'py>(py: Python<'py>, views: Vec<PyRef<'py, PyView>>, lo: [f64; 3], hi: [f64; 3], voxel: f64, min_n: f64, r_max: f64) -> PyResult<Bound<'py, PyDict>> {
     use nalgebra::Vector3;
     use rayon::prelude::*;
-    let vs: Vec<&View> = views.iter().map(|v| &v.inner).collect();
+    let vs: Vec<&View> = views.iter().map(|v| &*v.inner).collect();
     let el = py.detach(|| {
         let v3 = |p: &[f64; 3]| Vector3::new(p[0], p[1], p[2]);
         let scans: Vec<_> = vs.par_iter().map(|v| {
@@ -274,9 +288,75 @@ fn l0_elements<'py>(py: Python<'py>, views: Vec<PyRef<'py, PyView>>, lo: [f64; 3
 
 pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyView>()?;
+    m.add_class::<PyConfig>()?;
     m.add_function(wrap_pyfunction!(l0_energy, m)?)?;
     m.add_function(wrap_pyfunction!(l0_predict, m)?)?;
     m.add_function(wrap_pyfunction!(l0_elements, m)?)?;
     m.add_function(wrap_pyfunction!(l0_error_model, m)?)?;
     Ok(())
+}
+
+/// A configuration of elements held against some views (rays::Config): `energy()`; `add(elements)` → (ids, energy
+/// change); `remove(ids)`, `alter(id, element)` and `trial(element)` (the change of adding it, the configuration left
+/// as it was) → the energy change; `rows()` as l0_energy's. Each element is rendered once per view, and a move
+/// recomputes only the field components it touches.
+#[pyclass(name = "L0Config")]
+struct PyConfig {
+    inner: Config<Arc<View>>,
+    em: ErrorModel,
+}
+
+#[pymethods]
+impl PyConfig {
+    #[new]
+    #[pyo3(signature = (views, elements, err=None, scene_=None))]
+    fn new(py: Python<'_>, views: Vec<PyRef<'_, PyView>>, elements: &Bound<'_, PyDict>, err: Option<&Bound<'_, PyDict>>,
+           scene_: Option<&Bound<'_, PyDict>>) -> PyResult<Self> {
+        let (em, sc) = (error_model(err)?, scene(scene_)?);
+        let el = elements_from_py(elements, &em)?;
+        let vs: Vec<Arc<View>> = views.iter().map(|v| v.inner.clone()).collect();
+        Ok(PyConfig { inner: py.detach(|| Config::new(vs, &el, em, sc)), em })
+    }
+
+    fn energy(&self) -> f64 {
+        self.inner.energy()
+    }
+
+    fn rows<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
+        Ok(rows_dict(py, self.inner.energy(), &self.inner.rows())?.1)
+    }
+
+    fn add(&mut self, py: Python<'_>, elements: &Bound<'_, PyDict>) -> PyResult<(Vec<u32>, f64)> {
+        let el = elements_from_py(elements, &self.em)?;
+        let c = &mut self.inner;
+        Ok(py.detach(|| el.into_iter().fold((Vec::new(), 0.0), |(mut ids, d), e| {
+            let (id, de) = c.add(e);
+            ids.push(id);
+            (ids, d + de)
+        })))
+    }
+
+    fn remove(&mut self, py: Python<'_>, ids: Vec<u32>) -> f64 {
+        let c = &mut self.inner;
+        py.detach(|| ids.into_iter().map(|id| c.remove(id)).sum())
+    }
+
+    fn alter(&mut self, py: Python<'_>, id: u32, element: &Bound<'_, PyDict>) -> PyResult<f64> {
+        let e = one(elements_from_py(element, &self.em)?)?;
+        let c = &mut self.inner;
+        Ok(py.detach(|| c.alter(id, e)))
+    }
+
+    fn trial(&mut self, py: Python<'_>, element: &Bound<'_, PyDict>) -> PyResult<f64> {
+        let e = one(elements_from_py(element, &self.em)?)?;
+        let c = &mut self.inner;
+        Ok(py.detach(|| c.trial(e)))
+    }
+}
+
+fn one(el: Vec<Element>) -> PyResult<Element> {
+    match el.as_slice() {
+        [e] => Ok(*e),
+        _ => Err(PyValueError::new_err("expected one element")),
+    }
 }

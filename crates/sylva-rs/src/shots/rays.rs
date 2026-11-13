@@ -43,6 +43,9 @@
 //!   element's own footprints, which differed between hypotheses and, once every fronted cell counted, favoured
 //!   the thinner (slice 7c).
 //!
+//! - **A configuration** ([`Config`]) holds elements against views, each rendered once. A move (add, remove, alter)
+//!   returns its energy change, and recomputes only the field components the touched element joins or leaves.
+//!
 //! Cells no element touches cancel. Context (neighbours, competitors) enters as more elements in the set.
 
 use super::view::{state, ErrorModel, View};
@@ -461,13 +464,13 @@ impl Field {
 /// Newton steps at most per energy.
 const MAX_NEWTON: usize = 40;
 
-/// One scan's energy for one configuration (elements other than `skip`): the Laplace marginal of its data over
+/// One scan's energy for a set of elements: the Laplace marginal of its data over
 /// the field's nodes, `U = −Σ_e A_e(δ̂_e) + ½ ẑᵀẑ + ½ log|Λ|`, Λ the posterior precision at the mode ẑ (the prior is
 /// unit; each element's spread is in its row), and a row per element.
-fn scan_energy(v: &View, si: usize, rendered: &[Vec<(usize, Layer)>], elems: &[Element], skip: Option<u32>, ref_epoch: u32, em: &ErrorModel, sc: &Scene)
+fn scan_energy(v: &View, si: usize, rendered: &[Vec<(usize, Layer)>], elems: &[Element], ref_epoch: u32, em: &ErrorModel, sc: &Scene)
                -> (f64, Vec<Row>) {
-    let per: Vec<Vec<(usize, Layer)>> = rendered.iter().enumerate().map(|(i, r)| if Some(i as u32) == skip { Vec::new() } else { r.clone() }).collect();
-    let buf = kbuffer(&per, MIN_FILL);
+    let per = rendered;
+    let buf = kbuffer(per, MIN_FILL);
     let cls = classes(v, &buf, elems.len(), em);
     let drop = drop_of(em, v);
     let other = v.epoch != ref_epoch;
@@ -504,7 +507,8 @@ fn scan_energy(v: &View, si: usize, rendered: &[Vec<(usize, Layer)>], elems: &[E
     }
     let n = field.nodes.len();
     let x_of = |el: &ElemData, z: &[f64]| el.along.iter().map(|&(j, w)| w * z[j]).sum::<f64>();
-    let objective = |z: &[f64]| 0.5 * z.iter().map(|x| x * x).sum::<f64>() - data.par_iter().map(|el| el.ll(x_of(el, z), drop, em, sc)).sum::<f64>();
+    // sums in a fixed order, so the same elements always give the same energy to the bit
+    let objective = |z: &[f64]| 0.5 * z.iter().map(|x| x * x).sum::<f64>() - data.par_iter().map(|el| el.ll(x_of(el, z), drop, em, sc)).collect::<Vec<f64>>().iter().sum::<f64>();
     // Newton with each element's −A as a quadratic in δ by central differences (negative curvature dropped); a step
     // at most 3 prior sds, halved until the objective falls, stopping under a millinat
     let h = 3e-4;
@@ -569,29 +573,185 @@ fn scan_energy(v: &View, si: usize, rendered: &[Vec<(usize, Layer)>], elems: &[E
     (u, rows)
 }
 
-/// The energy of `elems` against `views` (−log likelihood ratio against the empty scene), and a row per (element,
-/// scan). Each scan's term is the Laplace marginal of its data over its offset field ([`scan_energy`]), the scans
-/// independent given the elements. With `only = Some(i)`, the energy change of adding element i to the others,
-/// `E(all) − E(all but i)`; rows are then empty. The reference epoch (whose scans take the same-day spread) is the
-/// first view's.
-pub fn energy(views: &[&View], elems: &[Element], em: &ErrorModel, sc: &Scene, only: Option<usize>) -> (f64, Vec<Row>) {
-    let ref_epoch = views.first().map_or(0, |v| v.epoch);
-    let per_scan: Vec<(f64, Vec<Row>)> = views
-        .par_iter()
-        .enumerate()
-        .map(|(si, v)| {
-            let rendered = render_all(v, elems, em);
-            let (u, rows) = scan_energy(v, si, &rendered, elems, None, ref_epoch, em, sc);
-            match only {
-                Some(i) => (u - scan_energy(v, si, &rendered, elems, Some(i as u32), ref_epoch, em, sc).0, Vec::new()),
-                None => (u, rows),
+/// A configuration of elements held against some views: the energy of a move (synthesis §16's incremental form).
+///
+/// - Each element is rendered once per view, and re-rendered only when it is added or altered.
+/// - A scan's energy is a sum over its components: the elements linked by a shared field node or a shared cell. Their
+///   Laplace marginals are independent (the field's prior is diagonal, and an element's terms touch only its nodes
+///   and cells), so the sum is the scan's whole marginal.
+/// - Component energies are memoised by membership. A move recomputes only the components the touched element joins
+///   or leaves, and removing an element restores the energy exactly (synthesis §18 invariant 7).
+/// - Element ids are stable and never reused.
+pub struct Config<V: std::ops::Deref<Target = View> + Sync> {
+    views: Vec<V>,
+    em: ErrorModel,
+    sc: Scene,
+    ref_epoch: u32,
+    elems: Vec<Option<Element>>,
+    /// [view][id]: the element's layers (empty when removed or unseen).
+    rendered: Vec<Vec<Vec<(usize, Layer)>>>,
+    /// [view]: component members (sorted ids) → its energy and rows; and the scan's energy.
+    memo: Vec<HashMap<Vec<u32>, (f64, Vec<Row>)>>,
+    scan_u: Vec<f64>,
+}
+
+impl<V: std::ops::Deref<Target = View> + Sync> Config<V> {
+    pub fn new(views: Vec<V>, elems: &[Element], em: ErrorModel, sc: Scene) -> Self {
+        let ref_epoch = views.first().map_or(0, |v| v.epoch);
+        let n = views.len();
+        let mut c = Config { views, em, sc, ref_epoch, elems: elems.iter().map(|e| Some(*e)).collect(), rendered: Vec::new(),
+                             memo: vec![HashMap::new(); n], scan_u: vec![0.0; n] };
+        c.rendered = c.views.par_iter().map(|v| render_all(v, elems, &c.em)).collect();
+        c.refresh(&(0..n).collect::<Vec<_>>());
+        c
+    }
+
+    /// The configuration's energy against the empty scene.
+    pub fn energy(&self) -> f64 {
+        self.scan_u.iter().sum()
+    }
+
+    /// A row per (element, scan), by element id.
+    pub fn rows(&self) -> Vec<Row> {
+        let mut rows: Vec<Row> = (0..self.views.len())
+            .flat_map(|s| self.components(s).into_iter().flat_map(move |m| self.memo[s][&m].1.clone()))
+            .collect();
+        rows.sort_by_key(|r| (r.elem, r.scan));
+        rows
+    }
+
+    /// Add an element: its id and the energy change.
+    pub fn add(&mut self, e: Element) -> (u32, f64) {
+        let id = self.elems.len() as u32;
+        self.elems.push(Some(e));
+        let em = self.em;
+        let layers: Vec<Vec<(usize, Layer)>> = self.views.par_iter().map(|v| render(v, &e, id, &em)).collect();
+        let touched: Vec<usize> = layers.iter().enumerate().filter(|(_, l)| !l.is_empty()).map(|(s, _)| s).collect();
+        for (s, l) in layers.into_iter().enumerate() {
+            self.rendered[s].push(l);
+        }
+        (id, self.refresh(&touched))
+    }
+
+    /// Remove an element: the energy change.
+    pub fn remove(&mut self, id: u32) -> f64 {
+        let touched = self.seen_in(id);
+        self.elems[id as usize] = None;
+        for r in self.rendered.iter_mut() {
+            r[id as usize].clear();
+        }
+        let d = self.refresh(&touched);
+        self.forget(id);
+        d
+    }
+
+    /// Replace an element: the energy change.
+    pub fn alter(&mut self, id: u32, e: Element) -> f64 {
+        let mut touched = self.seen_in(id);
+        self.forget(id);
+        self.elems[id as usize] = Some(e);
+        let em = self.em;
+        let layers: Vec<Vec<(usize, Layer)>> = self.views.par_iter().map(|v| render(v, &e, id, &em)).collect();
+        for (s, l) in layers.into_iter().enumerate() {
+            if !l.is_empty() && !touched.contains(&s) {
+                touched.push(s);
             }
-        })
-        .collect();
-    let total = per_scan.iter().map(|(u, _)| u).sum();
-    let mut rows: Vec<Row> = per_scan.into_iter().flat_map(|(_, r)| r).collect();
-    rows.sort_by_key(|r| (r.elem, r.scan));
-    (total, rows)
+            self.rendered[s][id as usize] = l;
+        }
+        self.refresh(&touched)
+    }
+
+    /// The energy change of adding an element, leaving the configuration as it was.
+    pub fn trial(&mut self, e: Element) -> f64 {
+        let (id, d) = self.add(e);
+        self.remove(id);
+        d
+    }
+
+    fn seen_in(&self, id: u32) -> Vec<usize> {
+        (0..self.views.len()).filter(|&s| !self.rendered[s][id as usize].is_empty()).collect()
+    }
+
+    /// Drop memoised components that contain an element whose form changed or left.
+    fn forget(&mut self, id: u32) {
+        for m in self.memo.iter_mut() {
+            m.retain(|k, _| k.binary_search(&id).is_err());
+        }
+    }
+
+    /// One scan's components: live elements it sees, linked by shared field nodes and shared cells, each sorted, in
+    /// order of their first id.
+    fn components(&self, s: usize) -> Vec<Vec<u32>> {
+        let ids: Vec<u32> = (0..self.elems.len() as u32).filter(|&i| self.elems[i as usize].is_some() && !self.rendered[s][i as usize].is_empty()).collect();
+        let mut parent: Vec<usize> = (0..ids.len()).collect();
+        fn find(p: &mut [usize], mut i: usize) -> usize {
+            while p[i] != i {
+                p[i] = p[p[i]];
+                i = p[i];
+            }
+            i
+        }
+        let mut owner: HashMap<(u8, [i64; 3]), usize> = HashMap::new();
+        for (k, &id) in ids.iter().enumerate() {
+            let e = self.elems[id as usize].as_ref().unwrap();
+            let nodes = if self.em.field { Field::hats(&e.mid(), self.em.field_spacing).into_iter().map(|(n, _)| (0u8, n)).collect() } else { Vec::new() };
+            let cells = self.rendered[s][id as usize].iter().filter(|(_, l)| l.f >= MIN_FILL).map(|&(c, _)| (1u8, [c as i64, 0, 0]));
+            for key in nodes.into_iter().chain(cells) {
+                match owner.get(&key) {
+                    Some(&j) => {
+                        let (a, b) = (find(&mut parent, k), find(&mut parent, j));
+                        parent[a.max(b)] = a.min(b);
+                    }
+                    None => {
+                        owner.insert(key, k);
+                    }
+                }
+            }
+        }
+        let mut groups: Vec<Vec<u32>> = Vec::new();
+        let mut at: HashMap<usize, usize> = HashMap::new();
+        for k in 0..ids.len() {
+            let r = find(&mut parent, k);
+            let g = *at.entry(r).or_insert_with(|| { groups.push(Vec::new()); groups.len() - 1 });
+            groups[g].push(ids[k]);
+        }
+        groups
+    }
+
+    /// Recompute the scans `touched` (their new components, from the memo where it holds them) and return the energy
+    /// change.
+    fn refresh(&mut self, touched: &[usize]) -> f64 {
+        let comps: Vec<(usize, Vec<Vec<u32>>)> = touched.iter().map(|&s| (s, self.components(s))).collect();
+        let todo: Vec<(usize, Vec<u32>)> = comps.iter().flat_map(|(s, cs)| cs.iter().filter(|m| !self.memo[*s].contains_key(*m)).map(move |m| (*s, m.clone()))).collect();
+        let done: Vec<(usize, Vec<u32>, (f64, Vec<Row>))> = todo.into_par_iter().map(|(s, m)| {
+            let elems: Vec<Element> = m.iter().map(|&i| self.elems[i as usize].unwrap()).collect();
+            // the component's layers, their elements numbered within it
+            let rendered: Vec<Vec<(usize, Layer)>> = m.iter().enumerate()
+                .map(|(k, &i)| self.rendered[s][i as usize].iter().map(|&(c, l)| (c, Layer { elem: k as u32, ..l })).collect())
+                .collect();
+            let (u, mut rows) = scan_energy(&self.views[s], s, &rendered, &elems, self.ref_epoch, &self.em, &self.sc);
+            rows.iter_mut().for_each(|r| r.elem = m[r.elem as usize]);
+            (s, m, (u, rows))
+        }).collect();
+        for (s, m, v) in done {
+            self.memo[s].insert(m, v);
+        }
+        let mut d = 0.0;
+        for (s, cs) in comps {
+            let u: f64 = cs.iter().map(|m| self.memo[s][m].0).sum();
+            d += u - self.scan_u[s];
+            self.scan_u[s] = u;
+        }
+        d
+    }
+}
+
+/// The energy of `elems` against `views` (−log likelihood ratio against the empty scene) and a row per (element,
+/// scan): a [`Config`]'s, the scans independent given the elements, each the Laplace marginal of its data over its
+/// offset field ([`scan_energy`]). The reference epoch (whose scans take the same-day spread) is the first view's.
+pub fn energy(views: &[&View], elems: &[Element], em: &ErrorModel, sc: &Scene) -> (f64, Vec<Row>) {
+    let c = Config::new(views.to_vec(), elems, *em, *sc);
+    (c.energy(), c.rows())
 }
 
 #[cfg(test)]
@@ -661,13 +821,13 @@ mod tests {
     }
 
     /// The true pole has negative energy; a stick of the wrong radius, shifted, or porous has more; a stick where
-    /// the pulses went through to the wall costs energy; `only` agrees with the difference of two energies, and
-    /// rows sum to the total.
+    /// the pulses went through to the wall costs energy; a configuration's move agrees with the difference of two
+    /// energies, and rows sum to the total.
     #[test]
     fn the_true_pole_wins() {
         let v = pole_view();
         let (em, sc) = (ErrorModel::default(), Scene::default());
-        let e = |s: Element| energy(&[&v], &[s], &em, &sc, None).0;
+        let e = |s: Element| energy(&[&v], &[s], &em, &sc).0;
         let truth = e(stick(0.0, 4.0, 0.03));
         assert!(truth < -3.0, "{truth}");
         for wrong in [stick(0.0, 4.0, 0.021), stick(0.0, 4.0, 0.015), stick(0.0, 4.0, 0.06), stick(0.03, 4.0, 0.03), stick(0.0, 3.98, 0.03),
@@ -676,11 +836,34 @@ mod tests {
         }
         assert!(e(stick(0.2, 6.0, 0.03)) > 1.0);
         let pair = [stick(0.0, 4.0, 0.03), stick(0.2, 6.0, 0.03)];
-        let both = energy(&[&v], &pair, &em, &sc, None);
-        let delta = energy(&[&v], &pair, &em, &sc, Some(1)).0;
+        let both = energy(&[&v], &pair, &em, &sc);
+        let delta = Config::new(vec![&v], &pair[..1], em, sc).trial(pair[1]);
         assert!((delta - (both.0 - truth)).abs() < 1e-6, "{delta} vs {}", both.0 - truth);
         let sum: f64 = both.1.iter().map(|r| r.energy).sum();
         assert!((sum - both.0).abs() < 1e-6);
+    }
+
+    /// A configuration's moves: adding then removing an element restores its energy exactly (synthesis §18
+    /// invariant 7), and each move's energy change equals the full recomputation's difference to rounding, for an
+    /// add, an alter and a remove, with an unrelated element far away left untouched.
+    #[test]
+    fn a_configurations_moves_match_full_recomputation() {
+        let v = pole_view();
+        let (em, sc) = (ErrorModel::default(), Scene::default());
+        let full = |els: &[Element]| energy(&[&v], els, &em, &sc).0;
+        let (pole, far, wide) = (stick(0.0, 4.0, 0.03), stick(0.6, 7.0, 0.03), stick(0.0, 4.0, 0.04));
+        let mut c = Config::new(vec![&v], &[far], em, sc);
+        let e0 = c.energy();
+        assert!((e0 - full(&[far])).abs() < 1e-6 * e0.abs().max(1.0));
+        let (id, d_add) = c.add(pole);
+        assert!((d_add - (full(&[far, pole]) - full(&[far]))).abs() < 1e-6 * d_add.abs().max(1.0), "{d_add}");
+        let d_alter = c.alter(id, wide);
+        assert!((d_alter - (full(&[far, wide]) - full(&[far, pole]))).abs() < 1e-6 * d_alter.abs().max(1.0), "{d_alter}");
+        c.remove(id);
+        assert_eq!(c.energy(), e0);
+        let t = c.trial(pole);
+        assert_eq!(c.energy(), e0);
+        assert!((t - d_add).abs() < 1e-9 * t.abs().max(1.0));
     }
 
     /// A stick under a footprint across leaves partial hits (the export keeps a footprint 8 % filled): scored on
@@ -692,7 +875,7 @@ mod tests {
         for y in [4.0, 8.0] {
             let v = thin_pole_view(0.004, y);
             let (em, sc) = (ErrorModel::default(), Scene::default());
-            let e = |r: f64| energy(&[&v], &[Element { misfit: 0.0, ..stick(0.0, y, r) }], &em, &sc, None).0;
+            let e = |r: f64| energy(&[&v], &[Element { misfit: 0.0, ..stick(0.0, y, r) }], &em, &sc).0;
             let (thin, truth, wide) = (e(0.0028), e(0.004), e(0.0056));
             assert!(wide > truth, "{y} m: wide {wide} truth {truth}");
             assert!(thin > truth - 0.02 * truth.abs(), "{y} m: thin {thin} truth {truth}");
@@ -739,14 +922,14 @@ mod tests {
             }
             w
         };
-        let (_, rows) = energy(&[&shifted], &[el], &em, &sc, None);
+        let (_, rows) = energy(&[&shifted], &[el], &em, &sc);
         assert!((rows[0].shift_along - 0.003).abs() < 0.0015, "{}", rows[0].shift_along);
         // the referee: a single element's data integrated by quadrature over the field's prior
         let rendered = render_all(&v, &[el], &em);
-        let (u_lap, out) = energy(&[&v], &[el], &em, &sc, None);
+        let (u_lap, out) = energy(&[&v], &[el], &em, &sc);
         assert_eq!(out.len(), 1);
         let em_off = ErrorModel { field: false, ..em };
-        let u_off = energy(&[&v], &[el], &em_off, &sc, None).0;
+        let u_off = energy(&[&v], &[el], &em_off, &sc).0;
         // the element sits on one node set: its along shift has prior sd s_along (√Σŵ² = 1)
         let (gh_x, gh_w) = ([-2.0201828704560856, -0.9585724646138185, 0.0, 0.9585724646138185, 2.0201828704560856],
                             [0.019953242059045913, 0.39361932315224116, 0.9453087204829419, 0.39361932315224116, 0.019953242059045913]);
@@ -778,7 +961,7 @@ mod tests {
         let f_max = layers.iter().map(|(_, l)| l.f).fold(0.0, f64::max);
         assert!(f_max > 0.99, "{f_max}");
         assert!(layers.iter().all(|(_, l)| l.x < 0.03 + 0.012 || l.f < 0.01));
-        let e = |s: Element| energy(&[&v], &[s], &em, &sc, None).0;
+        let e = |s: Element| energy(&[&v], &[s], &em, &sc).0;
         assert!(e(patch(0.0)) < e(patch(0.1)));
         let p = predict(&v, &[stick(0.0, 4.0, 0.03)], &em, &sc, 0.01);
         let on = p.iter().filter(|q| q.fill > 0.9).all(|q| q.code == code::ON);
