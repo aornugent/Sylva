@@ -16,44 +16,23 @@ scan, bounds and existence where a circle isn't determined, the pieces with
 several stems fitted by the exact likelihood, and one solve over the tree.
 :func:`joint_table` gives the pairs the likelihood reads.
 
-The parameters are a :class:`JointParams`, whose fields are:
+The settings a caller may set are a :class:`JointParams`, whose fields are:
 
-- the likelihood: ``exit`` and ``divergence`` (the beam's diameter at the
-  aperture, m, and full divergence, rad), ``sigma_r`` (range noise, m),
-  ``rough`` (surface roughness as a share of R), ``tau`` (the footprint's share
-  on the wood an echo needs), ``edge`` (the detection edge's sd, a share of the
-  footprint's width), ``eps``, ``eps_min`` and ``mp_len`` (mixed pixels:
-  their share ``eps_min + eps (1 - f)`` and how far behind the surface, m),
-  ``hide`` (the share of stops whose echo the export deleted, among pulses
-  that lost an echo where it could lie: such a recorded pass may be one);
-- echo character (3dtrees research 93 §11.2, read by :func:`support_tree`
-  only): ``refl_wood``, ``refl_wood_sd``, ``refl_leaf`` and ``refl_leaf_sd``
-  (the reflectance, dB, of a single return from bark that fills the footprint
-  and from leaf, mean and sd), ``refl_multi`` and ``refl_multi_sd`` (a return
-  that shares its pulse is ``refl_multi`` dB brighter, negative, with
-  ``refl_multi_sd`` more spread in quadrature), ``refl_thin`` (thin wood's
-  shift, dB, in full at R <= 1 cm and none from 3 cm);
-- the support path's own (read by :func:`support_tree` only): ``stop_wood``
-  and ``stop_leaf`` (the share of the pulses aimed at a core that stop there,
-  on wood and on foliage), ``exist_scale`` (the weight of a scan's existence
-  log odds: its pulses are correlated beyond the beam's oversampling),
-  ``model_sd`` (the floor on a support measurement's
-  sd, m), ``lean_sd`` (the lean's anchor, m per m), ``lean_bend`` (its random
-  walk between a row's pieces, per sqrt(m)), ``exist`` and ``exist_off``
-  (existence along a branch: a base piece is wood with ``exist``, one after a
-  piece that isn't with ``exist_off``), ``dh`` (the site's largest stem D/H:
-  no radius the rays don't measure is wider than ``dh`` times its reach to the
-  tips over 2; 0 for no cap), ``thin_seed`` (which pulses a routed piece of
-  more pairs than its budget fits: a hash of each pulse's direction and this;
-  0 in production, a bench varies it to measure the thinning's noise);
-- the prior: ``lam_prior`` and ``lam_sd`` (foliage's median, 1/m, and log
-  sd), ``sig_ell`` (its random walk), ``sig_eta`` (the taper's random walk per
-  sqrt(m)), ``mu_fork`` and ``sig_fork`` (soft Leonardo's log area ratio and
-  its sd), ``sig_root`` (the level at a base), ``r_tip`` and ``sig_tip`` (a
-  tip's radius, m, 0 for none, and its log sd), ``sig_delta`` (the centre's
-  random walk, m per sqrt(m)), ``centre_rel`` and ``centre_abs`` (its anchor,
-  ``centre_rel r_prior + centre_abs``), ``scan_abs`` and ``scan_rel`` (each
-  (scan, branch)'s offset, ``scan_abs + scan_rel r``; both 0 for none).
+- the beam: ``exit`` and ``divergence`` (its diameter at the aperture, m, and
+  full divergence, rad);
+- echo character (3dtrees research 93 §11.2): ``refl_wood``, ``refl_wood_sd``,
+  ``refl_leaf`` and ``refl_leaf_sd`` (the reflectance, dB, of a single return
+  from bark that fills the footprint and from leaf, mean and sd),
+  ``refl_multi`` and ``refl_multi_sd`` (a return that shares its pulse is
+  ``refl_multi`` dB brighter, negative, with ``refl_multi_sd`` more spread in
+  quadrature), ``refl_thin`` (thin wood's shift, dB, in full at R <= 1 cm and
+  none from 3 cm);
+- ``dh``: the site's largest stem D/H: no radius the rays don't measure is
+  wider than ``dh`` times its reach to the tips over 2 (0 for no cap).
+
+Every other calibration (the likelihood's range noise, detection and mixed
+pixels, the prior's widths, existence) is a constant of the core, with its
+reason, in ``joint.rs``, ``joint_fit.rs`` and ``support_tree.rs``.
 """
 
 from __future__ import annotations
@@ -148,7 +127,7 @@ def support_tree(scans, a, b, r_prior, parent, context=None, params: JointParams
     A row longer than 30 cm is cut into pieces, each a node of the tree, so a bent row is a chain of straight pieces.
     Per (piece, scan) the pulses in a tube about it reduce to a profile across it, whose edges and front measure a
     leaning circle; a stop counts as wood by its echo character (``refl_*``). Where no circle is determined, each
-    scan still bounds R (its woody stops' span, the passes beside them, and the capacity floor ``tau``), and passes
+    scan still bounds R (its woody stops' span, the passes beside them, and the capacity floor), and passes
     alone bound it too (the ray veto). A row none of whose pieces has a circle of its own gets one from its own stops
     (point evidence, as 3dtrees' refit fitted RCT's points), unless the veto refutes it. A piece with several stems
     or a hull (``RUNS``, ``HULL``) is fitted by the exact likelihood: seeds from its runs, then 1, 2, ... stems while
@@ -173,18 +152,13 @@ def support_tree(scans, a, b, r_prior, parent, context=None, params: JointParams
         ``(a, b, r)`` of other cylinders near the tree (its neighbours'), or None: a routed piece's exact fit leaves
         them the stops they explain better, as it does the tree's own measured and bounded pieces.
     params
-        :class:`JointParams`: the likelihood's footprint, ``tau``, ``edge``, ``sigma_r``, ``rough`` and ``refl_*``,
-        ``stop_wood``, ``stop_leaf``, ``exist_scale``, ``refl_thin`` and ``model_sd``, and the prior's ``sig_eta``,
-        ``mu_fork``, ``sig_fork``, ``sig_root``, ``sig_delta``, ``lean_sd``, ``lean_bend``, ``exist``, ``exist_off``,
-        ``centre_rel``, ``centre_abs`` and ``dh``; the rest are unused.
+        :class:`JointParams`: the beam's footprint, the echo character (``refl_*``) and the site's cap ``dh``.
     threads
         Threads to use (0: one per core).
 
     Returns
     -------
-    dict, per row (``(n,)`` unless noted), with the same per node under ``pieces``: the pieces, then the routed
-    pieces' further stems, with each node's ``row``, the piece it came from (``src``: itself for a piece) and its stem
-    there (``stem``: 0 for a piece's own):
+    dict, per row (``(n,)`` unless noted):
 
     - ``a``, ``b`` ``(n, 3)``: the fitted axis, world coordinates (the claim moved by the centre and turned by the
       lean; a row's runs from its first piece's start to its last's end); ``r``, ``sd_log_r``: the radius, held inside

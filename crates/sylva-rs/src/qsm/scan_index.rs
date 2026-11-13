@@ -4,8 +4,7 @@
 // see the LICENSE file. There is no warranty, to the extent permitted by law.
 //! A scan's pulses indexed by direction ([`ScanIndex`]), and every pulse near
 //! each cylinder with all its echoes ([`pairs`]): the raw table the joint
-//! model's per-pulse likelihood reads, and what [`crate::qsm::evidence`]
-//! reduces inside.
+//! model's per-pulse likelihood reads.
 //!
 //! Speed comes from looking only where wood is: each scan is indexed once by
 //! pulse direction, each cylinder visits only the pulses near its axis, and
@@ -48,14 +47,10 @@ pub(crate) fn pool(threads: usize) -> Result<std::rc::Rc<rayon::ThreadPool>> {
     })
 }
 
-/// One scan's pulses, indexed by direction: what [`evidence`](crate::qsm::evidence::evidence) reads. About
+/// One scan's pulses, indexed by direction: what [`pairs`], the joint table and `support_tree` read. About
 /// 20 bytes per pulse (21 with the number of returns; 4 of them its row in the file) and 4 per echo (8 with
 /// reflectance and deviation, 1 more with return numbers), plus a 6.5 MB cell
 /// table.
-///
-/// [`ScanIndex::pulses_near`], [`ScanIndex::origin`] and
-/// [`ScanIndex::misses`] are all that [`evidence`](crate::qsm::evidence::evidence) asks of it, so the storage
-/// can change without touching the evidence.
 #[derive(Debug, Clone)]
 pub struct ScanIndex {
     origin: Point,
@@ -288,7 +283,7 @@ pub(crate) fn closest(d: &Point, u: &Point, w0: &Point, dd: f64) -> (f64, f64, f
 }
 
 /// Every pulse near each cylinder, with all its echoes: the raw table a
-/// per-pulse likelihood reads (what [`evidence`](crate::qsm::evidence::evidence) reduces inside).
+/// per-pulse likelihood reads.
 ///
 /// Cylinder `c`'s rows are `cyl_start[c]..cyl_start[c + 1]`; row `i`'s echoes
 /// (all of its pulse's, nearest first) are `echo_start[i]..echo_start[i + 1]`.
@@ -322,7 +317,7 @@ pub struct Pairs {
 /// The [`Pairs`] of cylinders `a[i] -> b[i]`, each with its own tube of
 /// radius `window[i]` around the axis: each pulse whose line comes closest to
 /// the axis within the segment (ends included, so a pulse exactly at a shared
-/// end belongs to both; [`evidence`](crate::qsm::evidence::evidence) counts it in neither), inside the tube,
+/// end belongs to both), inside the tube,
 /// ahead of the scanner, and that reached the tube (its last echo is at or
 /// beyond where its line enters it, or it missed). A pulse that stopped short
 /// of the tube says nothing about what is in it and is left out. Runs on
@@ -463,7 +458,7 @@ pub(crate) mod tests {
     pub(crate) fn index(shots: &Shots, row_group_size: usize) -> ScanIndex {
         static FILES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
         let k = FILES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let path = std::env::temp_dir().join(format!("sylva_evidence_{}_{k}.parquet", std::process::id()));
+        let path = std::env::temp_dir().join(format!("sylva_scan_index_{}_{k}.parquet", std::process::id()));
         write_shots(shots, &path, &ShotsWriteOptions { row_group_size, ..Default::default() }).unwrap();
         let index = ScanIndex::from_file(&path, 3).unwrap();
         std::fs::remove_file(&path).unwrap();

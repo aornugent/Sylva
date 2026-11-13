@@ -5,9 +5,8 @@
 """A scan's pulses indexed by direction, and every pulse near each cylinder with all its echoes.
 
 :class:`ScanIndex` is built once per scan and read by :func:`pairs`,
-:func:`~sylva.qsm.joint_table`, :func:`~sylva.qsm.support_tree` and
-:func:`~sylva.qsm.evidence`; :func:`pairs` is the per-pulse table a
-likelihood reads.
+:func:`~sylva.qsm.joint_table` and :func:`~sylva.qsm.support_tree`;
+:func:`pairs` is the per-pulse table a likelihood reads.
 """
 
 from __future__ import annotations
@@ -22,8 +21,8 @@ from .. import _core
 class ScanIndex:
     """One scan's pulses, read from a single-position Shots file and indexed by direction.
 
-    Built once per scan and reused by every :func:`~sylva.qsm.evidence`, :func:`pairs` and
-    :func:`~sylva.qsm.joint_table` call (about 20 bytes per pulse, 21 where the
+    Built once per scan and reused by every :func:`pairs`, :func:`~sylva.qsm.joint_table` and
+    :func:`~sylva.qsm.support_tree` call (about 20 bytes per pulse, 21 where the
     store has ``las_number_of_returns``, and 4 per echo, 8 where it has
     reflectance and deviation and 1 more with ``las_return_number``, held on
     the Rust side). Only the angles, the echo ranges and those four attributes
@@ -68,8 +67,7 @@ class ScanIndex:
 def pairs(scans, a, b, window, threads: int = 0) -> dict[str, np.ndarray]:
     """Every pulse near each cylinder ``a[i] -> b[i]``, with all its echoes.
 
-    The raw table a per-pulse likelihood reads, which :func:`~sylva.qsm.evidence`
-    reduces inside. A row is a pulse whose line comes closest to the axis
+    The raw table a per-pulse likelihood reads. A row is a pulse whose line comes closest to the axis
     within the segment (ends included), closer than its cylinder's ``window``,
     ahead of the scanner, and that reached the tube of that radius around the axis
     (its last echo is at or beyond where its line enters the tube, or it

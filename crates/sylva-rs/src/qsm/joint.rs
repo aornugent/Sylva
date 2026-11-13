@@ -20,8 +20,8 @@
 //! or a mixed pixel behind; a pass is censoring at the chord's end. Each
 //! pulse is conditioned on having been recorded: a pass needs something
 //! behind (`q`), and a pass by a pulse that lost an echo where it could lie
-//! may be a stop whose echo the export deleted (`hide`). A stop needs the footprint's share `tau` on the wood, with an
-//! edge `edge w` wide (w the footprint's width), and wood wide enough to give
+//! may be a stop whose echo the export deleted ([`HIDE`]). A stop needs the footprint's share [`TAU`] on the wood, with an
+//! edge [`EDGE`] `w` wide (w the footprint's width), and wood wide enough to give
 //! that share at all.
 //!
 //! The derivatives come from evaluating the likelihood once on second-order
@@ -311,7 +311,7 @@ impl Mul<f64> for D {
     }
 }
 
-/// A settings record written once: the struct, each field a real with its
+/// The settings record written once: the struct, each field a real with its
 /// default (`name: f64 = default`), its [`Default`], and its fields by name
 /// (`FIELDS`, `get`, `set`), which is how they cross to Python.
 macro_rules! params {
@@ -348,10 +348,9 @@ macro_rules! params {
         }
     };
 }
-pub(crate) use params;
-
 params! {
-    /// The scanner and export constants of the likelihood (a plot calibration).
+    /// The settings of [`crate::qsm::support_tree`] a caller may set; every other calibration is a constant (here,
+    /// in [`crate::qsm::joint_fit`] and in [`crate::qsm::support_tree`]).
     ///
     /// The defaults are the calibration for TERN's RIEGL VZ-400i exports (3dtrees research 74 §§13-19 and 93 §§11.2, 17: Alice Mulga).
     #[derive(Debug, Clone, Copy, PartialEq)]
@@ -359,22 +358,6 @@ params! {
         /// Beam diameter at the aperture (m) and full divergence (rad).
         pub exit: f64 = 0.007,
         pub divergence: f64 = 0.35e-3,
-        /// Range noise (m), and surface roughness as a share of the radius.
-        pub sigma_r: f64 = 0.005,
-        pub rough: f64 = 0.03,
-        /// Energy share of the footprint an echo needs, and the sd of the
-        /// detection edge as a share of the footprint's width.
-        pub tau: f64 = 0.11,
-        pub edge: f64 = 0.5,
-        /// Mixed-pixel share: `eps_min + eps (1 - f)`, f the footprint's share on the wood, landing up to
-        /// `mp_len` m behind the surface.
-        pub eps: f64 = 0.1,
-        pub eps_min: f64 = 0.01,
-        pub mp_len: f64 = 0.5,
-        /// The share of stops whose echo the export deleted, among pulses that
-        /// lost an echo where it could lie (research 74 §19; 0: a recorded pass is
-        /// a pass).
-        pub hide: f64 = 0.09,
         /// Echo character (3dtrees research 93 §11.2): the reflectance (dB) of a single return from bark that fills
         /// the footprint and from leaf, mean and sd; a return that shares its pulse is `refl_multi` dB brighter (it
         /// is negative) with `refl_multi_sd` more spread, in quadrature. Read by [`crate::qsm::support_tree`] only.
@@ -388,23 +371,26 @@ params! {
         /// research 93 §16: rows under 2 cm at -17.8 dB p50 against -15.9): wood's mean shifts by `refl_thin` dB at
         /// R <= 1 cm, by none from 3 cm, linearly in log R between. Read by [`crate::qsm::support_tree`] only.
         pub refl_thin: f64 = -3.0,
-        /// The share of the pulses aimed at a core that stop there, on wood (opaque but for the soft edge) and on
-        /// foliage, and the weight of a scan's existence log odds (its pulses are correlated beyond the beam's
-        /// oversampling): existence's evidence, fitted on the wood and NO_WOOD rows of the former per-tree fit
-        /// `joint_tree` (at `archive/sylva-develop-2026-11-12`; 3dtrees research 93 §17 review). Read by
-        /// [`crate::qsm::support_tree`] only.
-        pub stop_wood: f64 = 0.99,
-        pub stop_leaf: f64 = 0.1,
-        pub exist_scale: f64 = 0.2,
-        /// The floor on each support measurement's sd (m): non-round sections and a ~4 mm offset between scans that
-        /// no sway explains (3dtrees research 93 §15.6). Read by [`crate::qsm::support_tree`] only.
-        pub model_sd: f64 = 0.004,
-        /// Which pulses a routed piece of more pairs than its budget fits ([`crate::qsm::support_tree`]'s thinning, a
-        /// hash of each pulse's direction and this, a whole number): 0 in production; the bench varies it to measure the
-        /// thinning's noise (3dtrees research 93 §19). Read by [`crate::qsm::support_tree`] only.
-        pub thin_seed: f64 = 0.0,
+        /// The site's largest stem D/H: no radius the rays don't measure is wider than `dh` times its reach to the tips
+        /// over 2 (0: no cap; Alice Mulga's census 0.035, 3dtrees research 62). Read by [`crate::qsm::support_tree`] only.
+        pub dh: f64 = 0.0,
     }
 }
+
+/// Range noise (m), and surface roughness as a share of the radius.
+pub(crate) const SIGMA_R: f64 = 0.005;
+pub(crate) const ROUGH: f64 = 0.03;
+/// Energy share of the footprint an echo needs, and the sd of the detection edge as a share of the footprint's width.
+pub(crate) const TAU: f64 = 0.11;
+pub(crate) const EDGE: f64 = 0.5;
+/// Mixed-pixel share: `EPS_MIN + EPS (1 - f)`, f the footprint's share on the wood, landing up to `MP_LEN` m behind
+/// the surface.
+const EPS: f64 = 0.1;
+const EPS_MIN: f64 = 0.01;
+const MP_LEN: f64 = 0.5;
+/// The share of stops whose echo the export deleted, among pulses that lost an echo where it could lie (research 74
+/// §19).
+const HIDE: f64 = 0.09;
 
 impl JointParams {
     /// The footprint's width (m) at range `t`.
@@ -412,9 +398,9 @@ impl JointParams {
         self.exit + self.divergence * t
     }
 
-    /// How far a silhouette's apparent edge lies beyond the wood's for a footprint `w` wide: `w (1/2 - tau)`.
+    /// How far a silhouette's apparent edge lies beyond the wood's for a footprint `w` wide: `w (1/2 - TAU)`.
     pub fn app(&self, w: f64) -> f64 {
-        w * (0.5 - self.tau)
+        w * (0.5 - TAU)
     }
 }
 
@@ -505,16 +491,16 @@ fn pair_terms<N: Num>(pu: &Pulse, s: [N; 4], p: &JointParams) -> (N, Option<(N, 
     // detected: the footprint's share on the wood reaches tau (a soft edge at the silhouette), and the wood is wide
     // enough to give that share at all (2 R / w >= tau: a twig thinner than that can't make an echo, however it
     // sits); P(miss) = (1 - p1) + p1 (1 - p2)
-    let z1 = (r + p.app(w) - bp.abs()) * (1.0 / (p.edge * w));
-    let z2 = (r * (2.0 / w) + (-p.tau)) * (1.0 / CAPACITY_SD);
+    let z1 = (r + p.app(w) - bp.abs()) * (1.0 / (EDGE * w));
+    let z2 = (r * (2.0 / w) + (-TAU)) * (1.0 / CAPACITY_SD);
     let (lp1, lq1, lp2, lq2) = (z1.log_ndtr(), (-z1).log_ndtr(), z2.log_ndtr(), (-z2).log_ndtr());
     let (lp, lq) = (lp1 + lp2, logaddexp(lq1, lp1 + lq2));
     let (c0, c1) = (N::c(pu.c0), N::c(pu.c1));
     let xw = (tp - hbar * (1.0 / pu.sin)).clamp(c0, c1);
     let zw = xw - c0;
-    let eps = (-(f.clamp(N::c(0.0), N::c(1.0))) + 1.0) * p.eps + p.eps_min;
+    let eps = (-(f.clamp(N::c(0.0), N::c(1.0))) + 1.0) * EPS + EPS_MIN;
     let ln = pu.c1 - pu.c0;
-    let over = ((xw + p.mp_len - c1) * (1.0 / p.mp_len)).clamp(N::c(1e-12), N::c(1.0));
+    let over = ((xw + MP_LEN - c1) * (1.0 / MP_LEN)).clamp(N::c(1e-12), N::c(1.0));
     let l_pass = logaddexp(lq - lam * ln, lp - lam * zw + (eps + 1e-300).ln() + over.ln());
     let q = pu.q;
     let p_pass = l_pass.min(N::c(0.0)).exp();
@@ -522,20 +508,20 @@ fn pair_terms<N: Num>(pu: &Pulse, s: [N; 4], p: &JointParams) -> (N, Option<(N, 
     let mut terms = None;
     let l = if pu.stop {
         // a stop: the wood's echo or foliage's (only a stop needs these terms)
-        let sig = (r.sq() * (p.rough * p.rough) + p.sigma_r * p.sigma_r).sqrt();
+        let sig = (r.sq() * (ROUGH * ROUGH) + SIGMA_R * SIGMA_R).sqrt();
         let x = N::c(pu.x);
         let z = (x - c0).max(N::c(0.0));
         let u = (x - xw) / sig;
         let log_sqrt2pi = 0.5 * (2.0 * std::f64::consts::PI).ln();
         let l_gauss = (-eps).log1p() - u.sq() * 0.5 - sig.ln() + (-log_sqrt2pi);
-        let l_tail = (eps + 1e-300).ln() + (-p.mp_len.ln()) + u.log_ndtr() + ((xw + p.mp_len - x) / sig).log_ndtr();
+        let l_tail = (eps + 1e-300).ln() + (-MP_LEN.ln()) + u.log_ndtr() + ((xw + MP_LEN - x) / sig).log_ndtr();
         let l_wood = lp - lam * zw + logaddexp(l_gauss, l_tail);
         let l_leaf = ell - lam * z + logaddexp(lq, lp + (-u).log_ndtr());
         terms = Some((l_wood, l_leaf));
         logaddexp(l_wood, l_leaf)
-    } else if pu.deleted && p.hide > 0.0 {
+    } else if pu.deleted {
         // a recorded pass where a deleted echo could lie: a pass, or a stop whose echo the export deleted
-        logaddexp(l_pass, (-p_pass).log1p() + p.hide.ln()) + q.ln()
+        logaddexp(l_pass, (-p_pass).log1p() + HIDE.ln()) + q.ln()
     } else {
         l_pass + q.ln()
     };
@@ -822,7 +808,7 @@ mod tests {
     use super::*;
 
     fn params() -> JointParams {
-        JointParams { exit: 0.007, divergence: 0.35e-3, sigma_r: 0.005, rough: 0.03, tau: 0.17, edge: 0.25, eps: 0.1, eps_min: 0.01, mp_len: 0.5, hide: 0.1, ..JointParams::default() }
+        JointParams::default()
     }
 
     /// A few pulses past a 5 cm stem at 8 m: on the surface, inside it, passing, and a leaf in front.
@@ -934,9 +920,8 @@ mod tests {
         let s = [0.0, 0.0, (0.05f64).ln(), (0.5f64).ln()];
         let pass = Pulse { b: 0.03, t: 8.0, sin: 1.0, jb: [1.0, 0.0], jt: [0.0, 1.0], c0: 7.85, c1: 8.15, x: 0.0, deleted: false, stop: false, early: false, q: 1.0 };
         let (plain, hid): (f64, f64) = (pair(&pass, s, &p), pair(&Pulse { deleted: true, ..pass }, s, &p));
-        let want = (plain.exp() + 0.1 * (1.0 - plain.exp())).ln();
+        let want = (plain.exp() + HIDE * (1.0 - plain.exp())).ln();
         assert!(plain < -3.0 && (hid - want).abs() < 1e-12 && hid > plain, "plain {plain}, deleted {hid}");
-        assert_eq!(pair(&Pulse { deleted: true, ..pass }, s, &JointParams { hide: 0.0, ..p }), plain);
     }
 
     #[test]

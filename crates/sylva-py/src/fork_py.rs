@@ -3,8 +3,8 @@
 // Free software under the GNU General Public License v3.0 or later;
 // see the LICENSE file. There is no warranty, to the extent permitted by law.
 //! Bindings 3dtrees' fork adds (CHANGELOG-3dtrees.md): the scan index, the
-//! joint model and `support_tree`, the evidence reduction, the trees' context
-//! and contest, the ray-cloud tiles, and the beam scan with solids. Kept apart from upstream's binding
+//! joint table and `support_tree`, the trees' context and contest, the ray-cloud
+//! tiles, and the beam scan with solids. Kept apart from upstream's binding
 //! files, so a merge from upstream meets them in one line of `lib.rs`.
 
 use std::path::PathBuf;
@@ -15,10 +15,9 @@ use pyo3::prelude::*;
 use pyo3::types::PyDict;
 use sylva_rs::io;
 use sylva_rs::qsm::{self, support_tree};
-use sylva_rs::qsm::evidence::{self, Beam, EvidenceParams};
 use sylva_rs::qsm::scan_index::{self, ScanIndex};
-use sylva_rs::qsm::joint::{self, Echoes, JointParams, Owner, Pulse};
-use sylva_rs::qsm::joint_fit::{PriorParams, Rows};
+use sylva_rs::qsm::joint::{self, Echoes, JointParams, Pulse};
+use sylva_rs::qsm::joint_fit::Rows;
 use sylva_rs::synthetic::scan::{self as synth, BeamScan, Reflectance, Solid};
 
 use crate::{cloud_from_py, err, xyz_from_py};
@@ -60,98 +59,6 @@ impl PyScanIndex {
     }
 }
 
-/// The fields of `EvidenceParams`, flat, with the beam's prefixed `beam_`
-/// (except `range_noise`), and the semantics `version`.
-fn evidence_params_to_py<'py>(py: Python<'py>, p: &EvidenceParams) -> PyResult<Bound<'py, PyDict>> {
-    let d = PyDict::new(py);
-    d.set_item("version", EvidenceParams::VERSION)?;
-    for (k, v) in [
-        ("beam_divergence", p.beam.divergence),
-        ("beam_exit", p.beam.exit),
-        ("range_noise", p.beam.range_noise),
-        ("floor_log", p.floor_log),
-        ("footprint_sd", p.footprint_sd),
-        ("spread_sd", p.spread_sd),
-        ("echoes_only_min_radius", p.echoes_only_min_radius),
-        ("min_footprints", p.min_footprints),
-        ("window_cap", p.window_cap),
-        ("window_min", p.window_min),
-        ("window_hi_factor", p.window_hi_factor),
-        ("window_hi_margin", p.window_hi_margin),
-        ("window_r_factor", p.window_r_factor),
-        ("window_r_margin", p.window_r_margin),
-        ("min_length", p.min_length),
-    ] {
-        d.set_item(k, v)?;
-    }
-    d.set_item("rounds", p.rounds)?;
-    Ok(d)
-}
-
-fn evidence_params_from_py(d: &Bound<'_, PyDict>) -> PyResult<EvidenceParams> {
-    let get = |k: &str| d.get_item(k)?.ok_or_else(|| PyValueError::new_err(format!("evidence params: no {k:?}")));
-    let f = |k: &str| get(k)?.extract::<f64>();
-    if get("version")?.extract::<u32>()? != EvidenceParams::VERSION {
-        return Err(PyValueError::new_err(format!("evidence params: version {} is not this Sylva's ({})", get("version")?, EvidenceParams::VERSION)));
-    }
-    let known = evidence_params_to_py(d.py(), &EvidenceParams::default())?;
-    if d.len() != known.len() || d.keys().iter().any(|k| !known.contains(&k).unwrap_or(false)) {
-        return Err(PyValueError::new_err("evidence params: unexpected fields"));
-    }
-    Ok(EvidenceParams {
-        beam: Beam { divergence: f("beam_divergence")?, exit: f("beam_exit")?, range_noise: f("range_noise")? },
-        floor_log: f("floor_log")?,
-        footprint_sd: f("footprint_sd")?,
-        spread_sd: f("spread_sd")?,
-        echoes_only_min_radius: f("echoes_only_min_radius")?,
-        min_footprints: f("min_footprints")?,
-        window_cap: f("window_cap")?,
-        window_min: f("window_min")?,
-        window_hi_factor: f("window_hi_factor")?,
-        window_hi_margin: f("window_hi_margin")?,
-        window_r_factor: f("window_r_factor")?,
-        window_r_margin: f("window_r_margin")?,
-        rounds: get("rounds")?.extract()?,
-        min_length: f("min_length")?,
-    })
-}
-
-/// The default evidence settings, as `evidence_params_to_py` lays them out.
-#[pyfunction]
-fn qsm_evidence_defaults(py: Python<'_>) -> PyResult<Bound<'_, PyDict>> {
-    evidence_params_to_py(py, &EvidenceParams::default())
-}
-
-/// The names of the `reason` codes.
-#[pyfunction]
-fn qsm_evidence_reasons() -> Vec<(&'static str, u8)> {
-    use evidence::reason::*;
-    vec![("MEASURED", MEASURED), ("NO_HITS", NO_HITS), ("CLUTTER", CLUTTER), ("FOOTPRINT", FOOTPRINT), ("ECHOES_ONLY", ECHOES_ONLY)]
-}
-
-#[pyfunction]
-fn qsm_evidence<'py>(py: Python<'py>, scans: Vec<Bound<'py, PyScanIndex>>, a: PyReadonlyArray2<f64>, b: PyReadonlyArray2<f64>, r_claim: Option<PyReadonlyArray1<f64>>, params: Bound<'py, PyDict>, threads: usize) -> PyResult<Bound<'py, PyDict>> {
-    let (a, b) = (xyz_from_py(a)?, xyz_from_py(b)?);
-    let r_claim: Option<Vec<f64>> = r_claim.map(|r| r.as_array().to_vec());
-    let p = evidence_params_from_py(&params)?;
-    let refs: Vec<&ScanIndex> = scans.iter().map(|s| &s.get().inner).collect();
-    let e = py.detach(|| evidence::evidence(&refs, &a, &b, r_claim.as_deref(), &p, threads)).map_err(err)?;
-    let d = PyDict::new(py);
-    d.set_item("mu", e.mu.into_pyarray(py))?;
-    d.set_item("tau", e.tau.into_pyarray(py))?;
-    d.set_item("lo", e.lo.into_pyarray(py))?;
-    d.set_item("hi", e.hi.into_pyarray(py))?;
-    d.set_item("n_hit", e.n_hit.into_pyarray(py))?;
-    d.set_item("n_cross", e.n_cross.into_pyarray(py))?;
-    d.set_item("n_contra", e.n_contra.into_pyarray(py))?;
-    d.set_item("reason", e.reason.into_pyarray(py))?;
-    d.set_item("n_core", e.n_core.into_pyarray(py))?;
-    d.set_item("n_pen", e.n_pen.into_pyarray(py))?;
-    d.set_item("reflectance", e.reflectance.into_pyarray(py))?;
-    d.set_item("deviation", e.deviation.into_pyarray(py))?;
-    Ok(d)
-}
-
 #[pyfunction]
 fn qsm_pairs<'py>(py: Python<'py>, scans: Vec<Bound<'py, PyScanIndex>>, a: PyReadonlyArray2<f64>, b: PyReadonlyArray2<f64>, window: PyReadonlyArray1<f64>, threads: usize) -> PyResult<Bound<'py, PyDict>> {
     let (a, b) = (xyz_from_py(a)?, xyz_from_py(b)?);
@@ -177,75 +84,30 @@ fn qsm_pairs<'py>(py: Python<'py>, scans: Vec<Bound<'py, PyScanIndex>>, a: PyRea
     Ok(d)
 }
 
-/// The default settings of `qsm_support_tree`, flat: the likelihood's fields, then the prior's.
+/// The default settings of `qsm_support_tree`, flat (`JointParams`' fields).
 #[pyfunction]
 fn qsm_joint_defaults(py: Python<'_>) -> PyResult<Bound<'_, PyDict>> {
-    let (like, prior) = (JointParams::default(), PriorParams::default());
+    let like = JointParams::default();
     let d = PyDict::new(py);
     for &k in JointParams::FIELDS {
         d.set_item(k, like.get(k))?;
-    }
-    for &k in PriorParams::FIELDS {
-        d.set_item(k, prior.get(k))?;
     }
     Ok(d)
 }
 
 /// The settings `qsm_joint_defaults` lays out, each field given once (`dataclasses.asdict(JointParams)`).
-fn joint_params(d: &Bound<'_, PyDict>) -> PyResult<(JointParams, PriorParams)> {
-    let (mut like, mut prior) = (JointParams::default(), PriorParams::default());
+fn joint_params(d: &Bound<'_, PyDict>) -> PyResult<JointParams> {
+    let mut like = JointParams::default();
     for (k, v) in d.iter() {
         let (k, v): (String, f64) = (k.extract()?, v.extract()?);
-        if !(like.set(&k, v) || prior.set(&k, v)) {
+        if !like.set(&k, v) {
             return Err(PyValueError::new_err(format!("joint params: {k:?} is not a field")));
         }
     }
-    if d.len() != JointParams::FIELDS.len() + PriorParams::FIELDS.len() {
+    if d.len() != JointParams::FIELDS.len() {
         return Err(PyValueError::new_err("joint params: every field once"));
     }
-    Ok((like, prior))
-}
-
-fn rows<const K: usize>(a: PyReadonlyArray2<f64>, what: &str) -> PyResult<Vec<[f64; K]>> {
-    let a = a.as_array();
-    if a.ncols() != K {
-        return Err(PyValueError::new_err(format!("joint: {what} must be (n, {K})")));
-    }
-    Ok(a.rows().into_iter().map(|r| std::array::from_fn(|k| r[k])).collect())
-}
-
-fn dict_item<'py>(d: &Bound<'py, PyDict>, k: &str, what: &str) -> PyResult<Bound<'py, PyAny>> {
-    d.get_item(k)?.ok_or_else(|| PyValueError::new_err(format!("{what}: no {k:?}")))
-}
-
-/// The pairs of a joint table's columns: each `Pulse` field an `(m,)` array (`jb`, `jt`: `(m, 2)`; `stop`, `early`:
-/// bool).
-fn pulses_from(table: &Bound<'_, PyDict>) -> PyResult<Vec<Pulse>> {
-    let what = "joint table";
-    let col = |k: &str| -> PyResult<Vec<f64>> { Ok(dict_item(table, k, what)?.extract::<PyReadonlyArray1<f64>>()?.as_array().to_vec()) };
-    let flag = |k: &str| -> PyResult<Vec<bool>> { Ok(dict_item(table, k, what)?.extract::<PyReadonlyArray1<bool>>()?.as_array().to_vec()) };
-    let (b, t, sin, c0, c1, x, q) = (col("b")?, col("t")?, col("sin")?, col("c0")?, col("c1")?, col("x")?, col("q")?);
-    let (jb, jt) = (rows::<2>(dict_item(table, "jb", what)?.extract()?, "jb")?, rows::<2>(dict_item(table, "jt", what)?.extract()?, "jt")?);
-    let (stop, early, deleted) = (flag("stop")?, flag("early")?, flag("deleted")?);
-    let n = b.len();
-    if [t.len(), sin.len(), jb.len(), jt.len(), c0.len(), c1.len(), x.len(), q.len(), deleted.len(), stop.len(), early.len()].iter().any(|&l| l != n) {
-        return Err(PyValueError::new_err("joint table: every column must have one entry per pair"));
-    }
-    Ok((0..n).map(|i| Pulse { b: b[i], t: t[i], sin: sin[i], jb: jb[i], jt: jt[i], c0: c0[i], c1: c1[i], x: x[i], deleted: deleted[i], stop: stop[i], early: early[i], q: q[i] }).collect())
-}
-
-/// Each pair's log likelihood at its own state `state` (m, 4: two offsets, log R, log lambda), the pairs as
-/// `qsm_joint_table` gives them: the likelihood without the fit, for checking it.
-#[pyfunction]
-#[pyo3(signature = (table, state, params, threads=0))]
-fn qsm_joint_loglik<'py>(py: Python<'py>, table: Bound<'py, PyDict>, state: PyReadonlyArray2<f64>, params: Bound<'py, PyDict>, threads: usize) -> PyResult<Bound<'py, PyArray1<f64>>> {
-    let (pulses, state, p) = (pulses_from(&table)?, rows::<4>(state, "state")?, joint_params(&params)?.0);
-    if state.len() != pulses.len() {
-        return Err(PyValueError::new_err("joint: one state per pair"));
-    }
-    let owners: Vec<Owner> = (0..pulses.len() as u32).map(|row| Owner { row, nu: u32::MAX }).collect();
-    let ll = py.detach(|| joint::joint_loglik(&pulses, &owners, &state, &[], &p, threads)).map_err(err)?;
-    Ok(ll.into_pyarray(py))
+    Ok(like)
 }
 
 /// The joint model's pair table of cylinders `a -> b`, each with its tube `window`: named columns (the `Pulse`
@@ -307,27 +169,28 @@ fn qsm_support_bases() -> Vec<(&'static str, u8)> {
     vec![("MEASURED", MEASURED), ("POINTS", POINTS), ("BOUNDED", BOUNDED), ("PRIOR", PRIOR), ("CAPPED", CAPPED)]
 }
 
-/// A support fit's rows or pieces as a dict of arrays.
-fn support_fit<'py>(py: Python<'py>, f: support_tree::Fit) -> PyResult<Bound<'py, PyDict>> {
-    let n = f.r.len();
+/// A support fit's rows as a dict of arrays.
+fn support_fit<'py>(py: Python<'py>, f: &[support_tree::Fit]) -> PyResult<Bound<'py, PyDict>> {
+    let n = f.len();
     let d = PyDict::new(py);
-    let xyz = |v: &[[f64; 3]]| v.concat().into_pyarray(py).reshape([n, 3]);
-    let two = |v: &[[f64; 2]]| v.concat().into_pyarray(py).reshape([n, 2]);
-    d.set_item("a", xyz(&f.a)?)?;
-    d.set_item("b", xyz(&f.b)?)?;
-    d.set_item("e1", xyz(&f.e1)?)?;
-    d.set_item("e2", xyz(&f.e2)?)?;
-    d.set_item("centre", two(&f.centre)?)?;
-    d.set_item("lean", two(&f.lean)?)?;
-    for (k, v) in [("r", f.r), ("sd_log_r", f.sd_log_r), ("r_lo", f.r_lo), ("r_hi", f.r_hi), ("p_wood", f.p_wood), ("data_share", f.data_share), ("contested", f.contested), ("deleted", f.deleted), ("r_cap", f.r_cap), ("pass_share", f.pass_share)] {
-        d.set_item(k, v.into_pyarray(py))?;
+    let xyz = |g: fn(&support_tree::Fit) -> [f64; 3]| f.iter().flat_map(g).collect::<Vec<f64>>().into_pyarray(py).reshape([n, 3]);
+    let two = |g: fn(&support_tree::Fit) -> [f64; 2]| f.iter().flat_map(g).collect::<Vec<f64>>().into_pyarray(py).reshape([n, 2]);
+    d.set_item("a", xyz(|x| x.a)?)?;
+    d.set_item("b", xyz(|x| x.b)?)?;
+    d.set_item("e1", xyz(|x| x.e1)?)?;
+    d.set_item("e2", xyz(|x| x.e2)?)?;
+    d.set_item("centre", two(|x| x.centre)?)?;
+    d.set_item("lean", two(|x| x.lean)?)?;
+    let reals: [(&str, fn(&support_tree::Fit) -> f64); 10] = [("r", |x| x.r), ("sd_log_r", |x| x.sd_log_r), ("r_lo", |x| x.r_lo), ("r_hi", |x| x.r_hi), ("p_wood", |x| x.p_wood), ("data_share", |x| x.data_share), ("contested", |x| x.contested), ("deleted", |x| x.deleted), ("r_cap", |x| x.r_cap), ("pass_share", support_tree::Fit::pass_share)];
+    for (k, g) in reals {
+        d.set_item(k, f.iter().map(g).collect::<Vec<f64>>().into_pyarray(py))?;
     }
-    d.set_item("diag", f.diag.into_pyarray(py))?;
-    d.set_item("flags", f.flags.into_pyarray(py))?;
-    d.set_item("n_scans", f.n_scans.into_pyarray(py))?;
-    d.set_item("k_stems", f.k_stems.into_pyarray(py))?;
-    d.set_item("n_pass", f.n_pass.into_pyarray(py))?;
-    d.set_item("basis", f.basis.into_pyarray(py))?;
+    d.set_item("diag", f.iter().map(|x| x.diag).collect::<Vec<u16>>().into_pyarray(py))?;
+    d.set_item("flags", f.iter().map(|x| x.flags).collect::<Vec<u8>>().into_pyarray(py))?;
+    d.set_item("n_scans", f.iter().map(|x| x.n_scans).collect::<Vec<u32>>().into_pyarray(py))?;
+    d.set_item("k_stems", f.iter().map(|x| x.k_stems).collect::<Vec<u32>>().into_pyarray(py))?;
+    d.set_item("n_pass", f.iter().map(|x| x.audit.1).collect::<Vec<u32>>().into_pyarray(py))?;
+    d.set_item("basis", f.iter().map(|x| x.basis).collect::<Vec<u8>>().into_pyarray(py))?;
     Ok(d)
 }
 
@@ -360,14 +223,9 @@ fn qsm_support_tree<'py>(py: Python<'py>, scans: Vec<Bound<'py, PyScanIndex>>, a
     let refs: Vec<&ScanIndex> = scans.iter().map(|s| &s.get().inner).collect();
     let f = py.detach(|| {
         let rows = Rows { a: &a, b: &b, r_prior: &r_prior, r_max: &[], parent: &parent };
-        support_tree::support_tree(&refs, &rows, &context, &p.0, &p.1, threads)
+        support_tree::support_tree(&refs, &rows, &context, &p, threads)
     }).map_err(err)?;
-    let d = support_fit(py, f.rows)?;
-    let pieces = support_fit(py, f.pieces)?;
-    pieces.set_item("row", f.piece_row.into_pyarray(py))?;
-    pieces.set_item("src", f.piece_src.into_pyarray(py))?;
-    pieces.set_item("stem", f.piece_stem.into_pyarray(py))?;
-    d.set_item("pieces", pieces)?;
+    let d = support_fit(py, &f.rows)?;
     d.set_item("converged", f.converged)?;
     d.set_item("echoes", echoes_to_py(py, f.echoes)?)?;
     let v = f.volume;
@@ -465,12 +323,8 @@ pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
         wrap_pyfunction!(qsm_support_tree, m)?,
         wrap_pyfunction!(qsm_tree_context, m)?,
         wrap_pyfunction!(qsm_joint_defaults, m)?,
-        wrap_pyfunction!(qsm_joint_loglik, m)?,
         wrap_pyfunction!(qsm_joint_table, m)?,
-        wrap_pyfunction!(qsm_evidence, m)?,
         wrap_pyfunction!(qsm_pairs, m)?,
-        wrap_pyfunction!(qsm_evidence_defaults, m)?,
-        wrap_pyfunction!(qsm_evidence_reasons, m)?,
         wrap_pyfunction!(qsm_contest, m)?,
         wrap_pyfunction!(tile_ray_clouds, m)?,
         wrap_pyfunction!(synthetic_scan_beam_solids, m)?,
