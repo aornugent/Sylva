@@ -1,6 +1,6 @@
 """Parity cases for sylva.qsm's joint model: the pair table.
 
-They replace 3dtrees' numpy oracle (research 74 §21), which they were recorded against: a change is a recorded
+They replace 3dtrees' numpy oracle (research 100 §21), which they were recorded against: a change is a recorded
 change, in its own commit.
 """
 

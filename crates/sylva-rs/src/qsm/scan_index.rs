@@ -179,7 +179,7 @@ impl ScanIndex {
     }
 
     /// `pulse`'s row in its Shots file: with an echo's place in the pulse, the key the tile sidecars carry
-    /// (`pulse.u32`, `echo.u8`; 3dtrees research 94, win 1).
+    /// (`pulse.u32`, `echo.u8`; 3dtrees research 104, win 1).
     pub fn file_row(&self, pulse: u32) -> u32 {
         self.src[pulse as usize]
     }

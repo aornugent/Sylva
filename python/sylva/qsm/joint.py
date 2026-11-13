@@ -9,7 +9,7 @@ foliage density; each pulse near it is a censored survival event along its
 line, where opaque wood (an echo at the footprint's centroid depth) and
 foliage (Beer-Lambert) compete to stop it. A Gaussian Markov prior over the
 tree ties the rows together: the taper's steps, soft Leonardo at forks, a
-random walk of the centre and of foliage (3dtrees research 74).
+random walk of the centre and of foliage (3dtrees research 100).
 
 :func:`support_tree` fits one tree: each row's pieces' support function per
 scan, bounds and existence where a circle isn't determined, the pieces with
@@ -20,7 +20,7 @@ The settings a caller may set are a :class:`JointParams`, whose fields are:
 
 - the beam: ``exit`` and ``divergence`` (its diameter at the aperture, m, and
   full divergence, rad);
-- echo character (3dtrees research 93 §11.2): ``refl_wood``, ``refl_wood_sd``,
+- echo character (3dtrees research 103 §11.2): ``refl_wood``, ``refl_wood_sd``,
   ``refl_leaf`` and ``refl_leaf_sd`` (the reflectance, dB, of a single return
   from bark that fills the footprint and from leaf, mean and sd),
   ``refl_multi`` and ``refl_multi_sd`` (a return that shares its pulse is
@@ -68,7 +68,7 @@ SupportFlag = IntFlag("SupportFlag", _core.qsm_support_flags())
 #: reason, and isn't restated here:
 #:
 #: - ``ONE_SIDED``: one scan supplies almost all its informative pulses, or every pair of the views that carry a share
-#:   of them looks from nearly one direction: no other view checks it (3dtrees research 93 §10, §11.1);
+#:   of them looks from nearly one direction: no other view checks it (3dtrees research 103 §10, §11.1);
 #: - ``SHADOWED``: an exact stem a side of whose silhouette is unseen (no pulse reaches the circle's neighbourhood
 #:   there from a scan that would decide R, as a crossing branch's shadow), so the sides seen leave its radius trading
 #:   against its centre: its message says nothing along what they leave free, and its own bounds (the span of its

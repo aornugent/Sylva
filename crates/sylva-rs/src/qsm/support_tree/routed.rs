@@ -3,7 +3,7 @@
 // Free software under the GNU General Public License v3.0 or later;
 // see the LICENSE file. There is no warranty, to the extent permitted by law.
 //! A routed piece (RUNS or HULL) fitted by the exact likelihood (3dtrees
-//! research 93 §18, after review): seeds from its runs, each stem on its own
+//! research 103 §18, after review): seeds from its runs, each stem on its own
 //! leaning axis, and its stems' likelihood messages.
 //!
 //! - **Seeds.** Each scan's profile is cut into slices along the piece
@@ -29,7 +29,7 @@
 //!   [`FIT_PAIRS`], and one in `ceil(n / FIT_PAIRS)` where it has more (a
 //!   hash of the pulse's direction): a scan's
 //!   pulses are about five times more correlated than the likelihood assumes
-//!   (research 93 §17's [`EXIST_SCALE`]), and fitting half of every piece made k
+//!   (research 103 §17's [`super::EXIST_SCALE`]), and fitting half of every piece made k
 //!   flip with the half (§18-§19). Then `k = 1, 2, ...` stems, each from
 //!   its seed on its own axis ([`fit_stems`]: each pulse seen from the stem
 //!   it meets first, each stem its own foliage, Newton to its stopping rule
@@ -39,8 +39,8 @@
 //! - **The message.** Each stem's likelihood curvature at its fit (directions
 //!   of positive curvature carry nothing; foliage integrated out), its
 //!   information scaled to the whole set's and discounted by the
-//!   pulses' correlation ([`JointParams::exist_scale`]), with
-//!   [`JointParams::model_sd`] added to its variances as a measured piece's
+//!   pulses' correlation ([`super::EXIST_SCALE`]), with
+//!   [`super::MODEL_SD`] added to its variances as a measured piece's
 //!   are; the lean is its seed's, with the seed's variance.
 //! - **Refusal,** decided here alone ([`exact_piece`]): no
 //!   seed (no fallback: no seed, no fit), no pulse left, Newton unconverged, a
@@ -283,7 +283,7 @@ const BAND_SHARE: f64 = 0.5;
 const BAND: (f64, f64) = (0.01, 0.03);
 
 /// How each scan sees a fitted stem (`r`, on the seed's `axis` (its ends) with frame `fr`, moved by `d`), from every
-/// pulse of the table `t` and its echoes' depths about the stem (research 93 §20): a side (the neighbourhood of an
+/// pulse of the table `t` and its echoes' depths about the stem (research 103 §20): a side (the neighbourhood of an
 /// edge, `R` to `R + W` beyond the axis across the beam, `W` [`BAND_SHARE`] of the radius within [`BAND`], or the
 /// front's middle) is seen where at least [`SEEN_MIN`] pulses reached it (an echo at or behind it, or none recorded
 /// where none was deleted), and weighs the pulses that did per m across the beam; one whose pulses all echoed
@@ -590,7 +590,7 @@ fn exact_thinned(scans: &[&ScanIndex], a0: &Point, frame: Frame, seeds: &[Seed],
     let Some((st, sf, mut stems)) = chosen else { return Ok(Fitted::Refused) };
     let k = st.len();
     // each stem as its scans see it: where the sides they see leave its radius undetermined, its message says nothing
-    // along what they leave free, and its own bounds go with it (research 93 §20)
+    // along what they leave free, and its own bounds go with it (research 103 §20)
     let mut shadow = vec![None; k];
     for (q, &(j, d, r)) in st.iter().enumerate() {
         let Some((sights, b)) = look(&t, scans, &axes[j], sfr[j], d, r, (a0, frame, tube), like) else { continue };
@@ -677,7 +677,7 @@ pub(crate) struct StemFit {
 /// across it, along that axis's frame. Each pair is seen from the stem it meets first ([`first_met`]), each stem a
 /// row of its own with its own foliage, fitted by [`joint_fit`] with `opts` from the axes; then each pair is seen
 /// again from the fitted stem it meets first, and scored there: the seeded exact fit of a routed piece, each stem
-/// on its own leaning axis (3dtrees research 93 §18).
+/// on its own leaning axis (3dtrees research 103 §18).
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn fit_stems(range: &[f64], see: &(dyn Fn(usize, usize, [f64; 2]) -> Pulse + Sync), axes: &[(Point, Point)], radii: &[f64], scan: &[u32], n_scans: usize, p: &JointParams, opts: &FitOptions) -> Result<StemFit> {
     let m = axes.len();
