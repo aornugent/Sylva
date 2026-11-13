@@ -25,18 +25,23 @@
 //!     outlier share. An empty cell has probability `e^{−κ t_end} Π (1 − op_j sel_j)`.
 //! - **Term C, a stick's located silhouette edges** ([`edge_ll`]): the fill band under 0.5 leaves A's cells for C,
 //!   so no echo counts twice.
-//! - **The offset field** (research 130 offset-field-design.md, slice 7): per scan, a 3-vector field on nodes ℓ
-//!   apart (trilinear hats, normalised), each node's components (along the beam, two across) in its beam frame,
-//!   with a Gaussian prior: along, unit, scaled at each element by its surface class's spread (and the other-epoch
-//!   part for a scan off the reference epoch); across, `α ρ`. A cell's depths shift by the field's along part at
-//!   its front element, a stick's term C by the across part along its silhouette's side. A scan's energy is the
-//!   Laplace marginal of its data over the nodes, so neighbours sharing nodes share one offset, and one scan's
-//!   joint evidence on a place is capped by the prior. The surface class k (which sets the along spread, the bias
-//!   and the noise) is the median class of the view's echoes on the element's front.
+//! - **Depth over a footprint:** a layer's depth is the mean of the section's depth over the part of the footprint
+//!   it meets, weighted by each part's energy (the cosine of incidence), as a scanner's mixed echo is
+//!   ([`footprint_depth`]). The misfit spreads the depth but doesn't move it (slice 7b).
+//! - **The offset field** (research 130 offset-field-design.md, slices 7 and 7b): per scan, an along-beam offset
+//!   on nodes ℓ apart (trilinear hats, normalised) with a unit Gaussian prior, scaled at each element by its surface
+//!   class's spread (and the other-epoch part for a scan off the reference epoch). A cell's depths shift by the
+//!   field at its front element. Neighbours sharing nodes share one offset, and one scan's joint evidence on a
+//!   place is capped by the prior. (An across-beam part didn't help held-out calibration; slice 7b dropped it.) The surface class k (which sets the along
+//!   spread, the bias and the noise) is the median class of the view's echoes on the element's front.
+//! - **The shape latent** (slice 7b, off by default): a stick's section less its circle as a random function of
+//!   the angle about its axis ([`Block`]), seen by each scan at its front (a depth) and its two edges (moving the
+//!   fill and term C). It couples the scans that see the stick.
+//! - **The energy** is the Laplace marginal of every scan's data over all these latents ([`joint`]).
 //! - **Weights:** each cell counts `1/m(ρ)`, with m the footprints per cell (overlapping footprints). An element's
 //!   terms in a scan are tempered by the residual design effect `1 + (n − 1) ρ`, n its fill-weighted footprints:
-//!   the occupancy correlation the field doesn't carry (misfit is rendered as a blur, not as a random function of
-//!   the section's angle; design §4's ρ_res). Without it, untempered occupancy rewards covering more cells.
+//!   the occupancy correlation the latents don't carry (design §4's ρ_res). Without it, untempered occupancy
+//!   rewards covering more cells, with or without the shape latent (slice 7b).
 //!
 //! Cells no element touches cancel. Context (neighbours, competitors) enters as more elements in the set.
 
@@ -143,11 +148,11 @@ pub struct Row {
     pub across: f64,
     pub surface: u8,
     pub energy: f64,
-    /// The offset field's posterior at the element in this scan: the along-beam shift and its sd, and the shift
-    /// across the beam along its silhouette's side (m).
+    /// The offset field's posterior at the element in this scan: the along-beam shift and its sd (m).
     pub shift_along: f64,
     pub sd_along: f64,
-    pub shift_across: f64,
+    /// The stick's shape latent at the scan's front angle: its section's radius there less a₀ (m; 0 without one).
+    pub shape: f64,
 }
 
 fn phi(x: f64) -> f64 {
@@ -217,22 +222,20 @@ fn render(v: &View, e: &Element, id: u32, em: &ErrorModel) -> Vec<(usize, Layer)
             if tm <= 0.0 || along.abs() > half {
                 continue;
             }
-            let sd = (0.0625 * em.footprint(tm).powi(2) + e.misfit * e.misfit).sqrt();
+            let fp = 0.25 * em.footprint(tm);
+            let sd = (fp * fp + e.misfit * e.misfit).sqrt();
             let f = phi((e.r - d) / sd) - phi((-e.r - d) / sd);
             if d > e.r + 3.0 * sd + 2.0 * em.step * tm {
                 continue;
             }
-            let depth = |x: f64| tm - (e.r * e.r - x * x).max(0.0).sqrt() / sin;
-            let x2 = (d + sd).min(e.r);
-            let x1 = (d - sd).max(0.0).min(x2);
-            let xm = 0.5 * (x1 + x2);
+            let (t, spread, cos) = footprint_depth(tm, d, e.r, sin, fp);
             out.push((
                 l as usize * v.n_cols + k as usize,
                 Layer {
-                    t: 0.5 * (depth(x1) + depth(x2)),
-                    spread: ((depth(x2) - depth(x1)).powi(2) / 12.0 + e.misfit * e.misfit).sqrt(),
+                    t,
+                    spread: (spread * spread + e.misfit * e.misfit).sqrt(),
                     f,
-                    cos: ((1.0 - (xm / e.r).powi(2)).max(0.0).sqrt() * sin).max(0.05),
+                    cos: (cos * sin).max(0.05),
                     elem: id,
                     op: e.opacity,
                     x,
@@ -242,6 +245,33 @@ fn render(v: &View, e: &Element, id: u32, em: &ErrorModel) -> Vec<(usize, Layer)
         }
     }
     out
+}
+
+/// The echo's depth over a footprint (Gaussian across the section, sd `fp`) whose centre passes `d` from the axis
+/// at range `tm`: the mean of the section's depth over the part it meets, each part weighted by its energy (the
+/// cosine of incidence, Lambertian); the spread of those depths; and the mean cosine. The misfit stays out: it
+/// spreads the depth about the form but doesn't move it.
+fn footprint_depth(tm: f64, d: f64, r: f64, sin: f64, fp: f64) -> (f64, f64, f64) {
+    const GH: [(f64, f64); 5] = [(0.0, 0.533333), (1.355626, 0.222076), (-1.355626, 0.222076), (2.856970, 0.011257), (-2.856970, 0.011257)];
+    let (mut sw, mut swc, mut sz, mut szz) = (0.0, 0.0, 0.0, 0.0);
+    for (u, w) in GH {
+        let x = d + u * fp;
+        if x.abs() < r {
+            let c = (1.0 - (x / r).powi(2)).sqrt();
+            let z = -r * c / sin;
+            sw += w;
+            swc += w * c;
+            sz += w * c * z;
+            szz += w * c * z * z;
+        }
+    }
+    if swc <= 0.0 {
+        // past the edge: the grazing surface
+        let c = (1.0 - (d.min(r) / r).powi(2)).max(0.0).sqrt();
+        return (tm - r * c / sin, 0.0, c);
+    }
+    let z = sz / swc;
+    (tm + z, (szz / swc - z * z).max(0.0).sqrt(), swc / sw)
 }
 
 /// Every element rendered into one view.
@@ -379,39 +409,51 @@ fn cell_ll(obs: f64, layers: &[(Layer, u8)], ground: Option<(f64, f64)>, delta: 
     ((1.0 - em.p_outlier) * dens + em.p_outlier / sc.t_max).ln()
 }
 
-/// One element's data in one scan, as functions of the offset field at it: its A cells (those it fronts at fill
-/// 0.5 or more), whose log-likelihood against the empty scene depends on the along-beam shift δ, and its term C,
-/// which depends on the shift τ across the beam (along its `side` direction).
+/// One element's data in one scan, as a function of three shifts there: δ, along the beam, of the depths of the
+/// cells it fronts at fill 0.5 or more (its A cells), and its silhouette's edges moved outward, `e₊` on its +x side
+/// and `e₋` on its −x side, which move its A cells' fill and its term C. Each shift is a row over the latents.
 struct ElemData<'a> {
     elem: usize,
-    cells: Vec<(f64, Vec<(Layer, u8)>, Option<(f64, f64)>, f64)>,
+    /// (obs, layers, ground, weight, the cell's log-likelihood against the empty scene)
+    cells: Vec<(f64, Vec<(Layer, u8)>, Option<(f64, f64)>, f64, f64)>,
     rendered: &'a [(usize, Layer)],
     class: u8,
-    /// The element's along-beam spread in this scan (class, and the other-epoch part), and its across-beam unit
-    /// direction (the side of its silhouette) and range.
-    s_along: f64,
-    side: Point,
-    range: f64,
     support: u32,
     n_cells: u32,
     across: f64,
-    /// Its fill-weighted footprints, and the residual design effect they give its terms (`1 / (1 + (n − 1) ρ)`).
     n_fp: f64,
+    /// The residual design effect on its terms, `1 / (1 + (n − 1) ρ)`.
     temper: f64,
+    /// The section's angles (about the axis, in the element's frame) the scan sees at its front and its +x and −x
+    /// edges.
+    angles: [f64; 3],
+    /// Its row over the scan's field nodes (local): the along shift, scaled by its class's along spread (and the
+    /// other-epoch part).
+    along: Vec<(usize, f64)>,
 }
 
 impl ElemData<'_> {
-    fn a_ll(&self, delta: f64, drop: f64, em: &ErrorModel, sc: &Scene) -> f64 {
-        self.cells.iter().map(|(obs, layers, ground, wt)| wt * (cell_ll(*obs, layers, *ground, delta, drop, em, sc) - cell_ll(*obs, &[], *ground, 0.0, drop, em, sc))).sum()
+    /// Its tempered A and C at shifts x = (δ, e₊, e₋); `e` is the element as rendered.
+    fn ll(&self, x: [f64; 3], v: &View, e: &Element, drop: f64, zt: f64, em: &ErrorModel, sc: &Scene) -> f64 {
+        let stick = matches!(e.form, Form::Stick { .. });
+        let a: f64 = self.cells.iter().map(|(obs, layers, ground, wt, base)| {
+            let mut ls = [layers[0]; K];
+            ls[..layers.len()].copy_from_slice(layers);
+            if stick && (x[1] != 0.0 || x[2] != 0.0) {
+                let l = &mut ls[0].0;
+                let sd = (0.0625 * em.footprint(l.t).powi(2) + e.misfit * e.misfit).sqrt();
+                l.f = phi((e.r + x[1] - l.x) / sd) - phi((-e.r - x[2] - l.x) / sd);
+            }
+            wt * (cell_ll(*obs, &ls[..layers.len()], *ground, x[0], drop, em, sc) - base)
+        }).sum();
+        self.temper * (a + edge_ll(v, self.rendered, e, self.class, zt, [x[1], x[2]], em))
     }
 }
 
 /// A scan's offset-field nodes: trilinear hats on a grid of spacing ℓ, normalised so the field's variance is the
-/// same everywhere (`t(x) = Σ w_j z_j / √Σ w_j²`); each node carries (along, across₁, across₂) in its beam frame.
+/// same everywhere (`t(x) = Σ w_j z_j / √Σ w_j²`); each node carries the along-beam offset.
 struct Field {
     nodes: HashMap<[i64; 3], usize>,
-    frames: Vec<[Point; 3]>,
-    ranges: Vec<f64>,
 }
 
 impl Field {
@@ -431,52 +473,61 @@ impl Field {
         out
     }
 
-    fn node(&mut self, k: [i64; 3], origin: &Point, l: f64) -> usize {
-        if let Some(&i) = self.nodes.get(&k) {
-            return i;
-        }
-        let p = k.map(|v| v as f64 * l);
-        let w = normalize(&sub(&p, origin));
-        let b1 = normalize(&cross(&w, &if w[2].abs() < 0.9 { [0.0, 0.0, 1.0] } else { [1.0, 0.0, 0.0] }));
-        let b2 = cross(&w, &b1);
-        self.frames.push([w, b1, b2]);
-        self.ranges.push(norm(&sub(&p, origin)));
-        self.nodes.insert(k, self.frames.len() - 1);
-        self.frames.len() - 1
+    fn node(&mut self, k: [i64; 3]) -> usize {
+        let n = self.nodes.len();
+        *self.nodes.entry(k).or_insert(n)
     }
 }
 
-/// One scan's energy for one configuration (elements other than `skip`): the Laplace marginal of its data over
-/// the offset field's nodes, `U = −Σ_e [A_e(δ̂_e) + C_e(τ̂_e)] + ½ ẑᵀQẑ + ½ log|Λ Q⁻¹|`, with Λ the posterior
-/// precision at the mode. Returns U and per element (index, its share of U, δ̂, sd δ, τ̂, cells, support, across,
-/// class).
-#[allow(clippy::type_complexity)]
-fn scan_energy(v: &View, rendered: &[Vec<(usize, Layer)>], elems: &[Element], skip: Option<u32>, ref_epoch: u32, em: &ErrorModel, sc: &Scene)
-               -> (f64, Vec<(usize, f64, f64, f64, f64, u32, u32, f64, u8)>) {
-    let per: Vec<Vec<(usize, Layer)>> = rendered.iter().enumerate().map(|(i, r)| if Some(i as u32) == skip { Vec::new() } else { r.clone() }).collect();
-    let buf = kbuffer(&per, 0.5);
+/// Newton steps at most per energy.
+const MAX_NEWTON: usize = 40;
+
+/// A frame about a stick's axis: two unit vectors across it.
+fn axis_frame(u: &Point) -> (Point, Point) {
+    let p1 = normalize(&cross(u, &if u[2].abs() < 0.9 { [0.0, 0.0, 1.0] } else { [1.0, 0.0, 0.0] }));
+    (p1, cross(u, &p1))
+}
+
+/// One scan's element data (elements other than `skip`) and its field's nodes.
+#[allow(clippy::too_many_arguments)]
+fn scan_data<'a>(v: &View, rendered: &'a [Vec<(usize, Layer)>], elems: &[Element], skip: Option<u32>, ref_epoch: u32, em: &ErrorModel, sc: &Scene)
+                 -> (Vec<ElemData<'a>>, Field, f64) {
+    let empty: &'a [(usize, Layer)] = &[];
+    let per: Vec<&'a [(usize, Layer)]> = rendered.iter().enumerate().map(|(i, r)| if Some(i as u32) == skip { empty } else { r.as_slice() }).collect();
+    let owned: Vec<Vec<(usize, Layer)>> = per.iter().map(|r| r.to_vec()).collect();
+    let buf = kbuffer(&owned, 0.5);
     let cls = classes(v, &buf, elems.len(), em);
     let drop = drop_of(em, v);
-    let zt = phi_inv(1.0 - em.edge_fill);
     let other = v.epoch != ref_epoch;
-    // each element's data in this scan
+    let mut field = Field { nodes: HashMap::new() };
     let mut data: Vec<ElemData> = Vec::new();
     let mut by_elem: HashMap<u32, usize> = HashMap::new();
     for (i, e) in elems.iter().enumerate() {
-        if Some(i as u32) == skip || per[i].is_empty() {
+        if per[i].is_empty() {
             continue;
         }
         let k = cls[i];
         let mid = e.mid();
         let c = sub(&mid, &v.origin);
-        let side = match e.form {
-            Form::Stick { a, b } => normalize(&cross(&normalize(&sub(&b, &a)), &c)),
+        let angles = match e.form {
+            Form::Stick { a, b } => {
+                let u = normalize(&sub(&b, &a));
+                let (p1, p2) = axis_frame(&u);
+                let ang = |w: &Point| dot(w, &p2).atan2(dot(w, &p1));
+                let ps = ang(&normalize(&cross(&u, &c)));
+                [ang(&c.map(|x| -x)), ps, ps + std::f64::consts::PI]
+            }
             Form::Patch { .. } => [0.0; 3],
         };
         let s_along = (em.field_along[k as usize].powi(2) + if other { em.field_epoch[k as usize].powi(2) } else { 0.0 }).sqrt();
+        let along = if em.field {
+            Field::hats(&mid, em.field_spacing).into_iter().map(|(key, w)| (field.node(key), w * s_along)).collect()
+        } else {
+            Vec::new()
+        };
         by_elem.insert(i as u32, data.len());
-        data.push(ElemData { elem: i, cells: Vec::new(), rendered: &per[i], class: k, s_along, side, range: norm(&c), support: 0, n_cells: 0,
-                             across: 2.0 * e.r / em.footprint(norm(&c)), n_fp: 0.0, temper: 1.0 });
+        data.push(ElemData { elem: i, cells: Vec::new(), rendered: per[i], class: k, support: 0, n_cells: 0, across: 2.0 * e.r / em.footprint(norm(&c)),
+                             n_fp: 0.0, temper: 1.0, angles, along });
     }
     for (&cell, ls) in &buf {
         let front = ls[0];
@@ -491,126 +542,303 @@ fn scan_energy(v: &View, rendered: &[Vec<(usize, Layer)>], elems: &[Element], sk
         el.n_fp += front.f / em.multiplicity(front.t);
         let sd = (em.sigma_e[el.class as usize].powi(2) + front.spread.powi(2)).sqrt();
         el.support += (cell_code(obs, front.t, sd) == code::ON) as u32;
-        el.cells.push((obs, layers, ground, wt));
+        el.cells.push((obs, layers, ground, wt, cell_ll(obs, &[], ground, 0.0, drop, em, sc)));
     }
     for el in data.iter_mut() {
         el.temper = 1.0 / (1.0 + (el.n_fp - 1.0).max(0.0) * em.rho);
     }
-    let a_c = |el: &ElemData, delta: f64| el.temper * el.a_ll(delta, drop, em, sc);
-    let c_c = |el: &ElemData, tau: f64| el.temper * edge_ll(v, el.rendered, &elems[el.elem], el.class, zt, tau, em);
-    // the field's design: each element's along and across rows over the nodes near it
-    let mut field = Field { nodes: HashMap::new(), frames: Vec::new(), ranges: Vec::new() };
-    let mut rows_a: Vec<Vec<(usize, f64)>> = Vec::new();
-    let mut rows_c: Vec<Vec<(usize, f64)>> = Vec::new();
-    for el in &data {
-        let (mut ra, mut rc) = (Vec::new(), Vec::new());
-        if em.field {
-            for (key, w) in Field::hats(&elems[el.elem].mid(), em.field_spacing) {
-                let j = field.node(key, &v.origin, em.field_spacing);
-                let f = field.frames[j];
-                ra.push((3 * j, w * el.s_along));
-                rc.push((3 * j + 1, w * dot(&el.side, &f[1])));
-                rc.push((3 * j + 2, w * dot(&el.side, &f[2])));
+    (data, field, drop)
+}
+
+/// One element's shape latent: the section's radius less its circle at the angles its scans see (front, +x edge,
+/// −x edge, per scan), a multivariate t (ν `shape_nu`) with scale `misfit² C`. C is the periodic squared-exponential
+/// correlation in angle (length `shape_angle`) with its constant and first harmonics taken out: those are the
+/// radius and the axis's place, which the element itself carries, so the latent can't stand in for them.
+struct Block {
+    start: usize,
+    n: usize,
+    kinv: nalgebra::DMatrix<f64>,
+    /// `ln Γ(ν/2) − ln Γ((ν+n)/2) + n/2 ln(νπ) + ½ ln|K|`: its −log density at 0.
+    norm: f64,
+}
+
+impl Block {
+    fn new(start: usize, angles: &[f64], misfit: f64, em: &ErrorModel) -> Block {
+        let n = angles.len();
+        // exp(−2 sin²(Δ/2)/θ²) = e^{−x} Σ_n ε_n I_n(x) cos nΔ with x = θ⁻², less its n = 0 and 1 terms, at unit variance
+        let x = em.shape_angle.powi(-2);
+        let bessel = |m: i32| (0..40).map(|k| (0.5 * x).powi(2 * k + m) / (libm::tgamma(k as f64 + 1.0) * libm::tgamma((k + m) as f64 + 1.0))).sum::<f64>();
+        let (c0, c1) = ((-x).exp() * bessel(0), 2.0 * (-x).exp() * bessel(1));
+        let corr = |d: f64| ((-2.0 * (0.5 * d).sin().powi(2) * x).exp() - c0 - c1 * d.cos()) / (1.0 - c0 - c1);
+        let k = nalgebra::DMatrix::from_fn(n, n, |i, j| misfit * misfit * (corr(angles[i] - angles[j]) + if i == j { 1e-3 } else { 0.0 }));
+        let ch = k.cholesky().expect("a shape covariance is positive definite");
+        let logdet = 2.0 * ch.l().diagonal().iter().map(|x| x.ln()).sum::<f64>();
+        let nu = em.shape_nu;
+        let norm = libm::lgamma(0.5 * nu) - libm::lgamma(0.5 * (nu + n as f64)) + 0.5 * n as f64 * (nu * std::f64::consts::PI).ln() + 0.5 * logdet;
+        let kinv = ch.inverse();
+        Block { start, n, kinv: (&kinv + kinv.transpose()) * 0.5, norm }
+    }
+
+    /// Its −log prior at z, the gradient, and the prior's (Gauss–Newton) precision.
+    fn prior(&self, z: &[f64], nu: f64) -> (f64, nalgebra::DVector<f64>, nalgebra::DMatrix<f64>) {
+        let g = nalgebra::DVector::from_column_slice(&z[self.start..self.start + self.n]);
+        let kg = &self.kinv * &g;
+        let q = g.dot(&kg);
+        let s = (nu + self.n as f64) / (nu + q);
+        (self.norm + 0.5 * (nu + self.n as f64) * (1.0 + q / nu).ln(), kg * s, &self.kinv * s)
+    }
+}
+
+/// The energy of one configuration (elements other than `skip`) against every scan: the Laplace marginal of the
+/// scans' data over all the latents, `U = −Σ ll(ẑ) − log p(ẑ) + ½ log|Λ| − (n/2) log 2π`, Λ the posterior precision
+/// at the mode ẑ. The latents: each scan's offset-field nodes, and each stick's shape latent ([`Block`]), which
+/// couples the scans that see it. Newton steps solve the field after eliminating each stick's block (a Schur
+/// complement), so the cost grows with the field's nodes, not the sticks.
+#[allow(clippy::too_many_arguments)]
+fn joint(views: &[&View], rendered: &[Vec<Vec<(usize, Layer)>>], elems: &[Element], skip: Option<u32>, ref_epoch: u32, em: &ErrorModel, sc: &Scene)
+         -> (f64, Vec<Row>) {
+    use nalgebra::{DMatrix, DVector, Matrix3, Vector3};
+    let zt = phi_inv(1.0 - em.edge_fill);
+    let scans: Vec<(Vec<ElemData>, Field, f64)> = views.par_iter().zip(rendered).map(|(v, r)| scan_data(v, r, elems, skip, ref_epoch, em, sc)).collect();
+    // the field's global layout, then each stick's block after it
+    let mut off = vec![0usize; scans.len() + 1];
+    for (s, (_, f, _)) in scans.iter().enumerate() {
+        off[s + 1] = off[s] + f.nodes.len();
+    }
+    let nf = off[scans.len()];
+    // the field's prior precision: unit (each element's spread is in its row)
+    let q = vec![1.0; nf];
+    // terms: (scan, data index, block, its three rows (global index, weight))
+    let mut slots: HashMap<usize, Vec<(usize, usize)>> = HashMap::new();
+    for (s, (data, _, _)) in scans.iter().enumerate() {
+        for (d, el) in data.iter().enumerate() {
+            if em.shape && matches!(elems[el.elem].form, Form::Stick { .. }) && elems[el.elem].misfit > 0.0 {
+                slots.entry(el.elem).or_default().push((s, d));
             }
         }
-        rows_a.push(ra);
-        rows_c.push(rc);
     }
-    let n = 3 * field.frames.len();
-    // the prior precision: unit along (each element's class scale is in its row), (α ρ)⁻² across
-    let q: Vec<f64> = (0..n).map(|i| if i % 3 == 0 { 1.0 } else { (em.field_across * field.ranges[i / 3].max(1.0)).powi(-2) }).collect();
-    let dot_row = |row: &[(usize, f64)], z: &[f64]| row.iter().map(|&(i, w)| w * z[i]).sum::<f64>();
-    let objective = |z: &[f64]| -> f64 {
-        data.iter().enumerate().map(|(d, el)| -(a_c(el, dot_row(&rows_a[d], z)) + c_c(el, dot_row(&rows_c[d], z)))).sum::<f64>()
-            + 0.5 * z.iter().zip(&q).map(|(x, p)| p * x * x).sum::<f64>()
-    };
-    // Newton with numerical derivatives of each element's two scalar functions; negative curvature dropped
-    let mut z = vec![0.0; n];
-    let mut hess = nalgebra::DMatrix::<f64>::zeros(n, n);
-    let (ha, hc) = (3e-4, 5e-4);
-    for _ in 0..if n > 0 { 8 } else { 0 } {
-        let mut grad = nalgebra::DVector::<f64>::from_iterator(n, z.iter().zip(&q).map(|(x, p)| p * x));
-        hess = nalgebra::DMatrix::<f64>::from_diagonal(&nalgebra::DVector::from_vec(q.clone()));
+    let mut keys: Vec<usize> = slots.keys().copied().collect();
+    keys.sort();
+    let mut blocks = Vec::new();
+    let mut block_of: HashMap<(usize, usize), (usize, usize)> = HashMap::new();
+    let mut n = nf;
+    for e in keys {
+        let angles: Vec<f64> = slots[&e].iter().flat_map(|&(s, d)| scans[s].0[d].angles).collect();
+        for (k, &(s, d)) in slots[&e].iter().enumerate() {
+            block_of.insert((s, d), (blocks.len(), n + 3 * k));
+        }
+        blocks.push(Block::new(n, &angles, elems[e].misfit, em));
+        n += angles.len();
+    }
+    type Rows = [Vec<(usize, f64)>; 3];
+    let mut terms: Vec<(usize, usize, Option<usize>, Rows)> = Vec::new();
+    for (s, (data, _, _)) in scans.iter().enumerate() {
         for (d, el) in data.iter().enumerate() {
-            for (row, f, h) in [(&rows_a[d], &a_c as &dyn Fn(&ElemData, f64) -> f64, ha), (&rows_c[d], &c_c, hc)] {
-                if row.is_empty() {
-                    continue;
+            let mut rows: Rows = [el.along.iter().map(|&(j, w)| (off[s] + j, w)).collect(), Vec::new(), Vec::new()];
+            let b = block_of.get(&(s, d)).map(|&(b, at)| {
+                rows[0].push((at, -1.0));
+                rows[1].push((at + 1, 1.0));
+                rows[2].push((at + 2, 1.0));
+                b
+            });
+            terms.push((s, d, b, rows));
+        }
+    }
+    let x_of = |rows: &Rows, z: &[f64]| rows.clone().map(|r| r.iter().map(|&(i, w)| w * z[i]).sum::<f64>());
+    let ll = |t: &(usize, usize, Option<usize>, Rows), x: [f64; 3]| {
+        let (data, _, drop) = &scans[t.0];
+        let el = &data[t.1];
+        el.ll(x, views[t.0], &elems[el.elem], *drop, zt, em, sc)
+    };
+    let nu = em.shape_nu;
+    let prior = |z: &[f64]| -> f64 {
+        0.5 * z[..nf].iter().zip(&q).map(|(x, p)| p * x * x).sum::<f64>() + blocks.iter().map(|b| b.prior(z, nu).0).sum::<f64>()
+    };
+    let objective = |z: &[f64]| -> f64 { prior(z) - terms.par_iter().map(|t| ll(t, x_of(&t.3, z))).sum::<f64>() };
+    // Newton; each term's −ll as a quadratic in its three shifts by central differences, made positive
+    // semi-definite; the blocks eliminated into the field's system
+    let h = [3e-4, 5e-4, 5e-4];
+    let mut z = vec![0.0; n];
+    let mut sinv = DMatrix::<f64>::zeros(nf, nf);
+    let mut logdet = 0.0;
+    let mut last = false;
+    for it in 0..=MAX_NEWTON {
+        let quads: Vec<(Vector3<f64>, Matrix3<f64>)> = terms.par_iter().map(|t| {
+            let x0 = x_of(&t.3, &z);
+            let f = |d: [f64; 3]| -ll(t, [x0[0] + d[0], x0[1] + d[1], x0[2] + d[2]]);
+            let used: Vec<usize> = (0..3).filter(|&i| !t.3[i].is_empty()).collect();
+            let f0 = f([0.0; 3]);
+            let mut g = Vector3::zeros();
+            let mut hm = Matrix3::zeros();
+            let e = |i: usize, s: f64| { let mut d = [0.0; 3]; d[i] = s * h[i]; d };
+            let fp: Vec<f64> = (0..3).map(|i| if used.contains(&i) { f(e(i, 1.0)) } else { f0 }).collect();
+            let fm: Vec<f64> = (0..3).map(|i| if used.contains(&i) { f(e(i, -1.0)) } else { f0 }).collect();
+            for &i in &used {
+                g[i] = (fp[i] - fm[i]) / (2.0 * h[i]);
+                hm[(i, i)] = (fp[i] - 2.0 * f0 + fm[i]) / (h[i] * h[i]);
+                for &j in used.iter().filter(|&&j| j > i) {
+                    let mut dp = e(i, 1.0);
+                    dp[j] = h[j];
+                    let mut dm = e(i, -1.0);
+                    dm[j] = -h[j];
+                    let hij = (f(dp) - fp[i] - fp[j] + 2.0 * f0 - fm[i] - fm[j] + f(dm)) / (2.0 * h[i] * h[j]);
+                    hm[(i, j)] = hij;
+                    hm[(j, i)] = hij;
                 }
-                let x0 = dot_row(row, &z);
-                let (fm, f0, fp) = (f(el, x0 - h), f(el, x0), f(el, x0 + h));
-                let (g, curv) = ((fp - fm) / (2.0 * h), (-(fp - 2.0 * f0 + fm) / (h * h)).max(0.0));
-                for &(i, wi) in row.iter() {
-                    grad[i] -= g * wi;
-                    for &(j, wj) in row.iter() {
-                        hess[(i, j)] += curv * wi * wj;
+            }
+            if !(g.iter().all(|x| x.is_finite()) && hm.iter().all(|x| x.is_finite())) {
+                return (Vector3::zeros(), Matrix3::zeros());
+            }
+            let eig = hm.symmetric_eigen();
+            let hm = eig.eigenvectors * Matrix3::from_diagonal(&eig.eigenvalues.map(|x| x.max(0.0))) * eig.eigenvectors.transpose();
+            (g, (hm + hm.transpose()) * 0.5)
+        }).collect();
+        // assemble: the field's block (dense), each stick's block, and their coupling on the field indices it touches
+        let mut grad = DVector::<f64>::zeros(n);
+        let mut hff = DMatrix::<f64>::from_diagonal(&DVector::from_vec(q.clone()));
+        for i in 0..nf {
+            grad[i] = q[i] * z[i];
+        }
+        let mut hbb: Vec<DMatrix<f64>> = Vec::with_capacity(blocks.len());
+        let mut fidx: Vec<Vec<usize>> = vec![Vec::new(); blocks.len()];
+        for blk in &blocks {
+            let (_, gb, pb) = blk.prior(&z, nu);
+            grad.rows_mut(blk.start, blk.n).copy_from(&gb);
+            hbb.push(pb);
+        }
+        for (_, _, b, rows) in &terms {
+            if let Some(b) = b {
+                for r in rows {
+                    for &(i, _) in r.iter().filter(|(i, _)| *i < nf) {
+                        if !fidx[*b].contains(&i) {
+                            fidx[*b].push(i);
+                        }
                     }
                 }
             }
         }
-        let Some(ch) = hess.clone().cholesky() else { break };
-        let step = ch.solve(&grad);
-        let f_now = objective(&z);
-        let mut t = 1.0;
-        loop {
-            let zn: Vec<f64> = z.iter().zip(step.iter()).map(|(a, b)| a - t * b).collect();
-            if objective(&zn) <= f_now || t < 1e-3 {
-                z = zn;
-                break;
+        let mut hfb: Vec<DMatrix<f64>> = blocks.iter().zip(&fidx).map(|(blk, fi)| DMatrix::zeros(fi.len(), blk.n)).collect();
+        for ((_, _, b, rows), (g, hm)) in terms.iter().zip(&quads) {
+            for a in 0..3 {
+                for &(i, wi) in &rows[a] {
+                    grad[i] += g[a] * wi;
+                    for c in 0..3 {
+                        let hac = hm[(a, c)];
+                        if hac == 0.0 {
+                            continue;
+                        }
+                        for &(j, wj) in &rows[c] {
+                            let v = hac * wi * wj;
+                            match (i < nf, j < nf) {
+                                (true, true) => hff[(i, j)] += v,
+                                (false, false) => {
+                                    let blk = &blocks[b.unwrap()];
+                                    hbb[b.unwrap()][(i - blk.start, j - blk.start)] += v;
+                                }
+                                (true, false) => {
+                                    let bb = b.unwrap();
+                                    let li = fidx[bb].iter().position(|&x| x == i).unwrap();
+                                    hfb[bb][(li, j - blocks[bb].start)] += v;
+                                }
+                                (false, true) => {}
+                            }
+                        }
+                    }
+                }
             }
-            t *= 0.5;
         }
-        if step.amax() * t < 1e-6 {
+        // eliminate the blocks: S = H_ff − Σ H_fb H_bb⁻¹ H_bf, r = g_f − Σ H_fb H_bb⁻¹ g_b
+        let mut s_mat = hff;
+        let mut r_f = grad.rows(0, nf).into_owned();
+        let mut ld_b = 0.0;
+        let mut hbb_inv = Vec::with_capacity(blocks.len());
+        for (b, blk) in blocks.iter().enumerate() {
+            let hb = (&hbb[b] + hbb[b].transpose()) * 0.5;
+            let ch = hb.clone().cholesky().unwrap_or_else(|| panic!("a block's precision is positive definite: {hb} at {:?}", &z[blk.start..blk.start + blk.n]));
+            ld_b += 2.0 * ch.l().diagonal().iter().map(|x| x.ln()).sum::<f64>();
+            let inv = ch.inverse();
+            let w = &hfb[b] * &inv;
+            let sub_s = &w * hfb[b].transpose();
+            let sub_r = &w * grad.rows(blk.start, blk.n);
+            for (a, &i) in fidx[b].iter().enumerate() {
+                r_f[i] -= sub_r[a];
+                for (c, &j) in fidx[b].iter().enumerate() {
+                    s_mat[(i, j)] -= sub_s[(a, c)];
+                }
+            }
+            hbb_inv.push(inv);
+        }
+        let ch = s_mat.clone().cholesky();
+        let ld_s = ch.as_ref().map_or(0.0, |c| 2.0 * c.l().diagonal().iter().map(|x| x.ln()).sum::<f64>());
+        logdet = ld_b + ld_s;
+        sinv = ch.as_ref().map_or_else(|| DMatrix::zeros(nf, nf), |c| c.inverse());
+        if last || it == MAX_NEWTON || n == 0 {
             break;
         }
+        let df = &sinv * &r_f;
+        let mut step = DVector::<f64>::zeros(n);
+        step.rows_mut(0, nf).copy_from(&df);
+        for (b, blk) in blocks.iter().enumerate() {
+            let mut rb = grad.rows(blk.start, blk.n).into_owned();
+            for (a, &i) in fidx[b].iter().enumerate() {
+                rb -= hfb[b].row(a).transpose() * df[i];
+            }
+            step.rows_mut(blk.start, blk.n).copy_from(&(&hbb_inv[b] * rb));
+        }
+        // a step at most 3 prior sds in the field and 2 cm in a shape, then halved until the objective falls; none
+        // that does ends the search
+        let over = (0..n).map(|i| step[i].abs() * if i < nf { q[i].sqrt() / 3.0 } else { 50.0 }).fold(1.0, f64::max);
+        step /= over;
+        let f_now = objective(&z);
+        let mut tstep = 1.0;
+        let mut fall = 0.0;
+        while tstep >= 1e-3 {
+            let zn: Vec<f64> = z.iter().zip(step.iter()).map(|(a, b)| a - tstep * b).collect();
+            let f_new = objective(&zn);
+            if f_new <= f_now {
+                z = zn;
+                fall = f_now - f_new;
+                break;
+            }
+            tstep *= 0.5;
+        }
+        // converged (under a millinat), or stuck: one more pass refreshes Λ at the mode
+        last = tstep < 1e-3 || fall < 1e-3;
     }
-    let logdet = if n > 0 {
-        hess.clone().cholesky().map_or(0.0, |c| 2.0 * c.l().diagonal().iter().map(|x| x.ln()).sum::<f64>()) - q.iter().map(|p| p.ln()).sum::<f64>()
-    } else {
-        0.0
-    };
-    let cov = if n > 0 { hess.clone().try_inverse().unwrap_or_else(|| nalgebra::DMatrix::zeros(n, n)) } else { nalgebra::DMatrix::zeros(0, 0) };
-    let prior_term = 0.5 * z.iter().zip(&q).map(|(x, p)| p * x * x).sum::<f64>() + 0.5 * logdet;
-    let mut u = prior_term;
-    let mut out = Vec::new();
-    for (d, el) in data.iter().enumerate() {
-        let (da, tc) = (dot_row(&rows_a[d], &z), dot_row(&rows_c[d], &z));
-        let e_el = -(a_c(el, da) + c_c(el, tc));
-        u += e_el;
-        let var: f64 = rows_a[d].iter().map(|&(i, wi)| rows_a[d].iter().map(|&(j, wj)| wi * wj * cov[(i, j)]).sum::<f64>()).sum();
-        out.push((el.elem, e_el + prior_term / data.len() as f64, da, var.max(0.0).sqrt(), tc, el.n_cells, el.support, el.across, el.class));
-    }
-    (u, out)
+    let lls: Vec<f64> = terms.par_iter().map(|t| ll(t, x_of(&t.3, &z))).collect();
+    let field_norm = -0.5 * q.iter().map(|p| p.ln()).sum::<f64>() + 0.5 * nf as f64 * (2.0 * std::f64::consts::PI).ln();
+    let shared = prior(&z) + field_norm + 0.5 * logdet - 0.5 * n as f64 * (2.0 * std::f64::consts::PI).ln();
+    let u = shared - lls.iter().sum::<f64>();
+    let rows = terms.iter().zip(&lls).map(|((s, d, b, rows), l)| {
+        let el = &scans[*s].0[*d];
+        let field_part = |r: &[(usize, f64)]| r.iter().filter(|(i, _)| *i < nf).map(|&(i, w)| w * z[i]).sum::<f64>();
+        let ra: Vec<(usize, f64)> = rows[0].iter().copied().filter(|(i, _)| *i < nf).collect();
+        let var: f64 = ra.iter().map(|&(i, wi)| ra.iter().map(|&(j, wj)| wi * wj * sinv[(i, j)]).sum::<f64>()).sum();
+        Row {
+            elem: el.elem as u32, scan: *s as u32, cells: el.n_cells, support: el.support, across: el.across, surface: el.class,
+            energy: -l + shared / terms.len() as f64, shift_along: field_part(&rows[0]), sd_along: var.max(0.0).sqrt(),
+            shape: b.map_or(0.0, |_| z[block_of[&(*s, *d)].1]),
+        }
+    }).collect();
+    (u, rows)
 }
 
-/// The energy of `elems` against `views` (−log likelihood ratio against the empty scene), and its rows. Each scan's
-/// term is the Laplace marginal of its data over its offset field ([`scan_energy`]), the scans independent given
-/// the elements. With `only = Some(i)`, the energy change of adding element i to the others, `E(all) − E(all but
-/// i)`; rows are then empty. The reference epoch (whose scans take the same-day spread) is the first view's.
+/// The energy of `elems` against `views` (−log likelihood ratio against the empty scene), and a row per (element,
+/// scan). It is the Laplace marginal over the scans' offset fields and the sticks' shape latents ([`joint`]). With
+/// `only = Some(i)`, the energy change of adding element i to the others, `E(all) − E(all but i)`; rows are then
+/// empty. The reference epoch (whose scans take the same-day spread) is the first view's.
 pub fn energy(views: &[&View], elems: &[Element], em: &ErrorModel, sc: &Scene, only: Option<usize>) -> (f64, Vec<Row>) {
     let ref_epoch = views.first().map_or(0, |v| v.epoch);
-    let per_scan: Vec<(f64, Vec<Row>)> = views
-        .par_iter()
-        .enumerate()
-        .map(|(si, v)| {
-            let rendered = render_all(v, elems, em);
-            let (u, rows) = scan_energy(v, &rendered, elems, None, ref_epoch, em, sc);
-            match only {
-                Some(i) => (u - scan_energy(v, &rendered, elems, Some(i as u32), ref_epoch, em, sc).0, Vec::new()),
-                None => (u, rows.into_iter().map(|(e, en, da, sda, tc, cells, support, across, surface)| Row {
-                    elem: e as u32, scan: si as u32, cells, support, across, surface, energy: en, shift_along: da, sd_along: sda, shift_across: tc,
-                }).collect()),
-            }
-        })
-        .collect();
-    let total = per_scan.iter().map(|(u, _)| u).sum();
-    let mut rows: Vec<Row> = per_scan.into_iter().flat_map(|(_, r)| r).collect();
-    rows.sort_by_key(|r| (r.elem, r.scan));
-    (total, rows)
+    let rendered: Vec<Vec<Vec<(usize, Layer)>>> = views.par_iter().map(|v| render_all(v, elems, em)).collect();
+    let (u, rows) = joint(views, &rendered, elems, None, ref_epoch, em, sc);
+    match only {
+        Some(i) => (u - joint(views, &rendered, elems, Some(i as u32), ref_epoch, em, sc).0, Vec::new()),
+        None => (u, rows),
+    }
 }
 
 /// Term C for one stick in one view (0 for a patch): the log likelihood ratio of its located silhouette edges
-/// against an edge placed evenly across the rendered band, with the stick shifted by `shift` (m) across the beam
-/// along its silhouette's +x side (the offset field's across-beam part at the stick).
+/// against an edge placed evenly across the rendered band.
 ///
 /// Its cells are cut into strips along the axis, a cell wide. In each strip with echoes on the stick, each side's
 /// outermost such echo and the next cell out locate the edge:
@@ -618,10 +846,10 @@ pub fn energy(views: &[&View], elems: &[Element], em: &ErrorModel, sc: &Scene, o
 /// - **unknown** (the next cell is empty, its echo deleted): censored, the edge lies beyond the last echo (Tobit);
 /// - **occluded** (the next cell's echo lies in front): no information.
 ///
-/// The stick's edge lies `R + z_τ sd` from the axis, where sd is the fill's (footprint and misfit) and z_τ puts the
-/// fill at `edge_fill` (τ). Its spread is the misfit and a third of the fill sd. Each strip counts
-/// `cell / footprint` (neighbouring strips share footprints).
-fn edge_ll(v: &View, cells: &[(usize, Layer)], e: &Element, k: u8, zt: f64, shift: f64, em: &ErrorModel) -> f64 {
+/// The stick's edge lies `R + z_τ sd + out` from the axis, where sd is the fill's (footprint and misfit), z_τ puts
+/// the fill at `edge_fill` (τ), and `out` moves the +x and −x edges outward (the shape latent). Its spread is the misfit and a third of the fill sd. Each strip counts `cell / footprint`
+/// (neighbouring strips share footprints).
+fn edge_ll(v: &View, cells: &[(usize, Layer)], e: &Element, k: u8, zt: f64, out: [f64; 2], em: &ErrorModel) -> f64 {
     if matches!(e.form, Form::Patch { .. }) {
         return 0.0;
     }
@@ -640,7 +868,7 @@ fn edge_ll(v: &View, cells: &[(usize, Layer)], e: &Element, k: u8, zt: f64, shif
         let se = (e.misfit * e.misfit + (sdf / 3.0).powi(2)).sqrt();
         let w = (em.step * t / fp).min(1.0);
         for side in [1.0, -1.0] {
-            let xe = e.r + zt * sdf + side * shift;
+            let xe = e.r + zt * sdf + if side > 0.0 { out[0] } else { out[1] };
             let x_in = cs.iter().filter(|c| c.1 == code::ON).map(|c| side * c.0).fold(f64::NEG_INFINITY, f64::max);
             let far = cs.iter().map(|c| side * c.0).fold(0.0, f64::max);
             let Some(&(xo, st, _)) = cs.iter().filter(|c| side * c.0 > x_in).min_by(|a, b| (side * a.0).total_cmp(&(side * b.0))) else { continue };
@@ -730,6 +958,42 @@ mod tests {
         assert!((sum - both.0).abs() < 1e-6);
     }
 
+    /// The rendered depth is the footprint's mean on the section, which the misfit (a spread about the form, not a
+    /// bias) doesn't move: on the pole's front and halfway out it sits within 0.3 mm of the echoes, whatever the
+    /// misfit. (The misfit used to widen the depth band, which a section's edge clips, so the front was rendered
+    /// behind the echoes; slice 7b.)
+    #[test]
+    fn misfit_does_not_move_the_rendered_front() {
+        let v = pole_view(0);
+        let em = ErrorModel::default();
+        for misfit in [0.0, 0.002, 0.008] {
+            for ly in render(&v, &Element { misfit, ..stick(0.0, 4.0, 0.03) }, 0, &em).iter().map(|(c, l)| (v.range[*c] as f64, l)) {
+                let (obs, l) = ly;
+                if l.x.abs() < 0.015 && obs.is_finite() && obs < 5.0 {
+                    assert!((obs - l.t).abs() < 3e-4, "misfit {misfit}: x {} obs {obs} t {}", l.x, l.t);
+                }
+            }
+        }
+    }
+
+    /// With the shape latent on (and untempered, so the data speak plainly), the true pole still beats a stick 40 %
+    /// too thick, a third too thin and one shifted by R, and the energy is smooth in the radius (one mode: the
+    /// latent's edges once made it jump by several nats).
+    #[test]
+    fn the_shape_latent_keeps_the_true_pole_and_a_smooth_energy() {
+        let v = pole_view(0);
+        let (em, sc) = (ErrorModel { rho: 0.0, shape: true, ..ErrorModel::default() }, Scene::default());
+        let e = |s: Element| energy(&[&v], &[s], &em, &sc, None).0;
+        let truth = e(stick(0.0, 4.0, 0.03));
+        for wrong in [stick(0.0, 4.0, 0.042), stick(0.0, 4.0, 0.021), stick(0.03, 4.0, 0.03)] {
+            assert!(e(wrong) > truth + 10.0, "{} vs {truth}", e(wrong));
+        }
+        for eps in [1e-4, 5e-4, 1e-3] {
+            let d = e(stick(0.0, 4.0, 0.03 * (1.0 + eps))) - truth;
+            assert!(d.abs() < 0.5, "{eps}: {d}");
+        }
+    }
+
     /// Term C censors an edge whose pixels were deleted rather than reading it as absent, and skips one seen
     /// against something nearer: with the +x edge deleted, the true radius still scores better in C than a stick a
     /// third thinner; with it occluded, C keeps only the other side's evidence (about half).
@@ -737,7 +1001,7 @@ mod tests {
     fn deleted_edges_are_censored_and_occluded_ones_skipped() {
         let em = ErrorModel::default();
         let zt = phi_inv(1.0 - em.edge_fill);
-        let c_of = |v: &View, s: &Element| edge_ll(v, &render(v, s, 0, &em), s, 0, zt, 0.0, &em);
+        let c_of = |v: &View, s: &Element| edge_ll(v, &render(v, s, 0, &em), s, 0, zt, [0.0; 2], &em);
         let (full, deleted, occluded) = (pole_view(0), pole_view(1), pole_view(2));
         let truth = stick(0.0, 4.0, 0.03);
         let c_full = c_of(&full, &truth);
@@ -757,8 +1021,9 @@ mod tests {
             assert!((h.iter().map(|(_, w)| w * w).sum::<f64>() - 1.0).abs() < 1e-12);
         }
         let v = pole_view(0);
-        // untempered (ρ 0), so one element's data speak plainly and the quadrature needs no design effect
-        let (em, sc) = (ErrorModel { rho: 0.0, ..ErrorModel::default() }, Scene::default());
+        // untempered (ρ 0), so one element's data speak plainly and the quadrature needs no design effect; the field
+        // alone (no shape latent)
+        let (em, sc) = (ErrorModel { rho: 0.0, shape: false, ..ErrorModel::default() }, Scene::default());
         let el = stick(0.0, 4.0, 0.03);
         // shift the pole's echoes 3 mm deeper: the field's along shift should find about that
         let shifted = {
@@ -772,14 +1037,13 @@ mod tests {
         };
         let (_, rows) = energy(&[&shifted], &[el], &em, &sc, None);
         assert!((rows[0].shift_along - 0.003).abs() < 0.0015, "{}", rows[0].shift_along);
-        // the referee: a single element's along/across functions integrated by quadrature over their prior
+        // the referee: a single element's data integrated by quadrature over the field's prior
         let rendered = render_all(&v, &[el], &em);
-        let (u_lap, out) = scan_energy(&v, &rendered, &[el], None, 0, &em, &sc);
+        let (u_lap, out) = energy(&[&v], &[el], &em, &sc, None);
         assert_eq!(out.len(), 1);
         let em_off = ErrorModel { field: false, ..em };
-        let u_off = scan_energy(&v, &rendered, &[el], None, 0, &em_off, &sc).0;
-        // the element sits on one node set: its along shift has prior sd s_along (√Σŵ² = 1) and its across shift
-        // sd (α ρ) · |side·b| summed over the hats; quadrature over δ alone (the across part changes little here)
+        let u_off = energy(&[&v], &[el], &em_off, &sc, None).0;
+        // the element sits on one node set: its along shift has prior sd s_along (√Σŵ² = 1)
         let (gh_x, gh_w) = ([-2.0201828704560856, -0.9585724646138185, 0.0, 0.9585724646138185, 2.0201828704560856],
                             [0.019953242059045913, 0.39361932315224116, 0.9453087204829419, 0.39361932315224116, 0.019953242059045913]);
         let buf = kbuffer(&rendered, 0.5);
@@ -793,7 +1057,7 @@ mod tests {
                 wt * (cell_ll(obs, &layers, None, delta, drop_of(&em, &v), &em, &sc) - cell_ll(obs, &[], None, 0.0, drop_of(&em, &v), &em, &sc))
             }).sum()
         };
-        let c0 = edge_ll(&v, &rendered[0], &el, cls[0], phi_inv(1.0 - em.edge_fill), 0.0, &em);
+        let c0 = edge_ll(&v, &rendered[0], &el, cls[0], phi_inv(1.0 - em.edge_fill), [0.0; 2], &em);
         let m = gh_x.iter().map(|&x| ed(std::f64::consts::SQRT_2 * s_along * x)).fold(f64::NEG_INFINITY, f64::max);
         let quad = -(m + (gh_x.iter().zip(&gh_w).map(|(&x, &w)| w * (ed(std::f64::consts::SQRT_2 * s_along * x) - m).exp()).sum::<f64>()
             / std::f64::consts::PI.sqrt()).ln()) - c0;
