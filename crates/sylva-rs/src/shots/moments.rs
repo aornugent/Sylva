@@ -17,16 +17,12 @@
 //!   - **medial collapse** about u: `R* = B/C` (the spread of `P(p − Rn)` is `A − 2RB + R²C`);
 //!   - **the line-complex axis:** `s² Σnnᵀ` added for the cylinder's `n·u = 0`, m eliminated by a Schur complement,
 //!     u the 3 × 3's smallest eigenvector;
-//!   - **the normal tensor's** eigenvalues;
-//!   - **one scan's patch excess:** alignment-rca's surface class as a moment statistic. It is
-//!     `√(expected / observed surfel density)`, with the observed density the count over the patch's area
-//!     (`12 √(λ₁λ₂)` of its position covariance, a uniform square) and the expected one a solid face's,
-//!     `cos ι / (ρ Δ)²`.
-//! - **Elements** ([`Moments::elements`]): each occupied voxel with its 26 neighbours (a 9 cm cube at 3 cm voxels,
-//!   octree.md's best) read out as a candidate stick. It gets an axis, collapse R* and ratio, normal-tensor
-//!   eigenvalues, and per scan the arc its normals cover around the axis (the support function's coverage) and its
-//!   excess. These are marginals of one neighbourhood, labelled as such: cached potentials and the proposal support,
-//!   not estimates.
+//!   - **the normal tensor's** eigenvalues.
+//! - **Candidates** ([`Moments::candidates`]): each occupied voxel with its 26 neighbours (a 9 cm cube at 3 cm
+//!   voxels, octree.md's best) read out as a candidate element. It gets an axis, collapse R* and ratio,
+//!   normal-tensor eigenvalues, an extent, and per scan the arc its normals cover around the axis (the support
+//!   function's coverage). These are marginals of one neighbourhood, labelled as such: cached potentials and the
+//!   proposal support, not estimates.
 
 use nalgebra::{Matrix3, Matrix6, SymmetricEigen, Vector3, Vector6};
 use std::collections::HashMap;
@@ -110,22 +106,6 @@ impl Mom {
         }
     }
 
-    /// The moments of the surfels rotated by r about the origin.
-    pub fn rotated(&self, r: &M3) -> Mom {
-        let mut d = Matrix6::zeros();
-        d.fixed_view_mut::<3, 3>(0, 0).copy_from(r);
-        d.fixed_view_mut::<3, 3>(3, 3).copy_from(r);
-        Mom {
-            n: self.n,
-            sp: r * self.sp,
-            spp: r * self.spp * r.transpose(),
-            sn: r * self.sn,
-            snn: r * self.snn * r.transpose(),
-            spn: r * self.spn * r.transpose(),
-            saa: d * self.saa * d.transpose(),
-        }
-    }
-
     /// Medial collapse about unit u: (R* = B/C clamped to 0..r_max, spread at R*, spread at 0), spreads as rms (m).
     pub fn collapse(&self, u: &V, r_max: f64) -> (f64, f64, f64) {
         let p = M3::identity() - u * u.transpose();
@@ -166,21 +146,6 @@ impl Mom {
         mm -= u * u.dot(&mm);
         Some((u, c0 + u.cross(&mm), lam[2].max(0.0) / self.n))
     }
-
-    /// One scan's patch excess from `origin` with lattice step `step` (rad); NaN under 3 surfels.
-    pub fn excess(&self, origin: &V, step: f64) -> f64 {
-        if self.n < 3.0 {
-            return f64::NAN;
-        }
-        let c = self.sp / self.n;
-        let (lam, _) = eig(&(self.spp / self.n - c * c.transpose()));
-        let area = 12.0 * (lam[0].max(0.0) * lam[1].max(0.0)).sqrt();
-        let w = (c - origin).normalize();
-        let rho = (c - origin).norm();
-        let cos = (self.sn.normalize().dot(&w)).abs().max(0.1);
-        let expected = cos / (rho * step).powi(2);
-        (expected * area / self.n).sqrt()
-    }
 }
 
 pub fn key(p: &V, cell: f64) -> Key {
@@ -189,9 +154,9 @@ pub fn key(p: &V, cell: f64) -> Key {
 
 /// A candidate element read off one neighbourhood: its centre and axis (u, through `point`), collapse R* and the
 /// ratio spread(R*)/spread(0), the normal tensor's eigenvalues, its surfel count; and per scan (in the order given)
-/// its surfels, the arc (rad) its normals cover around the axis and its patch excess.
+/// its surfels and the arc (rad) its normals cover around the axis.
 #[derive(Debug, Clone)]
-pub struct Element {
+pub struct Candidate {
     pub key: Key,
     pub point: V,
     pub u: V,
@@ -203,19 +168,18 @@ pub struct Element {
     pub extent: f64,
     pub scan_n: Vec<f64>,
     pub arc: Vec<f64>,
-    pub excess: Vec<f64>,
 }
 
 /// Per (voxel, scan) moments: covariant parts kept per scan, fused on demand.
 pub struct Moments {
     pub voxel: f64,
     pub cells: HashMap<Key, Vec<Mom>>,
-    pub origins: Vec<V>,
+    pub n_scans: usize,
 }
 
 impl Moments {
-    /// From each scan's surfels (p, n) and its origin, on `voxel` cells.
-    pub fn new(scans: &[(Vec<V>, Vec<V>)], origins: Vec<V>, voxel: f64) -> Self {
+    /// From each scan's surfels (p, n), on `voxel` cells.
+    pub fn new(scans: &[(Vec<V>, Vec<V>)], voxel: f64) -> Self {
         let k = scans.len();
         let mut cells: HashMap<Key, Vec<Mom>> = HashMap::new();
         for (s, (p, n)) in scans.iter().enumerate() {
@@ -223,12 +187,12 @@ impl Moments {
                 cells.entry(key(x, voxel)).or_insert_with(|| vec![Mom::zero(); k])[s].add(x, y);
             }
         }
-        Moments { voxel, cells, origins }
+        Moments { voxel, cells, n_scans: k }
     }
 
     /// The 27-cell neighbourhood of `k`, per scan.
     pub fn neighbourhood(&self, k: &Key) -> Vec<Mom> {
-        let mut out = vec![Mom::zero(); self.origins.len()];
+        let mut out = vec![Mom::zero(); self.n_scans];
         for dx in -1..=1 {
             for dy in -1..=1 {
                 for dz in -1..=1 {
@@ -243,8 +207,8 @@ impl Moments {
         out
     }
 
-    /// Candidate elements at every voxel whose neighbourhood holds at least `min_n` surfels, in key order.
-    pub fn elements(&self, min_n: f64, r_max: f64, step: f64) -> Vec<Element> {
+    /// Candidates at every voxel whose neighbourhood holds at least `min_n` surfels, in key order.
+    pub fn candidates(&self, min_n: f64, r_max: f64) -> Vec<Candidate> {
         use rayon::prelude::*;
         let mut keys: Vec<Key> = self.cells.keys().copied().collect();
         keys.sort();
@@ -280,12 +244,11 @@ impl Moments {
                         0.5 * (lo + hi)
                     })
                     .collect();
-                Some(Element {
+                Some(Candidate {
                     key: *k, point, u, r, ratio: if s0 > 0.0 { s1 / s0 } else { f64::NAN }, lam: all.tensor(), n: all.n,
                     extent: eig(&(all.spp / all.n - c * c.transpose())).0[0].max(0.0).sqrt(),
                     scan_n: per.iter().map(|m| m.n).collect(),
                     arc,
-                    excess: per.iter().zip(&self.origins).map(|(m, o)| m.excess(o, step)).collect(),
                 })
             })
             .collect()
@@ -324,6 +287,23 @@ mod tests {
             .collect()
     }
 
+    /// The moments of surfels rotated by r about the origin: diag(R, R) on the line matrix, conjugation on the
+    /// tensors (synthesis §13's rotation; the invariant the test checks).
+    fn rotated(m: &Mom, r: &M3) -> Mom {
+        let mut d = Matrix6::zeros();
+        d.fixed_view_mut::<3, 3>(0, 0).copy_from(r);
+        d.fixed_view_mut::<3, 3>(3, 3).copy_from(r);
+        Mom {
+            n: m.n,
+            sp: r * m.sp,
+            spp: r * m.spp * r.transpose(),
+            sn: r * m.sn,
+            snn: r * m.snn * r.transpose(),
+            spn: r * m.spn * r.transpose(),
+            saa: d * m.saa * d.transpose(),
+        }
+    }
+
     fn close(a: &Mom, b: &Mom, tol: f64) -> bool {
         let d = |x: &f64, y: &f64| (x - y).abs() <= tol * (1.0 + x.abs().max(y.abs()));
         d(&a.n, &b.n)
@@ -352,7 +332,7 @@ mod tests {
         assert!(close(&per[0].moved(&t), &Mom::of(&pt, n), 1e-11));
         let r = nalgebra::Rotation3::from_euler_angles(0.3, -0.5, 1.1).into_inner();
         let (pr, nr): (Vec<V>, Vec<V>) = p.iter().zip(n).map(|(x, y)| (r * x, r * y)).unzip();
-        assert!(close(&per[0].rotated(&r), &Mom::of(&pr, &nr), 1e-11));
+        assert!(close(&rotated(&per[0], &r), &Mom::of(&pr, &nr), 1e-11));
     }
 
     #[test]
@@ -396,31 +376,10 @@ mod tests {
     }
 
     #[test]
-    fn a_solid_face_has_excess_one_and_a_half_empty_one_more() {
-        // a wall 5 m away, face-on, sampled on a lattice of 0.5 mrad: 2.5 mm spacing over a 3 cm patch
-        let (o, step) = (V::zeros(), 0.0005);
-        let face = |keep: &dyn Fn(i32, i32) -> bool| {
-            let mut m = Mom::zero();
-            for i in 0..12 {
-                for j in 0..12 {
-                    if keep(i, j) {
-                        m.add(&V::new(i as f64 * 0.0025, 5.0, j as f64 * 0.0025), &V::new(0.0, -1.0, 0.0));
-                    }
-                }
-            }
-            m
-        };
-        let solid = face(&|_, _| true).excess(&o, step);
-        let holes = face(&|i, j| (i + j) % 2 == 0).excess(&o, step);
-        assert!((solid - 1.0).abs() < 0.1, "{solid}");
-        assert!((holes - 2f64.sqrt()).abs() < 0.15, "{holes}");
-    }
-
-    #[test]
     fn a_stick_reads_out_as_an_element() {
         let scans = cylinder(V::new(1.0, 1.0, 1.0), V::new(0.0, 0.0, 1.0), 0.02, 0.05, 2, 1500, 4);
-        let m = Moments::new(&scans, vec![V::new(5.0, 1.0, 1.0), V::new(-3.0, 1.0, 1.0)], 0.03);
-        let el = m.elements(30.0, 0.3, 0.0005);
+        let m = Moments::new(&scans, 0.03);
+        let el = m.candidates(30.0, 0.3);
         let best = el.iter().find(|e| e.key == [33, 33, 33]).unwrap();
         assert!(best.u[2] > 0.99 && (best.r - 0.02).abs() < 0.004, "{:?} {}", best.u, best.r);
         // each scan's normals cover its 120° arc

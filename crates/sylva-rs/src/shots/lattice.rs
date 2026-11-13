@@ -4,7 +4,8 @@
 // see the LICENSE file. There is no warranty, to the extent permitted by law.
 //! A scan's native angular lattice: every pulse the scanner fired has a cell
 //! `(line, col)`, so a cell no recorded pulse falls in is a known missing
-//! pulse (no echo, or an echo deleted in export).
+//! pulse (no echo, or an echo deleted in export). From 3dtrees research 128
+//! (`lattice.md`); the L0 view (research 130) builds on it.
 //!
 //! A RIEGL scanner sweeps the zenith at constant speed along each mirror
 //! line and steps the head in azimuth between lines; each line's pulses are

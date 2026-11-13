@@ -18,10 +18,14 @@
 //!   neighbours beyond a `jump` left out, one refit without 3-MAD outliers;
 //!   `cos ι = 1/√(1 + |∇ ln r|²)`. Where the window's cells lie in a row,
 //!   only the gradient along it is known.
-//! - **runs and ends:** along each lattice axis, cells within `jump` of their
-//!   neighbour are one run; each cell keeps its run's length and how the run
-//!   ends at either side ([`end`]). Footprints across a run are
-//!   [`ErrorModel::across`].
+//! - **runs:** along each lattice axis, cells within `jump` of their
+//!   neighbour are one run; each cell keeps its run's length. Footprints
+//!   across a run are [`ErrorModel::across`].
+//! - **surfaces:** echo cells connected through neighbours within `jump`
+//!   (union-find), numbered per scan.
+//! - **in-surface deletion:** of the cells inside a continuous surface facing
+//!   the beam, the share without an echo ([`View::deletion`]): the export's
+//!   loss, measured on the scan.
 //! - **excess:** the surface's continuity at cm scale, alignment-rca's
 //!   covariate on the lattice: `√(25 / n)` for the `n` surfel cells (a normal
 //!   facing within 60° of the beam) of the 5 × 5 window, itself included,
@@ -43,18 +47,6 @@ pub mod state {
     pub const DELETED: u8 = 1;
     pub const MISS: u8 = 2;
     pub const UNKNOWN: u8 = 3;
-}
-
-/// How a run ends on one side (2 bits each in [`View::ends`]: along-low, along-high, across-low, across-high,
-/// from the low bits up; "along" runs along a mirror line, across the columns).
-pub mod end {
-    /// The next cell is farther: a silhouette edge.
-    pub const SHARP: u8 = 0;
-    /// The next cell is empty.
-    pub const UNKNOWN: u8 = 1;
-    /// The next cell is nearer: this surface passes behind something.
-    pub const OCCLUDED: u8 = 2;
-    pub const BORDER: u8 = 3;
 }
 
 /// Settings of [`View::new`].
@@ -99,7 +91,8 @@ pub struct ErrorModel {
     /// The offset is one value per (scan, block of this size, m): correlated over 1-5 m.
     pub block: f64,
     /// The export: echoes under `cut_db` after a per-echo reflectance error of `refl_noise_db` are deleted, and
-    /// a kept echo is lost anyway with `p_drop` (NaN: each view's measured in-surface deletion, `View::deletion`). Echo densities carry a uniform outlier share `p_outlier`.
+    /// a kept echo is lost anyway with `p_drop` (NaN: each view's measured in-surface deletion, `View::deletion`).
+    /// Echo densities carry a uniform outlier share `p_outlier`.
     pub cut_db: f64,
     pub refl_noise_db: f64,
     pub p_drop: f64,
@@ -107,27 +100,14 @@ pub struct ErrorModel {
     /// Overdispersion: a group's `n` footprints count as `n / (1 + (n − 1) ρ)` independent ones (the
     /// beta-binomial design effect of research 128's evidence term, ρ 0.1-0.6 there).
     pub rho: f64,
-    /// Mixed pixels: a partial layer's echo (fill f) is a ghost with probability `ghost (1 − f)`, its range spread
-    /// evenly over the `ghost_depth` (m) behind the layer (the energy-weighted range of a footprint straddling the
-    /// edge, when the background lies within the echo separation). With the selection term, the edge mechanism.
-    pub ghost: f64,
-    pub ghost_depth: f64,
-    /// Per-element misfit, a declared latent: the section and axis depart from a straight round stick by an sd of
-    /// `misfit[0] + misfit[1] R` (m), blurring its fill and spreading its depth. Fourier terms past a₀ aren't
-    /// identifiable here (synthesis §3), so a scale stands in for them. This is a prior any reconstruction may
+    /// The per-element misfit's declared prior: the section and axis depart from the form by an sd of
+    /// `misfit[0] + misfit[1] R` (m). Fourier terms past a₀ aren't identifiable here (synthesis §3), so a scale
+    /// stands in for them. Each element carries its own misfit (a latent); this is the default a caller may
     /// override.
     pub misfit: [f64; 2],
-    /// Misregistration across the beam (rad): a view's silhouette sits off by about this times the range. It spreads
-    /// the located edges of term C; a held-out prediction integrates it as a shift (research 130 slice 6).
-    pub lateral: f64,
-    /// Term C: each view's located silhouette edges score the section's support function, and the fill band under
-    /// 0.5 leaves A's cells. A stick's edge is where its fill falls to `edge_fill`, the selection latent on fill:
-    /// 0.2 by maximum likelihood on the simulated stand's true sticks (with ghosts then 0; research 130 slice 3).
-    pub edges: bool,
+    /// Term C: a stick's edge is where its fill falls to `edge_fill`, the selection latent on fill: 0.2 by maximum
+    /// likelihood on the simulated stand's true sticks (research 130 slice 3).
     pub edge_fill: f64,
-    /// Centre each (scan, block) offset on its medial estimate from the view's normals (synthesis §13), instead of
-    /// zero.
-    pub medial_offset: bool,
 }
 
 impl Default for ErrorModel {
@@ -148,13 +128,8 @@ impl Default for ErrorModel {
             p_drop: f64::NAN,
             p_outlier: 0.01,
             rho: 0.3,
-            ghost: 0.0,
-            ghost_depth: 0.5,
             misfit: [0.002, 0.1],
-            lateral: 0.0,
-            edges: true,
             edge_fill: 0.2,
-            medial_offset: false,
         }
     }
 }
@@ -221,14 +196,13 @@ pub struct View {
     pub excess: Vec<f32>,
     /// Run length (cells) along and across.
     pub run: Vec<[u16; 2]>,
-    pub ends: Vec<u8>,
     /// The export's in-surface deletion: of the cells inside a continuous surface facing the beam (their four
     /// neighbours echoes within `jump` of one another, each a surfel with cos ι > `min_cos`, so grazing ground the
     /// reflectance cut thins is left out), the share without an echo. An export property, measured on the scan; the
     /// likelihood takes it as the chance a kept echo is lost anyway (`ErrorModel::p_drop` NaN).
     pub deletion: f64,
     /// The surface each echo cell belongs to: connected through neighbours (4-connected) within `jump`, numbered
-    /// from 0 in cell order (`u32::MAX` for no echo). Its boundary is where the ends are.
+    /// from 0 in cell order (`u32::MAX` for no echo).
     pub surface_id: Vec<u32>,
 }
 
@@ -301,7 +275,7 @@ impl View {
         drop(sat);
         let mut v = View {
             lat, c0, n_lines: nl, n_cols: nc, rot, origin, epoch, state: state_, range: rng, pulse,
-            normal: Vec::new(), cos_inc: Vec::new(), excess: Vec::new(), run: Vec::new(), ends: Vec::new(), surface_id: Vec::new(),
+            normal: Vec::new(), cos_inc: Vec::new(), excess: Vec::new(), run: Vec::new(), surface_id: Vec::new(),
             deletion: 0.0,
         };
         let fits: Vec<([f32; 3], f32)> = (0..n).into_par_iter().map(|k| v.fit(k, direction, p)).collect();
@@ -497,11 +471,10 @@ impl View {
             .unzip()
     }
 
-    /// Runs and their ends along both axes.
+    /// Run lengths along both axes.
     fn runs(&mut self, jump: f64) {
         let (nl, nc) = (self.n_lines, self.n_cols);
         self.run = vec![[0u16; 2]; nl * nc];
-        self.ends = vec![0u8; nl * nc];
         // axis 0: along a mirror line (stride 1, nc cells per line); axis 1: across lines (stride nc)
         for (axis, (lines, len, stride, step)) in [(nl, nc, nc, 1), (nc, nl, 1, nc)].into_iter().enumerate() {
             for s in 0..lines {
@@ -517,20 +490,8 @@ impl View {
                     while j < len && self.state[at(j)] == state::ECHO && (self.range[at(j)] - self.range[at(j - 1)]).abs() as f64 <= jump {
                         j += 1;
                     }
-                    let code = |nb: Option<usize>, here: usize| -> u8 {
-                        match nb {
-                            None => end::BORDER,
-                            Some(m) if self.state[m] != state::ECHO => end::UNKNOWN,
-                            Some(m) if self.range[m] > self.range[here] => end::SHARP,
-                            _ => end::OCCLUDED,
-                        }
-                    };
-                    let lo = code(i.checked_sub(1).map(at), at(i));
-                    let hi = code((j < len).then(|| at(j)), at(j - 1));
-                    let bits = (lo | hi << 2) << (4 * axis);
                     for m in i..j {
                         self.run[at(m)][axis] = (j - i).min(u16::MAX as usize) as u16;
-                        self.ends[at(m)] |= bits;
                     }
                     i = j;
                 }
@@ -546,7 +507,7 @@ mod tests {
 
     /// A scan of a vertical wall 5 m away (the y = 5 plane), lines 0.03° apart in azimuth, a hole of deleted
     /// pulses in it, and a pole 1 m in front of part of it: normals face the scanner, the hole reads deleted, and
-    /// the pole's runs end sharp against the wall.
+    /// the pole and the wall are separate surfaces with their own runs.
     #[test]
     fn a_wall_with_a_hole_and_a_pole() {
         let (period, interval, zstep) = (6.6e-3, 0.825e-6, 0.03);
@@ -577,12 +538,8 @@ mod tests {
         let n = v.normal[k];
         assert!(n[1] < -0.999, "{n:?}");
         assert!((v.excess[k] - 1.0).abs() < 1e-6);
-        // the pole: 20 lines across, sharp at both sides across lines, and the wall beside it occluded
-        let k = cell(50, 100);
-        assert_eq!(v.run[k][1], 20);
-        assert_eq!((v.ends[k] >> 4) & 3, end::SHARP);
-        assert_eq!((v.ends[k] >> 6) & 3, end::SHARP);
-        assert_eq!((v.ends[cell(39, 100)] >> 6) & 3, end::OCCLUDED);
+        // the pole: a run 20 lines across
+        assert_eq!(v.run[cell(50, 100)][1], 20);
         // beside the hole, the wall is less continuous
         assert!(v.excess[cell(95, 203)] > 1.1);
         // the pole and the wall are two surfaces; the wall stays one around its hole
