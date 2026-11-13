@@ -478,34 +478,35 @@ const EP_NODES: usize = 64;
 /// sites a few steps in, not settled (each round is one elimination).
 const FIRST_ROUNDS: usize = 5;
 
-/// One tree's fit, per row or per piece (the tree's nodes): each field one entry per node, meaning what the key of
-/// the same name in `sylva.qsm.support_tree`'s returns means (its docstring owns them). The radius `r` is held inside
-/// the bounds `r_lo`, `r_hi` but where [`diag::PINNED`] says otherwise; `flags` are [`flag`] bits, `diag` [`diag`]
-/// bits, `basis` a [`basis`] code.
-#[derive(Debug, Clone, Default, PartialEq)]
+/// One row's fit, or one node's (a piece, or a routed piece's further stem): each field meaning what the key of the
+/// same name in `sylva.qsm.support_tree`'s returns means (its docstring owns them). The radius `r` is held inside the
+/// bounds `r_lo`, `r_hi` but where [`diag::PINNED`] says otherwise; `flags` are [`flag`] bits, `diag` [`diag`] bits,
+/// `basis` a [`basis`] code.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub struct Fit {
-    pub a: Vec<Point>,
-    pub b: Vec<Point>,
-    pub r: Vec<f64>,
-    pub sd_log_r: Vec<f64>,
-    pub centre: Vec<[f64; 2]>,
-    pub lean: Vec<[f64; 2]>,
-    pub e1: Vec<Point>,
-    pub e2: Vec<Point>,
-    pub r_lo: Vec<f64>,
-    pub r_hi: Vec<f64>,
-    pub p_wood: Vec<f64>,
-    pub flags: Vec<u8>,
-    pub n_scans: Vec<u32>,
-    pub k_stems: Vec<u32>,
-    pub diag: Vec<u16>,
-    pub data_share: Vec<f64>,
-    pub contested: Vec<f64>,
-    pub deleted: Vec<f64>,
-    pub r_cap: Vec<f64>,
-    pub n_pass: Vec<u32>,
-    pub pass_share: Vec<f64>,
-    pub basis: Vec<u8>,
+    pub a: Point,
+    pub b: Point,
+    pub r: f64,
+    pub sd_log_r: f64,
+    pub centre: [f64; 2],
+    pub lean: [f64; 2],
+    pub e1: Point,
+    pub e2: Point,
+    pub r_lo: f64,
+    pub r_hi: f64,
+    pub p_wood: f64,
+    pub flags: u8,
+    pub n_scans: u32,
+    pub k_stems: u32,
+    pub diag: u16,
+    pub data_share: f64,
+    pub contested: f64,
+    pub deleted: f64,
+    pub r_cap: f64,
+    /// The veto's stops and passes through its fitted circle: `n_pass` is the second, `pass_share`
+    /// [`Fit::pass_share`].
+    pub audit: (u32, u32),
+    pub basis: u8,
 }
 
 /// A tree's volume (m^3), over its pieces (the served wood: a routed piece's further stems aside): the point, from
@@ -526,7 +527,7 @@ pub struct Volume {
 /// The fit of one tree: per row, in the input's order; and its echoes classified.
 #[derive(Debug, Clone, PartialEq)]
 pub struct SupportTree {
-    pub rows: Fit,
+    pub rows: Vec<Fit>,
     /// Whether the censored solve settled within [`EP_ROUNDS`].
     pub converged: bool,
     pub echoes: Echoes,
@@ -1891,7 +1892,7 @@ pub fn support_tree(scans: &[&ScanIndex], rows: &Rows, context: &[(Point, Point,
 }
 
 /// [`support_tree`], with each node's fit (the pieces, then the routed pieces' further stems) and its row.
-fn fit_tree(scans: &[&ScanIndex], rows: &Rows, context: &[(Point, Point, f64)], like: &JointParams, prior: &PriorParams, threads: usize) -> Result<(SupportTree, Fit, Vec<usize>)> {
+fn fit_tree(scans: &[&ScanIndex], rows: &Rows, context: &[(Point, Point, f64)], like: &JointParams, prior: &PriorParams, threads: usize) -> Result<(SupportTree, Vec<Fit>, Vec<usize>)> {
     let fr = rows.check("support tree")?;
     prior.check()?;
     let mut nd = Nodes::of(rows, &fr);
@@ -2033,9 +2034,8 @@ fn fit_tree(scans: &[&ScanIndex], rows: &Rows, context: &[(Point, Point, f64)], 
         tally(&sums[nd.src(k).0].seen, &x)
     }).collect();
 
-    let mut pieces = Fit::default();
     let mut out = SupportTree {
-        rows: Fit::default(),
+        rows: Vec::new(),
         converged,
         echoes,
         volume: Volume::default(),
@@ -2050,7 +2050,7 @@ fn fit_tree(scans: &[&ScanIndex], rows: &Rows, context: &[(Point, Point, f64)], 
         let e = if side == Side::Upper { it.fold(f64::INFINITY, f64::min) } else { it.fold(f64::NEG_INFINITY, f64::max) };
         if e.is_finite() { e.exp() } else { f64::NAN }
     };
-    for (k, s) in sums.iter().enumerate() {
+    let pieces: Vec<Fit> = sums.iter().enumerate().map(|(k, s)| {
         let (diag, data_share, contested) = diagnose(s, sol.x[k][4].exp(), sol.cov[k][(4, 4)], sol.site_tau[k], 0.5 * nd.frame[k].3, (seen_stops[k], kept_stops[k]));
         let diag = diag | bits[k] | if refuted(audit[k]) { diag::REFUTED } else { 0 };
         let basis = if !s.bounded() {
@@ -2064,7 +2064,7 @@ fn fit_tree(scans: &[&ScanIndex], rows: &Rows, context: &[(Point, Point, f64)], 
         } else {
             basis::BOUNDED
         };
-        let own = Own {
+        let own = Fit {
             diag,
             data_share,
             contested,
@@ -2078,48 +2078,49 @@ fn fit_tree(scans: &[&ScanIndex], rows: &Rows, context: &[(Point, Point, f64)], 
             k_stems: k_stems[k],
             audit: audit[k],
             basis,
+            ..Fit::default()
         };
-        pieces.push(&sol.x[k], &widened(&sol.cov[k], widen(basis)), nd.frame[k], nd.a[k], own);
-    }
+        own.placed(&sol.x[k], &widened(&sol.cov[k], widen(basis)), nd.frame[k], nd.a[k])
+    }).collect();
     for k in 0..rows.a.len() {
         let (k0, k1) = (nd.first[k], nd.first[k + 1]);
-        let p = &pieces;
+        let p = &pieces[k0..k1];
         // each piece's log R widened by its own basis's factor: a row of mixed bases piece by piece
-        let k_of: Vec<f64> = p.basis[k0..k1].iter().map(|&b| widen(b)).collect();
+        let k_of: Vec<f64> = p.iter().map(|q| widen(q.basis)).collect();
         let (x, cov) = row_line(&sol, k0, k1, fr[k].3, nd.frame[k0].3, &k_of);
-        let fold = |v: &[f64], f: fn(f64, f64) -> f64| v[k0..k1].iter().copied().filter(|x| x.is_finite()).reduce(f).unwrap_or(f64::NAN);
-        let mean = |v: &[f64]| {
-            let v: Vec<f64> = v[k0..k1].iter().copied().filter(|x| x.is_finite()).collect();
+        let fold = |f: fn(&Fit) -> f64, g: fn(f64, f64) -> f64| p.iter().map(f).filter(|x| x.is_finite()).reduce(g).unwrap_or(f64::NAN);
+        let mean = |f: fn(&Fit) -> f64| {
+            let v: Vec<f64> = p.iter().map(f).filter(|x| x.is_finite()).collect();
             if v.is_empty() { f64::NAN } else { v.iter().sum::<f64>() / v.len() as f64 }
         };
         // a row's bounds as its radius: its pieces' root mean square, a piece without a lower bound at 0 and one
         // without an upper unbounded, so a row whose pieces lie inside their bounds lies inside its own
-        let rms = |v: &[f64], none: f64| {
-            let v = &v[k0..k1];
-            let ms = v.iter().map(|x| if x.is_finite() { x * x } else { none }).sum::<f64>() / v.len() as f64;
-            if v.iter().all(|x| x.is_nan()) || ms.is_infinite() { f64::NAN } else { ms.sqrt() }
+        let rms = |f: fn(&Fit) -> f64, none: f64| {
+            let ms = p.iter().map(f).map(|x| if x.is_finite() { x * x } else { none }).sum::<f64>() / p.len() as f64;
+            if p.iter().map(f).all(|x| x.is_nan()) || ms.is_infinite() { f64::NAN } else { ms.sqrt() }
         };
-        let audit = audit[k0..k1].iter().fold((0, 0), |a, q| (a.0 + q.0, a.1 + q.1));
+        let audit = p.iter().fold((0, 0), |a, q| (a.0 + q.audit.0, a.1 + q.audit.1));
         // most of its pieces' basis, the less known on a tie (max_by_key keeps the last of equal maxima)
-        let basis = (1..=basis::CAPPED).max_by_key(|&b| p.basis[k0..k1].iter().filter(|&&x| x == b).count()).unwrap_or(basis::PRIOR);
-        let own = Own {
-            diag: (p.diag[k0..k1].iter().fold(0, |a, &f| a | f) & !diag::REFUTED) | if refuted(audit) { diag::REFUTED } else { 0 },
-            data_share: mean(&p.data_share),
-            contested: mean(&p.contested),
-            deleted: mean(&p.deleted),
-            r_lo: rms(&p.r_lo, 0.0),
-            r_hi: rms(&p.r_hi, f64::INFINITY),
-            r_cap: fold(&p.r_cap, f64::max),
-            p_wood: p.p_wood[k0..k1].iter().sum::<f64>() / (k1 - k0) as f64,
-            flags: p.flags[k0..k1].iter().fold(0, |a, &f| a | f),
-            n_scans: p.n_scans[k0..k1].iter().copied().max().unwrap_or(0),
-            k_stems: p.k_stems[k0..k1].iter().copied().max().unwrap_or(0),
+        let basis = (1..=basis::CAPPED).max_by_key(|&b| p.iter().filter(|q| q.basis == b).count()).unwrap_or(basis::PRIOR);
+        let own = Fit {
+            diag: (p.iter().fold(0, |a, q| a | q.diag) & !diag::REFUTED) | if refuted(audit) { diag::REFUTED } else { 0 },
+            data_share: mean(|q| q.data_share),
+            contested: mean(|q| q.contested),
+            deleted: mean(|q| q.deleted),
+            r_lo: rms(|q| q.r_lo, 0.0),
+            r_hi: rms(|q| q.r_hi, f64::INFINITY),
+            r_cap: fold(|q| q.r_cap, f64::max),
+            p_wood: p.iter().map(|q| q.p_wood).sum::<f64>() / (k1 - k0) as f64,
+            flags: p.iter().fold(0, |a, q| a | q.flags),
+            n_scans: p.iter().map(|q| q.n_scans).max().unwrap_or(0),
+            k_stems: p.iter().map(|q| q.k_stems).max().unwrap_or(0),
             audit,
             basis,
+            ..Fit::default()
         };
-        out.rows.push(&x, &cov, fr[k], rows.a[k], own);
+        out.rows.push(own.placed(&x, &cov, fr[k], rows.a[k]));
     }
-    out.volume = volume(&nd, &sol, &held, &pieces.basis);
+    out.volume = volume(&nd, &sol, &held, &pieces.iter().map(|q| q.basis).collect::<Vec<_>>());
     Ok((out, pieces, nd.row))
 }
 
@@ -2270,24 +2271,6 @@ fn diagnose(s: &Summary, r: f64, var_eta: f64, site_tau: f64, half: f64, (seen, 
     (bits.iter().filter(|b| b.0).fold(0, |a, b| a | b.1), data_share, contested)
 }
 
-/// A piece's or row's own outputs (see [`Fit`]).
-struct Own {
-    diag: u16,
-    data_share: f64,
-    contested: f64,
-    deleted: f64,
-    r_lo: f64,
-    r_hi: f64,
-    r_cap: f64,
-    p_wood: f64,
-    flags: u8,
-    n_scans: u32,
-    k_stems: u32,
-    /// The veto's stops and passes through its fitted circle.
-    audit: (u32, u32),
-    basis: u8,
-}
-
 /// Classifies a piece's stops with no exact fit (see [`Echoes`]): on its circle's front arc (the tree's posterior
 /// `x`, log R last) or not, times the weight of its echo's character.
 fn classify(s: &Summary, x: &Vector5<f64>, node: u32, scans: &[&ScanIndex], p: &JointParams, out: &mut Echoes) {
@@ -2313,34 +2296,17 @@ fn widened(cov: &Matrix5<f64>, f: f64) -> Matrix5<f64> {
 }
 
 impl Fit {
-    /// Appends a piece or row: its state `[c1, c2, t1, t2, log R]` and covariance (log R's widened: [`WIDEN`]), frame
-    /// and claimed start `a0`.
-    fn push(&mut self, x: &Vector5<f64>, cov: &Matrix5<f64>, (u, e1, e2, len): Frame, a0: Point, own: Own) {
+    /// The share of the veto's tally that passes (NaN with none).
+    pub fn pass_share(&self) -> f64 {
+        let (stop, pass) = self.audit;
+        if stop + pass > 0 { f64::from(pass) / f64::from(stop + pass) } else { f64::NAN }
+    }
+
+    /// It placed at its state `[c1, c2, t1, t2, log R]` and covariance (log R's widened: [`WIDEN`]), frame and
+    /// claimed start `a0`.
+    fn placed(self, x: &Vector5<f64>, cov: &Matrix5<f64>, (u, e1, e2, len): Frame, a0: Point) -> Fit {
         let at = |s: f64| -> Point { std::array::from_fn(|i| a0[i] + (s + 0.5 * len) * u[i] + (x[0] + s * x[2]) * e1[i] + (x[1] + s * x[3]) * e2[i]) };
-        self.a.push(at(-0.5 * len));
-        self.b.push(at(0.5 * len));
-        self.r.push(x[4].exp());
-        let sd = |i: usize| cov[(i, i)].max(0.0).sqrt();
-        self.sd_log_r.push(sd(4));
-        self.centre.push([x[0], x[1]]);
-        self.lean.push([x[2], x[3]]);
-        self.e1.push(e1);
-        self.e2.push(e2);
-        self.r_lo.push(own.r_lo);
-        self.r_hi.push(own.r_hi);
-        self.p_wood.push(own.p_wood);
-        self.flags.push(own.flags);
-        self.n_scans.push(own.n_scans);
-        self.k_stems.push(own.k_stems);
-        self.diag.push(own.diag);
-        self.data_share.push(own.data_share);
-        self.contested.push(own.contested);
-        self.deleted.push(own.deleted);
-        self.r_cap.push(own.r_cap);
-        let (stop, pass) = own.audit;
-        self.n_pass.push(pass);
-        self.pass_share.push(if stop + pass > 0 { f64::from(pass) / f64::from(stop + pass) } else { f64::NAN });
-        self.basis.push(own.basis);
+        Fit { a: at(-0.5 * len), b: at(0.5 * len), r: x[4].exp(), sd_log_r: cov[(4, 4)].max(0.0).sqrt(), centre: [x[0], x[1]], lean: [x[2], x[3]], e1, e2, ..self }
     }
 }
 
@@ -2738,35 +2704,35 @@ mod tests {
         let (f, q) = (&t.rows, &q);
         // the 2 m row is seven pieces of the tree; the fan sees the middle three, and they are measured
         assert_eq!(row, vec![0; 7]);
-        let seen: Vec<usize> = (0..7).filter(|&j| q.n_scans[j] > 0).collect();
-        assert_eq!(seen, vec![2, 3, 4], "scans {:?}", q.n_scans);
-        assert!(seen.iter().all(|&j| q.flags[j] == 0 && (q.r[j] - 0.05).abs() < 0.0025 && q.n_scans[j] == 1), "flags {:?} r {:?}", q.flags, q.r);
+        let seen: Vec<usize> = (0..7).filter(|&j| q[j].n_scans > 0).collect();
+        assert_eq!(seen, vec![2, 3, 4], "{q:?}");
+        assert!(seen.iter().all(|&j| q[j].flags == 0 && (q[j].r - 0.05).abs() < 0.0025 && q[j].n_scans == 1), "{q:?}");
         // the others are the prior's along the chain, with nothing to bound them; the row says so
-        assert!((0..7).filter(|j| !seen.contains(j)).all(|j| q.flags[j] == flag::BOUNDS && q.r_lo[j].is_nan() && q.r_hi[j].is_nan()));
-        assert_eq!(f.flags[0], flag::BOUNDS);
-        assert!((f.r[0] - 0.05).abs() < 0.0025, "R {}", f.r[0]);
+        assert!((0..7).filter(|j| !seen.contains(j)).all(|j| q[j].flags == flag::BOUNDS && q[j].r_lo.is_nan() && q[j].r_hi.is_nan()));
+        assert_eq!(f[0].flags, flag::BOUNDS);
+        assert!((f[0].r - 0.05).abs() < 0.0025, "R {}", f[0].r);
         // the row runs from its first piece's start to its last's end
-        assert!((0..3).all(|i| (f.a[0][i] - q.a[0][i]).abs() < 1e-9 && (f.b[0][i] - q.b[6][i]).abs() < 1e-9));
+        assert!((0..3).all(|i| (f[0].a[i] - q[0].a[i]).abs() < 1e-9 && (f[0].b[i] - q[6].b[i]).abs() < 1e-9));
         // and its volume is its pieces'
-        let area: f64 = q.r.iter().map(|r| r * r).sum::<f64>() / 7.0;
-        assert!((f.r[0] * f.r[0] - area).abs() < 1e-12 * area, "{} against {}", f.r[0], area.sqrt());
+        let area: f64 = q.iter().map(|x| x.r * x.r).sum::<f64>() / 7.0;
+        assert!((f[0].r * f[0].r - area).abs() < 1e-12 * area, "{} against {}", f[0].r, area.sqrt());
         // an opaque bark-free stem is wood, at the most one scan can say, and lifts the unseen pieces it carries on from
         let pp = PriorParams::default();
-        assert!(seen.iter().all(|&j| q.p_wood[j] > 0.75) && q.p_wood.iter().all(|&p| p > pp.exist), "p_wood {:?}", q.p_wood);
+        assert!(seen.iter().all(|&j| q[j].p_wood > 0.75) && q.iter().all(|x| x.p_wood > pp.exist), "{q:?}");
         // its diagnostics: one scan, both edges seen; its own data give most of what the tree says of its measured
         // pieces' R, none of the others'
-        assert!(seen.iter().all(|&j| q.diag[j] == diag::ONE_SIDED && q.data_share[j] > 0.5 && q.data_share[j] <= 1.0 && q.deleted[j] == 0.0 && (0.0..=1.0).contains(&q.contested[j])), "diag {:?} share {:?}", q.diag, q.data_share);
-        assert!((0..7).filter(|j| !seen.contains(j)).all(|j| q.diag[j] == 0 && q.data_share[j] == 0.0 && q.contested[j].is_nan() && q.deleted[j].is_nan()), "diag {:?} share {:?}", q.diag, q.data_share);
-        assert_eq!(f.diag[0], diag::ONE_SIDED);
+        assert!(seen.iter().all(|&j| q[j].diag == diag::ONE_SIDED && q[j].data_share > 0.5 && q[j].data_share <= 1.0 && q[j].deleted == 0.0 && (0.0..=1.0).contains(&q[j].contested)), "{q:?}");
+        assert!((0..7).filter(|j| !seen.contains(j)).all(|j| q[j].diag == 0 && q[j].data_share == 0.0 && q[j].contested.is_nan() && q[j].deleted.is_nan()), "{q:?}");
+        assert_eq!(f[0].diag, diag::ONE_SIDED);
 
         // the part the fan sees, 48 cm in two pieces: measured, the claim moved back by 1 cm, upright
         let (a2, b2) = ([a1[0], a1[1], -0.24], [b1[0], b1[1], 0.24]);
         let rows = Rows { a: &[a2], b: &[b2], r_prior: &[0.08], r_max: &[], parent: &[-1] };
         let (t, q, row) = fit_tree(&[&scan], &rows, &[], &like(), &PriorParams::default(), 2).unwrap();
         let (f, q) = (&t.rows, &q);
-        assert!(row == vec![0, 0] && f.flags[0] == 0 && q.flags == vec![0, 0], "flags {:?}", q.flags);
-        assert!((f.r[0] - 0.05).abs() < 0.0025 && f.sd_log_r[0] / widen(f.basis[0]) < 0.1, "R {}", f.r[0]);
-        assert!((0.5 * (f.a[0][0] + f.b[0][0])).abs() < 0.002 && f.lean[0][1].abs() < 0.02, "x {} {} lean {:?}", f.a[0][0], f.b[0][0], f.lean[0]);
+        assert!(row == vec![0, 0] && f[0].flags == 0 && q.iter().all(|x| x.flags == 0), "{q:?}");
+        assert!((f[0].r - 0.05).abs() < 0.0025 && f[0].sd_log_r / widen(f[0].basis) < 0.1, "R {}", f[0].r);
+        assert!((0.5 * (f[0].a[0] + f[0].b[0])).abs() < 0.002 && f[0].lean[1].abs() < 0.02, "x {} {} lean {:?}", f[0].a[0], f[0].b[0], f[0].lean);
     }
 
     /// An accepted exact fit of `stems`, none shadowed.
@@ -3455,20 +3421,20 @@ mod tests {
             support_tree(&[&scan], &rows, &[], &like(), &PriorParams::default(), 2).unwrap()
         };
         let near = piece(0.05, 0.3);
-        assert!(near.rows.flags[0] == 0 && near.rows.diag[0] & diag::TUBE_EDGE == 0 && (near.rows.r[0] - 0.05).abs() < 0.003, "{:?}", near.rows);
+        assert!(near.rows[0].flags == 0 && near.rows[0].diag & diag::TUBE_EDGE == 0 && (near.rows[0].r - 0.05).abs() < 0.003, "{:?}", near.rows);
         let far = piece(0.005, 0.1);
         let q = &far.rows;
-        assert!(q.flags[0] == flag::BOUNDS && q.diag[0] & diag::TUBE_EDGE != 0 && q.basis[0] != basis::MEASURED,
-            "flags {} diag {} basis {}", q.flags[0], q.diag[0], q.basis[0]);
+        assert!(q[0].flags == flag::BOUNDS && q[0].diag & diag::TUBE_EDGE != 0 && q[0].basis != basis::MEASURED,
+            "flags {} diag {} basis {}", q[0].flags, q[0].diag, q[0].basis);
         // nor is the captor's span a lower bound on it
-        assert!(q.r_lo[0].is_nan() && q.r[0] < 0.02, "r_lo {} r {}", q.r_lo[0], q.r[0]);
+        assert!(q[0].r_lo.is_nan() && q[0].r < 0.02, "r_lo {} r {}", q[0].r_lo, q[0].r);
         // nor does the row's point circle re-fit the captor: a 2.5 cm claim 4.8 cm off the stem, whose own circle and
         // point circle (inside the refit's shift and width tests) both reach its 10.5 cm tube's edge
         let rows = Rows { a: &[[0.048, 5.0, -0.05]], b: &[[0.048, 5.0, 0.05]], r_prior: &[0.025], r_max: &[], parent: &[-1] };
         let t = support_tree(&[&scan], &rows, &[], &like(), &PriorParams::default(), 2).unwrap();
         let q = &t.rows;
-        assert!(q.flags[0] == flag::BOUNDS && q.diag[0] & diag::TUBE_EDGE != 0 && q.basis[0] != basis::POINTS,
-            "flags {} diag {} basis {}", q.flags[0], q.diag[0], q.basis[0]);
+        assert!(q[0].flags == flag::BOUNDS && q[0].diag & diag::TUBE_EDGE != 0 && q[0].basis != basis::POINTS,
+            "flags {} diag {} basis {}", q[0].flags, q[0].diag, q[0].basis);
         assert!(reaches_edge(&Vector5::new(0.07, 0.0, 0.0, 0.0, 0.05), 0.15, 0.115) && !reaches_edge(&Vector5::new(0.01, 0.0, 0.0, 0.0, 0.05), 0.15, 0.115));
         // a lean carries a circle to the edge at its ends
         assert!(reaches_edge(&Vector5::new(0.0, 0.0, 0.3, 0.0, 0.05), 0.15, 0.1));

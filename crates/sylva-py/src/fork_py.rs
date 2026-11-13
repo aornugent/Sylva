@@ -173,26 +173,27 @@ fn qsm_support_bases() -> Vec<(&'static str, u8)> {
 }
 
 /// A support fit's rows as a dict of arrays.
-fn support_fit<'py>(py: Python<'py>, f: support_tree::Fit) -> PyResult<Bound<'py, PyDict>> {
-    let n = f.r.len();
+fn support_fit<'py>(py: Python<'py>, f: &[support_tree::Fit]) -> PyResult<Bound<'py, PyDict>> {
+    let n = f.len();
     let d = PyDict::new(py);
-    let xyz = |v: &[[f64; 3]]| v.concat().into_pyarray(py).reshape([n, 3]);
-    let two = |v: &[[f64; 2]]| v.concat().into_pyarray(py).reshape([n, 2]);
-    d.set_item("a", xyz(&f.a)?)?;
-    d.set_item("b", xyz(&f.b)?)?;
-    d.set_item("e1", xyz(&f.e1)?)?;
-    d.set_item("e2", xyz(&f.e2)?)?;
-    d.set_item("centre", two(&f.centre)?)?;
-    d.set_item("lean", two(&f.lean)?)?;
-    for (k, v) in [("r", f.r), ("sd_log_r", f.sd_log_r), ("r_lo", f.r_lo), ("r_hi", f.r_hi), ("p_wood", f.p_wood), ("data_share", f.data_share), ("contested", f.contested), ("deleted", f.deleted), ("r_cap", f.r_cap), ("pass_share", f.pass_share)] {
-        d.set_item(k, v.into_pyarray(py))?;
+    let xyz = |g: fn(&support_tree::Fit) -> [f64; 3]| f.iter().flat_map(g).collect::<Vec<f64>>().into_pyarray(py).reshape([n, 3]);
+    let two = |g: fn(&support_tree::Fit) -> [f64; 2]| f.iter().flat_map(g).collect::<Vec<f64>>().into_pyarray(py).reshape([n, 2]);
+    d.set_item("a", xyz(|x| x.a)?)?;
+    d.set_item("b", xyz(|x| x.b)?)?;
+    d.set_item("e1", xyz(|x| x.e1)?)?;
+    d.set_item("e2", xyz(|x| x.e2)?)?;
+    d.set_item("centre", two(|x| x.centre)?)?;
+    d.set_item("lean", two(|x| x.lean)?)?;
+    let reals: [(&str, fn(&support_tree::Fit) -> f64); 10] = [("r", |x| x.r), ("sd_log_r", |x| x.sd_log_r), ("r_lo", |x| x.r_lo), ("r_hi", |x| x.r_hi), ("p_wood", |x| x.p_wood), ("data_share", |x| x.data_share), ("contested", |x| x.contested), ("deleted", |x| x.deleted), ("r_cap", |x| x.r_cap), ("pass_share", support_tree::Fit::pass_share)];
+    for (k, g) in reals {
+        d.set_item(k, f.iter().map(g).collect::<Vec<f64>>().into_pyarray(py))?;
     }
-    d.set_item("diag", f.diag.into_pyarray(py))?;
-    d.set_item("flags", f.flags.into_pyarray(py))?;
-    d.set_item("n_scans", f.n_scans.into_pyarray(py))?;
-    d.set_item("k_stems", f.k_stems.into_pyarray(py))?;
-    d.set_item("n_pass", f.n_pass.into_pyarray(py))?;
-    d.set_item("basis", f.basis.into_pyarray(py))?;
+    d.set_item("diag", f.iter().map(|x| x.diag).collect::<Vec<u16>>().into_pyarray(py))?;
+    d.set_item("flags", f.iter().map(|x| x.flags).collect::<Vec<u8>>().into_pyarray(py))?;
+    d.set_item("n_scans", f.iter().map(|x| x.n_scans).collect::<Vec<u32>>().into_pyarray(py))?;
+    d.set_item("k_stems", f.iter().map(|x| x.k_stems).collect::<Vec<u32>>().into_pyarray(py))?;
+    d.set_item("n_pass", f.iter().map(|x| x.audit.1).collect::<Vec<u32>>().into_pyarray(py))?;
+    d.set_item("basis", f.iter().map(|x| x.basis).collect::<Vec<u8>>().into_pyarray(py))?;
     Ok(d)
 }
 
@@ -227,7 +228,7 @@ fn qsm_support_tree<'py>(py: Python<'py>, scans: Vec<Bound<'py, PyScanIndex>>, a
         let rows = Rows { a: &a, b: &b, r_prior: &r_prior, r_max: &[], parent: &parent };
         support_tree::support_tree(&refs, &rows, &context, &p.0, &p.1, threads)
     }).map_err(err)?;
-    let d = support_fit(py, f.rows)?;
+    let d = support_fit(py, &f.rows)?;
     d.set_item("converged", f.converged)?;
     d.set_item("echoes", echoes_to_py(py, f.echoes)?)?;
     let v = f.volume;
