@@ -26,7 +26,7 @@
 //! Directions must be in the scanner's own frame (undo the SOP first):
 //! a tilted frame bends the lines.
 
-use super::reconstruct::{median, pulse_interval, quantile, scan_lines, zen_az};
+use crate::shots::reconstruct::{median, pulse_interval, quantile, scan_lines, zen_az};
 use crate::Point;
 use std::f64::consts::TAU;
 
@@ -92,7 +92,7 @@ impl Lattice {
     /// The unit direction (scanner frame) of a cell's centre.
     pub fn cell_direction(&self, l: f64, c: f64) -> Point {
         let (z, a) = self.cell_angles(l, c);
-        super::reconstruct::dir(z, a)
+        crate::shots::reconstruct::dir(z, a)
     }
 
     /// The fractional cell `(line, col)` a direction (scanner frame) falls in: the cell-centre model inverted by

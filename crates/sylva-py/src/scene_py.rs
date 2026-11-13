@@ -2,25 +2,26 @@
 // Copyright (C) 2026 Tim Devereux, The University of Queensland.
 // Free software under the GNU General Public License v3.0 or later;
 // see the LICENSE file. There is no warranty, to the extent permitted by law.
-//! Bindings for the L0 view, the moments' candidates and the ray likelihood (sylva_rs::shots::view, ::moments,
-//! ::rays).
+//! Bindings for range images, candidates and the scene (sylva_rs::scene).
 //!
-//! - **Error model and scene:** flat dicts whose keys are the structs' fields (arrays as lists). `l0_error_model()` returns the defaults.
+//! - **Error model and background:** flat dicts whose keys are the structs' fields (arrays as lists).
+//!   `error_model_defaults()` returns the error model's.
 //! - **Elements:** a dict of arrays, one row per element: `a`, `b` (n, 3) and `r` (n,) are required; `opacity` (n,)
 //!   defaults to 1, `misfit` (n,) to the error model's prior `misfit[0] + misfit[1] r`, and `patch` (n,) bool to
 //!   false. A patch is a ball about `a` of radius `r` (its extent); its `b` is ignored.
-//! - **Configurations:** `L0Config(views, elements, err, scene)` holds elements and returns the energy change of each
-//!   move (`add`, `remove`, `alter`, `trial`), and an element's latents' statistics (`stats`) and predictions
-//!   (`predict`); `l0_energy(..., only=i)` is a configuration's `trial`.
+//! - **Scenes:** `Scene(images, elements, err, background)` holds elements against range images: `cost()`, `rows()`,
+//!   the cost change of each move (`add`, `remove`, `change`, `cost_to_add`), and an element's counts (`counts`)
+//!   and cell predictions (`predict`).
 
 use numpy::{IntoPyArray, PyArray1, PyArrayMethods, PyReadonlyArray1, PyReadonlyArray2};
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
-use sylva_rs::shots::moments::{Candidate, Moments};
 use std::sync::Arc;
-use sylva_rs::shots::rays::{energy, predict, Config, Element, Form, Prediction, Row, Scene};
-use sylva_rs::shots::view::{ErrorModel, View, ViewParams};
+use sylva_rs::scene::model::{Background, ErrorModel};
+use sylva_rs::scene::moments::{Candidate, Moments};
+use sylva_rs::scene::range_image::{RangeImage, RangeImageParams};
+use sylva_rs::scene::scene::{CellPrediction, Element, ElementScan, Form, Scene};
 
 use crate::xyz_from_py;
 
@@ -60,8 +61,7 @@ fn error_model(d: Option<&Bound<'_, PyDict>>) -> PyResult<ErrorModel> {
 
 /// The error model's defaults (AM's calibration), as the dict the other calls take.
 #[pyfunction]
-fn l0_error_model<'py>(py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
-    let m = ErrorModel::default();
+fn error_model_defaults<'py>(py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {    let m = ErrorModel::default();
     let d = PyDict::new(py);
     for (k, v) in [("exit", m.exit), ("divergence", m.divergence), ("step", m.step), ("nu_e", m.nu_e), ("bias_ref", m.bias_ref),
                    ("field_spacing", m.field_spacing), ("cut_db", m.cut_db), ("refl_noise_db", m.refl_noise_db), ("p_drop", m.p_drop),
@@ -78,9 +78,8 @@ fn l0_error_model<'py>(py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
     Ok(d)
 }
 
-fn scene(d: Option<&Bound<'_, PyDict>>) -> PyResult<Scene> {
-    let mut s = Scene::default();
-    for (k, v) in d.into_iter().flat_map(|d| d.iter()) {
+fn background(d: Option<&Bound<'_, PyDict>>) -> PyResult<Background> {
+    let mut s = Background::default();    for (k, v) in d.into_iter().flat_map(|d| d.iter()) {
         let k: String = k.extract()?;
         let x: f64 = v.extract()?;
         match k.as_str() {
@@ -125,15 +124,16 @@ fn elements_from_py(d: &Bound<'_, PyDict>, em: &ErrorModel) -> PyResult<Vec<Elem
         .collect())
 }
 
-/// One scan's L0 view: its pulses in acquisition order (`time` s, `direction` world unit vectors, first-echo
-/// `range` with NaN for a pulse without one), its pose `rot` (3 × 3, world = rot · scanner + origin) and `epoch`.
-#[pyclass(name = "L0View", frozen)]
-struct PyView {
-    inner: Arc<View>,
+/// One scan as a range image: its pulses in acquisition order (`time` s, `direction` world unit vectors,
+/// first-echo `range` with NaN for a pulse without one), its pose `rot` (3 × 3, world = rot · scanner + origin) and
+/// `epoch`.
+#[pyclass(name = "RangeImage", frozen)]
+struct PyRangeImage {
+    inner: Arc<RangeImage>,
 }
 
 #[pymethods]
-impl PyView {
+impl PyRangeImage {
     #[new]
     #[pyo3(signature = (time, direction, range, rot, origin, epoch=0))]
     fn new(py: Python<'_>, time: PyReadonlyArray1<f64>, direction: PyReadonlyArray2<f64>, range: PyReadonlyArray1<f32>, rot: PyReadonlyArray2<f64>,
@@ -145,12 +145,12 @@ impl PyView {
         }
         let ra = rot.as_array();
         let rot = [0, 1, 2].map(|i| [0, 1, 2].map(|j| ra[[i, j]]));
-        let p = ViewParams::default();
-        let inner = py.detach(|| View::new(&t, &dir, &r, rot, [origin.0, origin.1, origin.2], epoch, &p));
+        let p = RangeImageParams::default();
+        let inner = py.detach(|| RangeImage::new(&t, &dir, &r, rot, [origin.0, origin.1, origin.2], epoch, &p));
         if inner.n_lines == 0 {
             return Err(PyValueError::new_err("no lattice: too few pulses"));
         }
-        Ok(PyView { inner: Arc::new(inner) })
+        Ok(PyRangeImage { inner: Arc::new(inner) })
     }
 
     #[getter]
@@ -158,7 +158,7 @@ impl PyView {
         (self.inner.n_lines, self.inner.n_cols)
     }
 
-    /// The export's in-surface deletion measured on this scan (View::deletion).
+    /// The export's in-surface deletion measured on this scan (RangeImage::deletion).
     #[getter]
     fn deletion(&self) -> f64 {
         self.inner.deletion
@@ -195,27 +195,12 @@ impl PyView {
     }
 }
 
-/// What the elements predict in one view, per touched cell with a layer of fill `min_fill` or more (rays::predict):
-/// cell (flat index), elem, surface, code (0 on, 1 empty, 2 front, 3 behind), and fill, kept, depth, sd, obs, weight
-/// (1/m), footprint (m), x and s (where the ray passes the axis, across and along).
-#[pyfunction]
-#[pyo3(signature = (view, elements, err=None, scene_=None, min_fill=0.01))]
-fn l0_predict<'py>(py: Python<'py>, view: PyRef<'py, PyView>, elements: &Bound<'_, PyDict>, err: Option<&Bound<'_, PyDict>>,
-                   scene_: Option<&Bound<'_, PyDict>>, min_fill: f64) -> PyResult<Bound<'py, PyDict>> {
-    let (em, sc) = (error_model(err)?, scene(scene_)?);
-    let el = elements_from_py(elements, &em)?;
-    let v = &view.inner;
-    let p = py.detach(|| predict(v, &el, &em, &sc, min_fill));
-    predictions_dict(py, &p)
-}
-
-fn predictions_dict<'py>(py: Python<'py>, p: &[Prediction]) -> PyResult<Bound<'py, PyDict>> {
+fn predictions_dict<'py>(py: Python<'py>, p: &[CellPrediction]) -> PyResult<Bound<'py, PyDict>> {
     let d = PyDict::new(py);
     d.set_item("cell", p.iter().map(|x| x.cell as i64).collect::<Vec<_>>().into_pyarray(py))?;
-    d.set_item("elem", p.iter().map(|x| x.elem).collect::<Vec<_>>().into_pyarray(py))?;
     d.set_item("surface", p.iter().map(|x| x.surface).collect::<Vec<_>>().into_pyarray(py))?;
-    d.set_item("code", p.iter().map(|x| x.code).collect::<Vec<_>>().into_pyarray(py))?;
-    type F = fn(&Prediction) -> f64;
+    d.set_item("outcome", p.iter().map(|x| x.outcome as u8).collect::<Vec<_>>().into_pyarray(py))?;
+    type F = fn(&CellPrediction) -> f64;
     for (k, f) in [("fill", (|x| x.fill) as F), ("kept", |x| x.kept), ("depth", |x| x.depth), ("sd", |x| x.sd), ("obs", |x| x.obs),
                    ("weight", |x| x.weight), ("footprint", |x| x.footprint), ("x", |x| x.x), ("s", |x| x.s)] {
         d.set_item(k, p.iter().map(f).collect::<Vec<_>>().into_pyarray(py))?;
@@ -223,28 +208,7 @@ fn predictions_dict<'py>(py: Python<'py>, p: &[Prediction]) -> PyResult<Bound<'p
     Ok(d)
 }
 
-/// The energy of `elements` against `views` (rays::energy): −log likelihood ratio against the empty scene. Returns
-/// (energy, rows): per (element, scan) its cells, support, footprints across, class, energy share and the offset
-/// field's posterior at it (shift_along, sd_along). With `only=i`, the energy change of adding element i to the rest (rows empty).
-#[pyfunction]
-#[pyo3(signature = (views, elements, err=None, scene_=None, only=None))]
-fn l0_energy<'py>(py: Python<'py>, views: Vec<PyRef<'py, PyView>>, elements: &Bound<'_, PyDict>, err: Option<&Bound<'_, PyDict>>,
-                  scene_: Option<&Bound<'_, PyDict>>, only: Option<usize>) -> PyResult<(f64, Bound<'py, PyDict>)> {
-    let (em, sc) = (error_model(err)?, scene(scene_)?);
-    let el = elements_from_py(elements, &em)?;
-    let vs: Vec<&View> = views.iter().map(|v| &*v.inner).collect();
-    let (e, rows) = py.detach(|| match only {
-        // the energy of adding element i to the rest: a configuration of the rest, and the move
-        Some(i) => {
-            let rest: Vec<Element> = el.iter().enumerate().filter(|&(k, _)| k != i).map(|(_, e)| *e).collect();
-            (Config::new(vs.clone(), &rest, em, sc).trial(el[i]), Vec::new())
-        }
-        None => energy(&vs, &el, &em, &sc),
-    });
-    rows_dict(py, e, &rows)
-}
-
-fn rows_dict<'py>(py: Python<'py>, e: f64, rows: &[Row]) -> PyResult<(f64, Bound<'py, PyDict>)> {
+fn rows_dict<'py>(py: Python<'py>, rows: &[ElementScan]) -> PyResult<Bound<'py, PyDict>> {
     let d = PyDict::new(py);
     d.set_item("elem", rows.iter().map(|r| r.elem).collect::<Vec<_>>().into_pyarray(py))?;
     d.set_item("scan", rows.iter().map(|r| r.scan).collect::<Vec<_>>().into_pyarray(py))?;
@@ -252,20 +216,20 @@ fn rows_dict<'py>(py: Python<'py>, e: f64, rows: &[Row]) -> PyResult<(f64, Bound
     d.set_item("support", rows.iter().map(|r| r.support).collect::<Vec<_>>().into_pyarray(py))?;
     d.set_item("across", rows.iter().map(|r| r.across).collect::<Vec<_>>().into_pyarray(py))?;
     d.set_item("surface", rows.iter().map(|r| r.surface).collect::<Vec<_>>().into_pyarray(py))?;
-    d.set_item("energy", rows.iter().map(|r| r.energy).collect::<Vec<_>>().into_pyarray(py))?;
+    d.set_item("cost", rows.iter().map(|r| r.cost).collect::<Vec<_>>().into_pyarray(py))?;
     d.set_item("shift_along", rows.iter().map(|r| r.shift_along).collect::<Vec<_>>().into_pyarray(py))?;
     d.set_item("sd_along", rows.iter().map(|r| r.sd_along).collect::<Vec<_>>().into_pyarray(py))?;
-    Ok((e, d))
+    Ok(d)
 }
 
-/// The moments' candidates (moments::Moments::candidates) from the views' surfels inside the box lo-hi, on `voxel`
-/// cells: key (k, 3), point, u, lam (k, 3), r, ratio, n, extent (k,), and per scan (k, S) scan_n and arc.
+/// The candidate elements read off the images' surfel moments (moments::Moments::candidates) inside the box lo-hi,
+/// on `voxel` cells: key (k, 3), point, u, lam (k, 3), r, ratio, n, extent (k,), and per scan (k, S) scan_n and arc.
 #[pyfunction]
-#[pyo3(signature = (views, lo, hi, voxel=0.03, min_n=30.0, r_max=0.3))]
-fn l0_elements<'py>(py: Python<'py>, views: Vec<PyRef<'py, PyView>>, lo: [f64; 3], hi: [f64; 3], voxel: f64, min_n: f64, r_max: f64) -> PyResult<Bound<'py, PyDict>> {
+#[pyo3(signature = (images, lo, hi, voxel=0.03, min_n=30.0, r_max=0.3))]
+fn candidates<'py>(py: Python<'py>, images: Vec<PyRef<'py, PyRangeImage>>, lo: [f64; 3], hi: [f64; 3], voxel: f64, min_n: f64, r_max: f64) -> PyResult<Bound<'py, PyDict>> {
     use nalgebra::Vector3;
     use rayon::prelude::*;
-    let vs: Vec<&View> = views.iter().map(|v| &*v.inner).collect();
+    let vs: Vec<&RangeImage> = images.iter().map(|v| &*v.inner).collect();
     let el = py.detach(|| {
         let v3 = |p: &[f64; 3]| Vector3::new(p[0], p[1], p[2]);
         let scans: Vec<_> = vs.par_iter().map(|v| {
@@ -291,46 +255,45 @@ fn l0_elements<'py>(py: Python<'py>, views: Vec<PyRef<'py, PyView>>, lo: [f64; 3
 }
 
 pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
-    m.add_class::<PyView>()?;
-    m.add_class::<PyConfig>()?;
-    m.add_function(wrap_pyfunction!(l0_energy, m)?)?;
-    m.add_function(wrap_pyfunction!(l0_predict, m)?)?;
-    m.add_function(wrap_pyfunction!(l0_elements, m)?)?;
-    m.add_function(wrap_pyfunction!(l0_error_model, m)?)?;
+    m.add_class::<PyRangeImage>()?;
+    m.add_class::<PyScene>()?;
+    m.add_function(wrap_pyfunction!(candidates, m)?)?;
+    m.add_function(wrap_pyfunction!(error_model_defaults, m)?)?;
     Ok(())
 }
 
-/// A configuration of elements held against some views (rays::Config): `energy()`; `add(elements)` → (ids, energy
-/// change); `remove(ids)`, `alter(id, element)` and `trial(element)` (the change of adding it, the configuration left
-/// as it was) → the energy change; `stats(element)`, the latents' statistics; `predict(element, scan)`, its cells as
-/// l0_predict gives them; `rows()` as l0_energy's. Each element
-/// is rendered once per view, and a move recomputes only the field components it touches.
-#[pyclass(name = "L0Config")]
-struct PyConfig {
-    inner: Config<Arc<View>>,
+/// A scene of elements held against range images (scene::Scene). Each element is rendered once per image, and a
+/// move recomputes only the offset-field components it touches.
+#[pyclass(name = "Scene")]
+struct PyScene {
+    inner: Scene,
     em: ErrorModel,
 }
 
 #[pymethods]
-impl PyConfig {
+impl PyScene {
     #[new]
-    #[pyo3(signature = (views, elements, err=None, scene_=None))]
-    fn new(py: Python<'_>, views: Vec<PyRef<'_, PyView>>, elements: &Bound<'_, PyDict>, err: Option<&Bound<'_, PyDict>>,
-           scene_: Option<&Bound<'_, PyDict>>) -> PyResult<Self> {
-        let (em, sc) = (error_model(err)?, scene(scene_)?);
+    #[pyo3(signature = (images, elements, err=None, background=None))]
+    fn new(py: Python<'_>, images: Vec<PyRef<'_, PyRangeImage>>, elements: &Bound<'_, PyDict>, err: Option<&Bound<'_, PyDict>>,
+           background: Option<&Bound<'_, PyDict>>) -> PyResult<Self> {
+        let (em, bg) = (error_model(err)?, self::background(background)?);
         let el = elements_from_py(elements, &em)?;
-        let vs: Vec<Arc<View>> = views.iter().map(|v| v.inner.clone()).collect();
-        Ok(PyConfig { inner: py.detach(|| Config::new(vs, &el, em, sc)), em })
+        let vs: Vec<Arc<RangeImage>> = images.iter().map(|v| v.inner.clone()).collect();
+        Ok(PyScene { inner: py.detach(|| Scene::new(vs, &el, em, bg)), em })
     }
 
-    fn energy(&self) -> f64 {
-        self.inner.energy()
+    /// The scene's cost: −log of its likelihood ratio against the empty scene.
+    fn cost(&self) -> f64 {
+        self.inner.cost()
     }
 
+    /// Per (element, scan): elem, scan, cells, support, footprints across, surface class, its share of the cost,
+    /// and the offset field's posterior at it (shift_along, sd_along).
     fn rows<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
-        Ok(rows_dict(py, self.inner.energy(), &self.inner.rows())?.1)
+        rows_dict(py, &self.inner.rows())
     }
 
+    /// Add elements: their ids and the cost change.
     fn add(&mut self, py: Python<'_>, elements: &Bound<'_, PyDict>) -> PyResult<(Vec<u32>, f64)> {
         let el = elements_from_py(elements, &self.em)?;
         let c = &mut self.inner;
@@ -341,24 +304,33 @@ impl PyConfig {
         })))
     }
 
+    /// Remove elements by id: the cost change.
     fn remove(&mut self, py: Python<'_>, ids: Vec<u32>) -> f64 {
         let c = &mut self.inner;
         py.detach(|| ids.into_iter().map(|id| c.remove(id)).sum())
     }
 
-    fn alter(&mut self, py: Python<'_>, id: u32, element: &Bound<'_, PyDict>) -> PyResult<f64> {
+    /// Replace an element: the cost change.
+    fn change(&mut self, py: Python<'_>, id: u32, element: &Bound<'_, PyDict>) -> PyResult<f64> {
         let e = one(elements_from_py(element, &self.em)?)?;
         let c = &mut self.inner;
-        Ok(py.detach(|| c.alter(id, e)))
+        Ok(py.detach(|| c.change(id, e)))
     }
 
-    /// The latents' statistics of one element against the configuration, per view (rays::Stats): scan, misfit_ss,
-    /// misfit_w, misfit_cells, on, empty, behind; `shift` (m, per view) comes off the depth residuals.
+    /// The cost change of adding one element, the scene left as it was.
+    fn cost_to_add(&mut self, py: Python<'_>, element: &Bound<'_, PyDict>) -> PyResult<f64> {
+        let e = one(elements_from_py(element, &self.em)?)?;
+        let c = &mut self.inner;
+        Ok(py.detach(|| c.cost_to_add(e)))
+    }
+
+    /// One element's counts against the scene, per scan (scene::ElementCounts): scan, misfit_ss, misfit_w,
+    /// misfit_cells, on, empty, behind; `shift` (m, per scan) comes off the depth residuals.
     #[pyo3(signature = (element, shift=None))]
-    fn stats<'py>(&self, py: Python<'py>, element: &Bound<'_, PyDict>, shift: Option<Vec<f64>>) -> PyResult<Bound<'py, PyDict>> {
+    fn counts<'py>(&self, py: Python<'py>, element: &Bound<'_, PyDict>, shift: Option<Vec<f64>>) -> PyResult<Bound<'py, PyDict>> {
         let e = one(elements_from_py(element, &self.em)?)?;
         let c = &self.inner;
-        let st = py.detach(|| c.stats(e, &shift.unwrap_or_default()));
+        let st = py.detach(|| c.counts(e, &shift.unwrap_or_default()));
         let d = PyDict::new(py);
         d.set_item("scan", st.iter().map(|x| x.scan).collect::<Vec<_>>().into_pyarray(py))?;
         d.set_item("misfit_ss", st.iter().map(|x| x.misfit_ss).collect::<Vec<_>>().into_pyarray(py))?;
@@ -370,19 +342,15 @@ impl PyConfig {
         Ok(d)
     }
 
-    /// What one element predicts in view `scan` against the configuration, per cell it fronts: l0_predict's dict.
+    /// What one element predicts in scan `scan` against the scene, per cell it fronts: cell (flat index), surface,
+    /// outcome (0 on, 1 empty, 2 in front, 3 behind), fill, kept, depth, sd, obs, weight (1/m), footprint (m), x and
+    /// s (where the ray passes the axis, across and along).
     #[pyo3(signature = (element, scan=0))]
     fn predict<'py>(&self, py: Python<'py>, element: &Bound<'_, PyDict>, scan: usize) -> PyResult<Bound<'py, PyDict>> {
         let e = one(elements_from_py(element, &self.em)?)?;
         let c = &self.inner;
         let p = py.detach(|| c.predict(e, scan));
         predictions_dict(py, &p)
-    }
-
-    fn trial(&mut self, py: Python<'_>, element: &Bound<'_, PyDict>) -> PyResult<f64> {
-        let e = one(elements_from_py(element, &self.em)?)?;
-        let c = &mut self.inner;
-        Ok(py.detach(|| c.trial(e)))
     }
 }
 

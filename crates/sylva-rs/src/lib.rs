@@ -32,6 +32,7 @@ pub mod quality;
 pub mod raster;
 pub mod registration;
 pub mod riscan;
+pub mod scene;
 pub mod shots;
 pub mod synthetic;
 pub mod transform;
