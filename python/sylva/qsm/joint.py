@@ -14,8 +14,7 @@ random walk of the centre and of foliage (3dtrees research 74).
 :func:`support_tree` fits one tree: each row's pieces' support function per
 scan, bounds and existence where a circle isn't determined, the pieces with
 several stems fitted by the exact likelihood, and one solve over the tree.
-:func:`joint_table` gives the pairs the likelihood reads, and
-:func:`rebase` re-sections a plant's base for it.
+:func:`joint_table` gives the pairs the likelihood reads.
 
 The parameters are a :class:`JointParams`, whose fields are:
 
@@ -71,7 +70,7 @@ from .scan_index import ScanIndex
 JointParams = dataclasses.make_dataclass(
     "JointParams", [(k, type(v), dataclasses.field(default=v)) for k, v in _core.qsm_joint_defaults().items()],
     frozen=True, module=__name__)
-JointParams.__doc__ = """The settings of :func:`support_tree` and :func:`rebase`, with the core's defaults.
+JointParams.__doc__ = """The settings of :func:`support_tree`, with the core's defaults.
 
 Calibrated on TERN's RIEGL VZ-400i exports (Alice Mulga). The fields are described in
 :mod:`sylva.qsm.joint`'s documentation; ``dataclasses.asdict(params)`` is what crosses to the core.
@@ -282,82 +281,3 @@ def joint_table(scans, a, b, window, threads: int = 0) -> dict[str, np.ndarray]:
     window = np.ascontiguousarray(np.broadcast_to(np.asarray(window, np.float64), (len(a),)))
     return _core.qsm_joint_table([s._core for s in scans], a, b, window, int(threads))
 
-
-def rebase(scans, a, b, r_prior, parent, member, centre, context=None, params: JointParams = JointParams(),
-           reach: float = 0.6, z_lo: float = 0.1, z_hi: float = 1.5, dz: float = 0.1, link: float = 0.02,
-           keep: float = 0.8, threads: int = 0) -> dict:
-    """A plant's base re-sectioned from the rays (3dtrees ticket 125): its grounded members' rows ``a[i] -> b[i]``
-    (``parent`` within the rows, -1 at a member's base, parents first; ``member`` each row's), joined to the columns
-    of wood standing in its bottom ``z_hi`` above the ground, where the rays favour them, for :func:`support_tree` to
-    measure.
-
-    From ``z_lo`` to ``z_hi`` above the ground ``centre[2]``, slabs ``dz`` thick about ``centre``'s vertical axis,
-    each scan's pulses within ``reach`` of it; a slab's woody stops (echo character over a half) from every scan,
-    linked where within ``link`` of each other, are its sections, each with a circle (RANSAC and least squares, a point
-    circle's tests on an arc of 60 degrees; a sliver one scan grazes is centred behind its stops) the ray veto audits. Sections
-    are linked upward into columns, which may fork. Each circle's evidence is its log odds of wood against foliage
-    from the pulses through it, by their opacity (a stop on its chord for it, a pass against it, as a piece's
-    existence weighs them, ``stop_wood``, ``stop_leaf``, ``exist_scale``); a row's is its axis's in each slab it
-    crosses, at the best of its radius, a half and a quarter of it.
-
-    A column wider than 0.3 m or twice the site's cap at the plant's top (``dh``), or with half its sections inside
-    the ``context``'s cylinders (other plants'), or (on the ground) starting over 0.5 m above it, is none of this
-    plant's stems. A row rising through a column's top
-    (its highest section) joins the column whose top lies nearest where it does, within 8 cm beyond the column's
-    radius, or else, where the rays refute the row's chain under that height, is grafted to the nearest column top
-    within 30 cm; it is cut there. A column and its forks replace the chains of the rows they take only where their
-    evidence is positive, those chains hold under ``keep`` of it in the same slabs, and under half of them are
-    measured (by an own circle the veto doesn't refute, as :func:`support_tree` would serve it): a skeleton already
-    on its wood keeps it. Nor is a column given to one member where another's rows already stand on half its
-    sections. A column's rows go to the member whose taken rows carry most of the skeleton above their cuts; another
-    member's row it takes starts that member's base at its cut (a fork, at the fork). A member that would stand on two
-    bases keeps its rows as they were. Of a member re-sectioned, other rows under the chosen columns' top whose
-    middle lies in a chosen column's circle, or that the veto refutes at a quarter of their radius, are dropped; a
-    kept row whose parent was dropped hangs from its member's nearest row end within 30 cm, no more than 5 cm above
-    its start, else is joined to such an end within 1 m by a row of its dropped parent's radius, else its member keeps
-    its rows. A column whose owner keeps a base of its own (a stem the columns missed) starts there.
-    ``support_tree.rs``'s ``base`` module documentation says it in full.
-
-    Parameters
-    ----------
-    scans
-        :class:`ScanIndex` of each scan to use.
-    a, b, r_prior, parent, member
-        The plant's grounded members' rows: ``(n, 3)`` axes, ``(n,)`` prior radii, parents (int; within the rows, each
-        before its child, -1 at a member's base) and each row's member (int).
-    centre
-        The base's centre ``(x, y)`` and its ground's ``z`` (m).
-    context
-        ``(a, b, r)`` of the other plants' cylinders near the base, or None.
-    params
-        :class:`JointParams`: ``stop_wood``, ``stop_leaf`` and ``exist_scale`` for the evidence, the ``refl_*`` fields
-        for which stops are woody, the footprint for the veto, and ``dh`` for the cap.
-    reach
-        The tube about the base's axis the slabs' pulses are taken in (m).
-    z_lo, z_hi, dz
-        The slabs, above the ground: the first's bottom, the last's top and their thickness (m).
-    link
-        Stops within this of each other are one section (m).
-    keep
-        The share of a column's evidence RCT's rows must hold in its slabs to keep their base.
-    threads
-        Threads for the slabs and the rows (0: all).
-
-    Returns a dict: the rows ``a``, ``b`` ``(m, 3)``, ``r_prior``, ``parent`` (a row of the same member, -1 at its
-    base: every member's rows hang from one base, parents first), ``member`` and ``column`` (-1 for a skeleton row);
-    ``columns``, per column ``e_col``, ``e_rct`` and ``measured`` (its root column's, with its forks), ``chosen``,
-    ``owner`` (-1: none), ``r`` (its median), ``believable``, ``joined``, ``grafted``; and ``counts`` of the rows
-    rising through a column's top near it (``entries``: ``joined``, ``grafted``, ``kept``), rows ``dropped`` and
-    ``hung``, and members ``reverted`` to their rows.
-    """
-    if not all(isinstance(s, ScanIndex) for s in scans):
-        raise TypeError("rebase: scans must be ScanIndex")
-    if not isinstance(params, JointParams):
-        raise TypeError("rebase: params must be JointParams")
-    f64 = lambda x: np.ascontiguousarray(x, np.float64)  # noqa: E731
-    ca, cb, cr = (np.zeros((0, 3)), np.zeros((0, 3)), np.zeros(0)) if context is None else context
-    return _core.qsm_rebase([s._core for s in scans], f64(a).reshape(-1, 3), f64(b).reshape(-1, 3), f64(r_prior),
-                            np.ascontiguousarray(parent, np.int64), np.ascontiguousarray(member, np.int64),
-                            [float(x) for x in centre], f64(ca).reshape(-1, 3), f64(cb).reshape(-1, 3), f64(cr),
-                            dataclasses.asdict(params), z_lo, z_hi, dz, reach, link, float(keep),
-                            int(threads))

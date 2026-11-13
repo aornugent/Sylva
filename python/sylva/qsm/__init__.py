@@ -33,11 +33,11 @@ from .plot import (  # noqa: F401
 )
 from .evidence import EvidenceParams, Reason, contradicted, evidence  # noqa: F401
 from .scan_index import ScanIndex, pairs  # noqa: F401
-from .joint import JointParams, SupportBasis, SupportDiag, SupportFlag, joint_table, rebase, support_tree, tree_context  # noqa: F401
+from .joint import JointParams, SupportBasis, SupportDiag, SupportFlag, joint_table, support_tree, tree_context  # noqa: F401
 from .support import contest  # noqa: F401
 from .wood import (  # noqa: F401
     wood_points,
 )
 
-__all__ = ["evidence", "pairs", "joint_table", "rebase", "support_tree", "tree_context", "JointParams", "SupportBasis", "SupportDiag", "SupportFlag", "EvidenceParams", "Reason", "ScanIndex", "contradicted", "contest", "QSM", "PlotQSMs", "build_plot", "fit_cylinder", "fit_cylinder_ransac", "skeletonize", "build_qsm", "wood_points",
+__all__ = ["evidence", "pairs", "joint_table", "support_tree", "tree_context", "JointParams", "SupportBasis", "SupportDiag", "SupportFlag", "EvidenceParams", "Reason", "ScanIndex", "contradicted", "contest", "QSM", "PlotQSMs", "build_plot", "fit_cylinder", "fit_cylinder_ransac", "skeletonize", "build_qsm", "wood_points",
            "write_obj", "write_ply_mesh", "Buttress", "buttress_mesh", "TreeMesh"]
