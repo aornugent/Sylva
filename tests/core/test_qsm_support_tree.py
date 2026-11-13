@@ -6,9 +6,8 @@ import pytest
 from sylva import PointCloud
 from sylva.qsm import JointParams, ScanIndex, SupportBasis, SupportDiag, SupportFlag, support_tree
 
-# the synthetic VZ-400i beam's detection share, calibrated on its vertical stems (3dtrees research 93 §10), and its
-# echo character: wood reflects 0.5 (-3 dB) and these scenes hold no leaf
-PARAMS = JointParams(tau=0.094, refl_wood=-3.0, refl_leaf=-60.0)
+# the synthetic VZ-400i beam's echo character: wood reflects 0.5 (-3 dB) and these scenes hold no leaf
+PARAMS = JointParams(refl_wood=-3.0, refl_leaf=-60.0)
 
 
 def scanned(tmp_path, a, b, r, scanners, zenith=(80.0, 100.0)):

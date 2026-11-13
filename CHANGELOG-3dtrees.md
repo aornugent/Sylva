@@ -22,9 +22,11 @@ branch `3dtrees/125-rebase`.
 - `qsm.joint` is the joint model's per-pulse likelihood, with exact derivatives. `qsm.joint_table` gives its pair
   table, and `joint_fit` (Rust) fits a routed piece's stems to a table under a Gaussian Markov prior. 3dtrees needs
   them because they fit `support_tree`'s routed pieces. Additive, with a `libm` dependency for erfc.
-- `qsm.JointParams` holds the settings of `support_tree` and the likelihood. Each field is a real, written
-  once in Rust (`params!`), and Python makes a frozen dataclass from the core's defaults. 3dtrees needs it because its
-  fit cache keys on `dataclasses.asdict` of it and the Sylva checkout. Additive.
+- `qsm.JointParams` holds the settings of `support_tree` a caller may set: the beam's footprint (`exit`,
+  `divergence`), the echo character (`refl_*`) and the site's D/H cap (`dh`). Every other calibration is a constant of
+  the core. Each field is a real, written once in Rust (`params!`), and Python makes a frozen dataclass from the core's
+  defaults. 3dtrees needs it because its recipes set `dh`, its fit cache keys on `dataclasses.asdict` of it and the
+  Sylva checkout, and `v1-landing`'s score reads the beam and the echo character. Additive.
 - `qsm.tree_context` gives each tree its neighbours' cylinders within a reach, in parallel. 3dtrees needs it because
   it built these in numpy, 5x slower; the contexts are identical. Additive.
 - `qsm.contest` gives, of the points near each tree's cylinders, the share another tree holds and which tree holds

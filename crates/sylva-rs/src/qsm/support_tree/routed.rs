@@ -27,9 +27,9 @@
 //!   (the tree's measured and bounded pieces) explains better than every seed
 //!   is the context's. Every pulse is fitted where the piece has at most
 //!   [`FIT_PAIRS`], and one in `ceil(n / FIT_PAIRS)` where it has more (a
-//!   hash of the pulse's direction and [`JointParams::thin_seed`]): a scan's
+//!   hash of the pulse's direction): a scan's
 //!   pulses are about five times more correlated than the likelihood assumes
-//!   (research 93 §17's `exist_scale`), and fitting half of every piece made k
+//!   (research 93 §17's [`EXIST_SCALE`]), and fitting half of every piece made k
 //!   flip with the half (§18-§19). Then `k = 1, 2, ...` stems, each from
 //!   its seed on its own axis ([`fit_stems`]: each pulse seen from the stem
 //!   it meets first, each stem its own foliage, Newton to its stopping rule
@@ -53,11 +53,11 @@
 
 use nalgebra::{Matrix2, Matrix3, Matrix4, Matrix5, SymmetricEigen, Vector5};
 
-use super::{fate, marginalise, measure, median, p_wood, profile_runs, solve_row, spacing, unseen, weights, Bound, Circle, Fate, Group, Side, Sight, Stats, CAP_SD, DEPTH_TOL, HULL_BEHIND, HULL_SHARE, RUN_HITS, SEEN_MIN};
+use super::{fate, marginalise, measure, median, p_wood, profile_runs, solve_row, spacing, unseen, weights, Bound, Circle, Fate, Group, Side, Sight, Stats, CAP_SD, DEPTH_TOL, EXIST_SCALE, HULL_BEHIND, HULL_SHARE, MODEL_SD, RUN_HITS, SEEN_MIN};
 use crate::error::Result;
 use crate::qsm::scan_index::ScanIndex;
-use crate::qsm::joint::{frames, joint_loglik, joint_table, joint_wood_share, window, Echoes, JointPairs, JointParams, Owner, Pulse};
-use crate::qsm::joint_fit::{joint_fit, Fit, FitOptions, Frame, PriorParams, Rows};
+use crate::qsm::joint::{frames, joint_loglik, joint_table, joint_wood_share, window, Echoes, JointPairs, JointParams, Owner, Pulse, EDGE, TAU};
+use crate::qsm::joint_fit::{joint_fit, Fit, FitOptions, Frame, Rows};
 use crate::transform::{cross, dot, norm, sub};
 use crate::Point;
 
@@ -108,7 +108,7 @@ fn section(n: [f64; 2], v: [f64; 2], b: f64, depth: f64) -> Option<[f64; 2]> {
 }
 
 /// Each scan's runs measured as circles with their lean (see the module documentation), with the beam that saw each.
-fn proposals(gs: &[Group], r_claim: f64, p: &JointParams, lean_sd: f64) -> Vec<(Seed, [f64; 2])> {
+fn proposals(gs: &[Group], r_claim: f64, p: &JointParams) -> Vec<(Seed, [f64; 2])> {
     let mut out = Vec::new();
     for g in gs {
         let n = g.recs.len();
@@ -148,7 +148,7 @@ fn proposals(gs: &[Group], r_claim: f64, p: &JointParams, lean_sd: f64) -> Vec<(
             let ra = hw + 0.01;
             let depths = if dlo.is_finite() && dhi.is_finite() { (dlo - DEPTH_TOL - LEAN_DEPTH, dhi + DEPTH_TOL + LEAN_DEPTH) } else { (f64::NEG_INFINITY, f64::INFINITY) };
             let o = measure(g, &fates, &wt, mid, ra, depths, p);
-            let Some(c) = solve_row(&Stats::of(&o.meas), ra, lean_sd, p.model_sd) else { continue };
+            let Some(c) = solve_row(&Stats::of(&o.meas), ra) else { continue };
             if c.x[4] >= 0.005 && c.x[4] <= 0.3 {
                 out.push((Seed { c: [c.x[0], c.x[1]], t: [c.x[2], c.x[3]], r: c.x[4], t_var: [c.cov[(2, 2)], c.cov[(3, 3)]] }, g.v));
             }
@@ -159,8 +159,8 @@ fn proposals(gs: &[Group], r_claim: f64, p: &JointParams, lean_sd: f64) -> Vec<(
 
 /// A routed piece's seeds (see the module documentation), strongest first; none where no run makes one (the piece
 /// is then refused).
-pub(super) fn seeds(gs: &[Group], r_claim: f64, p: &JointParams, lean_sd: f64) -> Vec<Seed> {
-    let props = proposals(gs, r_claim, p, lean_sd);
+pub(super) fn seeds(gs: &[Group], r_claim: f64, p: &JointParams) -> Vec<Seed> {
+    let props = proposals(gs, r_claim, p);
     if props.is_empty() {
         return Vec::new();
     }
@@ -361,14 +361,14 @@ fn look(t: &JointPairs, scans: &[&ScanIndex], axis: &(Point, Point), fr: (Point,
         let w = median(&mut a.iter().map(|q| q.1).collect::<Vec<_>>());
         ws.push(w);
         let half = 0.5 * (a[((ARC_TRIM - 1) * m) / ARC_TRIM - 1].0 - a[m / ARC_TRIM].0) - like.app(w);
-        if half > 0.5 * like.tau * w && half.ln() > lo {
+        if half > 0.5 * TAU * w && half.ln() > lo {
             lo = half.ln();
             bounds.retain(|b: &Bound| b.side != Side::Lower);
-            bounds.push(Bound { eta: lo, sd: like.edge * w / std::f64::consts::SQRT_2 / half, side: Side::Lower });
+            bounds.push(Bound { eta: lo, sd: EDGE * w / std::f64::consts::SQRT_2 / half, side: Side::Lower });
         }
     }
     if let Some(w) = ws.into_iter().reduce(f64::max) {
-        bounds.push(Bound { eta: (0.5 * like.tau * w).ln(), sd: CAP_SD, side: Side::Floor });
+        bounds.push(Bound { eta: (0.5 * TAU * w).ln(), sd: CAP_SD, side: Side::Floor });
     }
     Some((sights, bounds))
 }
@@ -392,8 +392,8 @@ fn thinning(n_all: usize, min: u32) -> u32 {
 
 /// Whether the pulse of direction `d` is one of the `1 / thin` fitted: by a hash of its direction (splitmix64), so
 /// the choice is the pulse's own, not its place in a file (a scan cut to a tree's pulses fits the same ones).
-fn kept(d: Point, thin: u32, seed: u64) -> bool {
-    let mut z = d.iter().fold(seed, |h, x| h.rotate_left(21) ^ x.to_bits()).wrapping_add(0x9e37_79b9_7f4a_7c15);
+fn kept(d: Point, thin: u32) -> bool {
+    let mut z = d.iter().fold(0u64, |h, x| h.rotate_left(21) ^ x.to_bits()).wrapping_add(0x9e37_79b9_7f4a_7c15);
     z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
     z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
     (z ^ (z >> 31)) % thin as u64 == 0
@@ -403,13 +403,13 @@ fn kept(d: Point, thin: u32, seed: u64) -> bool {
 /// its `seeds`, with `ctx` (each cylinder's ends and radius) owning the stops it explains better; refused where there is no seed or no pulse, where Newton didn't converge, where a stem isn't finite or says
 /// nothing of its radius, or where one stem is narrower than the piece's detection bound `lower` (log R).
 #[allow(clippy::too_many_arguments)]
-pub(super) fn exact_piece(scans: &[&ScanIndex], a0: &Point, frame: Frame, seeds: &[Seed], ctx: &[(Point, Point, f64)], lower: f64, like: &JointParams, prior: &PriorParams) -> Result<Fitted> {
-    exact_thinned(scans, a0, frame, seeds, ctx, lower, like, prior, THIN)
+pub(super) fn exact_piece(scans: &[&ScanIndex], a0: &Point, frame: Frame, seeds: &[Seed], ctx: &[(Point, Point, f64)], lower: f64, like: &JointParams) -> Result<Fitted> {
+    exact_thinned(scans, a0, frame, seeds, ctx, lower, like, THIN)
 }
 
 /// [`exact_piece`], fitting one pulse in at least `min_thin`.
 #[allow(clippy::too_many_arguments)]
-fn exact_thinned(scans: &[&ScanIndex], a0: &Point, frame: Frame, seeds: &[Seed], ctx: &[(Point, Point, f64)], lower: f64, like: &JointParams, prior: &PriorParams, min_thin: u32) -> Result<Fitted> {
+fn exact_thinned(scans: &[&ScanIndex], a0: &Point, frame: Frame, seeds: &[Seed], ctx: &[(Point, Point, f64)], lower: f64, like: &JointParams, min_thin: u32) -> Result<Fitted> {
     if seeds.is_empty() {
         return Ok(Fitted::Refused);
     }
@@ -474,7 +474,7 @@ fn exact_thinned(scans: &[&ScanIndex], a0: &Point, frame: Frame, seeds: &[Seed],
     let idx: Vec<usize> = (0..t.pulses.len()).filter(|&i| keep[i] && in_window(i)).collect();
     let n_all = idx.len();
     let thin = thinning(n_all, min_thin);
-    let fit_idx: Vec<usize> = idx.iter().copied().filter(|&i| kept(ray(i).1, thin, like.thin_seed as u64)).collect();
+    let fit_idx: Vec<usize> = idx.iter().copied().filter(|&i| kept(ray(i).1, thin)).collect();
     let n = fit_idx.len();
     if n == 0 {
         return Ok(Fitted::Refused);
@@ -498,7 +498,7 @@ fn exact_thinned(scans: &[&ScanIndex], a0: &Point, frame: Frame, seeds: &[Seed],
         }).collect();
         let radii: Vec<f64> = st.iter().map(|s| s.2).collect();
         let see = |q: usize, i: usize, d: [f64; 2]| shifted(&views[st[q].0][i], [st[q].1[0] + d[0], st[q].1[1] + d[1]]);
-        let sf = fit_stems(&range, &see, &moved, &radii, &scan, scans.len(), like, prior, &opts)?;
+        let sf = fit_stems(&range, &see, &moved, &radii, &scan, scans.len(), like, &opts)?;
         // an unconverged fit of k > 1 stems isn't weighed; one stem's is kept, to be refused as a message, and
         // no more are tried
         if k > 1 && !sf.fit.converged {
@@ -543,9 +543,9 @@ fn exact_thinned(scans: &[&ScanIndex], a0: &Point, frame: Frame, seeds: &[Seed],
         am.fixed_view_mut::<2, 2>(0, 0).copy_from(&m2);
         am[(2, 2)] = r;
         let ai = am.try_inverse().unwrap_or_else(Matrix3::identity);
-        let im = ai.transpose() * i3 * ai * (n_all as f64 / n as f64 * like.exist_scale);
+        let im = ai.transpose() * i3 * ai * (n_all as f64 / n as f64 * EXIST_SCALE);
         // (in its eigenbasis, so a direction it doesn't inform stays uninformed: variance 1 / l + model_sd^2)
-        let s2 = like.model_sd * like.model_sd;
+        let s2 = MODEL_SD * MODEL_SD;
         let e3 = SymmetricEigen::new(0.5 * (im + im.transpose()));
         let l3 = e3.eigenvalues.map(|l| if l.is_finite() { l.max(0.0) } else { 0.0 });
         let im = e3.eigenvectors * Matrix3::from_diagonal(&l3.map(|l| l / (1.0 + l * s2))) * e3.eigenvectors.transpose();
@@ -679,7 +679,7 @@ pub(crate) struct StemFit {
 /// again from the fitted stem it meets first, and scored there: the seeded exact fit of a routed piece, each stem
 /// on its own leaning axis (3dtrees research 93 §18).
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn fit_stems(range: &[f64], see: &(dyn Fn(usize, usize, [f64; 2]) -> Pulse + Sync), axes: &[(Point, Point)], radii: &[f64], scan: &[u32], n_scans: usize, p: &JointParams, prior: &PriorParams, opts: &FitOptions) -> Result<StemFit> {
+pub(crate) fn fit_stems(range: &[f64], see: &(dyn Fn(usize, usize, [f64; 2]) -> Pulse + Sync), axes: &[(Point, Point)], radii: &[f64], scan: &[u32], n_scans: usize, p: &JointParams, opts: &FitOptions) -> Result<StemFit> {
     let m = axes.len();
     let (sa, sb): (Vec<Point>, Vec<Point>) = axes.iter().copied().unzip();
     let sw: Vec<f64> = radii.iter().map(|&r| window(r)).collect();
@@ -696,7 +696,7 @@ pub(crate) fn fit_stems(range: &[f64], see: &(dyn Fn(usize, usize, [f64; 2]) -> 
     let (sp, own) = assign(&radii.iter().map(|&r| ([0.0, 0.0], r)).collect::<Vec<_>>());
     let row: Vec<u32> = own.iter().map(|o| o.row).collect();
     let rows = Rows { a: &sa, b: &sb, r_prior: radii, r_max: &sw, parent: &parent };
-    let f = joint_fit(&sp, &row, scan, &rows, n_scans, p, prior, opts)?;
+    let f = joint_fit(&sp, &row, scan, &rows, n_scans, p, opts)?;
     let fitted: Vec<([f64; 2], f64)> = f.theta.iter().map(|t| ([t[0], t[1]], t[2].exp())).collect();
     let (sp, own) = assign(&fitted);
     let theta: Vec<[f64; 4]> = f.theta.iter().map(|t| [0.0, 0.0, t[2], t[3]]).collect();
@@ -746,7 +746,7 @@ mod tests {
         // the fan's 5 cm stem seen whole, and with a screen 1 m in front of its left edge (stopping the pulses that
         // would cross the stem's plane 2-15 cm left of its axis): seen whole, both edges and the front decide R; behind
         // the screen, one edge and the front leave it trading against the centre
-        let like = JointParams { tau: 0.17, edge: 0.25, hide: 0.0, ..JointParams::default() };
+        let like = JointParams::default();
         let (whole, a, b) = crate::qsm::scan_index::tests::scene(0.05, true);
         let (screened, _, _) = crate::qsm::scan_index::tests::scene_screened(0.05, (-0.15, -0.02));
         let (a0, b0) = ([a[0], a[1], -0.15], [b[0], b[1], 0.15]);
@@ -782,7 +782,7 @@ mod tests {
             [z.sin() * a.sin(), z.sin() * a.cos(), z.cos()]
         }).collect();
         for thin in [2u32, 3, 7] {
-            let share = dirs.iter().filter(|&&d| kept(d, thin, 0)).count() as f64 / dirs.len() as f64;
+            let share = dirs.iter().filter(|&&d| kept(d, thin)).count() as f64 / dirs.len() as f64;
             assert!((share * thin as f64 - 1.0).abs() < 0.03, "thin {thin}: {share}");
         }
     }
@@ -803,7 +803,7 @@ mod tests {
         let (a0, b0) = ([a[0], a[1], -0.15], [b[0], b[1], 0.15]);
         let fr = frames(&[a0], &[b0])[0];
         let seed = [Seed { c: [0.0, 0.0], t: [0.0, 0.0], r: 0.05, t_var: [0.01, 0.01] }];
-        let fit = |thin: u32| match exact_thinned(&[&scan], &a0, fr, &seed, &[], f64::NEG_INFINITY, &JointParams { tau: 0.17, edge: 0.25, hide: 0.0, ..JointParams::default() }, &PriorParams::default(), thin).unwrap() {
+        let fit = |thin: u32| match exact_thinned(&[&scan], &a0, fr, &seed, &[], f64::NEG_INFINITY, &JointParams::default(), thin).unwrap() {
             Fitted::Accepted(e) => e,
             Fitted::Refused => panic!("refused"),
         };
@@ -819,7 +819,7 @@ mod tests {
     fn a_shifted_pair_is_the_pair_seen_from_the_moved_axis() {
         let (scan, a, b) = crate::qsm::scan_index::tests::scene(0.05, true);
         let t = joint_table(&[&scan], &[a], &[b], &[window(0.08)], 2).unwrap();
-        let p = JointParams { tau: 0.17, edge: 0.25, hide: 0.0, ..JointParams::default() };
+        let p = JointParams::default();
         let d = [0.012, -0.007];
         let moved: Vec<Pulse> = t.pulses.iter().map(|pu| shifted(pu, d)).collect();
         let own: Vec<Owner> = t.pulses.iter().map(|_| Owner { row: 0, nu: u32::MAX }).collect();

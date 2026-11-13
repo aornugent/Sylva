@@ -11,7 +11,7 @@
 //! (scan, branch) a nuisance offset `nu` that the scan's view of the branch
 //! is shifted by (sway, registration). The prior is a Gaussian Markov field
 //! over the tree: anchors of the centre on the starting axis, of foliage on
-//! its prior, of the level at a base and (optionally) of the radius at a tip;
+//! its prior and of the level at a base;
 //! along a branch, the taper's steps (the prior radii's own) and a random walk
 //! of the centre; at a fork, soft Leonardo with the prior radii's area shares;
 //! foliage a random walk. A radius is capped at its row's `r_max` (the tube
@@ -34,75 +34,31 @@
 use nalgebra::{DMatrix, DVector, Matrix2, Matrix4, SymmetricEigen};
 
 use crate::error::{Error, Result};
-use crate::qsm::joint::{frames, joint_blocks, joint_loglik, params, JointParams, Owner, Pulse};
+use crate::qsm::joint::{frames, joint_blocks, joint_loglik, JointParams, Owner, Pulse};
 use crate::Point;
 
-params! {
-    /// The prior's widths and anchors (all sds; see the module documentation).
-    ///
-    /// The defaults are the calibration for TERN's Alice Mulga exports (3dtrees research 74 §14): real axes and scans are freer
-    /// than a synthetic bench's, and RCT's taper is no guide to the rays' radii there (§21: rows fitted alone
-    /// disagree with its steps by ~1 in log R, which `sig_eta` 0.05 priced at ~10^6 log units).
-    #[derive(Debug, Clone, Copy, PartialEq)]
-    pub struct PriorParams {
-        /// Foliage: prior median (1/m) and log sd; its random walk along the tree.
-        pub lam_prior: f64 = 1.0,
-        pub lam_sd: f64 = 2.0,
-        pub sig_ell: f64 = 1.0,
-        /// The taper's random walk per sqrt(m) of row length; soft Leonardo (log
-        /// area ratio at a fork and its sd); the level at a base.
-        pub sig_eta: f64 = 0.5,
-        pub mu_fork: f64 = 0.10,
-        pub sig_fork: f64 = 0.17,
-        pub sig_root: f64 = 0.5,
-        /// A tip's radius (m; 0: no anchor) and its log sd, at rows without
-        /// children.
-        pub r_tip: f64 = 0.0,
-        pub sig_tip: f64 = 0.3,
-        /// The centre: its random walk (m per sqrt(m)) and its anchor on the
-        /// starting axis, `centre_rel r_prior + centre_abs`.
-        pub sig_delta: f64 = 0.02,
-        pub centre_rel: f64 = 1.0,
-        pub centre_abs: f64 = 0.003,
-        /// The per-scan nuisance, `scan_abs + scan_rel r` (both 0: none).
-        pub scan_abs: f64 = 0.002,
-        pub scan_rel: f64 = 0.3,
-        /// The lean's anchor (m per m) and its random walk between a row's pieces (per sqrt(m); 3dtrees research 93
-        /// §13.1: rows of 67-98 cm whose centres drift 8-24 cm). Read by [`crate::qsm::support_tree`] only.
-        pub lean_sd: f64 = 0.5,
-        pub lean_bend: f64 = 0.3,
-        /// Existence along a branch: a base piece is wood with `exist`, one after a piece that isn't with `exist_off`
-        /// (wood doesn't stop and restart). Read by [`crate::qsm::support_tree`] only.
-        pub exist: f64 = 0.65,
-        pub exist_off: f64 = 0.5,
-        /// The site's largest stem D/H: no radius the rays don't measure is wider than `dh` times its reach to the tips
-        /// over 2 (0: no cap; Alice Mulga's census 0.035, 3dtrees research 62). Read by [`crate::qsm::support_tree`] only.
-        pub dh: f64 = 0.0,
-    }
-}
-
-impl PriorParams {
-    pub(crate) fn check(&self) -> Result<()> {
-        let sds = [("lam_prior", self.lam_prior), ("lam_sd", self.lam_sd), ("sig_ell", self.sig_ell), ("sig_eta", self.sig_eta), ("sig_fork", self.sig_fork), ("sig_root", self.sig_root), ("sig_delta", self.sig_delta), ("lean_sd", self.lean_sd), ("lean_bend", self.lean_bend)];
-        if let Some((k, _)) = sds.iter().find(|(_, v)| !(v.is_finite() && *v > 0.0)) {
-            return Err(Error::invalid(format!("joint fit: {k} must be positive")));
-        }
-        if let Some((k, _)) = [("exist", self.exist), ("exist_off", self.exist_off)].iter().find(|(_, v)| !(*v > 0.0 && *v < 1.0)) {
-            return Err(Error::invalid(format!("joint fit: {k} must be a probability in (0, 1)")));
-        }
-        let shares = [("dh", self.dh), ("mu_fork", self.mu_fork), ("centre_rel", self.centre_rel), ("centre_abs", self.centre_abs), ("scan_abs", self.scan_abs), ("scan_rel", self.scan_rel), ("r_tip", self.r_tip)];
-        if let Some((k, _)) = shares.iter().find(|(k, v)| !v.is_finite() || (*k != "mu_fork" && *v < 0.0)) {
-            return Err(Error::invalid(format!("joint fit: {k} must be finite (and not negative)")));
-        }
-        if self.centre_rel == 0.0 && self.centre_abs == 0.0 {
-            return Err(Error::invalid("joint fit: the centre anchor needs centre_rel or centre_abs"));
-        }
-        if self.r_tip > 0.0 && !(self.sig_tip.is_finite() && self.sig_tip > 0.0) {
-            return Err(Error::invalid("joint fit: a tip anchor needs a positive sig_tip"));
-        }
-        Ok(())
-    }
-}
+// The prior's widths and anchors (all sds; see the module documentation): the calibration for TERN's Alice Mulga
+// exports (3dtrees research 74 §14): real axes and scans are freer than a synthetic bench's, and RCT's taper is no
+// guide to the rays' radii there (§21: rows fitted alone disagree with its steps by ~1 in log R, which a taper sd of
+// 0.05 priced at ~10^6 log units).
+/// Foliage: prior median (1/m) and log sd; its random walk along the tree.
+const LAM_PRIOR: f64 = 1.0;
+const LAM_SD: f64 = 2.0;
+const SIG_ELL: f64 = 1.0;
+/// The taper's random walk per sqrt(m) of row length; soft Leonardo (log area ratio at a fork and its sd); the
+/// level at a base.
+pub(crate) const SIG_ETA: f64 = 0.5;
+pub(crate) const MU_FORK: f64 = 0.10;
+pub(crate) const SIG_FORK: f64 = 0.17;
+pub(crate) const SIG_ROOT: f64 = 0.5;
+/// The centre: its random walk (m per sqrt(m)) and its anchor on the starting axis, `CENTRE_REL r_prior +
+/// CENTRE_ABS`.
+pub(crate) const SIG_DELTA: f64 = 0.02;
+pub(crate) const CENTRE_REL: f64 = 1.0;
+pub(crate) const CENTRE_ABS: f64 = 0.003;
+/// The per-scan nuisance, `SCAN_ABS + SCAN_REL r`.
+const SCAN_ABS: f64 = 0.002;
+const SCAN_REL: f64 = 0.3;
 
 /// How the fit runs.
 #[derive(Debug, Clone, PartialEq)]
@@ -246,8 +202,7 @@ struct System {
 type Groups = (Vec<[f64; 4]>, Vec<[[f64; 4]; 4]>);
 
 impl<'a> Problem<'a> {
-    fn new(pulses: &'a [Pulse], row: &[u32], scan: &[u32], rows: &Rows, n_scans: usize, p: &PriorParams, threads: usize) -> Result<Self> {
-        p.check()?;
+    fn new(pulses: &'a [Pulse], row: &[u32], scan: &[u32], rows: &Rows, n_scans: usize, threads: usize) -> Result<Self> {
         let n = rows.a.len();
         let fr = rows.check("joint fit")?;
         if rows.r_max.len() != n {
@@ -280,7 +235,7 @@ impl<'a> Problem<'a> {
             blocks[branch[k]].rows.push(k);
         }
         let nb = blocks.len();
-        let use_nu = p.scan_abs > 0.0 || p.scan_rel > 0.0;
+        let use_nu = SCAN_ABS > 0.0 || SCAN_REL > 0.0;
         if use_nu && n_scans.saturating_mul(nb) >= u32::MAX as usize {
             return Err(Error::invalid("joint fit: too many scans times branches"));
         }
@@ -292,31 +247,28 @@ impl<'a> Problem<'a> {
         let mut factors = Vec::new();
         let mut add = |vars: Vec<(usize, f64)>, mean: f64, sd: f64| factors.push(Factor { vars, mean, w: 1.0 / (sd * sd) });
         for k in 0..n {
-            let centre = p.centre_rel * rows.r_prior[k] + p.centre_abs;
+            let centre = CENTRE_REL * rows.r_prior[k] + CENTRE_ABS;
             add(vec![(4 * k, 1.0)], 0.0, centre);
             add(vec![(4 * k + 1, 1.0)], 0.0, centre);
-            add(vec![(4 * k + 3, 1.0)], p.lam_prior.ln(), p.lam_sd);
-            if kids[k].is_empty() && p.r_tip > 0.0 {
-                add(vec![(4 * k + 2, 1.0)], p.r_tip.ln(), p.sig_tip);
-            }
+            add(vec![(4 * k + 3, 1.0)], LAM_PRIOR.ln(), LAM_SD);
             let Some(q) = parent[k] else {
-                add(vec![(4 * k + 2, 1.0)], eta0[k], p.sig_root);
+                add(vec![(4 * k + 2, 1.0)], eta0[k], SIG_ROOT);
                 continue;
             };
             let ls = fr[k].3.max(0.01).sqrt();
             if kids[q].len() == 1 {
-                add(vec![(4 * k + 2, 1.0), (4 * q + 2, -1.0)], eta0[k] - eta0[q], p.sig_eta * ls);
+                add(vec![(4 * k + 2, 1.0), (4 * q + 2, -1.0)], eta0[k] - eta0[q], SIG_ETA * ls);
                 // the parent's offset seen in this row's frame
                 let (ek, eq) = ([fr[k].1, fr[k].2], [fr[q].1, fr[q].2]);
                 for j in 0..2 {
                     let t: Vec<f64> = (0..2).map(|i| (0..3).map(|x| ek[j][x] * eq[i][x]).sum()).collect();
-                    add(vec![(4 * k + j, 1.0), (4 * q, -t[0]), (4 * q + 1, -t[1])], 0.0, p.sig_delta * ls);
+                    add(vec![(4 * k + j, 1.0), (4 * q, -t[0]), (4 * q + 1, -t[1])], 0.0, SIG_DELTA * ls);
                 }
             } else {
                 let share = share[k];
-                add(vec![(4 * k + 2, 1.0), (4 * q + 2, -1.0)], 0.5 * (p.mu_fork + share.ln()), p.sig_fork);
+                add(vec![(4 * k + 2, 1.0), (4 * q + 2, -1.0)], 0.5 * (MU_FORK + share.ln()), SIG_FORK);
             }
-            add(vec![(4 * k + 3, 1.0), (4 * q + 3, -1.0)], 0.0, p.sig_ell);
+            add(vec![(4 * k + 3, 1.0), (4 * q + 3, -1.0)], 0.0, SIG_ELL);
         }
         let g_nu = if use_nu { n_scans * nb } else { 0 };
         let n_var = 4 * n + 2 * g_nu;
@@ -330,7 +282,7 @@ impl<'a> Problem<'a> {
         for s in 0..(if use_nu { n_scans } else { 0 }) {
             for (bi, r) in rb.iter().enumerate() {
                 let i = 2 * (s * nb + bi);
-                let sd = p.scan_abs + p.scan_rel * r;
+                let sd = SCAN_ABS + SCAN_REL * r;
                 nu_w[i..i + 2].fill(1.0 / (sd * sd));
                 cap[4 * n + i..4 * n + i + 2].fill(0.2 * r + 0.001);
             }
@@ -609,14 +561,14 @@ pub(crate) fn abs_eig(h: &Matrix4<f64>) -> Matrix4<f64> {
 /// Fits the joint model to `pulses` (row and scan of each) on `rows`, from the
 /// starting axes, the prior radii and the prior foliage.
 #[allow(clippy::too_many_arguments)]
-pub fn joint_fit(pulses: &[Pulse], row: &[u32], scan: &[u32], rows: &Rows, n_scans: usize, like: &JointParams, prior: &PriorParams, opts: &FitOptions) -> Result<Fit> {
-    let pr = Problem::new(pulses, row, scan, rows, n_scans, prior, opts.threads)?;
+pub fn joint_fit(pulses: &[Pulse], row: &[u32], scan: &[u32], rows: &Rows, n_scans: usize, like: &JointParams, opts: &FitOptions) -> Result<Fit> {
+    let pr = Problem::new(pulses, row, scan, rows, n_scans, opts.threads)?;
     if opts.tol.is_nan() || opts.tol < 0.0 {
         return Err(Error::invalid("joint fit: tol must not be negative"));
     }
     let mut x = vec![0.0; pr.n_var];
     for k in 0..pr.n {
-        x[4 * k..4 * k + 4].copy_from_slice(&[0.0, 0.0, rows.r_prior[k].ln(), prior.lam_prior.ln()]);
+        x[4 * k..4 * k + 4].copy_from_slice(&[0.0, 0.0, rows.r_prior[k].ln(), LAM_PRIOR.ln()]);
     }
     pr.project(&mut x);
     let converged = pr.newton(&mut x, like, opts.iters, opts.tol)?;
@@ -639,12 +591,8 @@ mod tests {
     use super::*;
     use crate::qsm::joint::joint_table;
 
-    fn prior() -> PriorParams {
-        PriorParams { lam_prior: 1.0, lam_sd: 2.0, sig_ell: 1.0, sig_eta: 0.05, mu_fork: 0.0, sig_fork: 0.17, sig_root: 0.5, r_tip: 0.0, sig_tip: 0.3, sig_delta: 0.02, centre_rel: 0.3, centre_abs: 0.003, scan_abs: 0.002, scan_rel: 0.05, ..PriorParams::default() }
-    }
-
     fn like() -> JointParams {
-        JointParams { exit: 0.007, divergence: 0.35e-3, sigma_r: 0.005, rough: 0.03, tau: 0.17, edge: 0.25, eps: 0.1, eps_min: 0.01, mp_len: 0.5, hide: 0.0, ..JointParams::default() }
+        JointParams::default()
     }
 
     fn opts() -> FitOptions {
@@ -655,8 +603,8 @@ mod tests {
     fn tree() -> (Vec<Point>, Vec<Point>, Vec<f64>, Vec<i64>) {
         let a = vec![[0.0, 0.0, 0.0], [0.0, 0.0, 0.1], [0.0, 0.0, 0.2], [0.0, 0.0, 0.3], [0.01, 0.0, 0.35], [0.0, 0.0, 0.3], [-0.01, 0.0, 0.35]];
         let b = vec![[0.0, 0.0, 0.1], [0.0, 0.0, 0.2], [0.0, 0.0, 0.3], [0.01, 0.0, 0.35], [0.02, 0.0, 0.4], [-0.01, 0.0, 0.35], [-0.02, 0.0, 0.4]];
-        // area-preserving at the fork (mu_fork 0), so the prior's mode is these radii
-        let fork = 0.046 / 2f64.sqrt();
+        // soft Leonardo at the fork (MU_FORK), so the prior's mode is these radii
+        let fork = 0.046 * (0.5 * MU_FORK).exp() / 2f64.sqrt();
         (a, b, vec![0.05, 0.048, 0.046, fork, 0.03, fork, 0.03], vec![-1, 0, 1, 2, 3, 2, 5])
     }
 
@@ -666,7 +614,7 @@ mod tests {
         let (a, b, r, parent) = tree();
         let rows = Rows { a: &a, b: &b, r_prior: &r, r_max: &[1.0; 7], parent: &parent };
         let pulses: Vec<Pulse> = Vec::new();
-        let pr = Problem::new(&pulses, &[], &[], &rows, 2, &prior(), 1).unwrap();
+        let pr = Problem::new(&pulses, &[], &[], &rows, 2, 1).unwrap();
         assert_eq!(pr.blocks.len(), 3, "trunk and two branches");
         let x: Vec<f64> = (0..pr.n_var).map(|i| ((i * 37 % 11) as f64 - 5.0) * 0.01).collect();
         let mut sys = pr.empty_system();
@@ -699,35 +647,26 @@ mod tests {
     fn without_data_the_fit_is_the_prior() {
         let (a, b, r, parent) = tree();
         let rows = Rows { a: &a, b: &b, r_prior: &r, r_max: &[1.0; 7], parent: &parent };
-        let f = joint_fit(&[], &[], &[], &rows, 2, &like(), &prior(), &opts()).unwrap();
+        let f = joint_fit(&[], &[], &[], &rows, 2, &like(), &opts()).unwrap();
         assert!(f.converged);
         for (k, t) in f.theta.iter().enumerate() {
             assert!((t[2] - r[k].ln()).abs() < 1e-6 && t[0].abs() < 1e-9, "row {k}: {t:?}");
         }
-        // a tip anchor at 2 cm pulls the tips' radii; a cap holds the trunk under 4.9 cm
-        let (tipped, cap) = (PriorParams { r_tip: 0.02, sig_tip: 0.1, ..prior() }, [0.049, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0]);
-        let g = joint_fit(&[], &[], &[], &Rows { r_max: &cap, ..rows }, 2, &like(), &tipped, &opts()).unwrap();
+        // a cap holds the trunk under 4.9 cm
+        let cap = [0.049, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0];
+        let g = joint_fit(&[], &[], &[], &Rows { r_max: &cap, ..rows }, 2, &like(), &opts()).unwrap();
         assert!(g.converged && g.theta[0][2] <= 0.049f64.ln() + 1e-12);
-        for k in [4, 6] {
-            assert!(g.theta[k][2] < r[k].ln() - 0.05, "tip {k}: {}", g.theta[k][2].exp());
-        }
-        let wide = joint_fit(&[], &[], &[], &rows, 2, &like(), &PriorParams { mu_fork: 0.2, ..prior() }, &opts()).unwrap();
-        assert!(wide.theta[3][2] > f.theta[3][2] && wide.theta[5][2] > f.theta[5][2], "a fork adding area thickens its children");
     }
 
     #[test]
     fn inputs_are_checked() {
         let (a, b, r, parent) = tree();
         let rows = Rows { a: &a, b: &b, r_prior: &r, r_max: &[1.0; 7], parent: &parent };
-        let fit = |rows: &Rows, p: &PriorParams| joint_fit(&[], &[], &[], rows, 2, &like(), p, &opts());
-        assert!(fit(&Rows { parent: &[-1, 0, 1, 2, 3, 6, 5], ..rows }, &prior()).is_err());
-        assert!(fit(&rows, &PriorParams { sig_eta: 0.0, ..prior() }).is_err());
-        assert!(fit(&rows, &PriorParams { lam_prior: -1.0, ..prior() }).is_err());
-        assert!(fit(&rows, &PriorParams { centre_rel: 0.0, centre_abs: 0.0, ..prior() }).is_err());
-        assert!(fit(&rows, &PriorParams { r_tip: 0.01, sig_tip: 0.0, ..prior() }).is_err());
+        let fit = |rows: &Rows| joint_fit(&[], &[], &[], rows, 2, &like(), &opts());
+        assert!(fit(&Rows { parent: &[-1, 0, 1, 2, 3, 6, 5], ..rows }).is_err());
         let flat = [a[0]; 7];
-        assert!(fit(&Rows { b: &flat, ..rows }, &prior()).is_err(), "rows without length");
-        assert!(fit(&Rows { r_max: &[0.0; 7], ..rows }, &prior()).is_err());
+        assert!(fit(&Rows { b: &flat, ..rows }).is_err(), "rows without length");
+        assert!(fit(&Rows { r_max: &[0.0; 7], ..rows }).is_err());
     }
 
     #[test]
@@ -737,18 +676,20 @@ mod tests {
         let (a1, b1) = ([a[0] + 0.005, a[1], a[2]], [b[0] + 0.005, b[1], b[2]]);
         let t = joint_table(&[&scan], &[a1], &[b1], &[0.15], 2).unwrap();
         let rows = Rows { a: &[a1], b: &[b1], r_prior: &[0.06], r_max: &[0.15], parent: &[-1] };
-        let p = PriorParams { scan_abs: 0.0, scan_rel: 0.0, ..prior() };
-        let f = joint_fit(&t.pulses, &t.row, &t.scan, &rows, 1, &like(), &p, &opts()).unwrap();
+        let f = joint_fit(&t.pulses, &t.row, &t.scan, &rows, 1, &like(), &opts()).unwrap();
         let r = f.theta[0][2].exp();
         assert!(f.converged);
-        assert!((r - 0.05).abs() < 0.003, "R {r}");
+        // (the fan's pulses hit the stem where their centre lines do, so the calibrated beam, whose silhouette is
+        // wider than the wood by its apparent edge, reads it up to that much narrower, its front where the stops are)
+        let app = like().app(like().footprint(5.0));
+        assert!(r > 0.05 - app - 0.002 && r < 0.053, "R {r}");
         let (_, e1, e2, _) = frames(&[a1], &[b1])[0];
         let off = [0, 1, 2].map(|i| f.theta[0][0] * e1[i] + f.theta[0][1] * e2[i]);
-        assert!((off[0] + 0.005).abs() < 0.003 && off[1].abs() < 0.005, "offset {off:?}");
+        assert!((off[0] + 0.005).abs() < 0.003 && off[1].abs() < 0.003 + (0.05 - r).max(0.0), "offset {off:?}");
         // the message is the likelihood's curvature there
         assert!(f.hess[0][2][2] < 0.0);
         // a cap below the stem holds the radius there
-        let capped = joint_fit(&t.pulses, &t.row, &t.scan, &Rows { r_max: &[0.04], ..rows }, 1, &like(), &p, &opts()).unwrap();
+        let capped = joint_fit(&t.pulses, &t.row, &t.scan, &Rows { r_max: &[0.04], ..rows }, 1, &like(), &opts()).unwrap();
         assert!((capped.theta[0][2].exp() - 0.04).abs() < 1e-9);
     }
 
@@ -762,7 +703,7 @@ mod tests {
         let (ra, rb) = (vec![a, mid], vec![mid, top]);
         let t = joint_table(&[&scan], &ra, &rb, &[0.15, 0.15], 2).unwrap();
         let rows = Rows { a: &ra, b: &rb, r_prior: &[0.05, 0.05], r_max: &[0.15, 0.15], parent: &[-1, 0] };
-        let pr = Problem::new(&t.pulses, &t.row, &t.scan, &rows, 1, &prior(), 2).unwrap();
+        let pr = Problem::new(&t.pulses, &t.row, &t.scan, &rows, 1, 2).unwrap();
         assert!(pr.use_nu && pr.blocks.len() == 1);
         // the same world offset in both rows (each sees its share across its own axis)
         let fr = frames(&ra, &rb);

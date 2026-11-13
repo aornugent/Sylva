@@ -17,7 +17,7 @@ use sylva_rs::io;
 use sylva_rs::qsm::{self, support_tree};
 use sylva_rs::qsm::scan_index::{self, ScanIndex};
 use sylva_rs::qsm::joint::{self, Echoes, JointParams, Pulse};
-use sylva_rs::qsm::joint_fit::{PriorParams, Rows};
+use sylva_rs::qsm::joint_fit::Rows;
 use sylva_rs::synthetic::scan::{self as synth, BeamScan, Reflectance, Solid};
 
 use crate::{cloud_from_py, err, xyz_from_py};
@@ -84,33 +84,30 @@ fn qsm_pairs<'py>(py: Python<'py>, scans: Vec<Bound<'py, PyScanIndex>>, a: PyRea
     Ok(d)
 }
 
-/// The default settings of `qsm_support_tree`, flat: the likelihood's fields, then the prior's.
+/// The default settings of `qsm_support_tree`, flat (`JointParams`' fields).
 #[pyfunction]
 fn qsm_joint_defaults(py: Python<'_>) -> PyResult<Bound<'_, PyDict>> {
-    let (like, prior) = (JointParams::default(), PriorParams::default());
+    let like = JointParams::default();
     let d = PyDict::new(py);
     for &k in JointParams::FIELDS {
         d.set_item(k, like.get(k))?;
-    }
-    for &k in PriorParams::FIELDS {
-        d.set_item(k, prior.get(k))?;
     }
     Ok(d)
 }
 
 /// The settings `qsm_joint_defaults` lays out, each field given once (`dataclasses.asdict(JointParams)`).
-fn joint_params(d: &Bound<'_, PyDict>) -> PyResult<(JointParams, PriorParams)> {
-    let (mut like, mut prior) = (JointParams::default(), PriorParams::default());
+fn joint_params(d: &Bound<'_, PyDict>) -> PyResult<JointParams> {
+    let mut like = JointParams::default();
     for (k, v) in d.iter() {
         let (k, v): (String, f64) = (k.extract()?, v.extract()?);
-        if !(like.set(&k, v) || prior.set(&k, v)) {
+        if !like.set(&k, v) {
             return Err(PyValueError::new_err(format!("joint params: {k:?} is not a field")));
         }
     }
-    if d.len() != JointParams::FIELDS.len() + PriorParams::FIELDS.len() {
+    if d.len() != JointParams::FIELDS.len() {
         return Err(PyValueError::new_err("joint params: every field once"));
     }
-    Ok((like, prior))
+    Ok(like)
 }
 
 /// The joint model's pair table of cylinders `a -> b`, each with its tube `window`: named columns (the `Pulse`
@@ -226,7 +223,7 @@ fn qsm_support_tree<'py>(py: Python<'py>, scans: Vec<Bound<'py, PyScanIndex>>, a
     let refs: Vec<&ScanIndex> = scans.iter().map(|s| &s.get().inner).collect();
     let f = py.detach(|| {
         let rows = Rows { a: &a, b: &b, r_prior: &r_prior, r_max: &[], parent: &parent };
-        support_tree::support_tree(&refs, &rows, &context, &p.0, &p.1, threads)
+        support_tree::support_tree(&refs, &rows, &context, &p, threads)
     }).map_err(err)?;
     let d = support_fit(py, &f.rows)?;
     d.set_item("converged", f.converged)?;
