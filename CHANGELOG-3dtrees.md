@@ -47,7 +47,8 @@ branch `3dtrees/125-rebase`.
   `scene.range_image` is one scan's observations on that lattice, read from a raw shots file (every echo; a cell
   without a pulse inside the pattern is a miss), and the signals read off them (normals, surface continuity and
   class); `scene.moments` keeps surfel moments per (voxel, scan) and reads candidate elements off them;
-  `scene.model` holds the error model (its detection floor rising with range) and the background; `scene.scene`'s `Scene` holds elements against range
+  `scene.model` holds the calibration as constants (the beam, the surface classes, the per-echo noise, the detection
+  floor rising with range) and what a caller may set as two `params!` records (`ErrorModel`, `Background`); `scene.scene`'s `Scene` holds elements against range
   images, each rendered once, with a per-scan along-beam offset field over which each scan's ray likelihood is
   integrated by a Laplace marginal, and returns its cost, the cost change of a move, and each element's counts and
   cell predictions. Bound as `_core.RangeImage`, `_core.Scene`, `_core.candidates` and `_core.error_model_defaults`

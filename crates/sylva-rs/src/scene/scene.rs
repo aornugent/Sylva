@@ -47,7 +47,7 @@
 //!
 //! Cells no element touches cancel. Context (neighbours, competitors) enters as more elements in the set.
 
-use super::model::{Background, ErrorModel};
+use super::model::{Background, ErrorModel, FIELD_SPACING, GROUND_DB, NU_E, P_OUTLIER, SIGMA_E, STEP, T_MAX, WOOD_DB};
 use super::range_image::{Cell, RangeImage};
 use std::sync::Arc;
 use crate::transform::{cross, dot, norm, normalize, sub};
@@ -217,7 +217,7 @@ fn render(v: &RangeImage, e: &Element, id: u32, em: &ErrorModel) -> Vec<(usize, 
             let fp = 0.25 * em.footprint(tm);
             let sd = (fp * fp + e.misfit * e.misfit).sqrt();
             let f = phi((e.r - d) / sd) - phi((-e.r - d) / sd);
-            if d > e.r + 3.0 * sd + 2.0 * em.step * tm {
+            if d > e.r + 3.0 * sd + 2.0 * STEP * tm {
                 continue;
             }
             let (t, spread, cos) = footprint_depth(tm, d, e.r, sin, fp);
@@ -334,7 +334,7 @@ pub struct CellPrediction {
 fn cell_ll(cell: usize, echoes: &[f32], layers: &[(Layer, u8)], ground: Option<(f64, f64)>, delta: f64, em: &ErrorModel, sc: &Background) -> f64 {
     // the first echo only, for now
     let obs = echoes.first().map_or(f64::NAN, |&r| r as f64);
-    let t_end = ground.map_or(sc.t_max, |g| g.0);
+    let t_end = ground.map_or(T_MAX, |g| g.0);
     let (mut beam, mut none_kept, mut none_before_obs, mut dens) = (1.0, 1.0, 1.0, 0.0);
     for &(ly, k) in layers {
         if ly.t >= t_end {
@@ -342,11 +342,11 @@ fn cell_ll(cell: usize, echoes: &[f32], layers: &[(Layer, u8)], ground: Option<(
         }
         let e = ly.f * beam;
         beam *= 1.0 - ly.f * ly.op;
-        let s = ly.op * em.p_detect(sc.wood_db, e * ly.cos, ly.t);
+        let s = ly.op * em.p_detect(WOOD_DB, e * ly.cos, ly.t);
         if obs.is_finite() {
             let sd = em.depth_sd(k, ly.spread);
             let mu = ly.t + em.depth_bias(k, ly.t) + delta;
-            dens += sc.survival(cell, ly.t) * none_kept * s * t_pdf((obs - mu) / sd, em.nu_e) / sd;
+            dens += sc.survival(cell, ly.t) * none_kept * s * t_pdf((obs - mu) / sd, NU_E) / sd;
             if ly.t < obs {
                 none_before_obs *= 1.0 - s;
             }
@@ -354,10 +354,10 @@ fn cell_ll(cell: usize, echoes: &[f32], layers: &[(Layer, u8)], ground: Option<(
         none_kept *= 1.0 - s;
     }
     if let Some((tg, cg)) = ground {
-        let s = em.p_detect(sc.ground_db, beam * cg, tg);
+        let s = em.p_detect(GROUND_DB, beam * cg, tg);
         if obs.is_finite() {
-            let sd = em.sigma_e[2];
-            dens += sc.survival(cell, tg) * none_kept * s * t_pdf((obs - tg) / sd, em.nu_e) / sd;
+            let sd = SIGMA_E[2];
+            dens += sc.survival(cell, tg) * none_kept * s * t_pdf((obs - tg) / sd, NU_E) / sd;
         }
         none_kept *= 1.0 - s;
     }
@@ -367,7 +367,7 @@ fn cell_ll(cell: usize, echoes: &[f32], layers: &[(Layer, u8)], ground: Option<(
     if obs < t_end {
         dens += sc.density(cell, obs) * none_before_obs;
     }
-    ((1.0 - em.p_outlier) * dens + em.p_outlier / sc.t_max).ln()
+    ((1.0 - P_OUTLIER) * dens + P_OUTLIER / T_MAX).ln()
 }
 
 /// One element's data in one scan: the cells it fronts (its A cells) and the along-beam shift δ of their depths, a
@@ -440,8 +440,8 @@ fn scan_cost(v: &RangeImage, si: usize, rendered: &[Vec<(usize, Layer)>], elems:
         }
         let k = cls[i];
         let mid = e.mid();
-        let s_along = (em.field_along[k as usize].powi(2) + if other { em.field_epoch[k as usize].powi(2) } else { 0.0 }).sqrt();
-        let along = OffsetField::hats(&mid, em.field_spacing).into_iter().map(|(key, w)| (field.node(key), w * s_along)).collect();
+        let s_along = em.field_sd(k, other);
+        let along = OffsetField::hats(&mid, FIELD_SPACING).into_iter().map(|(key, w)| (field.node(key), w * s_along)).collect();
         by_elem.insert(i as u32, data.len());
         data.push(ElemData { elem: i, cells: Vec::new(), class: k, support: 0, across: 2.0 * e.r / em.footprint(norm(&sub(&mid, &v.origin))), along });
     }
@@ -653,14 +653,14 @@ impl Scene {
         per.insert(0, mine);
         let buf = kbuffer(&per, MIN_FILL);
         let k = classes(v, &buf, per.len(), em)[0];
-        let off = em.field_along[k as usize];
+        let off = em.field_sd(k, false);
         let mut out: Vec<CellPrediction> = buf.iter().filter(|(_, ls)| ls[0].elem == 0).map(|(&cell, ls)| {
             let ly = ls[0];
             let depth = ly.t + em.depth_bias(k, ly.t);
             let sd = em.depth_sd(k, ly.spread.hypot(off));
             let obs = if v.cell[cell] == Cell::Echoes { v.range[cell] as f64 } else { f64::NAN };
             CellPrediction {
-                cell, elem: 0, fill: ly.f, kept: ly.op * em.p_detect(self.sc.wood_db, ly.f * ly.cos, ly.t), surface: k,
+                cell, elem: 0, fill: ly.f, kept: ly.op * em.p_detect(WOOD_DB, ly.f * ly.cos, ly.t), surface: k,
                 depth, sd, obs, outcome: Outcome::of(obs, depth, sd), weight: 1.0 / em.multiplicity(ly.t), footprint: em.footprint(ly.t), x: ly.x, s: ly.s,
             }
         }).collect();
@@ -728,7 +728,7 @@ impl Scene {
         let mut owner: HashMap<(u8, [i64; 3]), usize> = HashMap::new();
         for (k, &id) in ids.iter().enumerate() {
             let e = self.elems[id as usize].as_ref().unwrap();
-            let nodes: Vec<(u8, [i64; 3])> = OffsetField::hats(&e.mid(), self.em.field_spacing).into_iter().map(|(n, _)| (0u8, n)).collect();
+            let nodes: Vec<(u8, [i64; 3])> = OffsetField::hats(&e.mid(), FIELD_SPACING).into_iter().map(|(n, _)| (0u8, n)).collect();
             let cells = self.rendered[s][id as usize].iter().filter(|(_, l)| l.f >= MIN_FILL).map(|&(c, _)| (1u8, [c as i64, 0, 0]));
             for key in nodes.into_iter().chain(cells) {
                 match owner.get(&key) {
@@ -786,6 +786,7 @@ mod tests {
     use super::*;
     use crate::shots::reconstruct::dir;
     use crate::scene::range_image::RangeImageParams;
+    use crate::scene::model::floor_db;
 
     /// A scan of a vertical pole (R = 3 cm, 4 m away, centred on the y axis) in front of a wall at 8 m, with a finite
     /// beam (as [`thin_pole_view`]).
@@ -821,7 +822,7 @@ mod tests {
                 let u = |s: u64| ((s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407) >> 11) as f64 + 0.5) / (1u64 << 53) as f64;
                 let seed = (l * 400 + k) as u64 * 2 + 1;
                 let n = 2.0 * (-2.0 * u(seed).ln()).sqrt() * (2.0 * std::f64::consts::PI * u(seed * 7919)).cos();
-                let floor = em.floor_db + em.floor_slope * (tm.max(em.floor_ref) / em.floor_ref).log10();
+                let floor = floor_db(tm);
                 let kept = -13.8 + 10.0 * (f * cos).max(1e-12).log10() + n > floor;
                 let range = if kept { depth } else { 2.0 * y_pole / w[1] };
                 t.push(l as f64 * period + k as f64 * interval);
@@ -978,7 +979,7 @@ mod tests {
                             [0.019953242059045913, 0.39361932315224116, 0.9453087204829419, 0.39361932315224116, 0.019953242059045913]);
         let buf = kbuffer(&rendered, MIN_FILL);
         let cls = classes(&v, &buf, 1, &em);
-        let s_along = em.field_along[cls[0] as usize];
+        let s_along = em.field_sd(cls[0], false);
         let ed = |delta: f64| -> f64 {
             buf.iter().map(|(&cell, ls)| {
                 let layers: Vec<(Layer, u8)> = ls.iter().map(|l| (*l, cls[0])).collect();

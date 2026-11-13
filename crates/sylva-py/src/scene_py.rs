@@ -4,10 +4,10 @@
 // see the LICENSE file. There is no warranty, to the extent permitted by law.
 //! Bindings for range images, candidates and the scene (sylva_rs::scene).
 //!
-//! - **Error model and background:** flat dicts whose keys are the structs' fields (arrays as lists).
-//!   `error_model_defaults()` returns the error model's.
+//! - **Error model and background:** flat dicts of the settings records' fields (`ErrorModel`, `Background`), each
+//!   optional; `error_model_defaults()` returns the error model's.
 //! - **Elements:** a dict of arrays, one row per element: `a`, `b` (n, 3) and `r` (n,) are required; `opacity` (n,)
-//!   defaults to 1, `misfit` (n,) to the error model's prior `misfit[0] + misfit[1] r`, and `patch` (n,) bool to
+//!   defaults to 1, `misfit` (n,) to the error model's prior `misfit_base + misfit_slope r`, and `patch` (n,) bool to
 //!   false. A patch is a ball about `a` of radius `r` (its extent); its `b` is ignored.
 //! - **Scenes:** `Scene(images, elements, err, background)` holds elements against range images: `cost()`, `rows()`,
 //!   the cost change of each move (`add`, `remove`, `change`, `cost_to_add`), and an element's counts (`counts`)
@@ -29,68 +29,34 @@ fn bad(k: &str) -> PyErr {
     PyValueError::new_err(format!("unknown or malformed key {k:?}"))
 }
 
-fn error_model(d: Option<&Bound<'_, PyDict>>) -> PyResult<ErrorModel> {
-    let mut m = ErrorModel::default();
+/// A settings record from a flat dict of its fields, each optional (the rest at their defaults).
+fn settings<T: Default>(d: Option<&Bound<'_, PyDict>>, set: fn(&mut T, &str, f64) -> bool) -> PyResult<T> {
+    let mut m = T::default();
     for (k, v) in d.into_iter().flat_map(|d| d.iter()) {
         let k: String = k.extract()?;
-        let x = |v: &Bound<'_, PyAny>| v.extract::<f64>();
-        match k.as_str() {
-            "exit" => m.exit = x(&v)?,
-            "divergence" => m.divergence = x(&v)?,
-            "step" => m.step = x(&v)?,
-            "class_edges" => m.class_edges = v.extract()?,
-            "sigma_e" => m.sigma_e = v.extract()?,
-            "nu_e" => m.nu_e = x(&v)?,
-            "bias" => m.bias = v.extract()?,
-            "bias_ref" => m.bias_ref = x(&v)?,
-            "field_spacing" => m.field_spacing = x(&v)?,
-            "field_along" => m.field_along = v.extract()?,
-            "field_epoch" => m.field_epoch = v.extract()?,
-            "floor_db" => m.floor_db = x(&v)?,
-            "floor_slope" => m.floor_slope = x(&v)?,
-            "floor_ref" => m.floor_ref = x(&v)?,
-            "detect_sd" => m.detect_sd = x(&v)?,
-            "p_outlier" => m.p_outlier = x(&v)?,
-            "misfit" => m.misfit = v.extract()?,
-            "dispersion" => m.dispersion = x(&v)?,
-            _ => return Err(bad(&k)),
+        if !set(&mut m, &k, v.extract().map_err(|_| bad(&k))?) {
+            return Err(bad(&k));
         }
     }
     Ok(m)
 }
 
-/// The error model's defaults (AM's calibration), as the dict the other calls take.
-#[pyfunction]
-fn error_model_defaults<'py>(py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {    let m = ErrorModel::default();
-    let d = PyDict::new(py);
-    for (k, v) in [("exit", m.exit), ("divergence", m.divergence), ("step", m.step), ("nu_e", m.nu_e), ("bias_ref", m.bias_ref),
-                   ("field_spacing", m.field_spacing), ("floor_db", m.floor_db), ("floor_slope", m.floor_slope), ("floor_ref", m.floor_ref), ("detect_sd", m.detect_sd),
-                   ("p_outlier", m.p_outlier), ("dispersion", m.dispersion)] {
-        d.set_item(k, v)?;
-    }
-    d.set_item("class_edges", m.class_edges.to_vec())?;
-    d.set_item("sigma_e", m.sigma_e.to_vec())?;
-    d.set_item("bias", m.bias.to_vec())?;
-    d.set_item("field_along", m.field_along.to_vec())?;
-    d.set_item("field_epoch", m.field_epoch.to_vec())?;
-    d.set_item("misfit", m.misfit.to_vec())?;
-    Ok(d)
+fn error_model(d: Option<&Bound<'_, PyDict>>) -> PyResult<ErrorModel> {
+    settings(d, ErrorModel::set)
 }
 
 fn background(d: Option<&Bound<'_, PyDict>>) -> PyResult<Background> {
-    let mut s = Background::default();    for (k, v) in d.into_iter().flat_map(|d| d.iter()) {
-        let k: String = k.extract()?;
-        let x: f64 = v.extract()?;
-        match k.as_str() {
-            "kappa" => s.kappa = x,
-            "ground_z" => s.ground_z = x,
-            "wood_db" => s.wood_db = x,
-            "ground_db" => s.ground_db = x,
-            "t_max" => s.t_max = x,
-            _ => return Err(bad(&k)),
-        }
+    settings(d, Background::set)
+}
+
+/// The error model's settings at their defaults (AM's calibration), as the flat dict the other calls take.
+#[pyfunction]
+fn error_model_defaults<'py>(py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
+    let (m, d) = (ErrorModel::default(), PyDict::new(py));
+    for &k in ErrorModel::FIELDS {
+        d.set_item(k, m.get(k))?;
     }
-    Ok(s)
+    Ok(d)
 }
 
 fn elements_from_py(d: &Bound<'_, PyDict>, em: &ErrorModel) -> PyResult<Vec<Element>> {
@@ -106,7 +72,7 @@ fn elements_from_py(d: &Bound<'_, PyDict>, em: &ErrorModel) -> PyResult<Vec<Elem
         })
     };
     let opacity = col("opacity", &|_| 1.0)?;
-    let misfit = col("misfit", &|i| em.misfit[0] + em.misfit[1] * r[i])?;
+    let misfit = col("misfit", &|i| em.misfit_sd(r[i]))?;
     let patch: Vec<bool> = match get("patch")? {
         Some(v) => v.extract::<PyReadonlyArray1<bool>>()?.as_array().to_vec(),
         None => vec![false; r.len()],

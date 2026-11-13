@@ -14,6 +14,44 @@
 //! Algorithms are grouped by topic: [`filters`], [`cluster`], [`ground`],
 //! [`canopy`], [`voxel`], [`trees`], [`registration`] and [`qsm`].
 
+/// The settings record written once: the struct, each field a real with its
+/// default (`name: f64 = default`), its [`Default`], and its fields by name
+/// (`FIELDS`, `get`, `set`), which is how they cross to Python.
+macro_rules! params {
+    ($(#[$m:meta])* pub struct $T:ident { $($(#[$fm:meta])* pub $f:ident: f64 = $v:expr,)* }) => {
+        $(#[$m])*
+        pub struct $T { $($(#[$fm])* pub $f: f64,)* }
+
+        impl Default for $T {
+            fn default() -> Self {
+                $T { $($f: $v,)* }
+            }
+        }
+
+        impl $T {
+            /// The fields' names, in order.
+            pub const FIELDS: &'static [&'static str] = &[$(stringify!($f)),*];
+
+            /// The field `name`'s value; `None` if there is no such field.
+            pub fn get(&self, name: &str) -> Option<f64> {
+                match name {
+                    $(stringify!($f) => Some(self.$f),)*
+                    _ => None,
+                }
+            }
+
+            /// Sets the field `name`; false if there is no such field.
+            pub fn set(&mut self, name: &str, v: f64) -> bool {
+                match name {
+                    $(stringify!($f) => self.$f = v,)*
+                    _ => return false,
+                }
+                true
+            }
+        }
+    };
+}
+
 pub mod als;
 pub mod canopy;
 pub mod change;
