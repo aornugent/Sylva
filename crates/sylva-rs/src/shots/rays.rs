@@ -573,6 +573,21 @@ fn scan_energy(v: &View, si: usize, rendered: &[Vec<(usize, Layer)>], elems: &[E
     (u, rows)
 }
 
+/// An element's latents' sufficient statistics in one view, each cell weighted `1/m(ρ)`.
+/// - **Misfit:** over its front cells at fill > 0.5 with an echo within `3 sd + 3 cm` of its sharp depth (its own
+///   misfit left out of sd), the weighted sum of `max(r² − sd², 0)`, the weights' sum and the cells.
+/// - **Opacity:** over its front cells at fill > 0.9, the weighted counts coded on, empty and behind.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Stats {
+    pub scan: u32,
+    pub misfit_ss: f64,
+    pub misfit_w: f64,
+    pub misfit_cells: u32,
+    pub on: f64,
+    pub empty: f64,
+    pub behind: f64,
+}
+
 /// A configuration of elements held against some views: the energy of a move (synthesis §16's incremental form).
 ///
 /// - Each element is rendered once per view, and re-rendered only when it is added or altered.
@@ -659,6 +674,60 @@ impl<V: std::ops::Deref<Target = View> + Sync> Config<V> {
             self.rendered[s][id as usize] = l;
         }
         self.refresh(&touched)
+    }
+
+    /// The latents' sufficient statistics of an element against the configuration, per view (the element is
+    /// rendered for them, not added). `shift` (m, per view; empty for none) is subtracted from the depth residuals.
+    pub fn stats(&self, e: Element, shift: &[f64]) -> Vec<Stats> {
+        (0..self.views.len()).into_par_iter().map(|s| {
+            let v = &*self.views[s];
+            let mut out = Stats { scan: s as u32, ..Stats::default() };
+            // the misfit's from the element drawn sharp (its own misfit left out of the depths it is measured
+            // from), the opacity's from the element as given
+            for (form, misfit) in [(Element { misfit: 0.0, ..e }, true), (e, false)] {
+                let mine = render(v, &form, 0, &self.em);
+                let cells: std::collections::HashSet<usize> = mine.iter().map(|&(c, _)| c).collect();
+                let mut per: Vec<Vec<(usize, Layer)>> = (0..self.elems.len())
+                    .filter(|&i| self.elems[i].is_some())
+                    .map(|i| self.rendered[s][i].iter().filter(|(c, _)| cells.contains(c)).copied().collect::<Vec<_>>())
+                    .filter(|l| !l.is_empty())
+                    .collect();
+                for (k, l) in per.iter_mut().enumerate() {
+                    l.iter_mut().for_each(|(_, ly)| ly.elem = k as u32);
+                }
+                let me = per.len() as u32;
+                per.push(mine.into_iter().map(|(c, ly)| (c, Layer { elem: me, ..ly })).collect());
+                let buf = kbuffer(&per, MIN_FILL);
+                let k = classes(v, &buf, per.len(), &self.em)[me as usize];
+                let off = if self.em.field { self.em.field_along[k as usize] } else { 0.0 };
+                for (&cell, ls) in &buf {
+                    let ly = ls[0];
+                    if ly.elem != me {
+                        continue;
+                    }
+                    let depth = ly.t + self.em.depth_bias(k, ly.t);
+                    let sd = (self.em.sigma_e[k as usize].powi(2) + ly.spread.powi(2) + off * off).sqrt();
+                    let obs = if v.state[cell] == state::ECHO { v.range[cell] as f64 } else { f64::NAN };
+                    let w = 1.0 / self.em.multiplicity(ly.t);
+                    if misfit {
+                        let r = obs - depth - shift.get(s).copied().unwrap_or(0.0);
+                        if ly.f > 0.5 && r.abs() < 3.0 * sd + 0.03 {
+                            out.misfit_ss += w * (r * r - sd * sd).max(0.0);
+                            out.misfit_w += w;
+                            out.misfit_cells += 1;
+                        }
+                    } else if ly.f > 0.9 {
+                        match cell_code(obs, depth, sd) {
+                            code::ON => out.on += w,
+                            code::EMPTY => out.empty += w,
+                            code::BEHIND => out.behind += w,
+                            _ => {}
+                        }
+                    }
+                }
+            }
+            out
+        }).collect()
     }
 
     /// The energy change of adding an element, leaving the configuration as it was.
@@ -864,6 +933,22 @@ mod tests {
         let t = c.trial(pole);
         assert_eq!(c.energy(), e0);
         assert!((t - d_add).abs() < 1e-9 * t.abs().max(1.0));
+    }
+
+    /// The latents' statistics: the true pole's full-fill cells are on it and its echoes fit its sharp depth (a small
+    /// excess over the noise); a stick where the pulses went through to the wall reads behind; the configuration is
+    /// left as it was.
+    #[test]
+    fn stats_read_on_for_the_pole_and_behind_for_a_phantom() {
+        let v = pole_view();
+        let (em, sc) = (ErrorModel::default(), Scene::default());
+        let c = Config::new(vec![&v], &[], em, sc);
+        let pole = c.stats(stick(0.0, 4.0, 0.03), &[])[0];
+        assert!(pole.on > 10.0 * (pole.behind + pole.empty).max(0.01), "{pole:?}");
+        assert!(pole.misfit_cells > 50 && pole.misfit_ss / pole.misfit_w < 1e-5, "{pole:?}");
+        let phantom = c.stats(stick(0.2, 6.0, 0.03), &[])[0];
+        assert!(phantom.behind > 10.0 * phantom.on.max(0.01), "{phantom:?}");
+        assert_eq!(c.energy(), 0.0);
     }
 
     /// A stick under a footprint across leaves partial hits (the export keeps a footprint 8 % filled): scored on

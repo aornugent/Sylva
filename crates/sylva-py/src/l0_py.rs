@@ -11,7 +11,8 @@
 //!   defaults to 1, `misfit` (n,) to the error model's prior `misfit[0] + misfit[1] r`, and `patch` (n,) bool to
 //!   false. A patch is a ball about `a` of radius `r` (its extent); its `b` is ignored.
 //! - **Configurations:** `L0Config(views, elements, err, scene)` holds elements and returns the energy change of each
-//!   move (`add`, `remove`, `alter`, `trial`); `l0_energy(..., only=i)` is a configuration's `trial`.
+//!   move (`add`, `remove`, `alter`, `trial`), and an element's latents' statistics (`stats`); `l0_energy(..., only=i)`
+//!   is a configuration's `trial`.
 
 use numpy::{IntoPyArray, PyArray1, PyArrayMethods, PyReadonlyArray1, PyReadonlyArray2};
 use pyo3::exceptions::PyValueError;
@@ -298,8 +299,8 @@ pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
 
 /// A configuration of elements held against some views (rays::Config): `energy()`; `add(elements)` → (ids, energy
 /// change); `remove(ids)`, `alter(id, element)` and `trial(element)` (the change of adding it, the configuration left
-/// as it was) → the energy change; `rows()` as l0_energy's. Each element is rendered once per view, and a move
-/// recomputes only the field components it touches.
+/// as it was) → the energy change; `stats(element)`, the latents' statistics; `rows()` as l0_energy's. Each element
+/// is rendered once per view, and a move recomputes only the field components it touches.
 #[pyclass(name = "L0Config")]
 struct PyConfig {
     inner: Config<Arc<View>>,
@@ -345,6 +346,24 @@ impl PyConfig {
         let e = one(elements_from_py(element, &self.em)?)?;
         let c = &mut self.inner;
         Ok(py.detach(|| c.alter(id, e)))
+    }
+
+    /// The latents' statistics of one element against the configuration, per view (rays::Stats): scan, misfit_ss,
+    /// misfit_w, misfit_cells, on, empty, behind; `shift` (m, per view) comes off the depth residuals.
+    #[pyo3(signature = (element, shift=None))]
+    fn stats<'py>(&self, py: Python<'py>, element: &Bound<'_, PyDict>, shift: Option<Vec<f64>>) -> PyResult<Bound<'py, PyDict>> {
+        let e = one(elements_from_py(element, &self.em)?)?;
+        let c = &self.inner;
+        let st = py.detach(|| c.stats(e, &shift.unwrap_or_default()));
+        let d = PyDict::new(py);
+        d.set_item("scan", st.iter().map(|x| x.scan).collect::<Vec<_>>().into_pyarray(py))?;
+        d.set_item("misfit_ss", st.iter().map(|x| x.misfit_ss).collect::<Vec<_>>().into_pyarray(py))?;
+        d.set_item("misfit_w", st.iter().map(|x| x.misfit_w).collect::<Vec<_>>().into_pyarray(py))?;
+        d.set_item("misfit_cells", st.iter().map(|x| x.misfit_cells).collect::<Vec<_>>().into_pyarray(py))?;
+        d.set_item("on", st.iter().map(|x| x.on).collect::<Vec<_>>().into_pyarray(py))?;
+        d.set_item("empty", st.iter().map(|x| x.empty).collect::<Vec<_>>().into_pyarray(py))?;
+        d.set_item("behind", st.iter().map(|x| x.behind).collect::<Vec<_>>().into_pyarray(py))?;
+        Ok(d)
     }
 
     fn trial(&mut self, py: Python<'_>, element: &Bound<'_, PyDict>) -> PyResult<f64> {
