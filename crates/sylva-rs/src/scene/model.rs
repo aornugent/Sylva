@@ -7,18 +7,20 @@
 //! field's spacing, the detection floor, the outlier share and the surfaces' reflectance. What a caller may set is
 //! two settings records: [`ErrorModel`] (the depth bias and the offset field's spreads by surface class, the misfit
 //! prior and the dispersion) and [`Background`] (a diffuse echo hazard and a ground plane). Defaults are AM's raw
-//! scans' calibration (research 129 alignment-rca, re-measured on raw in research 130's migration).
+//! scans' calibration: alignment-rca (research 129) rerun on the raw scans, the floor from their faintest echoes and
+//! φ from their cross-scan residuals (research 130 `constants.py`, `dispersion.py`).
 
 /// The beam: its diameter at the exit (m) and full divergence (rad); the footprint at range ρ is `EXIT + DIVERGENCE ρ`.
 pub const EXIT: f64 = 0.007;
 pub const DIVERGENCE: f64 = 0.35e-3;
 /// The lattice step (rad).
 pub const STEP: f64 = 0.5227e-3;
-/// Excess at the solid/mid and mid/fragmented boundaries; the classes are 0 solid, 1 mid, 2 fragmented.
+/// Excess at the solid/mid and mid/fragmented boundaries; the classes are 0 solid, 1 mid, 2 fragmented. On raw
+/// scans they still split alignment-rca's symptom (1.4 / 3.1 / 4.8 mm between cells), so they stay.
 pub const CLASS_EDGES: [f64; 2] = [1.2, 1.8];
 /// Per-echo noise (m) per class, a t with `NU_E` degrees of freedom.
-pub const SIGMA_E: [f64; 3] = [0.0024, 0.0037, 0.0051];
-pub const NU_E: f64 = 4.0;
+pub const SIGMA_E: [f64; 3] = [0.0023, 0.00355, 0.0052];
+pub const NU_E: f64 = 4.2;
 /// The range the depth bias's slope is taken from (m).
 pub const BIAS_REF: f64 = 4.0;
 /// The offset field's node spacing ℓ (m).
@@ -45,22 +47,22 @@ params! {
     pub struct ErrorModel {
         /// Depth bias: an echo off a surface of class k reads `-(bias_k + bias_slope_k (range - BIAS_REF))` behind it
         /// (m, m/m). Measured between views, so a bias common to every view is not in it.
-        pub bias_solid: f64 = -0.0007,
-        pub bias_mid: f64 = -0.00175,
-        pub bias_fragmented: f64 = -0.00235,
-        pub bias_slope_solid: f64 = -0.00003,
-        pub bias_slope_mid: f64 = -0.000055,
-        pub bias_slope_fragmented: f64 = -0.000135,
+        pub bias_solid: f64 = -0.000245,
+        pub bias_mid: f64 = -0.0009,
+        pub bias_fragmented: f64 = -0.00157,
+        pub bias_slope_solid: f64 = -0.0000265,
+        pub bias_slope_mid: f64 = -0.0000385,
+        pub bias_slope_fragmented: f64 = -0.0000935,
         /// The offset field (research 130 offset-field-design.md): its along-beam spread per class within the
         /// reference epoch (σ_u ≈ 0.57 σ_L,same, from alignment-rca's pair spreads and their +0.32 same-near-scan
         /// correlation), and the other-epoch part added in quadrature (σ_E² = (σ_L,other² − σ_L,same²) / 2). Along the
         /// beam only: an across-beam part didn't help same-day held-out calibration (slice 7b).
-        pub field_along_solid: f64 = 0.0011,
-        pub field_along_mid: f64 = 0.00165,
-        pub field_along_fragmented: f64 = 0.0021,
-        pub field_epoch_solid: f64 = 0.0014,
-        pub field_epoch_mid: f64 = 0.0023,
-        pub field_epoch_fragmented: f64 = 0.0035,
+        pub field_along_solid: f64 = 0.00097,
+        pub field_along_mid: f64 = 0.00138,
+        pub field_along_fragmented: f64 = 0.00188,
+        pub field_epoch_solid: f64 = 0.00176,
+        pub field_epoch_mid: f64 = 0.00189,
+        pub field_epoch_fragmented: f64 = 0.00222,
         /// The per-element misfit's declared prior: the section and axis depart from the form by an sd of
         /// `misfit_base + misfit_slope R` (m). Fourier terms past a₀ aren't identifiable here (synthesis §3), so a
         /// scale stands in for them. Each element carries its own misfit (a latent); this is its default.
@@ -69,7 +71,7 @@ params! {
         /// The ray likelihood's dispersion φ: each cell's log-likelihood ratio counts `1/φ` (with the footprints'
         /// `1/m`), for what the model leaves correlated between cells (departures every cell of a section shares, in
         /// one view or all). AM's is measured from its own cross-scan residuals: per-view radii of one element
-        /// disagree by √φ times their per-view sd (research 130 slice 7d). The simulated stand takes 4, from its
+        /// disagree by √φ times their per-view sd (research 130 slice 7d; 10.5 on raw). The simulated stand takes 4, from its
         /// injected-field coverage.
         pub dispersion: f64 = 10.0,
     }
