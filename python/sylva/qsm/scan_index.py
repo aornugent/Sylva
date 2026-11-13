@@ -22,11 +22,9 @@ class ScanIndex:
     """One scan's pulses, read from a single-position Shots file and indexed by direction.
 
     Built once per scan and reused by every :func:`pairs`, :func:`~sylva.qsm.joint_table` and
-    :func:`~sylva.qsm.support_tree` call (about 20 bytes per pulse, 21 where the
-    store has ``las_number_of_returns``, and 4 per echo, 8 where it has
-    reflectance and deviation and 1 more with ``las_return_number``, held on
-    the Rust side). Only the angles, the echo ranges and those four attributes
-    are read.
+    :func:`~sylva.qsm.support_tree` call (about 20 bytes per pulse and 4 per echo, 8 where
+    the store has reflectance and deviation, held on the Rust side). Only the
+    angles, the echo ranges and those two attributes are read.
 
     Parameters
     ----------
@@ -38,15 +36,6 @@ class ScanIndex:
 
     def __init__(self, path: str | PathLike, threads: int = 0) -> None:
         self._core = _core.ScanIndex(path, int(threads))
-
-    @property
-    def misses(self) -> bool:
-        """Whether the store kept pulses without echoes: whether any pulse has none.
-
-        An echoes-only export (e.g. a filtered COPC) has none, and has lost
-        echoes too; the calliper's upper bound is then incomplete and thin wood
-        rests on the prior."""
-        return self._core.misses
 
     @property
     def n_pulses(self) -> int:
@@ -73,8 +62,7 @@ def pairs(scans, a, b, window, threads: int = 0) -> dict[str, np.ndarray]:
     (its last echo is at or beyond where its line enters the tube, or it
     missed): a pulse that stopped short says nothing about what is in the
     tube. Every row carries all its pulse's echoes, so whether it echoed
-    before the tube (an echoes-only export then recorded it anyway) is
-    ``range`` against that entry.
+    before the tube is ``range`` against that entry.
 
     Parameters
     ----------
@@ -96,15 +84,9 @@ def pairs(scans, a, b, window, threads: int = 0) -> dict[str, np.ndarray]:
     - ``t``, ``s``, ``d``: closest approach of the pulse's line to the axis
       line, as the range along the pulse, the position along the axis from
       ``a``, and the distance between the lines;
-    - ``lost``: the export deleted some of the pulse's echoes (the scanner
-      counted more returns than the store holds; False where it doesn't say);
-    - ``returns``: the pulse's number of returns as the scanner counted them
-      (0 where the store doesn't say);
     - ``echo_start`` ``(m + 1,)``: row ``i``'s echoes, all of its pulse's,
       nearest first, are ``echo_start[i]:echo_start[i + 1]`` of ``range``,
-      ``reflectance`` (dB) and ``deviation`` (NaN where the store has none) and
-      ``return_number`` (0 where it has none; a number missing below
-      ``returns`` is an echo the export deleted).
+      ``reflectance`` (dB) and ``deviation`` (NaN where the store has none).
     """
     scans = list(scans)
     if not all(isinstance(s, ScanIndex) for s in scans):

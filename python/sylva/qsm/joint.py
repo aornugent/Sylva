@@ -185,11 +185,10 @@ def support_tree(scans, a, b, r_prior, parent, context=None, params: JointParams
     - ``n_scans``: the scans that measured it (a row's: the most);
     - ``k_stems``: the stems a routed piece's exact fit put in the tree (0: none, or the fit refused; a row's: the
       most);
-    - ``diag`` (:class:`SupportDiag` bits; a row's: its pieces') and three numbers: ``data_share``, the share of log
+    - ``diag`` (:class:`SupportDiag` bits; a row's: its pieces') and two numbers: ``data_share``, the share of log
       R's posterior precision its own data give (its measurement's information on R with its centre and lean unknown,
       and its bounds' EP site), 0-1, NaN where that site's precision came out negative; ``contested``, the share of
-      its stops claimed by context or another node (NaN with none); ``deleted``, the share of its pulses with echoes
-      the export deleted (an exact stem's: its piece's; NaN with none). A row's: its pieces' means;
+      its stops claimed by context or another node (NaN with none). A row's: its pieces' means;
 
     and per tree ``converged``, whether the censored solve settled; ``volume``, a dict of m^3: ``point`` (at each
     piece's posterior R: the drawn geometry's, per-piece medians), ``mean`` (the volume of record), ``q05`` and
@@ -217,10 +216,7 @@ def joint_table(scans, a, b, window, threads: int = 0) -> dict[str, np.ndarray]:
     its signed impact on the axis and range of closest approach, how both move
     when the axis moves across itself, its chord through the tube, and its fate
     there: the first echo inside the chord is a stop; otherwise the pulse went
-    on. ``deleted`` says the export deleted an echo of the pulse that could lie
-    in the chord before its first recorded one (``las_return_number`` and
-    ``las_number_of_returns`` say which, and so between which recorded echoes
-    it lay; without return numbers, anywhere).
+    on.
 
     Parameters
     ----------
@@ -243,8 +239,6 @@ def joint_table(scans, a, b, window, threads: int = 0) -> dict[str, np.ndarray]:
       offset along the row's two cross directions;
     - ``c0``, ``c1``: the chord through the tube along the pulse (m);
     - ``stop``, ``x``: whether an echo lay inside the chord, and its range;
-    - ``deleted``: a deleted echo could lie in the chord before the first
-      recorded one;
     - ``early``: the pulse echoed before the tube (recorded whatever happened);
     - ``q``: the chance something behind records a pass (1);
     - ``row``, ``scan``, ``pulse``, ``n_echo``: where the pair came from.
