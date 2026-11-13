@@ -127,8 +127,9 @@ impl ErrorModel {
     }
 }
 
-/// What lies behind the elements, crudely: the diffuse exported-echo hazard (1/m), a ground plane's height (NaN for
-/// none), the elements' and the ground's reflectance (dB at full fill, face-on) and the longest range.
+/// What lies behind the elements, crudely: a diffuse echo hazard `kappa` (1/m) along every ray, a ground plane's
+/// height (NaN for none), the elements' and the ground's reflectance (dB at full fill, face-on) and the longest range.
+/// The ray likelihood reads the hazard only through [`Background::survival`] and [`Background::density`], per cell.
 #[derive(Debug, Clone, Copy)]
 pub struct Background {
     pub kappa: f64,
@@ -136,6 +137,18 @@ pub struct Background {
     pub wood_db: f64,
     pub ground_db: f64,
     pub t_max: f64,
+}
+
+impl Background {
+    /// The chance a pulse in `cell` meets no background echo before range `t`.
+    pub fn survival(&self, _cell: usize, t: f64) -> f64 {
+        (-self.kappa * t).exp()
+    }
+
+    /// The density (1/m) of the pulse's first background echo at range `t` in `cell`.
+    pub fn density(&self, cell: usize, t: f64) -> f64 {
+        self.kappa * self.survival(cell, t)
+    }
 }
 
 impl Default for Background {

@@ -329,9 +329,9 @@ pub struct CellPrediction {
 }
 
 
-/// One cell's log-likelihood: its first echo `obs` (NaN for none) against its layers (each with its element's
-/// surface class), the ground at `ground` = (range, cos) and the field, with every layer shifted by `delta`.
-fn cell_ll(echoes: &[f32], layers: &[(Layer, u8)], ground: Option<(f64, f64)>, delta: f64, em: &ErrorModel, sc: &Background) -> f64 {
+/// One cell's log-likelihood: its first echo (or none) against the background, its layers (each with its element's
+/// surface class) and the ground at `ground` = (range, cos), with every layer shifted by `delta`.
+fn cell_ll(cell: usize, echoes: &[f32], layers: &[(Layer, u8)], ground: Option<(f64, f64)>, delta: f64, em: &ErrorModel, sc: &Background) -> f64 {
     // the first echo only, for now
     let obs = echoes.first().map_or(f64::NAN, |&r| r as f64);
     let t_end = ground.map_or(sc.t_max, |g| g.0);
@@ -346,7 +346,7 @@ fn cell_ll(echoes: &[f32], layers: &[(Layer, u8)], ground: Option<(f64, f64)>, d
         if obs.is_finite() {
             let sd = em.depth_sd(k, ly.spread);
             let mu = ly.t + em.depth_bias(k, ly.t) + delta;
-            dens += (-sc.kappa * ly.t).exp() * none_kept * s * t_pdf((obs - mu) / sd, em.nu_e) / sd;
+            dens += sc.survival(cell, ly.t) * none_kept * s * t_pdf((obs - mu) / sd, em.nu_e) / sd;
             if ly.t < obs {
                 none_before_obs *= 1.0 - s;
             }
@@ -357,15 +357,15 @@ fn cell_ll(echoes: &[f32], layers: &[(Layer, u8)], ground: Option<(f64, f64)>, d
         let s = em.p_detect(sc.ground_db, beam * cg, tg);
         if obs.is_finite() {
             let sd = em.sigma_e[2];
-            dens += (-sc.kappa * tg).exp() * none_kept * s * t_pdf((obs - tg) / sd, em.nu_e) / sd;
+            dens += sc.survival(cell, tg) * none_kept * s * t_pdf((obs - tg) / sd, em.nu_e) / sd;
         }
         none_kept *= 1.0 - s;
     }
     if !obs.is_finite() {
-        return ((-sc.kappa * t_end).exp() * none_kept).max(1e-300).ln();
+        return (sc.survival(cell, t_end) * none_kept).max(1e-300).ln();
     }
     if obs < t_end {
-        dens += sc.kappa * (-sc.kappa * obs).exp() * none_before_obs;
+        dens += sc.density(cell, obs) * none_before_obs;
     }
     ((1.0 - em.p_outlier) * dens + em.p_outlier / sc.t_max).ln()
 }
@@ -374,8 +374,8 @@ fn cell_ll(echoes: &[f32], layers: &[(Layer, u8)], ground: Option<(f64, f64)>, d
 /// row over the scan's field nodes.
 struct ElemData {
     elem: usize,
-    /// (echoes, layers, ground, weight, the cell's log-likelihood against the empty scene)
-    cells: Vec<(Vec<f32>, Vec<(Layer, u8)>, Option<(f64, f64)>, f64, f64)>,
+    /// (cell, echoes, layers, ground, weight, the cell's log-likelihood against the empty scene)
+    cells: Vec<(usize, Vec<f32>, Vec<(Layer, u8)>, Option<(f64, f64)>, f64, f64)>,
     class: u8,
     support: u32,
     across: f64,
@@ -386,7 +386,7 @@ struct ElemData {
 impl ElemData {
     /// Its ray likelihood with its cells' depths shifted by δ.
     fn ll(&self, delta: f64, em: &ErrorModel, sc: &Background) -> f64 {
-        self.cells.iter().map(|(echoes, layers, ground, wt, base)| wt * (cell_ll(echoes, layers, *ground, delta, em, sc) - base)).sum()
+        self.cells.iter().map(|(cell, echoes, layers, ground, wt, base)| wt * (cell_ll(*cell, echoes, layers, *ground, delta, em, sc) - base)).sum()
     }
 }
 
@@ -460,8 +460,9 @@ fn scan_cost(v: &RangeImage, si: usize, rendered: &[Vec<(usize, Layer)>], elems:
         let el = &mut data[d];
         let sd = em.depth_sd(el.class, front.spread);
         el.support += (Outcome::of(obs, front.t, sd) == Outcome::On) as u32;
-        let echoes = v.echoes(cell).to_vec();
-        el.cells.push((echoes.clone(), layers, ground, wt, cell_ll(&echoes, &[], ground, 0.0, em, sc)));
+        let echoes = v.echoes(cell);
+        let base = cell_ll(cell, echoes, &[], ground, 0.0, em, sc);
+        el.cells.push((cell, echoes.to_vec(), layers, ground, wt, base));
     }
     let n = field.nodes.len();
     let x_of = |el: &ElemData, z: &[f64]| el.along.iter().map(|&(j, w)| w * z[j]).sum::<f64>();
@@ -983,7 +984,7 @@ mod tests {
                 let layers: Vec<(Layer, u8)> = ls.iter().map(|l| (*l, cls[0])).collect();
                 let echoes = v.echoes(cell);
                 let wt = 1.0 / (em.dispersion * em.multiplicity(echoes.first().map_or(ls[0].t, |&r| r as f64)));
-                wt * (cell_ll(echoes, &layers, None, delta, &em, &sc) - cell_ll(echoes, &[], None, 0.0, &em, &sc))
+                wt * (cell_ll(cell, echoes, &layers, None, delta, &em, &sc) - cell_ll(cell, echoes, &[], None, 0.0, &em, &sc))
             }).sum()
         };
         let m = gh_x.iter().map(|&x| ed(std::f64::consts::SQRT_2 * s_along * x)).fold(f64::NEG_INFINITY, f64::max);
