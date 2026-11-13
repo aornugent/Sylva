@@ -37,9 +37,11 @@
 //!   The surface class k (which sets the along spread, the bias and the noise) is the median class of the view's
 //!   echoes on the element's front. A scan's energy is the Laplace marginal of its data over its field
 //!   ([`scan_energy`]).
-//! - **Weights:** each cell counts `1/m(ρ)`, with m the footprints per cell (overlapping footprints). There is no
-//!   further design effect: with every fronted cell scored, the stand's discrimination holds untempered and a stick
-//!   under 1.5 footprints across gains nothing from a wider radius (slice 7c).
+//! - **Weights:** each cell counts `1 / (φ m(ρ))`, with m the footprints per cell (overlapping footprints) and φ
+//!   the error model's `dispersion`: one constant for every cell and every hypothesis, so it widens posteriors
+//!   without favouring any hypothesis (a quasi-likelihood). It replaced slice 7's ρ_res, `1 + (n − 1) ρ` with n an
+//!   element's own footprints, which differed between hypotheses and, once every fronted cell counted, favoured
+//!   the thinner (slice 7c).
 //!
 //! Cells no element touches cancel. Context (neighbours, competitors) enters as more elements in the set.
 
@@ -494,7 +496,7 @@ fn scan_energy(v: &View, si: usize, rendered: &[Vec<(usize, Layer)>], elems: &[E
         let obs = if v.state[cell] == state::ECHO { v.range[cell] as f64 } else { f64::NAN };
         let w = v.direction((cell / v.n_cols) as f64, (cell % v.n_cols) as f64);
         let ground = (sc.ground_z.is_finite() && w[2] < -1e-6).then(|| ((sc.ground_z - v.origin[2]) / w[2], -w[2]));
-        let wt = 1.0 / em.multiplicity(if obs.is_finite() { obs } else { front.t });
+        let wt = 1.0 / (em.dispersion * em.multiplicity(if obs.is_finite() { obs } else { front.t }));
         let el = &mut data[d];
         let sd = (em.sigma_e[el.class as usize].powi(2) + front.spread.powi(2)).sqrt();
         el.support += (cell_code(obs, front.t, sd) == code::ON) as u32;
@@ -502,7 +504,7 @@ fn scan_energy(v: &View, si: usize, rendered: &[Vec<(usize, Layer)>], elems: &[E
     }
     let n = field.nodes.len();
     let x_of = |el: &ElemData, z: &[f64]| el.along.iter().map(|&(j, w)| w * z[j]).sum::<f64>();
-    let objective = |z: &[f64]| 0.5 * z.iter().map(|x| x * x).sum::<f64>() - data.iter().map(|el| el.ll(x_of(el, z), drop, em, sc)).sum::<f64>();
+    let objective = |z: &[f64]| 0.5 * z.iter().map(|x| x * x).sum::<f64>() - data.par_iter().map(|el| el.ll(x_of(el, z), drop, em, sc)).sum::<f64>();
     // Newton with each element's −A as a quadratic in δ by central differences (negative curvature dropped); a step
     // at most 3 prior sds, halved until the objective falls, stopping under a millinat
     let h = 3e-4;
@@ -511,13 +513,16 @@ fn scan_energy(v: &View, si: usize, rendered: &[Vec<(usize, Layer)>], elems: &[E
     for it in 0..=MAX_NEWTON {
         let mut grad = nalgebra::DVector::from_column_slice(&z);
         hess = nalgebra::DMatrix::identity(n, n);
-        for el in &data {
+        // each element's slope and curvature in parallel (the costly part), then assembled
+        let quads: Vec<(f64, f64)> = data.par_iter().map(|el| {
             if el.along.is_empty() {
-                continue;
+                return (0.0, 0.0);
             }
             let x0 = x_of(el, &z);
             let (fm, f0, fp) = (el.ll(x0 - h, drop, em, sc), el.ll(x0, drop, em, sc), el.ll(x0 + h, drop, em, sc));
-            let (g, curv) = (-(fp - fm) / (2.0 * h), (-(fp - 2.0 * f0 + fm) / (h * h)).max(0.0));
+            (-(fp - fm) / (2.0 * h), (-(fp - 2.0 * f0 + fm) / (h * h)).max(0.0))
+        }).collect();
+        for (el, &(g, curv)) in data.iter().zip(&quads) {
             for &(i, wi) in &el.along {
                 grad[i] += g * wi;
                 for &(j, wj) in &el.along {
@@ -552,7 +557,7 @@ fn scan_energy(v: &View, si: usize, rendered: &[Vec<(usize, Layer)>], elems: &[E
         None => (0.0, nalgebra::DMatrix::zeros(n, n)),
     };
     let shared = 0.5 * z.iter().map(|x| x * x).sum::<f64>() + 0.5 * logdet;
-    let lls: Vec<f64> = data.iter().map(|el| el.ll(x_of(el, &z), drop, em, sc)).collect();
+    let lls: Vec<f64> = data.par_iter().map(|el| el.ll(x_of(el, &z), drop, em, sc)).collect();
     let u = shared - lls.iter().sum::<f64>();
     let rows = data.iter().zip(&lls).map(|(el, l)| {
         let var: f64 = el.along.iter().map(|&(i, wi)| el.along.iter().map(|&(j, wj)| wi * wj * cov[(i, j)]).sum::<f64>()).sum();
@@ -752,7 +757,7 @@ mod tests {
             buf.iter().map(|(&cell, ls)| {
                 let layers: Vec<(Layer, u8)> = ls.iter().map(|l| (*l, cls[0])).collect();
                 let obs = if v.state[cell] == state::ECHO { v.range[cell] as f64 } else { f64::NAN };
-                let wt = 1.0 / em.multiplicity(if obs.is_finite() { obs } else { ls[0].t });
+                let wt = 1.0 / (em.dispersion * em.multiplicity(if obs.is_finite() { obs } else { ls[0].t }));
                 wt * (cell_ll(obs, &layers, None, delta, drop_of(&em, &v), &em, &sc) - cell_ll(obs, &[], None, 0.0, drop_of(&em, &v), &em, &sc))
             }).sum()
         };

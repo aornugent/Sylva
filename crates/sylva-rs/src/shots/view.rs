@@ -105,6 +105,10 @@ pub struct ErrorModel {
     /// stands in for them. Each element carries its own misfit (a latent); this is the default a caller may
     /// override.
     pub misfit: [f64; 2],
+    /// Term A's dispersion φ: each cell's log-likelihood ratio counts `1/φ` (with the footprints' `1/m`), for what
+    /// the model leaves correlated between cells (the edge along a stick, faceting and other departures that every
+    /// cell of a section shares). Calibrated on the stand's injected-field coverage (research 130 slice 7c).
+    pub dispersion: f64,
 }
 
 impl Default for ErrorModel {
@@ -126,6 +130,7 @@ impl Default for ErrorModel {
             p_drop: f64::NAN,
             p_outlier: 0.01,
             misfit: [0.002, 0.1],
+            dispersion: 4.0,
         }
     }
 }

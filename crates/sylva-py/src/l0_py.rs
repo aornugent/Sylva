@@ -48,6 +48,7 @@ fn error_model(d: Option<&Bound<'_, PyDict>>) -> PyResult<ErrorModel> {
             "p_drop" => m.p_drop = x(&v)?,
             "p_outlier" => m.p_outlier = x(&v)?,
             "misfit" => m.misfit = v.extract()?,
+            "dispersion" => m.dispersion = x(&v)?,
             _ => return Err(bad(&k)),
         }
     }
@@ -61,7 +62,7 @@ fn l0_error_model<'py>(py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
     let d = PyDict::new(py);
     for (k, v) in [("beam_exit", m.beam.exit), ("beam_divergence", m.beam.divergence), ("step", m.step), ("nu_e", m.nu_e), ("bias_ref", m.bias_ref),
                    ("field_spacing", m.field_spacing), ("cut_db", m.cut_db), ("refl_noise_db", m.refl_noise_db), ("p_drop", m.p_drop),
-                   ("p_outlier", m.p_outlier)] {
+                   ("p_outlier", m.p_outlier), ("dispersion", m.dispersion)] {
         d.set_item(k, v)?;
     }
     d.set_item("class_edges", m.class_edges.to_vec())?;
