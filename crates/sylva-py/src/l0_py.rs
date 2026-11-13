@@ -45,6 +45,7 @@ fn error_model(d: Option<&Bound<'_, PyDict>>) -> PyResult<ErrorModel> {
             "ghost" => m.ghost = x(&v)?,
             "ghost_depth" => m.ghost_depth = x(&v)?,
             "misfit" => m.misfit = v.extract()?,
+            "lateral" => m.lateral = x(&v)?,
             "edges" => m.edges = v.extract()?,
             "edge_fill" => m.edge_fill = x(&v)?,
             "medial_offset" => m.medial_offset = v.extract()?,
@@ -67,6 +68,7 @@ fn l0_error_model<'py>(py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
     d.set_item("bias", m.bias.to_vec())?;
     d.set_item("sigma_l", m.sigma_l.to_vec())?;
     d.set_item("misfit", m.misfit.to_vec())?;
+    d.set_item("lateral", m.lateral)?;
     d.set_item("edges", m.edges)?;
     d.set_item("edge_fill", m.edge_fill)?;
     d.set_item("medial_offset", m.medial_offset)?;
@@ -184,7 +186,7 @@ fn l0_predict<'py>(py: Python<'py>, view: PyRef<'py, PyView>, sticks: PyReadonly
     d.set_item("cell", p.iter().map(|x| x.cell as i64).collect::<Vec<_>>().into_pyarray(py))?;
     d.set_item("stick", p.iter().map(|x| x.stick).collect::<Vec<_>>().into_pyarray(py))?;
     d.set_item("surface", p.iter().map(|x| x.surface).collect::<Vec<_>>().into_pyarray(py))?;
-    for (k, f) in [("fill", (|x: &sylva_rs::shots::rays::Prediction| x.fill) as fn(&_) -> f64), ("kept", |x| x.kept), ("depth", |x| x.depth), ("sd", |x| x.sd), ("obs", |x| x.obs), ("misfit", |x| x.misfit)] {
+    for (k, f) in [("fill", (|x: &sylva_rs::shots::rays::Prediction| x.fill) as fn(&_) -> f64), ("kept", |x| x.kept), ("depth", |x| x.depth), ("sd", |x| x.sd), ("obs", |x| x.obs), ("misfit", |x| x.misfit), ("x", |x| x.x), ("s", |x| x.s)] {
         d.set_item(k, p.iter().map(f).collect::<Vec<_>>().into_pyarray(py))?;
     }
     Ok(d)
@@ -242,6 +244,7 @@ fn l0_elements<'py>(py: Python<'py>, views: Vec<PyRef<'py, PyView>>, lo: [f64; 3
     d.set_item("r", el.iter().map(|e| e.r).collect::<Vec<_>>().into_pyarray(py))?;
     d.set_item("ratio", el.iter().map(|e| e.ratio).collect::<Vec<_>>().into_pyarray(py))?;
     d.set_item("n", el.iter().map(|e| e.n).collect::<Vec<_>>().into_pyarray(py))?;
+    d.set_item("extent", el.iter().map(|e| e.extent).collect::<Vec<_>>().into_pyarray(py))?;
     d.set_item("scan_n", el.iter().flat_map(|e| e.scan_n.clone()).collect::<Vec<_>>().into_pyarray(py).reshape([k, s])?)?;
     d.set_item("arc", el.iter().flat_map(|e| e.arc.clone()).collect::<Vec<_>>().into_pyarray(py).reshape([k, s])?)?;
     d.set_item("excess", el.iter().flat_map(|e| e.excess.clone()).collect::<Vec<_>>().into_pyarray(py).reshape([k, s])?)?;

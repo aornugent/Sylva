@@ -117,6 +117,9 @@ pub struct ErrorModel {
     /// identifiable here (synthesis §3), so a scale stands in for them. This is a prior any reconstruction may
     /// override.
     pub misfit: [f64; 2],
+    /// Misregistration across the beam (rad): a view's silhouette sits off by about this times the range. It spreads
+    /// the located edges of term C; a held-out prediction integrates it as a shift (research 130 slice 6).
+    pub lateral: f64,
     /// Term C: each view's located silhouette edges score the section's support function, and the fill band under
     /// 0.5 leaves A's cells. A stick's edge is where its fill falls to `edge_fill`, the selection latent on fill:
     /// 0.2 by maximum likelihood on the simulated stand's true sticks (with ghosts then 0; research 130 slice 3).
@@ -148,6 +151,7 @@ impl Default for ErrorModel {
             ghost: 0.0,
             ghost_depth: 0.5,
             misfit: [0.002, 0.1],
+            lateral: 0.0,
             edges: true,
             edge_fill: 0.2,
             medial_offset: false,

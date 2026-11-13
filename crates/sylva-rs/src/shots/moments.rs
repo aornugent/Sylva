@@ -199,6 +199,8 @@ pub struct Element {
     pub ratio: f64,
     pub lam: [f64; 3],
     pub n: f64,
+    /// The neighbourhood's extent: the sd of its surfels' positions along their widest direction (m).
+    pub extent: f64,
     pub scan_n: Vec<f64>,
     pub arc: Vec<f64>,
     pub excess: Vec<f64>,
@@ -280,6 +282,7 @@ impl Moments {
                     .collect();
                 Some(Element {
                     key: *k, point, u, r, ratio: if s0 > 0.0 { s1 / s0 } else { f64::NAN }, lam: all.tensor(), n: all.n,
+                    extent: eig(&(all.spp / all.n - c * c.transpose())).0[0].max(0.0).sqrt(),
                     scan_n: per.iter().map(|m| m.n).collect(),
                     arc,
                     excess: per.iter().zip(&self.origins).map(|(m, o)| m.excess(o, step)).collect(),

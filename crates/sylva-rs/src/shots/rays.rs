@@ -45,7 +45,8 @@ pub const K: usize = 3;
 /// Quadrature nodes over the offset, spanning ±4 sd.
 const NODES: usize = 21;
 
-/// A stick: an axis from `a` to `b` (world, m), a radius, its surface class (0-2, or negative for "from the view")
+/// A stick: an axis from `a` to `b` (world, m), a radius (with `a == b`, a ball of that radius: a leaf patch or
+/// clump with extent, its section a disc in every view), its surface class (0-2, or negative for "from the view")
 /// and its opacity: the chance a pulse its section fills meets solid there, its gaps wider than the footprint (1
 /// solid wood, less for a porous clump; synthesis §1's "extent, opacity"). A full-fill cell keeps an echo from it
 /// with `opacity × sel`, and passes `1 − opacity f` of the beam on. An element property, a latent the caller
@@ -122,10 +123,11 @@ fn render(v: &View, s: &Stick, id: u32, em: &ErrorModel) -> Vec<(usize, Layer)> 
     let mut out = Vec::new();
     let ax = sub(&s.b, &s.a);
     let len = norm(&ax);
-    if !(len > 0.0) || !(s.r > 0.0) {
+    if !(s.r > 0.0) {
         return out;
     }
-    let u = ax.map(|x| x / len);
+    let ball = !(len > 0.0);
+    let u = if ball { [0.0, 0.0, 1.0] } else { ax.map(|x| x / len) };
     let half = 0.5 * len;
     let mid = [0, 1, 2].map(|k| 0.5 * (s.a[k] + s.b[k]));
     let c = sub(&mid, &v.origin);
@@ -139,32 +141,38 @@ fn render(v: &View, s: &Stick, id: u32, em: &ErrorModel) -> Vec<(usize, Layer)> 
     let cu = dot(&c, &u);
     let bv = [0, 1, 2].map(|k| -(c[k] - cu * u[k]));
     let bb = dot(&bv, &bv);
-    let side = crate::transform::normalize(&crate::transform::cross(&u, &c));
+    let side = crate::transform::normalize(&crate::transform::cross(&if ball { [0.0, 0.0, 1.0] } else { u }, &c));
     let sm = em.misfit_sd(s.r);
     let (li, ki) = (l0.round() as i64, k0.round() as i64);
     for l in (li - dl).max(0)..=(li + dl).min(v.n_lines as i64 - 1) {
         for k in (ki - dc).max(0)..=(ki + dc).min(v.n_cols as i64 - 1) {
             let w = v.direction(l as f64, k as f64);
-            let wu = dot(&w, &u);
-            let a = [0, 1, 2].map(|j| w[j] - wu * u[j]);
-            let aa = dot(&a, &a);
-            if aa < 1e-12 {
-                continue;
-            }
-            let ab = dot(&a, &bv);
-            let tm = -ab / aa;
-            let along = tm * wu - cu;
+            // the ray's closest approach to the axis (to the centre for a ball): range, distance, place along it
+            let (tm, d, along, sin, q) = if ball {
+                let tm = dot(&w, &c);
+                let q = [0, 1, 2].map(|j| tm * w[j] - c[j]);
+                (tm, norm(&q), 0.0, 1.0, q)
+            } else {
+                let wu = dot(&w, &u);
+                let a = [0, 1, 2].map(|j| w[j] - wu * u[j]);
+                let aa = dot(&a, &a);
+                if aa < 1e-12 {
+                    continue;
+                }
+                let ab = dot(&a, &bv);
+                let tm = -ab / aa;
+                let along = tm * wu - cu;
+                (tm, (bb - ab * ab / aa).max(0.0).sqrt(), along, aa.sqrt(), [0, 1, 2].map(|j| tm * w[j] - c[j] - along * u[j]))
+            };
             if tm <= 0.0 || along.abs() > half {
                 continue;
             }
-            let d = (bb - ab * ab / aa).max(0.0).sqrt();
             let sd = (0.0625 * em.footprint(tm).powi(2) + sm * sm).sqrt();
             let f = phi((s.r - d) / sd) - phi((-s.r - d) / sd);
             if f < 0.01 && !(em.edges && d < s.r + 3.0 * sd + 2.0 * em.step * tm) {
                 continue;
             }
-            let x = dot(&[0, 1, 2].map(|j| tm * w[j] - c[j] - along * u[j]), &side);
-            let sin = aa.sqrt();
+            let x = if ball { d } else { dot(&q, &side) };
             let depth = |x: f64| tm - (s.r * s.r - x * x).max(0.0).sqrt() / sin;
             let x2 = (d + sd).min(s.r);
             let x1 = (d - sd).max(0.0).min(x2);
@@ -255,6 +263,9 @@ pub struct Prediction {
     pub obs: f64,
     /// The stick's misfit sd (m), included in `sd`.
     pub misfit: f64,
+    /// Where the cell's ray passes the axis: across it (signed, m) and along it (m); for a ball, the distance.
+    pub x: f64,
+    pub s: f64,
 }
 
 pub fn predict(v: &View, sticks: &[Stick], em: &ErrorModel, sc: &Scene) -> Vec<Prediction> {
@@ -271,6 +282,8 @@ pub fn predict(v: &View, sticks: &[Stick], em: &ErrorModel, sc: &Scene) -> Vec<P
                 depth: ly.t + em.depth_bias(k, ly.t),
                 sd: (em.sigma_e[k as usize].powi(2) + ly.spread.powi(2) + 0.5 * same * same).sqrt(),
                 misfit: em.misfit_sd(sticks[ly.stick as usize].r),
+                x: ly.x,
+                s: ly.s,
                 obs: if v.state[cell] == state::ECHO { v.range[cell] as f64 } else { f64::NAN },
             }
         })
@@ -528,7 +541,7 @@ fn edge_ll(v: &View, cells: &[(usize, Layer)], s: &Stick, k: u8, zt: f64, sd_lat
         let fp = em.footprint(t);
         let sdf = (0.0625 * fp * fp + sm * sm).sqrt();
         let xe = s.r + zt * sdf;
-        let se = (sm * sm + sd_lat * sd_lat + (sdf / 3.0).powi(2)).sqrt();
+        let se = (sm * sm + sd_lat * sd_lat + (sdf / 3.0).powi(2) + (em.lateral * t).powi(2)).sqrt();
         let w = (em.step * t / fp).min(1.0);
         for side in [1.0, -1.0] {
             let x_in = cs.iter().filter(|c| c.1 == ON).map(|c| side * c.0).fold(f64::NEG_INFINITY, f64::max);
