@@ -93,19 +93,6 @@ pub struct ErrorModel {
     pub field_spacing: f64,
     pub field_along: [f64; 3],
     pub field_epoch: [f64; 3],
-    /// The residual overdispersion (design §4's ρ_res): an element's `n` footprints in a scan count as
-    /// `n / (1 + (n − 1) ρ)`, for the occupancy correlation the field and the rendered latents don't carry (the
-    /// shape latent doesn't carry it either, slice 7b).
-    pub rho: f64,
-    /// The shape latent (research 130 slice 7b, offset-field-design §2): a stick's section departs from its circle
-    /// by a random function of the angle about its axis, a multivariate t with `shape_nu` degrees of freedom and
-    /// scale its misfit, correlated over `shape_angle` (rad; a periodic squared exponential), its first harmonics
-    /// out. It is constant along the stick and couples the scans that see it; the misfit's blur of each cell stays,
-    /// for the departures along the stick. Off by default: on the stand it didn't carry what ρ_res carries (slice
-    /// 7b), and heavy tails (ν 4) let a wrong hypothesis buy its misfit cheaply.
-    pub shape: bool,
-    pub shape_angle: f64,
-    pub shape_nu: f64,
     /// The export: echoes under `cut_db` after a per-echo reflectance error of `refl_noise_db` are deleted, and
     /// a kept echo is lost anyway with `p_drop` (NaN: each view's measured in-surface deletion, `View::deletion`).
     /// Echo densities carry a uniform outlier share `p_outlier`.
@@ -118,9 +105,6 @@ pub struct ErrorModel {
     /// stands in for them. Each element carries its own misfit (a latent); this is the default a caller may
     /// override.
     pub misfit: [f64; 2],
-    /// Term C: a stick's edge is where its fill falls to `edge_fill`, the selection latent on fill: 0.2 by maximum
-    /// likelihood on the simulated stand's true sticks (research 130 slice 3).
-    pub edge_fill: f64,
 }
 
 impl Default for ErrorModel {
@@ -137,16 +121,11 @@ impl Default for ErrorModel {
             field_spacing: 2.0,
             field_along: [0.0011, 0.00165, 0.0021],
             field_epoch: [0.0014, 0.0023, 0.0035],
-            rho: 0.3,
-            shape: false,
-            shape_angle: 1.0,
-            shape_nu: 1e6,
             cut_db: -25.0,
             refl_noise_db: 2.0,
             p_drop: f64::NAN,
             p_outlier: 0.01,
             misfit: [0.002, 0.1],
-            edge_fill: 0.2,
         }
     }
 }
