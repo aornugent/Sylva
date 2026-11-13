@@ -7,8 +7,8 @@
 //! prior and the dispersion) and the background ([`Background`]: a diffuse echo hazard and a ground plane).
 
 /// The error model, as data. Defaults are AM's calibration (alignment-rca, research 129): per surface class
-/// (solid, mid, fragmented) the per-echo noise, the depth bias and the per-scan offset's spread; the export's
-/// reflectance cut (sim-clumps' calibration); the VZ-400i beam.
+/// (solid, mid, fragmented) the per-echo noise, the depth bias and the per-scan offset's spread; the detection
+/// floor; the VZ-400i beam.
 #[derive(Debug, Clone, Copy)]
 pub struct ErrorModel {
     /// The beam: its diameter at the exit (m) and full divergence (rad); the footprint at range ρ is
@@ -33,12 +33,15 @@ pub struct ErrorModel {
     pub field_spacing: f64,
     pub field_along: [f64; 3],
     pub field_epoch: [f64; 3],
-    /// The export: echoes under `cut_db` after a per-echo reflectance error of `refl_noise_db` are deleted, and
-    /// a kept echo is lost anyway with `p_drop` (NaN: each view's measured in-surface deletion, `RangeImage::deletion`).
-    /// Echo densities carry a uniform outlier share `p_outlier`.
-    pub cut_db: f64,
-    pub refl_noise_db: f64,
-    pub p_drop: f64,
+    /// The detection floor: an echo is recorded when its reflectance (dB, the surface's at full fill and face-on plus
+    /// `10 log10` of its energy share) clears `floor_db + floor_slope log10(max(ρ, floor_ref) / floor_ref)` at range ρ,
+    /// within a spread `detect_sd` (dB). The scanner's floor is in amplitude, so in reflectance it rises with range
+    /// (AM's raw scans: about −40.5 dB to 7 m, then 15 dB a decade). Echo densities carry a uniform outlier share
+    /// `p_outlier`.
+    pub floor_db: f64,
+    pub floor_slope: f64,
+    pub floor_ref: f64,
+    pub detect_sd: f64,
     pub p_outlier: f64,
     /// The per-element misfit's declared prior: the section and axis depart from the form by an sd of
     /// `misfit[0] + misfit[1] R` (m). Fourier terms past a₀ aren't identifiable here (synthesis §3), so a scale
@@ -67,9 +70,10 @@ impl Default for ErrorModel {
             field_spacing: 2.0,
             field_along: [0.0011, 0.00165, 0.0021],
             field_epoch: [0.0014, 0.0023, 0.0035],
-            cut_db: -25.0,
-            refl_noise_db: 2.0,
-            p_drop: f64::NAN,
+            floor_db: -40.5,
+            floor_slope: 15.0,
+            floor_ref: 7.0,
+            detect_sd: 2.0,
             p_outlier: 0.01,
             misfit: [0.002, 0.1],
             dispersion: 10.0,
@@ -102,6 +106,13 @@ impl ErrorModel {
         } else {
             2
         }
+    }
+
+    /// The chance an echo of energy share `e` (fill × cos) off a surface of reflectance `db` (dB) at range `range` is
+    /// recorded: above the detection floor.
+    pub fn p_detect(&self, db: f64, e: f64, range: f64) -> f64 {
+        let floor = self.floor_db + self.floor_slope * (range.max(self.floor_ref) / self.floor_ref).log10();
+        0.5 * libm::erfc(-((db + 10.0 * e.max(1e-12).log10() - floor) / self.detect_sd) / std::f64::consts::SQRT_2)
     }
 
     /// A stick's misfit sd (m) at radius r.

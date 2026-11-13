@@ -14,15 +14,14 @@
 //!   first, each with a depth, a depth spread, a fill and a cosine. Fill is the footprint (a Gaussian, sd =
 //!   footprint / 4, and the misfit) convolved with the section. Along a stick's axis it is cut square, so a chain of
 //!   sticks joins without seams.
-//! - **The ray likelihood, one cell:** its first exported echo, or none, against a diffuse exported-echo hazard κ along the ray
-//!   (the crude field), the layers in depth order, then a ground plane (the crude ground).
-//!   - The beam reaches layer i with energy `e_i = f_i Π_{j<i} (1 − op_j f_j)`, and its echo is kept with
-//!     `op_i sel_i`, where `sel_i = (1 − d) Φ((ρ_dB + 10 log10(e_i cos ι_i) − cut) / σ_refl)`: the export's
-//!     reflectance cut as a selection on fill, and d the view's measured in-surface deletion
-//!     ([`RangeImage::deletion`]).
+//! - **The ray likelihood, one cell:** its first echo, or none, against a diffuse echo hazard κ along the ray (the
+//!   background), the layers in depth order, then a ground plane.
+//!   - The beam reaches layer i with energy `e_i = f_i Π_{j<i} (1 − op_j f_j)`, and its echo is recorded with
+//!     `op_i det_i`, where `det_i` is the chance it clears the detection floor ([`ErrorModel::p_detect`]):
+//!     `Φ((ρ_dB + 10 log10(e_i cos ι_i) − floor(t_i)) / σ)`.
 //!   - An echo at r has density `Σ_i P_i op_i sel_i t_ν(r − t_i − bias_k − δ; σ_k ⊕ spread_i)` plus
-//!     `κ e^{−κr} Π_{t_j<r} (1 − op_j sel_j)`, where P_i is the chance that nothing nearer was kept, plus a uniform
-//!     outlier share. An empty cell has probability `e^{−κ t_end} Π (1 − op_j sel_j)`.
+//!     `κ e^{−κr} Π_{t_j<r} (1 − op_j det_j)`, where P_i is the chance that nothing nearer was kept, plus a uniform
+//!     outlier share. An empty cell has probability `e^{−κ t_end} Π (1 − op_j det_j)`.
 //!   - Every cell an element fronts at fill [`MIN_FILL`] or more counts, partial hits included, so every
 //!     hypothesis is scored on the same echoes (slice 7c: a gate at fill 0.5, with the band below it scored by
 //!     located edges, let a wider stick move echoes from the edges into the gate, where each is worth far more).
@@ -49,7 +48,7 @@
 //! Cells no element touches cancel. Context (neighbours, competitors) enters as more elements in the set.
 
 use super::model::{Background, ErrorModel};
-use super::range_image::{state, RangeImage};
+use super::range_image::{Cell, RangeImage};
 use std::sync::Arc;
 use crate::transform::{cross, dot, norm, normalize, sub};
 use crate::Point;
@@ -287,24 +286,13 @@ fn kbuffer(per: &[Vec<(usize, Layer)>], min_f: f64) -> HashMap<usize, Vec<Layer>
     buf
 }
 
-/// The probability an echo of energy share `e` (fill × cos) off a surface of `db` survives the export, with `drop`
-/// the export's loss inside surfaces.
-fn sel(drop: f64, em: &ErrorModel, db: f64, e: f64) -> f64 {
-    (1.0 - drop) * phi((db + 10.0 * e.max(1e-12).log10() - em.cut_db) / em.refl_noise_db)
-}
-
-/// The export's in-surface loss for a view: the error model's, or the view's measured one.
-fn drop_of(em: &ErrorModel, v: &RangeImage) -> f64 {
-    if em.p_drop.is_nan() { v.deletion } else { em.p_drop }
-}
-
 /// Each element's surface class in one view: the median class of the view's echoes on its front (mid where none).
 fn classes(v: &RangeImage, buf: &HashMap<usize, Vec<Layer>>, n: usize, em: &ErrorModel) -> Vec<u8> {
     let mut ex: Vec<Vec<f64>> = vec![Vec::new(); n];
     for (&cell, ls) in buf {
         let ly = ls[0];
         let r = v.range[cell] as f64;
-        if ly.f > 0.5 && v.state[cell] == state::ECHO && (r - ly.t).abs() < 0.03 && v.excess[cell].is_finite() {
+        if ly.f > 0.5 && v.cell[cell] == Cell::Echoes && (r - ly.t).abs() < 0.03 && v.excess[cell].is_finite() {
             ex[ly.elem as usize].push(v.excess[cell] as f64);
         }
     }
@@ -343,7 +331,9 @@ pub struct CellPrediction {
 
 /// One cell's log-likelihood: its first echo `obs` (NaN for none) against its layers (each with its element's
 /// surface class), the ground at `ground` = (range, cos) and the field, with every layer shifted by `delta`.
-fn cell_ll(obs: f64, layers: &[(Layer, u8)], ground: Option<(f64, f64)>, delta: f64, drop: f64, em: &ErrorModel, sc: &Background) -> f64 {
+fn cell_ll(echoes: &[f32], layers: &[(Layer, u8)], ground: Option<(f64, f64)>, delta: f64, em: &ErrorModel, sc: &Background) -> f64 {
+    // the first echo only, for now
+    let obs = echoes.first().map_or(f64::NAN, |&r| r as f64);
     let t_end = ground.map_or(sc.t_max, |g| g.0);
     let (mut beam, mut none_kept, mut none_before_obs, mut dens) = (1.0, 1.0, 1.0, 0.0);
     for &(ly, k) in layers {
@@ -352,7 +342,7 @@ fn cell_ll(obs: f64, layers: &[(Layer, u8)], ground: Option<(f64, f64)>, delta: 
         }
         let e = ly.f * beam;
         beam *= 1.0 - ly.f * ly.op;
-        let s = ly.op * sel(drop, em, sc.wood_db, e * ly.cos);
+        let s = ly.op * em.p_detect(sc.wood_db, e * ly.cos, ly.t);
         if obs.is_finite() {
             let sd = em.depth_sd(k, ly.spread);
             let mu = ly.t + em.depth_bias(k, ly.t) + delta;
@@ -364,7 +354,7 @@ fn cell_ll(obs: f64, layers: &[(Layer, u8)], ground: Option<(f64, f64)>, delta: 
         none_kept *= 1.0 - s;
     }
     if let Some((tg, cg)) = ground {
-        let s = sel(drop, em, sc.ground_db, beam * cg);
+        let s = em.p_detect(sc.ground_db, beam * cg, tg);
         if obs.is_finite() {
             let sd = em.sigma_e[2];
             dens += (-sc.kappa * tg).exp() * none_kept * s * t_pdf((obs - tg) / sd, em.nu_e) / sd;
@@ -384,8 +374,8 @@ fn cell_ll(obs: f64, layers: &[(Layer, u8)], ground: Option<(f64, f64)>, delta: 
 /// row over the scan's field nodes.
 struct ElemData {
     elem: usize,
-    /// (obs, layers, ground, weight, the cell's log-likelihood against the empty scene)
-    cells: Vec<(f64, Vec<(Layer, u8)>, Option<(f64, f64)>, f64, f64)>,
+    /// (echoes, layers, ground, weight, the cell's log-likelihood against the empty scene)
+    cells: Vec<(Vec<f32>, Vec<(Layer, u8)>, Option<(f64, f64)>, f64, f64)>,
     class: u8,
     support: u32,
     across: f64,
@@ -395,8 +385,8 @@ struct ElemData {
 
 impl ElemData {
     /// Its ray likelihood with its cells' depths shifted by δ.
-    fn ll(&self, delta: f64, drop: f64, em: &ErrorModel, sc: &Background) -> f64 {
-        self.cells.iter().map(|(obs, layers, ground, wt, base)| wt * (cell_ll(*obs, layers, *ground, delta, drop, em, sc) - base)).sum()
+    fn ll(&self, delta: f64, em: &ErrorModel, sc: &Background) -> f64 {
+        self.cells.iter().map(|(echoes, layers, ground, wt, base)| wt * (cell_ll(echoes, layers, *ground, delta, em, sc) - base)).sum()
     }
 }
 
@@ -440,7 +430,6 @@ fn scan_cost(v: &RangeImage, si: usize, rendered: &[Vec<(usize, Layer)>], elems:
     let per = rendered;
     let buf = kbuffer(per, MIN_FILL);
     let cls = classes(v, &buf, elems.len(), em);
-    let drop = drop_of(em, v);
     let other = v.epoch != ref_epoch;
     let mut field = OffsetField { nodes: HashMap::new() };
     let mut data: Vec<ElemData> = Vec::new();
@@ -464,19 +453,20 @@ fn scan_cost(v: &RangeImage, si: usize, rendered: &[Vec<(usize, Layer)>], elems:
         let front = ls[0];
         let Some(&d) = by_elem.get(&front.elem) else { continue };
         let layers: Vec<(Layer, u8)> = ls.iter().map(|l| (*l, cls[l.elem as usize])).collect();
-        let obs = if v.state[cell] == state::ECHO { v.range[cell] as f64 } else { f64::NAN };
+        let obs = if v.cell[cell] == Cell::Echoes { v.range[cell] as f64 } else { f64::NAN };
         let w = v.direction((cell / v.n_cols) as f64, (cell % v.n_cols) as f64);
         let ground = (sc.ground_z.is_finite() && w[2] < -1e-6).then(|| ((sc.ground_z - v.origin[2]) / w[2], -w[2]));
         let wt = 1.0 / (em.dispersion * em.multiplicity(if obs.is_finite() { obs } else { front.t }));
         let el = &mut data[d];
         let sd = em.depth_sd(el.class, front.spread);
         el.support += (Outcome::of(obs, front.t, sd) == Outcome::On) as u32;
-        el.cells.push((obs, layers, ground, wt, cell_ll(obs, &[], ground, 0.0, drop, em, sc)));
+        let echoes = v.echoes(cell).to_vec();
+        el.cells.push((echoes.clone(), layers, ground, wt, cell_ll(&echoes, &[], ground, 0.0, em, sc)));
     }
     let n = field.nodes.len();
     let x_of = |el: &ElemData, z: &[f64]| el.along.iter().map(|&(j, w)| w * z[j]).sum::<f64>();
     // sums in a fixed order, so the same elements always give the same cost to the bit
-    let objective = |z: &[f64]| 0.5 * z.iter().map(|x| x * x).sum::<f64>() - data.par_iter().map(|el| el.ll(x_of(el, z), drop, em, sc)).collect::<Vec<f64>>().iter().sum::<f64>();
+    let objective = |z: &[f64]| 0.5 * z.iter().map(|x| x * x).sum::<f64>() - data.par_iter().map(|el| el.ll(x_of(el, z), em, sc)).collect::<Vec<f64>>().iter().sum::<f64>();
     // Newton with each element's −A as a quadratic in δ by central differences (negative curvature dropped); a step
     // at most 3 prior sds, halved until the objective falls, stopping under a millinat
     let h = 3e-4;
@@ -491,7 +481,7 @@ fn scan_cost(v: &RangeImage, si: usize, rendered: &[Vec<(usize, Layer)>], elems:
                 return (0.0, 0.0);
             }
             let x0 = x_of(el, &z);
-            let (fm, f0, fp) = (el.ll(x0 - h, drop, em, sc), el.ll(x0, drop, em, sc), el.ll(x0 + h, drop, em, sc));
+            let (fm, f0, fp) = (el.ll(x0 - h, em, sc), el.ll(x0, em, sc), el.ll(x0 + h, em, sc));
             (-(fp - fm) / (2.0 * h), (-(fp - 2.0 * f0 + fm) / (h * h)).max(0.0))
         }).collect();
         for (el, &(g, curv)) in data.iter().zip(&quads) {
@@ -529,7 +519,7 @@ fn scan_cost(v: &RangeImage, si: usize, rendered: &[Vec<(usize, Layer)>], elems:
         None => (0.0, nalgebra::DMatrix::zeros(n, n)),
     };
     let shared = 0.5 * z.iter().map(|x| x * x).sum::<f64>() + 0.5 * logdet;
-    let lls: Vec<f64> = data.par_iter().map(|el| el.ll(x_of(el, &z), drop, em, sc)).collect();
+    let lls: Vec<f64> = data.par_iter().map(|el| el.ll(x_of(el, &z), em, sc)).collect();
     let u = shared - lls.iter().sum::<f64>();
     let rows = data.iter().zip(&lls).map(|(el, l)| {
         let var: f64 = el.along.iter().map(|&(i, wi)| el.along.iter().map(|&(j, wj)| wi * wj * cov[(i, j)]).sum::<f64>()).sum();
@@ -667,9 +657,9 @@ impl Scene {
             let ly = ls[0];
             let depth = ly.t + em.depth_bias(k, ly.t);
             let sd = em.depth_sd(k, ly.spread.hypot(off));
-            let obs = if v.state[cell] == state::ECHO { v.range[cell] as f64 } else { f64::NAN };
+            let obs = if v.cell[cell] == Cell::Echoes { v.range[cell] as f64 } else { f64::NAN };
             CellPrediction {
-                cell, elem: 0, fill: ly.f, kept: ly.op * sel(drop_of(em, v), em, self.sc.wood_db, ly.f * ly.cos), surface: k,
+                cell, elem: 0, fill: ly.f, kept: ly.op * em.p_detect(self.sc.wood_db, ly.f * ly.cos, ly.t), surface: k,
                 depth, sd, obs, outcome: Outcome::of(obs, depth, sd), weight: 1.0 / em.multiplicity(ly.t), footprint: em.footprint(ly.t), x: ly.x, s: ly.s,
             }
         }).collect();
@@ -796,34 +786,23 @@ mod tests {
     use crate::shots::reconstruct::dir;
     use crate::scene::range_image::RangeImageParams;
 
-    /// A scan of a vertical pole (R = 3 cm, 4 m away, centred on the y axis) in front of a wall at 8 m.
+    /// A scan of a vertical pole (R = 3 cm, 4 m away, centred on the y axis) in front of a wall at 8 m, with a finite
+    /// beam (as [`thin_pole_view`]).
     fn pole_image() -> RangeImage {
-        let (period, interval, zstep) = (6.6e-3, 0.825e-6, 0.03);
-        let (r_pole, y_pole) = (0.03, 4.0);
-        let (mut t, mut d, mut r) = (Vec::new(), Vec::new(), Vec::new());
-        for l in 0..200usize {
-            for k in 0..400usize {
-                let (zen, az) = (84.0 + zstep * k as f64, -3.0 + zstep * l as f64);
-                let w = dir(zen, az);
-                // ray against the infinite cylinder x² + (y − y_pole)² = R²
-                let (a, b, c) = (w[0] * w[0] + w[1] * w[1], -2.0 * w[1] * y_pole, y_pole * y_pole - r_pole * r_pole);
-                let disc = b * b - 4.0 * a * c;
-                let range = if disc > 0.0 { (-b - disc.sqrt()) / (2.0 * a) } else { 8.0 / w[1] };
-                t.push(l as f64 * period + k as f64 * interval);
-                d.push(w);
-                r.push(range as f32);
-            }
-        }
-        let id = [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]];
-        RangeImage::new(&t, &d, &r, id, [0.0; 3], 0, &RangeImageParams::default())
+        pole_scan(0.03, 4.0)
     }
 
     /// A scan of a thin vertical pole (radius `r`, `y` m away on the y axis) in front of a wall at 2y, with a
     /// finite beam: a pulse's footprint (Gaussian, sd footprint / 4) meets the pole over a fraction f of its
-    /// energy; its echo is kept where the export's cut keeps it (wood at −13.8 dB, cut at −25 dB: f cos > 0.076),
+    /// energy; its echo is recorded where it clears the detection floor (wood at −13.8 dB against the error model's
+    /// floor, within its 2 dB spread),
     /// at the footprint's Lambertian-weighted depth; otherwise the wall's echo. Sub-footprint widths leave partial
     /// hits, as a real scan does.
     fn thin_pole_view(r_pole: f64, y_pole: f64) -> Arc<RangeImage> {
+        Arc::new(pole_scan(r_pole, y_pole))
+    }
+
+    fn pole_scan(r_pole: f64, y_pole: f64) -> RangeImage {
         let (period, interval, zstep) = (6.6e-3, 0.825e-6, 0.03);
         let em = ErrorModel::default();
         let fp = 0.25 * em.footprint(y_pole);
@@ -837,11 +816,12 @@ mod tests {
                 let tm = y_pole * w[1] / (h * h);
                 let f = phi((r_pole - miss) / fp) - phi((-r_pole - miss) / fp);
                 let (depth, _, cos) = footprint_depth(tm, miss.abs(), r_pole, h, fp);
-                // the export's reflectance error (2 dB), drawn per pulse from a fixed hash
+                // the detection's spread (2 dB), drawn per pulse from a fixed hash
                 let u = |s: u64| ((s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407) >> 11) as f64 + 0.5) / (1u64 << 53) as f64;
                 let seed = (l * 400 + k) as u64 * 2 + 1;
                 let n = 2.0 * (-2.0 * u(seed).ln()).sqrt() * (2.0 * std::f64::consts::PI * u(seed * 7919)).cos();
-                let kept = -13.8 + 10.0 * (f * cos).max(1e-12).log10() + n > -25.0;
+                let floor = em.floor_db + em.floor_slope * (tm.max(em.floor_ref) / em.floor_ref).log10();
+                let kept = -13.8 + 10.0 * (f * cos).max(1e-12).log10() + n > floor;
                 let range = if kept { depth } else { 2.0 * y_pole / w[1] };
                 t.push(l as f64 * period + k as f64 * interval);
                 d.push(w);
@@ -849,7 +829,7 @@ mod tests {
             }
         }
         let id = [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]];
-        Arc::new(RangeImage::new(&t, &d, &r, id, [0.0; 3], 0, &RangeImageParams::default()))
+        RangeImage::from_first_echoes(&t, &d, &r, id, [0.0; 3], 0, &RangeImageParams::default())
     }
 
     fn pole_view() -> Arc<RangeImage> {
@@ -977,9 +957,11 @@ mod tests {
         // shift the pole's echoes 3 mm deeper: the field's along shift should find about that
         let shifted = {
             let mut w = pole_image();
-            for (k, r) in w.range.iter_mut().enumerate() {
-                if r.is_finite() && *r < 4.5 && w.state[k] == state::ECHO {
-                    *r += 0.003;
+            for k in 0..w.cell.len() {
+                if w.cell[k] == Cell::Echoes && w.range[k] < 4.5 {
+                    w.range[k] += 0.003;
+                    let i = w.echo_start[w.pulse[k] as usize] as usize;
+                    w.echo_range[i] += 0.003;
                 }
             }
             Arc::new(w)
@@ -999,9 +981,9 @@ mod tests {
         let ed = |delta: f64| -> f64 {
             buf.iter().map(|(&cell, ls)| {
                 let layers: Vec<(Layer, u8)> = ls.iter().map(|l| (*l, cls[0])).collect();
-                let obs = if v.state[cell] == state::ECHO { v.range[cell] as f64 } else { f64::NAN };
-                let wt = 1.0 / (em.dispersion * em.multiplicity(if obs.is_finite() { obs } else { ls[0].t }));
-                wt * (cell_ll(obs, &layers, None, delta, drop_of(&em, &v), &em, &sc) - cell_ll(obs, &[], None, 0.0, drop_of(&em, &v), &em, &sc))
+                let echoes = v.echoes(cell);
+                let wt = 1.0 / (em.dispersion * em.multiplicity(echoes.first().map_or(ls[0].t, |&r| r as f64)));
+                wt * (cell_ll(echoes, &layers, None, delta, &em, &sc) - cell_ll(echoes, &[], None, 0.0, &em, &sc))
             }).sum()
         };
         let m = gh_x.iter().map(|&x| ed(std::f64::consts::SQRT_2 * s_along * x)).fold(f64::NEG_INFINITY, f64::max);

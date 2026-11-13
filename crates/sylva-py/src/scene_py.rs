@@ -46,9 +46,10 @@ fn error_model(d: Option<&Bound<'_, PyDict>>) -> PyResult<ErrorModel> {
             "field_spacing" => m.field_spacing = x(&v)?,
             "field_along" => m.field_along = v.extract()?,
             "field_epoch" => m.field_epoch = v.extract()?,
-            "cut_db" => m.cut_db = x(&v)?,
-            "refl_noise_db" => m.refl_noise_db = x(&v)?,
-            "p_drop" => m.p_drop = x(&v)?,
+            "floor_db" => m.floor_db = x(&v)?,
+            "floor_slope" => m.floor_slope = x(&v)?,
+            "floor_ref" => m.floor_ref = x(&v)?,
+            "detect_sd" => m.detect_sd = x(&v)?,
             "p_outlier" => m.p_outlier = x(&v)?,
             "misfit" => m.misfit = v.extract()?,
             "dispersion" => m.dispersion = x(&v)?,
@@ -63,7 +64,7 @@ fn error_model(d: Option<&Bound<'_, PyDict>>) -> PyResult<ErrorModel> {
 fn error_model_defaults<'py>(py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {    let m = ErrorModel::default();
     let d = PyDict::new(py);
     for (k, v) in [("exit", m.exit), ("divergence", m.divergence), ("step", m.step), ("nu_e", m.nu_e), ("bias_ref", m.bias_ref),
-                   ("field_spacing", m.field_spacing), ("cut_db", m.cut_db), ("refl_noise_db", m.refl_noise_db), ("p_drop", m.p_drop),
+                   ("field_spacing", m.field_spacing), ("floor_db", m.floor_db), ("floor_slope", m.floor_slope), ("floor_ref", m.floor_ref), ("detect_sd", m.detect_sd),
                    ("p_outlier", m.p_outlier), ("dispersion", m.dispersion)] {
         d.set_item(k, v)?;
     }
@@ -122,9 +123,10 @@ fn elements_from_py(d: &Bound<'_, PyDict>, em: &ErrorModel) -> PyResult<Vec<Elem
         .collect())
 }
 
-/// One scan as a range image: its pulses in acquisition order (`time` s, `direction` world unit vectors,
-/// first-echo `range` with NaN for a pulse without one), its pose `rot` (3 × 3, world = rot · scanner + origin) and
-/// `epoch`.
+/// One scan as a range image: `RangeImage.from_file(path, epoch)` reads a shots file (every echo of every pulse
+/// that returned) and its sidecar's pose; `RangeImage(time, direction, range, rot, origin, epoch)` takes pulses with at
+/// most one echo each (`range` NaN for none) in acquisition order, `direction` world unit vectors and the pose `rot`
+/// (3 × 3, world = rot · scanner + origin).
 #[pyclass(name = "RangeImage", frozen)]
 struct PyRangeImage {
     inner: Arc<RangeImage>,
@@ -144,7 +146,7 @@ impl PyRangeImage {
         let ra = rot.as_array();
         let rot = [0, 1, 2].map(|i| [0, 1, 2].map(|j| ra[[i, j]]));
         let p = RangeImageParams::default();
-        let inner = py.detach(|| RangeImage::new(&t, &dir, &r, rot, [origin.0, origin.1, origin.2], epoch, &p));
+        let inner = py.detach(|| RangeImage::from_first_echoes(&t, &dir, &r, rot, [origin.0, origin.1, origin.2], epoch, &p));
         if inner.n_lines == 0 {
             return Err(PyValueError::new_err("no lattice: too few pulses"));
         }
@@ -156,13 +158,17 @@ impl PyRangeImage {
         (self.inner.n_lines, self.inner.n_cols)
     }
 
-    /// The export's in-surface deletion measured on this scan (RangeImage::deletion).
-    #[getter]
-    fn deletion(&self) -> f64 {
-        self.inner.deletion
+    /// One scan's range image from its shots file and the pose in its sidecar (`.json` beside it).
+    #[staticmethod]
+    #[pyo3(signature = (path, epoch=0))]
+    fn from_file(py: Python<'_>, path: std::path::PathBuf, epoch: u32) -> PyResult<Self> {
+        let p = RangeImageParams::default();
+        let inner = py.detach(|| RangeImage::from_file(&path, epoch, &p)).map_err(|e| PyValueError::new_err(e.to_string()))?;
+        Ok(PyRangeImage { inner: Arc::new(inner) })
     }
 
-    /// The cell arrays, each (n_lines, n_cols[, k]): state, range, pulse (-1 none), normal, cos_inc, excess; and
+    /// The cell arrays, each (n_lines, n_cols[, k]): cell (0 echoes, 1 miss, 2 no pulse), echoes (their count),
+    /// range (the first echo's), pulse (-1 none), normal, cos_inc, excess; and
     /// from the error model `err`, surface (class).
     #[pyo3(signature = (err=None))]
     fn arrays<'py>(&self, py: Python<'py>, err: Option<&Bound<'_, PyDict>>) -> PyResult<Bound<'py, PyDict>> {
@@ -170,7 +176,8 @@ impl PyRangeImage {
         let v = &self.inner;
         let sh = [v.n_lines, v.n_cols];
         let d = PyDict::new(py);
-        d.set_item("state", v.state.clone().into_pyarray(py).reshape(sh)?)?;
+        d.set_item("cell", v.cell.iter().map(|&c| c as u8).collect::<Vec<u8>>().into_pyarray(py).reshape(sh)?)?;
+        d.set_item("echoes", (0..v.cell.len()).map(|k| v.echoes(k).len() as u32).collect::<Vec<u32>>().into_pyarray(py).reshape(sh)?)?;
         d.set_item("range", v.range.clone().into_pyarray(py).reshape(sh)?)?;
         d.set_item("pulse", v.pulse.iter().map(|&p| if p == u32::MAX { -1 } else { p as i64 }).collect::<Vec<_>>().into_pyarray(py).reshape(sh)?)?;
         d.set_item("normal", v.normal.iter().flatten().copied().collect::<Vec<f32>>().into_pyarray(py).reshape([sh[0], sh[1], 3])?)?;

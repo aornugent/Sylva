@@ -44,10 +44,11 @@ branch `3dtrees/125-rebase`.
   `register` line, so a merge from upstream meets them nowhere else. No outputs.
 - `scene` scores proposed elements (sticks, and leaf patches as balls) against scans' range images by the ray
   likelihood (3dtrees research 130). `scene.lattice` places every pulse in its native (line, col) cell from its time;
-  `scene.range_image` is one scan's observations on that lattice and the signals read off them (normals, surface
-  continuity and class); `scene.moments` keeps surfel moments per (voxel, scan) and reads candidate elements off them;
-  `scene.model` holds the error model and the background; `scene.scene`'s `Scene` holds elements against range
+  `scene.range_image` is one scan's observations on that lattice, read from a raw shots file (every echo; a cell
+  without a pulse inside the pattern is a miss), and the signals read off them (normals, surface continuity and
+  class); `scene.moments` keeps surfel moments per (voxel, scan) and reads candidate elements off them;
+  `scene.model` holds the error model (its detection floor rising with range) and the background; `scene.scene`'s `Scene` holds elements against range
   images, each rendered once, with a per-scan along-beam offset field over which each scan's ray likelihood is
   integrated by a Laplace marginal, and returns its cost, the cost change of a move, and each element's counts and
   cell predictions. Bound as `_core.RangeImage`, `_core.Scene`, `_core.candidates` and `_core.error_model_defaults`
-  in `scene_py.rs`. 3dtrees needs them to score geometry and class hypotheses from the rays. Additive.
+  in `scene_py.rs`, with `ShotsFile::read_echo_f64` for per-echo attributes. 3dtrees needs them to score geometry and class hypotheses from the rays. Additive.

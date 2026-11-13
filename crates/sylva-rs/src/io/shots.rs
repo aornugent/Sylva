@@ -534,6 +534,21 @@ impl ShotsFile {
         Ok(Rays { zenith, azimuth, echo_count, range, attrs })
     }
 
+    /// One numeric echo attribute of one row group in double precision, in echo order (a pulse time needs more
+    /// than [`ShotsFile::read_rays`]' single precision).
+    pub fn read_echo_f64(&self, group: usize, name: &str) -> Result<Vec<f64>> {
+        let rg = self.reader.get_row_group(group)?;
+        let rows = rg.metadata().num_rows() as usize;
+        let first = if self.per_pulse { 3 } else { 1 };
+        let i = self.attrs.iter().position(|a| a.0 == name).ok_or_else(|| Error::invalid(format!("shots file: no echo attribute {name:?}")))?;
+        let c = rg.get_column_reader(first + 3 + i)?;
+        Ok(match self.attrs[i].1.as_str() {
+            "float64" => read_values::<DoubleType>(c, rows, true, reader_of!(DoubleColumnReader))?.0,
+            "float32" => read_values::<FloatType>(c, rows, true, reader_of!(FloatColumnReader))?.0.into_iter().map(f64::from).collect(),
+            other => return Err(Error::invalid(format!("shots file: echo attribute {name:?} is {other}, not real"))),
+        })
+    }
+
     /// Read every row group into one [`Shots`].
     pub fn read_all(&self) -> Result<Shots> {
         self.read_groups(&(0..self.n_groups()).collect::<Vec<_>>())
