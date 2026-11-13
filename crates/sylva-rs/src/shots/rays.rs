@@ -25,13 +25,18 @@
 //!     outlier share. An empty cell has probability `e^{−κ t_end} Π (1 − op_j sel_j)`.
 //! - **Term C, a stick's located silhouette edges** ([`edge_ll`]): the fill band under 0.5 leaves A's cells for C,
 //!   so no echo counts twice.
-//! - **The offset:** a cell belongs to the (scan, block) of its nearest element. Each group shares one offset δ
-//!   along the beam, the scan's offset field there. δ is drawn `t_ν_L(0, σ_L[k] / √2)`, with the cross-epoch part
-//!   added when the scans span epochs, and integrated once per group by quadrature. The surface class k (which
-//!   sets the spread, the bias and the noise) is the median class of the view's echoes on the element's front.
-//! - **Weights:** each cell counts `1/m(ρ)`, with m the footprints per cell (overlapping footprints), over the
-//!   design effect `1 + (n − 1) ρ` of its nearest element, n that element's fill-weighted footprints in the scan
-//!   (correlated misfit; the element is the unit).
+//! - **The offset field** (research 130 offset-field-design.md, slice 7): per scan, a 3-vector field on nodes ℓ
+//!   apart (trilinear hats, normalised), each node's components (along the beam, two across) in its beam frame,
+//!   with a Gaussian prior: along, unit, scaled at each element by its surface class's spread (and the other-epoch
+//!   part for a scan off the reference epoch); across, `α ρ`. A cell's depths shift by the field's along part at
+//!   its front element, a stick's term C by the across part along its silhouette's side. A scan's energy is the
+//!   Laplace marginal of its data over the nodes, so neighbours sharing nodes share one offset, and one scan's
+//!   joint evidence on a place is capped by the prior. The surface class k (which sets the along spread, the bias
+//!   and the noise) is the median class of the view's echoes on the element's front.
+//! - **Weights:** each cell counts `1/m(ρ)`, with m the footprints per cell (overlapping footprints). An element's
+//!   terms in a scan are tempered by the residual design effect `1 + (n − 1) ρ`, n its fill-weighted footprints:
+//!   the occupancy correlation the field doesn't carry (misfit is rendered as a blur, not as a random function of
+//!   the section's angle; design §4's ρ_res). Without it, untempered occupancy rewards covering more cells.
 //!
 //! Cells no element touches cancel. Context (neighbours, competitors) enters as more elements in the set.
 
@@ -39,12 +44,10 @@ use super::view::{state, ErrorModel, View};
 use crate::transform::{cross, dot, norm, normalize, sub};
 use crate::Point;
 use rayon::prelude::*;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 
 /// Layers kept per cell. A cell that runs out (rare among a few elements) drops its farthest.
 pub const K: usize = 3;
-/// Quadrature nodes over the offset, spanning ±4 sd.
-const NODES: usize = 21;
 
 /// An element's form.
 #[derive(Debug, Clone, Copy)]
@@ -128,9 +131,9 @@ struct Layer {
 }
 
 /// What one scan says about one element. `cells`: cells where it is the nearest layer at fill > 0.5; `support`:
-/// those with an echo on it; `across`: footprints across its diameter; `energy`: its share of its groups' energy
-/// (its cells' terms at the group's most likely offset, plus the group's remainder split by cells, plus its term
-/// C), so the rows sum to the total.
+/// those with an echo on it; `across`: footprints across its diameter; `energy`: its share of the scan's energy
+/// (its A and C terms at the field's mode, plus an equal share of the field's prior and log-determinant terms), so
+/// the rows sum to the total.
 #[derive(Debug, Clone, Copy)]
 pub struct Row {
     pub elem: u32,
@@ -140,9 +143,12 @@ pub struct Row {
     pub across: f64,
     pub surface: u8,
     pub energy: f64,
+    /// The offset field's posterior at the element in this scan: the along-beam shift and its sd, and the shift
+    /// across the beam along its silhouette's side (m).
+    pub shift_along: f64,
+    pub sd_along: f64,
+    pub shift_across: f64,
 }
-
-type Key = (u32, [i64; 3]);
 
 fn phi(x: f64) -> f64 {
     0.5 * libm::erfc(-x / std::f64::consts::SQRT_2)
@@ -293,7 +299,7 @@ fn classes(v: &View, buf: &HashMap<usize, Vec<Layer>>, n: usize, em: &ErrorModel
 
 /// What the elements predict in one view, per touched cell with a layer of fill `min_fill` or more: its nearest
 /// layer (element, fill, the chance its echo is kept, the echo's predicted depth with the bias, its sd: noise,
-/// spread, misfit and one scan's offset spread), the element's surface class, the observed first echo (NaN for
+/// spread, misfit and the offset field's along spread), the element's surface class, the observed first echo (NaN for
 /// none), the cell's code against the layer ([`cell_code`]), its weight `1/m(ρ)`, the footprint (m) at the layer,
 /// and where its ray passes the axis (across, along). For held-out checks: the cell arrays term A scores, without the scene.
 pub struct Prediction {
@@ -320,9 +326,9 @@ pub fn predict(v: &View, elems: &[Element], em: &ErrorModel, sc: &Scene, min_fil
         .map(|(&cell, ls)| {
             let ly = ls[0];
             let k = cls[ly.elem as usize];
-            let [same, _] = em.sigma_l[k as usize];
             let depth = ly.t + em.depth_bias(k, ly.t);
-            let sd = (em.sigma_e[k as usize].powi(2) + ly.spread.powi(2) + 0.5 * same * same).sqrt();
+            let off = if em.field { em.field_along[k as usize] } else { 0.0 };
+            let sd = (em.sigma_e[k as usize].powi(2) + ly.spread.powi(2) + off * off).sqrt();
             let obs = if v.state[cell] == state::ECHO { v.range[cell] as f64 } else { f64::NAN };
             Prediction {
                 cell, elem: ly.elem, fill: ly.f, kept: ly.op * sel(drop_of(em, v), em, sc.wood_db, ly.f * ly.cos), surface: k,
@@ -373,154 +379,238 @@ fn cell_ll(obs: f64, layers: &[(Layer, u8)], ground: Option<(f64, f64)>, delta: 
     ((1.0 - em.p_outlier) * dens + em.p_outlier / sc.t_max).ln()
 }
 
-/// The energy of `elems` against `views` (−log likelihood ratio against the empty scene), and its rows. With
-/// `only = Some(i)`, the energy change of adding element i to the others, `E(all) − E(all but i)`, over the groups
-/// it touches; rows are then empty.
-pub fn energy(views: &[&View], elems: &[Element], em: &ErrorModel, sc: &Scene, only: Option<usize>) -> (f64, Vec<Row>) {
-    let rendered: Vec<Vec<Vec<(usize, Layer)>>> = views.iter().map(|v| render_all(v, elems, em)).collect();
-    let bufs: Vec<HashMap<usize, Vec<Layer>>> = rendered.iter().map(|r| kbuffer(r, 0.5)).collect();
-    let classes: Vec<Vec<u8>> = views.iter().zip(&bufs).map(|(v, buf)| classes(v, buf, elems.len(), em)).collect();
-    let epochs = views.iter().map(|v| v.epoch).collect::<HashSet<u32>>().len() > 1;
-    // each element's design effect per view, from its fill-weighted footprints
-    let temper: Vec<Vec<f64>> = bufs
-        .iter()
-        .map(|buf| {
-            let mut n = vec![0.0; elems.len()];
-            for ls in buf.values() {
-                for l in ls {
-                    n[l.elem as usize] += l.f / em.multiplicity(l.t);
+/// One element's data in one scan, as functions of the offset field at it: its A cells (those it fronts at fill
+/// 0.5 or more), whose log-likelihood against the empty scene depends on the along-beam shift δ, and its term C,
+/// which depends on the shift τ across the beam (along its `side` direction).
+struct ElemData<'a> {
+    elem: usize,
+    cells: Vec<(f64, Vec<(Layer, u8)>, Option<(f64, f64)>, f64)>,
+    rendered: &'a [(usize, Layer)],
+    class: u8,
+    /// The element's along-beam spread in this scan (class, and the other-epoch part), and its across-beam unit
+    /// direction (the side of its silhouette) and range.
+    s_along: f64,
+    side: Point,
+    range: f64,
+    support: u32,
+    n_cells: u32,
+    across: f64,
+    /// Its fill-weighted footprints, and the residual design effect they give its terms (`1 / (1 + (n − 1) ρ)`).
+    n_fp: f64,
+    temper: f64,
+}
+
+impl ElemData<'_> {
+    fn a_ll(&self, delta: f64, drop: f64, em: &ErrorModel, sc: &Scene) -> f64 {
+        self.cells.iter().map(|(obs, layers, ground, wt)| wt * (cell_ll(*obs, layers, *ground, delta, drop, em, sc) - cell_ll(*obs, &[], *ground, 0.0, drop, em, sc))).sum()
+    }
+}
+
+/// A scan's offset-field nodes: trilinear hats on a grid of spacing ℓ, normalised so the field's variance is the
+/// same everywhere (`t(x) = Σ w_j z_j / √Σ w_j²`); each node carries (along, across₁, across₂) in its beam frame.
+struct Field {
+    nodes: HashMap<[i64; 3], usize>,
+    frames: Vec<[Point; 3]>,
+    ranges: Vec<f64>,
+}
+
+impl Field {
+    fn hats(x: &Point, l: f64) -> Vec<([i64; 3], f64)> {
+        let g = x.map(|v| v / l);
+        let f = g.map(|v| v.floor());
+        let mut out = Vec::with_capacity(8);
+        for c in 0..8 {
+            let o = [c & 1, (c >> 1) & 1, (c >> 2) & 1];
+            let w: f64 = (0..3).map(|k| if o[k] == 1 { g[k] - f[k] } else { 1.0 - (g[k] - f[k]) }).product();
+            if w > 1e-9 {
+                out.push(([0, 1, 2].map(|k| f[k] as i64 + o[k] as i64), w));
+            }
+        }
+        let n = out.iter().map(|(_, w)| w * w).sum::<f64>().sqrt();
+        out.iter_mut().for_each(|(_, w)| *w /= n);
+        out
+    }
+
+    fn node(&mut self, k: [i64; 3], origin: &Point, l: f64) -> usize {
+        if let Some(&i) = self.nodes.get(&k) {
+            return i;
+        }
+        let p = k.map(|v| v as f64 * l);
+        let w = normalize(&sub(&p, origin));
+        let b1 = normalize(&cross(&w, &if w[2].abs() < 0.9 { [0.0, 0.0, 1.0] } else { [1.0, 0.0, 0.0] }));
+        let b2 = cross(&w, &b1);
+        self.frames.push([w, b1, b2]);
+        self.ranges.push(norm(&sub(&p, origin)));
+        self.nodes.insert(k, self.frames.len() - 1);
+        self.frames.len() - 1
+    }
+}
+
+/// One scan's energy for one configuration (elements other than `skip`): the Laplace marginal of its data over
+/// the offset field's nodes, `U = −Σ_e [A_e(δ̂_e) + C_e(τ̂_e)] + ½ ẑᵀQẑ + ½ log|Λ Q⁻¹|`, with Λ the posterior
+/// precision at the mode. Returns U and per element (index, its share of U, δ̂, sd δ, τ̂, cells, support, across,
+/// class).
+#[allow(clippy::type_complexity)]
+fn scan_energy(v: &View, rendered: &[Vec<(usize, Layer)>], elems: &[Element], skip: Option<u32>, ref_epoch: u32, em: &ErrorModel, sc: &Scene)
+               -> (f64, Vec<(usize, f64, f64, f64, f64, u32, u32, f64, u8)>) {
+    let per: Vec<Vec<(usize, Layer)>> = rendered.iter().enumerate().map(|(i, r)| if Some(i as u32) == skip { Vec::new() } else { r.clone() }).collect();
+    let buf = kbuffer(&per, 0.5);
+    let cls = classes(v, &buf, elems.len(), em);
+    let drop = drop_of(em, v);
+    let zt = phi_inv(1.0 - em.edge_fill);
+    let other = v.epoch != ref_epoch;
+    // each element's data in this scan
+    let mut data: Vec<ElemData> = Vec::new();
+    let mut by_elem: HashMap<u32, usize> = HashMap::new();
+    for (i, e) in elems.iter().enumerate() {
+        if Some(i as u32) == skip || per[i].is_empty() {
+            continue;
+        }
+        let k = cls[i];
+        let mid = e.mid();
+        let c = sub(&mid, &v.origin);
+        let side = match e.form {
+            Form::Stick { a, b } => normalize(&cross(&normalize(&sub(&b, &a)), &c)),
+            Form::Patch { .. } => [0.0; 3],
+        };
+        let s_along = (em.field_along[k as usize].powi(2) + if other { em.field_epoch[k as usize].powi(2) } else { 0.0 }).sqrt();
+        by_elem.insert(i as u32, data.len());
+        data.push(ElemData { elem: i, cells: Vec::new(), rendered: &per[i], class: k, s_along, side, range: norm(&c), support: 0, n_cells: 0,
+                             across: 2.0 * e.r / em.footprint(norm(&c)), n_fp: 0.0, temper: 1.0 });
+    }
+    for (&cell, ls) in &buf {
+        let front = ls[0];
+        let Some(&d) = by_elem.get(&front.elem) else { continue };
+        let layers: Vec<(Layer, u8)> = ls.iter().map(|l| (*l, cls[l.elem as usize])).collect();
+        let obs = if v.state[cell] == state::ECHO { v.range[cell] as f64 } else { f64::NAN };
+        let w = v.direction((cell / v.n_cols) as f64, (cell % v.n_cols) as f64);
+        let ground = (sc.ground_z.is_finite() && w[2] < -1e-6).then(|| ((sc.ground_z - v.origin[2]) / w[2], -w[2]));
+        let wt = 1.0 / em.multiplicity(if obs.is_finite() { obs } else { front.t });
+        let el = &mut data[d];
+        el.n_cells += 1;
+        el.n_fp += front.f / em.multiplicity(front.t);
+        let sd = (em.sigma_e[el.class as usize].powi(2) + front.spread.powi(2)).sqrt();
+        el.support += (cell_code(obs, front.t, sd) == code::ON) as u32;
+        el.cells.push((obs, layers, ground, wt));
+    }
+    for el in data.iter_mut() {
+        el.temper = 1.0 / (1.0 + (el.n_fp - 1.0).max(0.0) * em.rho);
+    }
+    let a_c = |el: &ElemData, delta: f64| el.temper * el.a_ll(delta, drop, em, sc);
+    let c_c = |el: &ElemData, tau: f64| el.temper * edge_ll(v, el.rendered, &elems[el.elem], el.class, zt, tau, em);
+    // the field's design: each element's along and across rows over the nodes near it
+    let mut field = Field { nodes: HashMap::new(), frames: Vec::new(), ranges: Vec::new() };
+    let mut rows_a: Vec<Vec<(usize, f64)>> = Vec::new();
+    let mut rows_c: Vec<Vec<(usize, f64)>> = Vec::new();
+    for el in &data {
+        let (mut ra, mut rc) = (Vec::new(), Vec::new());
+        if em.field {
+            for (key, w) in Field::hats(&elems[el.elem].mid(), em.field_spacing) {
+                let j = field.node(key, &v.origin, em.field_spacing);
+                let f = field.frames[j];
+                ra.push((3 * j, w * el.s_along));
+                rc.push((3 * j + 1, w * dot(&el.side, &f[1])));
+                rc.push((3 * j + 2, w * dot(&el.side, &f[2])));
+            }
+        }
+        rows_a.push(ra);
+        rows_c.push(rc);
+    }
+    let n = 3 * field.frames.len();
+    // the prior precision: unit along (each element's class scale is in its row), (α ρ)⁻² across
+    let q: Vec<f64> = (0..n).map(|i| if i % 3 == 0 { 1.0 } else { (em.field_across * field.ranges[i / 3].max(1.0)).powi(-2) }).collect();
+    let dot_row = |row: &[(usize, f64)], z: &[f64]| row.iter().map(|&(i, w)| w * z[i]).sum::<f64>();
+    let objective = |z: &[f64]| -> f64 {
+        data.iter().enumerate().map(|(d, el)| -(a_c(el, dot_row(&rows_a[d], z)) + c_c(el, dot_row(&rows_c[d], z)))).sum::<f64>()
+            + 0.5 * z.iter().zip(&q).map(|(x, p)| p * x * x).sum::<f64>()
+    };
+    // Newton with numerical derivatives of each element's two scalar functions; negative curvature dropped
+    let mut z = vec![0.0; n];
+    let mut hess = nalgebra::DMatrix::<f64>::zeros(n, n);
+    let (ha, hc) = (3e-4, 5e-4);
+    for _ in 0..if n > 0 { 8 } else { 0 } {
+        let mut grad = nalgebra::DVector::<f64>::from_iterator(n, z.iter().zip(&q).map(|(x, p)| p * x));
+        hess = nalgebra::DMatrix::<f64>::from_diagonal(&nalgebra::DVector::from_vec(q.clone()));
+        for (d, el) in data.iter().enumerate() {
+            for (row, f, h) in [(&rows_a[d], &a_c as &dyn Fn(&ElemData, f64) -> f64, ha), (&rows_c[d], &c_c, hc)] {
+                if row.is_empty() {
+                    continue;
+                }
+                let x0 = dot_row(row, &z);
+                let (fm, f0, fp) = (f(el, x0 - h), f(el, x0), f(el, x0 + h));
+                let (g, curv) = ((fp - fm) / (2.0 * h), (-(fp - 2.0 * f0 + fm) / (h * h)).max(0.0));
+                for &(i, wi) in row.iter() {
+                    grad[i] -= g * wi;
+                    for &(j, wj) in row.iter() {
+                        hess[(i, j)] += curv * wi * wj;
+                    }
                 }
             }
-            n.iter().map(|&n| 1.0 / (1.0 + (n - 1.0f64).max(0.0) * em.rho)).collect()
+        }
+        let Some(ch) = hess.clone().cholesky() else { break };
+        let step = ch.solve(&grad);
+        let f_now = objective(&z);
+        let mut t = 1.0;
+        loop {
+            let zn: Vec<f64> = z.iter().zip(step.iter()).map(|(a, b)| a - t * b).collect();
+            if objective(&zn) <= f_now || t < 1e-3 {
+                z = zn;
+                break;
+            }
+            t *= 0.5;
+        }
+        if step.amax() * t < 1e-6 {
+            break;
+        }
+    }
+    let logdet = if n > 0 {
+        hess.clone().cholesky().map_or(0.0, |c| 2.0 * c.l().diagonal().iter().map(|x| x.ln()).sum::<f64>()) - q.iter().map(|p| p.ln()).sum::<f64>()
+    } else {
+        0.0
+    };
+    let cov = if n > 0 { hess.clone().try_inverse().unwrap_or_else(|| nalgebra::DMatrix::zeros(n, n)) } else { nalgebra::DMatrix::zeros(0, 0) };
+    let prior_term = 0.5 * z.iter().zip(&q).map(|(x, p)| p * x * x).sum::<f64>() + 0.5 * logdet;
+    let mut u = prior_term;
+    let mut out = Vec::new();
+    for (d, el) in data.iter().enumerate() {
+        let (da, tc) = (dot_row(&rows_a[d], &z), dot_row(&rows_c[d], &z));
+        let e_el = -(a_c(el, da) + c_c(el, tc));
+        u += e_el;
+        let var: f64 = rows_a[d].iter().map(|&(i, wi)| rows_a[d].iter().map(|&(j, wj)| wi * wj * cov[(i, j)]).sum::<f64>()).sum();
+        out.push((el.elem, e_el + prior_term / data.len() as f64, da, var.max(0.0).sqrt(), tc, el.n_cells, el.support, el.across, el.class));
+    }
+    (u, out)
+}
+
+/// The energy of `elems` against `views` (−log likelihood ratio against the empty scene), and its rows. Each scan's
+/// term is the Laplace marginal of its data over its offset field ([`scan_energy`]), the scans independent given
+/// the elements. With `only = Some(i)`, the energy change of adding element i to the others, `E(all) − E(all but
+/// i)`; rows are then empty. The reference epoch (whose scans take the same-day spread) is the first view's.
+pub fn energy(views: &[&View], elems: &[Element], em: &ErrorModel, sc: &Scene, only: Option<usize>) -> (f64, Vec<Row>) {
+    let ref_epoch = views.first().map_or(0, |v| v.epoch);
+    let per_scan: Vec<(f64, Vec<Row>)> = views
+        .par_iter()
+        .enumerate()
+        .map(|(si, v)| {
+            let rendered = render_all(v, elems, em);
+            let (u, rows) = scan_energy(v, &rendered, elems, None, ref_epoch, em, sc);
+            match only {
+                Some(i) => (u - scan_energy(v, &rendered, elems, Some(i as u32), ref_epoch, em, sc).0, Vec::new()),
+                None => (u, rows.into_iter().map(|(e, en, da, sda, tc, cells, support, across, surface)| Row {
+                    elem: e as u32, scan: si as u32, cells, support, across, surface, energy: en, shift_along: da, sd_along: sda, shift_across: tc,
+                }).collect()),
+            }
         })
         .collect();
-    let block = |i: u32| elems[i as usize].mid().map(|x| (x / em.block).floor() as i64);
-    // per cell, its group in a configuration that leaves out `skip`
-    let key_of = |si: usize, ls: &[Layer], skip: Option<u32>| ls.iter().find(|l| Some(l.elem) != skip).map(|l| (si as u32, block(l.elem)));
-    let skip_i = only.map(|i| i as u32);
-    let touched: Option<HashSet<Key>> = skip_i.map(|i| {
-        let mut g = HashSet::new();
-        for (si, buf) in bufs.iter().enumerate() {
-            for ls in buf.values() {
-                if ls.iter().any(|l| l.elem == i) {
-                    g.extend(key_of(si, ls, None));
-                    g.extend(key_of(si, ls, Some(i)));
-                }
-            }
-        }
-        g
-    });
-    // the configurations to score: all elements (+1), and without element i (−1)
-    let configs: Vec<(Option<u32>, f64)> = match skip_i {
-        None => vec![(None, 1.0)],
-        Some(i) => vec![(None, 1.0), (Some(i), -1.0)],
-    };
-    let mut total = 0.0;
-    let mut rows: HashMap<(u32, u32), Row> = HashMap::new();
-    // term C per (view, element), tempered as A; it doesn't see the offset (it lies across the beam)
-    let zt = phi_inv(1.0 - em.edge_fill);
-    for (si, v) in views.iter().enumerate() {
-        let cs: Vec<f64> = (0..elems.len())
-            .into_par_iter()
-            .map(|h| {
-                let k = classes[si][h];
-                temper[si][h] * edge_ll(v, &rendered[si][h], &elems[h], k, zt, sd_of(em, k, epochs), em)
-            })
-            .collect();
-        for (h, c) in cs.into_iter().enumerate() {
-            if only.is_none() || only == Some(h) {
-                total -= c;
-            }
-            if only.is_none() && c != 0.0 {
-                rows.entry((h as u32, si as u32))
-                    .or_insert(Row { elem: h as u32, scan: si as u32, cells: 0, support: 0, across: 0.0, surface: classes[si][h], energy: 0.0 })
-                    .energy -= c;
-            }
-        }
-    }
-    for &(skip, sign) in &configs {
-        // per group: the weighted log-likelihood at each offset node, the empty scene's, and its elements' shares
-        struct Acc {
-            ll: [f64; NODES],
-            ll0: f64,
-            members: HashMap<u32, (f64, [f64; NODES])>,
-        }
-        let mut groups: HashMap<Key, Acc> = HashMap::new();
-        for (si, (v, buf)) in views.iter().zip(&bufs).enumerate() {
-            let cells: Vec<(usize, &Vec<Layer>)> = buf.iter().map(|(&c, ls)| (c, ls)).collect();
-            let drop = drop_of(em, v);
-            let terms: Vec<Option<(Key, u32, f64, [f64; NODES])>> = cells
-                .par_iter()
-                .map(|&(cell, ls)| {
-                    let key = key_of(si, ls, skip)?;
-                    if touched.as_ref().is_some_and(|t| !t.contains(&key)) {
-                        return None;
-                    }
-                    let layers: Vec<(Layer, u8)> = ls.iter().filter(|l| Some(l.elem) != skip).map(|l| (*l, classes[si][l.elem as usize])).collect();
-                    let front = layers[0].0;
-                    let obs = if v.state[cell] == state::ECHO { v.range[cell] as f64 } else { f64::NAN };
-                    let w = v.direction((cell / v.n_cols) as f64, (cell % v.n_cols) as f64);
-                    let ground = (sc.ground_z.is_finite() && w[2] < -1e-6).then(|| ((sc.ground_z - v.origin[2]) / w[2], -w[2]));
-                    let wt = temper[si][front.elem as usize] / em.multiplicity(if obs.is_finite() { obs } else { front.t });
-                    let sd = sd_of(em, classes[si][front.elem as usize], epochs);
-                    let ll: [f64; NODES] = std::array::from_fn(|g| wt * cell_ll(obs, &layers, ground, node(g) * sd, drop, em, sc));
-                    Some((key, front.elem, wt * cell_ll(obs, &[], ground, 0.0, drop, em, sc), ll))
-                })
-                .collect();
-            for ((cell, ls), t) in cells.iter().zip(terms) {
-                let Some((key, front, ll0, ll)) = t else { continue };
-                let acc = groups.entry(key).or_insert_with(|| Acc { ll: [0.0; NODES], ll0: 0.0, members: HashMap::new() });
-                acc.ll0 += ll0;
-                let m = acc.members.entry(front).or_insert((0.0, [0.0; NODES]));
-                m.0 += 1.0;
-                for g in 0..NODES {
-                    acc.ll[g] += ll[g];
-                    m.1[g] += ll[g] - ll0;
-                }
-                if skip.is_none() && only.is_none() {
-                    let ly = ls[0];
-                    let across = 2.0 * elems[front as usize].r / em.footprint(ly.t);
-                    let row = rows.entry((front, si as u32)).or_insert(Row {
-                        elem: front, scan: si as u32, cells: 0, support: 0, across, surface: classes[si][front as usize], energy: 0.0,
-                    });
-                    if row.across == 0.0 {
-                        row.across = across;
-                    }
-                    if ly.f > 0.5 {
-                        row.cells += 1;
-                        let sd = (em.sigma_e[row.surface as usize].powi(2) + ly.spread * ly.spread).sqrt();
-                        let obs = if v.state[*cell] == state::ECHO { v.range[*cell] as f64 } else { f64::NAN };
-                        row.support += (cell_code(obs, ly.t, sd) == code::ON) as u32;
-                    }
-                }
-            }
-        }
-        for (key, acc) in &groups {
-            // the offset's prior over the nodes, then −log ∫ p(cells | δ) p(δ) dδ against the empty scene
-            let lp: Vec<f64> = (0..NODES).map(|g| t_pdf(node(g), em.nu_l).ln()).collect();
-            let z = logsumexp(&lp);
-            let post: Vec<f64> = (0..NODES).map(|g| lp[g] - z + acc.ll[g]).collect();
-            let e = -(logsumexp(&post) - acc.ll0);
-            total += sign * e;
-            if skip.is_none() && only.is_none() {
-                let best = (0..NODES).max_by(|&a, &b| post[a].total_cmp(&post[b])).unwrap();
-                let n: f64 = acc.members.values().map(|m| m.0).sum();
-                let shares: f64 = acc.members.values().map(|m| -m.1[best]).sum();
-                for (&el, m) in &acc.members {
-                    if let Some(r) = rows.get_mut(&(el, key.0)) {
-                        r.energy += -m.1[best] + (e - shares) * m.0 / n;
-                    }
-                }
-            }
-        }
-    }
-    let mut rows: Vec<Row> = rows.into_values().collect();
+    let total = per_scan.iter().map(|(u, _)| u).sum();
+    let mut rows: Vec<Row> = per_scan.into_iter().flat_map(|(_, r)| r).collect();
     rows.sort_by_key(|r| (r.elem, r.scan));
     (total, rows)
 }
 
 /// Term C for one stick in one view (0 for a patch): the log likelihood ratio of its located silhouette edges
-/// against an edge placed evenly across the rendered band.
+/// against an edge placed evenly across the rendered band, with the stick shifted by `shift` (m) across the beam
+/// along its silhouette's +x side (the offset field's across-beam part at the stick).
 ///
 /// Its cells are cut into strips along the axis, a cell wide. In each strip with echoes on the stick, each side's
 /// outermost such echo and the next cell out locate the edge:
@@ -529,9 +619,9 @@ pub fn energy(views: &[&View], elems: &[Element], em: &ErrorModel, sc: &Scene, o
 /// - **occluded** (the next cell's echo lies in front): no information.
 ///
 /// The stick's edge lies `R + z_τ sd` from the axis, where sd is the fill's (footprint and misfit) and z_τ puts the
-/// fill at `edge_fill` (τ). Its spread is the misfit, the offset across the beam and a third of the fill sd. Each
-/// strip counts `cell / footprint` (neighbouring strips share footprints).
-fn edge_ll(v: &View, cells: &[(usize, Layer)], e: &Element, k: u8, zt: f64, sd_lat: f64, em: &ErrorModel) -> f64 {
+/// fill at `edge_fill` (τ). Its spread is the misfit and a third of the fill sd. Each strip counts
+/// `cell / footprint` (neighbouring strips share footprints).
+fn edge_ll(v: &View, cells: &[(usize, Layer)], e: &Element, k: u8, zt: f64, shift: f64, em: &ErrorModel) -> f64 {
     if matches!(e.form, Form::Patch { .. }) {
         return 0.0;
     }
@@ -547,10 +637,10 @@ fn edge_ll(v: &View, cells: &[(usize, Layer)], e: &Element, k: u8, zt: f64, sd_l
         let Some(t) = cs.iter().find(|c| c.1 == code::ON).map(|c| c.2) else { continue };
         let fp = em.footprint(t);
         let sdf = (0.0625 * fp * fp + e.misfit * e.misfit).sqrt();
-        let xe = e.r + zt * sdf;
-        let se = (e.misfit * e.misfit + sd_lat * sd_lat + (sdf / 3.0).powi(2)).sqrt();
+        let se = (e.misfit * e.misfit + (sdf / 3.0).powi(2)).sqrt();
         let w = (em.step * t / fp).min(1.0);
         for side in [1.0, -1.0] {
+            let xe = e.r + zt * sdf + side * shift;
             let x_in = cs.iter().filter(|c| c.1 == code::ON).map(|c| side * c.0).fold(f64::NEG_INFINITY, f64::max);
             let far = cs.iter().map(|c| side * c.0).fold(0.0, f64::max);
             let Some(&(xo, st, _)) = cs.iter().filter(|c| side * c.0 > x_in).min_by(|a, b| (side * a.0).total_cmp(&(side * b.0))) else { continue };
@@ -577,24 +667,6 @@ fn phi_inv(p: f64) -> f64 {
         if phi(m) < p { lo = m } else { hi = m }
     }
     0.5 * (lo + hi)
-}
-
-/// Offset node g, in sds: −4 … 4.
-fn node(g: usize) -> f64 {
-    -4.0 + 8.0 * g as f64 / (NODES - 1) as f64
-}
-
-/// One scan's offset spread (m) for surface class k: half the between-view variance within an epoch, and half
-/// the cross-epoch excess when the views span epochs.
-fn sd_of(em: &ErrorModel, k: u8, epochs: bool) -> f64 {
-    let [same, other] = em.sigma_l[k as usize];
-    let var = 0.5 * same * same + if epochs { 0.5 * (other * other - same * same) } else { 0.0 };
-    var.sqrt()
-}
-
-fn logsumexp(x: &[f64]) -> f64 {
-    let m = x.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
-    m + x.iter().map(|v| (v - m).exp()).sum::<f64>().ln()
 }
 
 #[cfg(test)]
@@ -665,7 +737,7 @@ mod tests {
     fn deleted_edges_are_censored_and_occluded_ones_skipped() {
         let em = ErrorModel::default();
         let zt = phi_inv(1.0 - em.edge_fill);
-        let c_of = |v: &View, s: &Element| edge_ll(v, &render(v, s, 0, &em), s, 0, zt, 0.001, &em);
+        let c_of = |v: &View, s: &Element| edge_ll(v, &render(v, s, 0, &em), s, 0, zt, 0.0, &em);
         let (full, deleted, occluded) = (pole_view(0), pole_view(1), pole_view(2));
         let truth = stick(0.0, 4.0, 0.03);
         let c_full = c_of(&full, &truth);
@@ -675,15 +747,57 @@ mod tests {
         assert!((0.3..0.7).contains(&ratio), "{ratio}");
     }
 
-    /// The offset's spread doubles its variance beyond the same-day part when the scans span epochs.
+    /// The Laplace marginal over the field agrees with Gauss–Hermite quadrature on a single-element query (the
+    /// referee), a range offset in the data is recovered by the field's along part, and the field's hats are
+    /// normalised.
     #[test]
-    fn cross_epoch_offsets_are_wider() {
-        let em = ErrorModel::default();
-        for k in 0..3u8 {
-            let [same, other] = em.sigma_l[k as usize];
-            assert!((sd_of(&em, k, false) - same / 2f64.sqrt()).abs() < 1e-12);
-            assert!((sd_of(&em, k, true) - other / 2f64.sqrt()).abs() < 1e-12);
+    fn the_field_integral_matches_quadrature_and_finds_an_offset() {
+        for x in [[0.3, 4.1, -0.7], [1.0, 2.0, 3.0]] {
+            let h = Field::hats(&x, 2.0);
+            assert!((h.iter().map(|(_, w)| w * w).sum::<f64>() - 1.0).abs() < 1e-12);
         }
+        let v = pole_view(0);
+        // untempered (ρ 0), so one element's data speak plainly and the quadrature needs no design effect
+        let (em, sc) = (ErrorModel { rho: 0.0, ..ErrorModel::default() }, Scene::default());
+        let el = stick(0.0, 4.0, 0.03);
+        // shift the pole's echoes 3 mm deeper: the field's along shift should find about that
+        let shifted = {
+            let mut w = pole_view(0);
+            for (k, r) in w.range.iter_mut().enumerate() {
+                if r.is_finite() && *r < 4.5 && w.state[k] == state::ECHO {
+                    *r += 0.003;
+                }
+            }
+            w
+        };
+        let (_, rows) = energy(&[&shifted], &[el], &em, &sc, None);
+        assert!((rows[0].shift_along - 0.003).abs() < 0.0015, "{}", rows[0].shift_along);
+        // the referee: a single element's along/across functions integrated by quadrature over their prior
+        let rendered = render_all(&v, &[el], &em);
+        let (u_lap, out) = scan_energy(&v, &rendered, &[el], None, 0, &em, &sc);
+        assert_eq!(out.len(), 1);
+        let em_off = ErrorModel { field: false, ..em };
+        let u_off = scan_energy(&v, &rendered, &[el], None, 0, &em_off, &sc).0;
+        // the element sits on one node set: its along shift has prior sd s_along (√Σŵ² = 1) and its across shift
+        // sd (α ρ) · |side·b| summed over the hats; quadrature over δ alone (the across part changes little here)
+        let (gh_x, gh_w) = ([-2.0201828704560856, -0.9585724646138185, 0.0, 0.9585724646138185, 2.0201828704560856],
+                            [0.019953242059045913, 0.39361932315224116, 0.9453087204829419, 0.39361932315224116, 0.019953242059045913]);
+        let buf = kbuffer(&rendered, 0.5);
+        let cls = classes(&v, &buf, 1, &em);
+        let s_along = em.field_along[cls[0] as usize];
+        let ed = |delta: f64| -> f64 {
+            buf.iter().map(|(&cell, ls)| {
+                let layers: Vec<(Layer, u8)> = ls.iter().map(|l| (*l, cls[0])).collect();
+                let obs = if v.state[cell] == state::ECHO { v.range[cell] as f64 } else { f64::NAN };
+                let wt = 1.0 / em.multiplicity(if obs.is_finite() { obs } else { ls[0].t });
+                wt * (cell_ll(obs, &layers, None, delta, drop_of(&em, &v), &em, &sc) - cell_ll(obs, &[], None, 0.0, drop_of(&em, &v), &em, &sc))
+            }).sum()
+        };
+        let c0 = edge_ll(&v, &rendered[0], &el, cls[0], phi_inv(1.0 - em.edge_fill), 0.0, &em);
+        let m = gh_x.iter().map(|&x| ed(std::f64::consts::SQRT_2 * s_along * x)).fold(f64::NEG_INFINITY, f64::max);
+        let quad = -(m + (gh_x.iter().zip(&gh_w).map(|(&x, &w)| w * (ed(std::f64::consts::SQRT_2 * s_along * x) - m).exp()).sum::<f64>()
+            / std::f64::consts::PI.sqrt()).ln()) - c0;
+        assert!((u_lap - quad).abs() < 0.1 * quad.abs().max(1.0), "laplace {u_lap} quadrature {quad} off {u_off}");
     }
 
     /// A patch renders as a disc: full fill at its centre, none beyond its rim; a patch of the pole's size where the

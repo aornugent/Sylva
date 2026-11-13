@@ -39,14 +39,16 @@ fn error_model(d: Option<&Bound<'_, PyDict>>) -> PyResult<ErrorModel> {
             "nu_e" => m.nu_e = x(&v)?,
             "bias" => m.bias = v.extract()?,
             "bias_ref" => m.bias_ref = x(&v)?,
-            "sigma_l" => m.sigma_l = v.extract()?,
-            "nu_l" => m.nu_l = x(&v)?,
-            "block" => m.block = x(&v)?,
+            "field" => m.field = v.extract()?,
+            "field_spacing" => m.field_spacing = x(&v)?,
+            "field_along" => m.field_along = v.extract()?,
+            "field_epoch" => m.field_epoch = v.extract()?,
+            "field_across" => m.field_across = x(&v)?,
+            "rho" => m.rho = x(&v)?,
             "cut_db" => m.cut_db = x(&v)?,
             "refl_noise_db" => m.refl_noise_db = x(&v)?,
             "p_drop" => m.p_drop = x(&v)?,
             "p_outlier" => m.p_outlier = x(&v)?,
-            "rho" => m.rho = x(&v)?,
             "misfit" => m.misfit = v.extract()?,
             "edge_fill" => m.edge_fill = x(&v)?,
             _ => return Err(bad(&k)),
@@ -61,14 +63,16 @@ fn l0_error_model<'py>(py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
     let m = ErrorModel::default();
     let d = PyDict::new(py);
     for (k, v) in [("beam_exit", m.beam.exit), ("beam_divergence", m.beam.divergence), ("step", m.step), ("nu_e", m.nu_e), ("bias_ref", m.bias_ref),
-                   ("nu_l", m.nu_l), ("block", m.block), ("cut_db", m.cut_db), ("refl_noise_db", m.refl_noise_db), ("p_drop", m.p_drop),
-                   ("p_outlier", m.p_outlier), ("rho", m.rho), ("edge_fill", m.edge_fill)] {
+                   ("field_spacing", m.field_spacing), ("field_across", m.field_across), ("rho", m.rho), ("cut_db", m.cut_db), ("refl_noise_db", m.refl_noise_db), ("p_drop", m.p_drop),
+                   ("p_outlier", m.p_outlier), ("edge_fill", m.edge_fill)] {
         d.set_item(k, v)?;
     }
     d.set_item("class_edges", m.class_edges.to_vec())?;
     d.set_item("sigma_e", m.sigma_e.to_vec())?;
     d.set_item("bias", m.bias.to_vec())?;
-    d.set_item("sigma_l", m.sigma_l.to_vec())?;
+    d.set_item("field", m.field)?;
+    d.set_item("field_along", m.field_along.to_vec())?;
+    d.set_item("field_epoch", m.field_epoch.to_vec())?;
     d.set_item("misfit", m.misfit.to_vec())?;
     Ok(d)
 }
@@ -215,7 +219,8 @@ fn l0_predict<'py>(py: Python<'py>, view: PyRef<'py, PyView>, elements: &Bound<'
 }
 
 /// The energy of `elements` against `views` (rays::energy): −log likelihood ratio against the empty scene. Returns
-/// (energy, rows): per (element, scan) its cells, support, footprints across, class and energy share. With
+/// (energy, rows): per (element, scan) its cells, support, footprints across, class, energy share and the offset
+/// field's posterior at it (shift_along, sd_along, shift_across). With
 /// `only=i`, the energy change of adding element i to the rest (rows empty).
 #[pyfunction]
 #[pyo3(signature = (views, elements, err=None, scene_=None, only=None))]
@@ -233,6 +238,9 @@ fn l0_energy<'py>(py: Python<'py>, views: Vec<PyRef<'py, PyView>>, elements: &Bo
     d.set_item("across", rows.iter().map(|r| r.across).collect::<Vec<_>>().into_pyarray(py))?;
     d.set_item("surface", rows.iter().map(|r| r.surface).collect::<Vec<_>>().into_pyarray(py))?;
     d.set_item("energy", rows.iter().map(|r| r.energy).collect::<Vec<_>>().into_pyarray(py))?;
+    d.set_item("shift_along", rows.iter().map(|r| r.shift_along).collect::<Vec<_>>().into_pyarray(py))?;
+    d.set_item("sd_along", rows.iter().map(|r| r.sd_along).collect::<Vec<_>>().into_pyarray(py))?;
+    d.set_item("shift_across", rows.iter().map(|r| r.shift_across).collect::<Vec<_>>().into_pyarray(py))?;
     Ok((e, d))
 }
 

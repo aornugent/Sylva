@@ -84,12 +84,18 @@ pub struct ErrorModel {
     /// Measured between views, so a bias common to every view is not in it.
     pub bias: [[f64; 2]; 3],
     pub bias_ref: f64,
-    /// The offset field's spread (m) per class, within one epoch and across epochs, between two views; one scan's
-    /// spread is this over √2. A t with `nu_l` degrees of freedom.
-    pub sigma_l: [[f64; 2]; 3],
-    pub nu_l: f64,
-    /// The offset is one value per (scan, block of this size, m): correlated over 1-5 m.
-    pub block: f64,
+    /// The offset field (research 130 offset-field-design.md): on (else every scan's offset is 0), its node
+    /// spacing ℓ (m), its along-beam spread per class within the reference epoch (σ_u ≈ 0.57 σ_L,same, from
+    /// alignment-rca's pair spreads and their +0.32 same-near-scan correlation) and the other-epoch part added in
+    /// quadrature (σ_E² = (σ_L,other² − σ_L,same²) / 2), and its across-beam spread (rad, times the range).
+    pub field: bool,
+    pub field_spacing: f64,
+    pub field_along: [f64; 3],
+    pub field_epoch: [f64; 3],
+    pub field_across: f64,
+    /// The residual overdispersion (design §4's ρ_res): an element's `n` footprints in a scan count as
+    /// `n / (1 + (n − 1) ρ)`, for the occupancy correlation the field and the rendered latents don't carry.
+    pub rho: f64,
     /// The export: echoes under `cut_db` after a per-echo reflectance error of `refl_noise_db` are deleted, and
     /// a kept echo is lost anyway with `p_drop` (NaN: each view's measured in-surface deletion, `View::deletion`).
     /// Echo densities carry a uniform outlier share `p_outlier`.
@@ -97,9 +103,6 @@ pub struct ErrorModel {
     pub refl_noise_db: f64,
     pub p_drop: f64,
     pub p_outlier: f64,
-    /// Overdispersion: a group's `n` footprints count as `n / (1 + (n − 1) ρ)` independent ones (the
-    /// beta-binomial design effect of research 128's evidence term, ρ 0.1-0.6 there).
-    pub rho: f64,
     /// The per-element misfit's declared prior: the section and axis depart from the form by an sd of
     /// `misfit[0] + misfit[1] R` (m). Fourier terms past a₀ aren't identifiable here (synthesis §3), so a scale
     /// stands in for them. Each element carries its own misfit (a latent); this is the default a caller may
@@ -120,14 +123,16 @@ impl Default for ErrorModel {
             nu_e: 4.0,
             bias: [[-0.0007, -0.00003], [-0.00175, -0.000055], [-0.00235, -0.000135]],
             bias_ref: 4.0,
-            sigma_l: [[0.0019, 0.00275], [0.0029, 0.0044], [0.00365, 0.0061]],
-            nu_l: 4.5,
-            block: 2.0,
+            field: true,
+            field_spacing: 2.0,
+            field_along: [0.0011, 0.00165, 0.0021],
+            field_epoch: [0.0014, 0.0023, 0.0035],
+            field_across: 0.21e-3,
+            rho: 0.3,
             cut_db: -25.0,
             refl_noise_db: 2.0,
             p_drop: f64::NAN,
             p_outlier: 0.01,
-            rho: 0.3,
             misfit: [0.002, 0.1],
             edge_fill: 0.2,
         }
