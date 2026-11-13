@@ -45,14 +45,18 @@ pub const K: usize = 3;
 /// Quadrature nodes over the offset, spanning ±4 sd.
 const NODES: usize = 21;
 
-/// A stick: an axis from `a` to `b` (world, m), a radius, and its surface class (0-2, or negative for "from the
-/// view").
+/// A stick: an axis from `a` to `b` (world, m), a radius, its surface class (0-2, or negative for "from the view")
+/// and its opacity: the chance a pulse its section fills meets solid there, its gaps wider than the footprint (1
+/// solid wood, less for a porous clump; synthesis §1's "extent, opacity"). A full-fill cell keeps an echo from it
+/// with `opacity × sel`, and passes `1 − opacity f` of the beam on. An element property, a latent the caller
+/// supplies.
 #[derive(Debug, Clone, Copy)]
 pub struct Stick {
     pub a: Point,
     pub b: Point,
     pub r: f64,
     pub surface: i8,
+    pub opacity: f64,
 }
 
 /// The crude scene behind the sticks: the diffuse exported-echo hazard (1/m), a ground plane's height (NaN for
@@ -79,6 +83,8 @@ struct Layer {
     f: f64,
     cos: f64,
     stick: u32,
+    /// The stick's opacity: the blocked share of the fill is `f op`.
+    op: f64,
     /// Where the cell's ray passes the axis: across it (signed, m, positive on `u × (c − o)`'s side) and along it.
     x: f64,
     s: f64,
@@ -171,6 +177,7 @@ fn render(v: &View, s: &Stick, id: u32, em: &ErrorModel) -> Vec<(usize, Layer)> 
                     f,
                     cos: ((1.0 - (xm / s.r).powi(2)).max(0.0).sqrt() * sin).max(0.05),
                     stick: id,
+                    op: s.opacity,
                     x,
                     s: along,
                 },
@@ -203,8 +210,8 @@ fn kbuffer(per: &[Vec<(usize, Layer)>], em: &ErrorModel) -> HashMap<usize, Vec<L
 }
 
 /// The probability an echo of energy share `e` (fill × cos) off a surface of `db` survives the export.
-fn sel(em: &ErrorModel, db: f64, e: f64) -> f64 {
-    (1.0 - em.p_drop) * phi((db + 10.0 * e.max(1e-12).log10() - em.cut_db) / em.refl_noise_db)
+fn sel(drop: f64, em: &ErrorModel, db: f64, e: f64) -> f64 {
+    (1.0 - drop) * phi((db + 10.0 * e.max(1e-12).log10() - em.cut_db) / em.refl_noise_db)
 }
 
 /// Each stick's surface class in one view: its own, or the median class of the view's echoes on its front.
@@ -260,7 +267,7 @@ pub fn predict(v: &View, sticks: &[Stick], em: &ErrorModel, sc: &Scene) -> Vec<P
             let k = cls[ly.stick as usize];
             let [same, _] = em.sigma_l[k as usize];
             Prediction {
-                cell, stick: ly.stick, fill: ly.f, kept: sel(em, sc.wood_db, ly.f * ly.cos), surface: k,
+                cell, stick: ly.stick, fill: ly.f, kept: ly.op * sel(drop_of(em, v), em, sc.wood_db, ly.f * ly.cos), surface: k,
                 depth: ly.t + em.depth_bias(k, ly.t),
                 sd: (em.sigma_e[k as usize].powi(2) + ly.spread.powi(2) + 0.5 * same * same).sqrt(),
                 misfit: em.misfit_sd(sticks[ly.stick as usize].r),
@@ -274,7 +281,12 @@ pub fn predict(v: &View, sticks: &[Stick], em: &ErrorModel, sc: &Scene) -> Vec<P
 
 /// One cell's log-likelihood: its first echo `obs` (NaN for none) against its layers (each with its stick's
 /// surface class), the ground at `ground` = (range, cos) and the field, with every layer shifted by `delta`.
-fn cell_ll(obs: f64, layers: &[(Layer, u8)], ground: Option<(f64, f64)>, delta: f64, em: &ErrorModel, sc: &Scene) -> f64 {
+/// The export's in-surface loss for a view: the error model's, or the view's measured one.
+fn drop_of(em: &ErrorModel, v: &View) -> f64 {
+    if em.p_drop.is_nan() { v.deletion } else { em.p_drop }
+}
+
+fn cell_ll(obs: f64, layers: &[(Layer, u8)], ground: Option<(f64, f64)>, delta: f64, drop: f64, em: &ErrorModel, sc: &Scene) -> f64 {
     let t_end = ground.map_or(sc.t_max, |g| g.0);
     let (mut beam, mut none_kept, mut none_before_obs, mut dens) = (1.0, 1.0, 1.0, 0.0);
     for &(ly, k) in layers {
@@ -282,8 +294,8 @@ fn cell_ll(obs: f64, layers: &[(Layer, u8)], ground: Option<(f64, f64)>, delta: 
             break;
         }
         let e = ly.f * beam;
-        beam *= 1.0 - ly.f;
-        let s = sel(em, sc.wood_db, e * ly.cos);
+        beam *= 1.0 - ly.f * ly.op;
+        let s = ly.op * sel(drop, em, sc.wood_db, e * ly.cos);
         if obs.is_finite() {
             let sd = (em.sigma_e[k as usize].powi(2) + ly.spread * ly.spread).sqrt();
             let mu = ly.t + em.depth_bias(k, ly.t) + delta;
@@ -297,7 +309,7 @@ fn cell_ll(obs: f64, layers: &[(Layer, u8)], ground: Option<(f64, f64)>, delta: 
         none_kept *= 1.0 - s;
     }
     if let Some((tg, cg)) = ground {
-        let s = sel(em, sc.ground_db, beam * cg);
+        let s = sel(drop, em, sc.ground_db, beam * cg);
         if obs.is_finite() {
             let sd = em.sigma_e[2];
             dens += (-sc.kappa * tg).exp() * none_kept * s * t_pdf((obs - tg) / sd, em.nu_e) / sd;
@@ -418,8 +430,8 @@ pub fn energy(views: &[&View], sticks: &[Stick], em: &ErrorModel, sc: &Scene, on
                     let ground = (sc.ground_z.is_finite() && w[2] < -1e-6).then(|| ((sc.ground_z - v.origin[2]) / w[2], -w[2]));
                     let wt = temper[si][front.stick as usize] / em.multiplicity(if obs.is_finite() { obs } else { front.t });
                     let (c0, sd) = centres.get(&key).copied().unwrap_or((0.0, sd_of(em, classes[si][front.stick as usize], epochs.len() > 1)));
-                    let ll: [f64; NODES] = std::array::from_fn(|g| wt * cell_ll(obs, &layers, ground, c0 + node(g) * sd, em, sc));
-                    Some((key, front.stick, wt * cell_ll(obs, &[], ground, 0.0, em, sc), ll))
+                    let ll: [f64; NODES] = std::array::from_fn(|g| wt * cell_ll(obs, &layers, ground, c0 + node(g) * sd, drop_of(em, v), em, sc));
+                    Some((key, front.stick, wt * cell_ll(obs, &[], ground, 0.0, drop_of(em, v), em, sc), ll))
                 })
                 .collect();
             for ((cell, ls), t) in cells.iter().zip(terms) {
@@ -636,7 +648,7 @@ mod tests {
         let id = [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]];
         let v = View::new(&t, &d, &r, id, [0.0; 3], 0, &ViewParams::default());
         let (em, sc) = (ErrorModel::default(), Scene::default());
-        let stick = |x: f64, y: f64, r: f64| Stick { a: [x, y, -0.2], b: [x, y, 0.2], r, surface: 0 };
+        let stick = |x: f64, y: f64, r: f64| Stick { a: [x, y, -0.2], b: [x, y, 0.2], r, surface: 0, opacity: 1.0 };
         let e = |s: Stick| energy(&[&v], &[s], &em, &sc, None).0;
         let truth = e(stick(0.0, y_pole, r_pole));
         assert!(truth < -3.0, "{truth}");
@@ -644,6 +656,8 @@ mod tests {
             assert!(e(wrong) > truth + 1.0, "{} vs {truth}", e(wrong));
         }
         assert!(e(stick(0.2, 6.0, 0.03)) > 1.0);
+        // a porous stick explains a solid pole worse than a solid one does
+        assert!(e(Stick { opacity: 0.3, ..stick(0.0, y_pole, r_pole) }) > truth + 1.0);
         let pair = [stick(0.0, y_pole, r_pole), stick(0.2, 6.0, 0.03)];
         let both = energy(&[&v], &pair, &em, &sc, None);
         let delta = energy(&[&v], &pair, &em, &sc, Some(1)).0;

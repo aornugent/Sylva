@@ -99,7 +99,7 @@ pub struct ErrorModel {
     /// The offset is one value per (scan, block of this size, m): correlated over 1-5 m.
     pub block: f64,
     /// The export: echoes under `cut_db` after a per-echo reflectance error of `refl_noise_db` are deleted, and
-    /// a kept echo is lost anyway with `p_drop`. Echo densities carry a uniform outlier share `p_outlier`.
+    /// a kept echo is lost anyway with `p_drop` (NaN: each view's measured in-surface deletion, `View::deletion`). Echo densities carry a uniform outlier share `p_outlier`.
     pub cut_db: f64,
     pub refl_noise_db: f64,
     pub p_drop: f64,
@@ -142,7 +142,7 @@ impl Default for ErrorModel {
             block: 2.0,
             cut_db: -25.0,
             refl_noise_db: 2.0,
-            p_drop: 0.02,
+            p_drop: f64::NAN,
             p_outlier: 0.01,
             rho: 0.3,
             ghost: 0.0,
@@ -218,6 +218,11 @@ pub struct View {
     /// Run length (cells) along and across.
     pub run: Vec<[u16; 2]>,
     pub ends: Vec<u8>,
+    /// The export's in-surface deletion: of the cells inside a continuous surface facing the beam (their four
+    /// neighbours echoes within `jump` of one another, each a surfel with cos ι > `min_cos`, so grazing ground the
+    /// reflectance cut thins is left out), the share without an echo. An export property, measured on the scan; the
+    /// likelihood takes it as the chance a kept echo is lost anyway (`ErrorModel::p_drop` NaN).
+    pub deletion: f64,
     /// The surface each echo cell belongs to: connected through neighbours (4-connected) within `jump`, numbered
     /// from 0 in cell order (`u32::MAX` for no echo). Its boundary is where the ends are.
     pub surface_id: Vec<u32>,
@@ -293,10 +298,12 @@ impl View {
         let mut v = View {
             lat, c0, n_lines: nl, n_cols: nc, rot, origin, epoch, state: state_, range: rng, pulse,
             normal: Vec::new(), cos_inc: Vec::new(), excess: Vec::new(), run: Vec::new(), ends: Vec::new(), surface_id: Vec::new(),
+            deletion: 0.0,
         };
         let fits: Vec<([f32; 3], f32)> = (0..n).into_par_iter().map(|k| v.fit(k, direction, p)).collect();
         (v.normal, v.cos_inc) = fits.into_iter().unzip();
         v.excess = (0..n).into_par_iter().map(|k| v.excess_at(k, direction, p)).collect();
+        v.deletion = v.in_surface_deletion(p.jump, p.min_cos);
         v.runs(p.jump);
         v.segment(p.jump);
         v
@@ -410,6 +417,27 @@ impl View {
             }
         }
         (25.0 / n.max(1) as f64).sqrt() as f32
+    }
+
+    /// The share of empty cells among those inside a continuous surface.
+    fn in_surface_deletion(&self, jump: f64, min_cos: f64) -> f64 {
+        let (nl, nc) = (self.n_lines, self.n_cols);
+        let (mut inside, mut empty) = (0usize, 0usize);
+        for l in 1..nl.saturating_sub(1) {
+            for c in 1..nc.saturating_sub(1) {
+                let nb = [(l - 1) * nc + c, (l + 1) * nc + c, l * nc + c - 1, l * nc + c + 1];
+                if nb.iter().any(|&j| self.state[j] != state::ECHO) {
+                    continue;
+                }
+                let r = nb.map(|j| self.range[j]);
+                let (lo, hi) = r.iter().fold((f32::INFINITY, f32::NEG_INFINITY), |(a, b), &x| (a.min(x), b.max(x)));
+                if ((hi - lo) as f64) <= jump && nb.iter().all(|&j| self.cos_inc[j] > min_cos as f32) {
+                    inside += 1;
+                    empty += (self.state[l * nc + c] != state::ECHO) as usize;
+                }
+            }
+        }
+        empty as f64 / inside.max(1) as f64
     }
 
     /// Surfaces: union-find over echo neighbours within `jump`.

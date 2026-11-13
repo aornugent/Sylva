@@ -123,6 +123,12 @@ impl PyView {
         (self.inner.n_lines, self.inner.n_cols)
     }
 
+    /// The export's in-surface deletion measured on this scan (View::deletion).
+    #[getter]
+    fn deletion(&self) -> f64 {
+        self.inner.deletion
+    }
+
     /// The cell arrays, each (n_lines, n_cols[, k]): state, range, pulse (-1 none), normal, cos_inc, excess, run
     /// (along, across), ends, surface_id (-1 for none); and from the error model `err`, surface (class) and across (footprints across the
     /// shorter run).
@@ -157,11 +163,11 @@ impl PyView {
 
 fn sticks_from_py(sticks: PyReadonlyArray2<f64>, surface: Option<PyReadonlyArray1<i8>>) -> PyResult<Vec<Stick>> {
     let a = sticks.as_array();
-    if a.ncols() != 7 {
-        return Err(PyValueError::new_err("sticks must be (n, 7): a, b, radius"));
+    if a.ncols() != 7 && a.ncols() != 8 {
+        return Err(PyValueError::new_err("sticks must be (n, 7) or (n, 8): a, b, radius[, opacity]"));
     }
     let surf: Vec<i8> = surface.map_or(vec![-1; a.nrows()], |s| s.as_array().to_vec());
-    Ok(a.rows().into_iter().zip(&surf).map(|(r, &s)| Stick { a: [r[0], r[1], r[2]], b: [r[3], r[4], r[5]], r: r[6], surface: s }).collect())
+    Ok(a.rows().into_iter().zip(&surf).map(|(r, &s)| Stick { a: [r[0], r[1], r[2]], b: [r[3], r[4], r[5]], r: r[6], surface: s, opacity: if r.len() > 7 { r[7] } else { 1.0 } }).collect())
 }
 
 /// What sticks predict in one view, per touched cell (rays::Prediction): cell (flat), stick, fill, kept, depth,
