@@ -749,8 +749,12 @@ pub struct Export {
     /// filter on pulse-shape deviation.
     pub min_fraction: f64,
     pub fraction_width: f64,
-    /// Echoes below this reflectance (dB) are deleted.
+    /// Echoes below the detection floor are deleted: `min_reflectance` (dB) out
+    /// to `floor_ref` m, rising by `floor_slope` dB a decade of range beyond
+    /// (a scanner's floor is in amplitude, so in reflectance it rises with range).
     pub min_reflectance: f64,
+    pub floor_slope: f64,
+    pub floor_ref: f64,
     /// Broadened echoes are deleted, the stand-in for a filter on pulse-shape
     /// deviation: an echo is also kept only with probability
     /// `1 / (1 + exp(-(max_spread - range_spread) / spread_width))` (a hard
@@ -778,7 +782,7 @@ pub struct Export {
 impl Default for Export {
     /// Keep everything, add nothing.
     fn default() -> Self {
-        Export { min_fraction: 0.0, fraction_width: 0.0, min_reflectance: f64::NEG_INFINITY, max_spread: f64::INFINITY, spread_width: 0.0, refl_noise: 0.0, echoes_only: false, range_a: 0.0, range_b: 0.0, yaw_mrad: 0.0, offset_sd: 0.0, offset_length: 0.5, seed: 0 }
+        Export { min_fraction: 0.0, fraction_width: 0.0, min_reflectance: f64::NEG_INFINITY, floor_slope: 0.0, floor_ref: 7.0, max_spread: f64::INFINITY, spread_width: 0.0, refl_noise: 0.0, echoes_only: false, range_a: 0.0, range_b: 0.0, yaw_mrad: 0.0, offset_sd: 0.0, offset_length: 0.5, seed: 0 }
     }
 }
 
@@ -831,7 +835,8 @@ pub fn export(s: &Shots, p: &Export) -> Result<Shots> {
                 }
                 _ => 1.0,
             };
-            keep_echo[e] = r >= p.min_reflectance && unit_hash(p.seed, i as u64, k as u64) < pk * ps;
+            let floor = p.min_reflectance + p.floor_slope * (f64::from(s.echo_range[e]).max(p.floor_ref) / p.floor_ref).log10();
+            keep_echo[e] = r >= floor && unit_hash(p.seed, i as u64, k as u64) < pk * ps;
         }
     }
     const K: usize = 64;

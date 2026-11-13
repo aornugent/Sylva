@@ -255,11 +255,11 @@ fn synthetic_scan_beam<'py>(py: Python<'py>, xyz: PyReadonlyArray2<f64>, attrs: 
 
 /// What a scanner's export holds of a beam scan (sylva_rs::synthetic::scan::export).
 #[pyfunction]
-#[pyo3(signature = (shots, min_fraction=0.0, fraction_width=0.0, min_reflectance=f64::NEG_INFINITY, max_spread=f64::INFINITY, spread_width=0.0, refl_noise=0.0, echoes_only=false, range_a=0.0, range_b=0.0, yaw_mrad=0.0, offset_sd=0.0, offset_length=0.5, seed=0))]
+#[pyo3(signature = (shots, min_fraction=0.0, fraction_width=0.0, min_reflectance=f64::NEG_INFINITY, floor_slope=0.0, floor_ref=7.0, max_spread=f64::INFINITY, spread_width=0.0, refl_noise=0.0, echoes_only=false, range_a=0.0, range_b=0.0, yaw_mrad=0.0, offset_sd=0.0, offset_length=0.5, seed=0))]
 #[allow(clippy::too_many_arguments)]
-fn synthetic_export<'py>(py: Python<'py>, shots: &Bound<'_, PyDict>, min_fraction: f64, fraction_width: f64, min_reflectance: f64, max_spread: f64, spread_width: f64, refl_noise: f64, echoes_only: bool, range_a: f64, range_b: f64, yaw_mrad: f64, offset_sd: f64, offset_length: f64, seed: u64) -> PyResult<Bound<'py, PyDict>> {
+fn synthetic_export<'py>(py: Python<'py>, shots: &Bound<'_, PyDict>, min_fraction: f64, fraction_width: f64, min_reflectance: f64, floor_slope: f64, floor_ref: f64, max_spread: f64, spread_width: f64, refl_noise: f64, echoes_only: bool, range_a: f64, range_b: f64, yaw_mrad: f64, offset_sd: f64, offset_length: f64, seed: u64) -> PyResult<Bound<'py, PyDict>> {
     let s = shots_from_py(shots)?;
-    let p = scan::Export { min_fraction, fraction_width, min_reflectance, max_spread, spread_width, refl_noise, echoes_only, range_a, range_b, yaw_mrad, offset_sd, offset_length, seed };
+    let p = scan::Export { min_fraction, fraction_width, min_reflectance, floor_slope, floor_ref, max_spread, spread_width, refl_noise, echoes_only, range_a, range_b, yaw_mrad, offset_sd, offset_length, seed };
     let x = py.detach(|| scan::export(&s, &p)).map_err(err)?;
     shots_to_py(py, &x)
 }
