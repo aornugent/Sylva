@@ -3,6 +3,12 @@
 // Free software under the GNU General Public License v3.0 or later;
 // see the LICENSE file. There is no warranty, to the extent permitted by law.
 //! Bindings for sylva_rs::als::tiles_trees: tiled segmentation and tree stores.
+//!
+//! Backs sylva.als.tiles_trees. The tile catalog arrives as the dict
+//! sylva.als builds, settings as dicts, paths as str or pathlib paths; trees
+//! come back as lists of dicts and clouds as `(N, 3)` arrays with attribute
+//! dicts. File and tiling errors reach Python as OSError or ValueError
+//! through `crate::err`.
 #![allow(clippy::too_many_arguments, clippy::type_complexity)]
 
 use std::path::PathBuf;
@@ -117,7 +123,7 @@ fn tiles_segment_trees<'py>(py: Python<'py>, catalog: &Bound<'_, PyDict>, stems:
     let stems = trees_from_py(stems)?;
     let seg = graph_params(SegmentParams { voxel_origin: Some([0.0; 3]), ..Default::default() }, segment, "segment")?;
     let s = TreeTiling { height_attr, segment: seg, merge: merge.map(merge_settings).transpose()?, percentile, prune: prune.map(prune_params).transpose()?, buffer, max_buffer, edge_margin, attribute };
-    let r = py.detach(|| tt::segment_trees(&c, &stems, &out_dir, format.as_deref(), &s, workers)).map_err(err)?;
+    let r = crate::detach_interruptible(py, || tt::segment_trees(&c, &stems, &out_dir, format.as_deref(), &s, workers))?.map_err(err)?;
     let list = PyList::empty(py);
     for (i, t) in &r.trees {
         list.append((*i, tree_to_py(py, t)?))?;
@@ -212,6 +218,7 @@ fn tiles_write_back<'py>(py: Python<'py>, catalog: &Bound<'_, PyDict>, store: Pa
     Ok((paths.into_iter().map(|p| p.to_string_lossy().to_string()).collect(), info_to_py(py, &info)?))
 }
 
+/// Adds this file's functions to the `_core` module.
 pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(tiles_segment_trees, m)?)?;
     m.add_function(wrap_pyfunction!(tiles_split_trees, m)?)?;

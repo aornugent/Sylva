@@ -3,6 +3,11 @@
 // Free software under the GNU General Public License v3.0 or later;
 // see the LICENSE file. There is no warranty, to the extent permitted by law.
 //! Bindings for sylva_rs::synthetic: the synthetic tree, forest and scan.
+//!
+//! Backs the simple generators in sylva.synthetic (and the scan used by
+//! sylva.fusion.synthetic). A cloud crosses the boundary as an `(N, 3)`
+//! float64 array plus a dict of per-point attribute arrays, shots as a dict
+//! of arrays via `crate::shots_to_py`; mismatched lengths are ValueError.
 #![allow(clippy::type_complexity, clippy::too_many_arguments)]
 
 use numpy::{IntoPyArray, PyArray1, PyArray2, PyReadonlyArray1, PyReadonlyArray2};
@@ -11,7 +16,7 @@ use pyo3::prelude::*;
 use pyo3::types::PyDict;
 use sylva_rs::synthetic;
 
-use crate::{cloud_from_py, cloud_to_py, shots_to_py};
+use crate::{cloud_from_py, cloud_into_py, shots_into_py};
 
 /// Terrain height at each `(x, y)`.
 #[pyfunction]
@@ -25,7 +30,7 @@ fn synthetic_terrain_height<'py>(py: Python<'py>, x: PyReadonlyArray1<f64>, y: P
 
 #[pyfunction]
 fn synthetic_tree<'py>(py: Python<'py>, x: f64, y: f64, dbh: f64, height: f64, z0: f64, n_branches: usize, leaf_points: usize, seed: u64) -> PyResult<(Bound<'py, PyArray2<f64>>, Bound<'py, PyDict>)> {
-    cloud_to_py(py, &py.detach(|| synthetic::tree(x, y, dbh, height, z0, n_branches, leaf_points, seed)))
+    cloud_into_py(py, py.detach(|| synthetic::tree(x, y, dbh, height, z0, n_branches, leaf_points, seed)))
 }
 
 #[pyfunction]
@@ -35,16 +40,17 @@ fn synthetic_leaf_area(classification: PyReadonlyArray1<f64>) -> f64 {
 
 #[pyfunction]
 fn synthetic_forest<'py>(py: Python<'py>, trees: Vec<(f64, f64, f64, f64)>, size: f64, ground_points: usize, margin: f64, seed: u64) -> PyResult<(Bound<'py, PyArray2<f64>>, Bound<'py, PyDict>)> {
-    cloud_to_py(py, &py.detach(|| synthetic::forest(&trees, size, ground_points, margin, seed)))
+    cloud_into_py(py, py.detach(|| synthetic::forest(&trees, size, ground_points, margin, seed)))
 }
 
 #[pyfunction]
 fn synthetic_scan<'py>(py: Python<'py>, xyz: PyReadonlyArray2<f64>, attrs: Option<&Bound<'_, PyDict>>, origin: (f64, f64, f64), resolution_deg: f64, max_zenith_deg: f64, max_echoes: usize, echo_separation: f64) -> PyResult<Bound<'py, PyDict>> {
     let cloud = cloud_from_py(xyz, attrs)?;
     let s = py.detach(|| synthetic::scan(&cloud, [origin.0, origin.1, origin.2], resolution_deg, max_zenith_deg, max_echoes, echo_separation));
-    shots_to_py(py, &s)
+    shots_into_py(py, s)
 }
 
+/// Adds this file's functions to the `_core` module.
 pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     for f in [
         wrap_pyfunction!(synthetic_terrain_height, m)?,

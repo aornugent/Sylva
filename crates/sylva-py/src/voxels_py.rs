@@ -265,7 +265,7 @@ fn ray_voxelize_file(py: Python<'_>, path: PathBuf, voxel_size: f64, bounds: Opt
     let params = params(voxel_size, bounds, weighting, occlusion, flat_top, neighbour_prior_min_rays, beam, subvoxel_split, subvoxel_min_beams, average_leaf_area, lad, lad_params, attenuation, inclination, n_iad_bins, knn_normal, triangle_lmax, unbounded_range)?;
     let labels = voxel::EchoLabels { class_attr: class_attr.into(), ground_class, ground_distance, leaf_classes, wood_classes, tree_attr: tree_attr.into(), intensity_attr: intensity_attr.into() };
     let dtm = dtm.map(|(data, xmin, ymin, res)| raster_from_py(data, xmin, ymin, res));
-    let inner = py.detach(|| voxel::voxelize_file(&sylva_rs::io::shots::ShotsFile::open(&path)?, &params, &labels, dtm.as_ref())).map_err(err)?;
+    let inner = crate::detach_interruptible(py, || voxel::voxelize_file(&sylva_rs::io::shots::ShotsFile::open(&path)?, &params, &labels, dtm.as_ref()))?.map_err(err)?;
     Ok(PyRayVoxels { inner })
 }
 
@@ -281,7 +281,7 @@ fn ray_voxelize(py: Python<'_>, shots: &Bound<'_, PyDict>, voxel_size: f64, boun
     let ground = ground.map(|a| a.as_array().to_vec());
     let foliage = foliage.map(|a| a.as_array().to_vec());
     let dtm = dtm.map(|(data, xmin, ymin, res)| raster_from_py(data, xmin, ymin, res));
-    let inner = py.detach(|| grid::voxelize_labelled(&s, &params, &labels, ground, foliage, dtm.as_ref())).map_err(err)?;
+    let inner = crate::detach_interruptible(py, || grid::voxelize_labelled(&s, &params, &labels, ground, foliage, dtm.as_ref()))?.map_err(err)?;
     Ok(PyRayVoxels { inner })
 }
 
@@ -299,6 +299,7 @@ fn leaf_projection<'py>(py: Python<'py>, theta: PyReadonlyArray1<f64>, lad: &str
     Ok(theta.as_array().iter().map(|&t| voxel::compute_g(t, &lad)).collect::<Vec<_>>().into_pyarray(py))
 }
 
+/// Adds this file's functions and classes to the `_core` module.
 pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyRayVoxels>()?;
     for f in [wrap_pyfunction!(ray_voxelize, m)?, wrap_pyfunction!(ray_voxelize_file, m)?, wrap_pyfunction!(laser_spec, m)?, wrap_pyfunction!(leaf_projection, m)?] {

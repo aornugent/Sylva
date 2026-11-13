@@ -1,7 +1,5 @@
 # Sylva
 
-NOTE: This software is still in ALPHA and is not yet thoroughly tested, if you notice anything strange please raise an issue [here](https://github.com/UQ-EORC/Sylva/issues).
-
 [![PyPI](https://img.shields.io/pypi/v/sylva-rs)](https://pypi.org/project/sylva-rs/)
 [![crates.io](https://img.shields.io/crates/v/sylva-rs)](https://crates.io/crates/sylva-rs)
 [![Documentation](https://img.shields.io/badge/docs-uq--eorc.github.io%2FSylva-blue)](https://uq-eorc.github.io/Sylva/)
@@ -41,6 +39,8 @@ command over it.
 
 ## Contributing
 
+If you notice anything strange, please raise an issue [here](https://github.com/UQ-EORC/Sylva/issues).
+
 Feedback, issues, and PRs all welcome. For issues please use [GitHub issues](https://github.com/UQ-EORC/Sylva/issues) (not a personal message) so the community can benefit.
 
 ## Citation
@@ -49,19 +49,21 @@ If Sylva contributed to your work, please cite it. Every release is archived
 on Zenodo, which gives it a DOI: https://doi.org/10.5281/zenodo.23718985
 always resolves to the latest version, and each version has its own.
 
-> Devereux, T. (2026). *Sylva: terrestrial and airborne laser scanning
-> processing for forest ecology* (version 0.3.2) [Computer software].
-> The University of Queensland. https://doi.org/10.5281/zenodo.23936915
+> Devereux, T., Rivory, J., Woodgate, W., Aryal, R. R., Eaton, G., & Phinn, S.
+> (2026). *Sylva: terrestrial and airborne laser scanning
+> processing for forest ecology* (version 1.0.0) [Computer software].
+> The University of Queensland. https://doi.org/10.5281/zenodo.23718985
 
 ```bibtex
 @software{sylva,
-  author       = {Devereux, Tim},
+  author       = {Devereux, Tim and Rivory, Josh and Woodgate, Will and
+                  Aryal, Raja Ram and Eaton, Glen and Phinn, Stuart},
   title        = {Sylva: terrestrial and airborne laser scanning processing
                   for forest ecology},
   year         = {2026},
-  version      = {0.3.2},
+  version      = {1.0.0},
   organization = {The University of Queensland},
-  doi          = {10.5281/zenodo.23936915},
+  doi          = {10.5281/zenodo.23718985},
   url          = {https://github.com/UQ-EORC/Sylva}
 }
 ```

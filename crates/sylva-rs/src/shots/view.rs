@@ -36,7 +36,6 @@
 //!   offset's spread.
 
 use super::lattice::{scan_lattice, Lattice};
-use crate::qsm::evidence::Beam;
 use crate::transform::{cross, dot, normalize};
 use crate::Point;
 use rayon::prelude::*;
@@ -72,7 +71,10 @@ impl Default for ViewParams {
 /// reflectance cut (sim-clumps' calibration); the VZ-400i beam.
 #[derive(Debug, Clone, Copy)]
 pub struct ErrorModel {
-    pub beam: Beam,
+    /// The beam: its diameter at the exit (m) and full divergence (rad); the footprint at range ρ is
+    /// `exit + divergence ρ` (the VZ-400i's).
+    pub exit: f64,
+    pub divergence: f64,
     /// The lattice step (rad).
     pub step: f64,
     /// Excess at the solid/mid and mid/fragmented boundaries.
@@ -116,7 +118,8 @@ pub struct ErrorModel {
 impl Default for ErrorModel {
     fn default() -> Self {
         ErrorModel {
-            beam: Beam::VZ400I,
+            exit: 0.007,
+            divergence: 0.35e-3,
             step: 0.5227e-3,
             class_edges: [1.2, 1.8],
             sigma_e: [0.0024, 0.0037, 0.0051],
@@ -140,7 +143,7 @@ impl Default for ErrorModel {
 impl ErrorModel {
     /// The beam's diameter (m) at a range.
     pub fn footprint(&self, range: f64) -> f64 {
-        self.beam.footprint(range)
+        self.exit + self.divergence * range
     }
 
     /// Footprints per cell, `(footprint / cell)²`, at least 1: how many cells see the same spot.

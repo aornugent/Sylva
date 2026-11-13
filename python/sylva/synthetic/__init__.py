@@ -136,7 +136,7 @@ def forest(trees=None, size: float = 20.0, ground_points: int = 40000, margin: f
 
 
 def scan(cloud: PointCloud, origin=(10.0, 10.0, 1.5), resolution_deg: float = 0.25,
-         max_zenith_deg: float = 130.0, max_echoes: int = 2, echo_separation: float = 0.5, *,
+         max_zenith_deg: float | None = None, max_echoes: int = 2, echo_separation: float = 0.5, *,
          scanner: str | None = None, min_zenith_deg: float | None = None, range_noise=None,
          beam_divergence: float | None = None, exit_diameter: float | None = None,
          footprint_samples: int | None = None, mixed_pixels: bool | None = None,
@@ -186,7 +186,9 @@ def scan(cloud: PointCloud, origin=(10.0, 10.0, 1.5), resolution_deg: float = 0.
     resolution_deg
         Angular step in zenith and azimuth (degrees).
     max_zenith_deg
-        Pulses are fired from straight up to this zenith.
+        Pulses are fired from straight up to this zenith (degrees). None
+        takes the ``scanner`` preset's limit, or 130 without one; a value
+        given here overrides the preset.
     max_echoes
         Echoes per pulse.
     echo_separation
@@ -259,6 +261,8 @@ def scan(cloud: PointCloud, origin=(10.0, 10.0, 1.5), resolution_deg: float = 0.
     >>> s.echo_attrs["range_spread"]
     """
     o = tuple(float(v) for v in origin)
+    zenith_given = max_zenith_deg
+    max_zenith_deg = 130.0 if max_zenith_deg is None else float(max_zenith_deg)
     beam = (scanner, min_zenith_deg, range_noise, beam_divergence, exit_diameter, footprint_samples,
             mixed_pixels, reflectance, target_radius, oriented, detection_threshold, max_range, solids)
     if all(v is None for v in beam):
@@ -287,9 +291,9 @@ def scan(cloud: PointCloud, origin=(10.0, 10.0, 1.5), resolution_deg: float = 0.
         refl_map = [(int(k), float(v)) for k, v in reflectance.items()]
     else:
         refl_const = float(reflectance)
-    d = _core.synthetic_scan_beam(
+    d = (_core.synthetic_scan_beam if solids is None else _core.synthetic_scan_beam_solids)(
         cloud.xyz, cloud.attrs, o, float(resolution_deg), pick(min_zenith_deg, "min_zenith_deg", 0.0),
-        float(preset.get("max_zenith_deg", max_zenith_deg)), int(max_echoes), float(echo_separation),
+        pick(zenith_given, "max_zenith_deg", max_zenith_deg), int(max_echoes), float(echo_separation),
         noise[0], noise[1], div, exit_d, int(footprint_samples),
         True if mixed_pixels is None else bool(mixed_pixels),
         None if target_radius is None else float(target_radius), True if oriented is None else bool(oriented),
@@ -300,9 +304,9 @@ def scan(cloud: PointCloud, origin=(10.0, 10.0, 1.5), resolution_deg: float = 0.
 
 
 def _solids(solids):
-    """The solids' arrays for the core (four Nones without)."""
+    """The solids' arrays for the core (none without)."""
     if solids is None:
-        return None, None, None, None
+        return ()
     a = np.ascontiguousarray(solids["a"], np.float64).reshape(-1, 3)
     b = np.ascontiguousarray(solids["b"], np.float64).reshape(-1, 3)
     return (a, b, np.ascontiguousarray(solids["r"], np.float64).ravel(),

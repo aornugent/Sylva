@@ -56,15 +56,25 @@ const FLUCTUATE: i32 = 0x8FFF_FFFFu32 as i32;
 pub struct Sampling {
     /// 0 undefined, 1 outgoing, 2 returning.
     pub kind: u8,
+    /// Detector channel the sampling was recorded on.
     pub channel: u8,
+    /// Bits storing each segment's duration from the anchor in the pulse's waves; 0 when it is not stored.
     pub bits_for_duration: u8,
+    /// Scale of the stored duration: `duration = duration_scale * stored + duration_offset` (sampling units).
     pub duration_scale: f32,
+    /// Offset of the stored duration (sampling units).
     pub duration_offset: f32,
+    /// Bits storing the number of segments per pulse; 0 when `n_segments` is fixed.
     pub bits_for_segments: u8,
+    /// Bits storing each segment's sample count; 0 when `n_samples` is fixed.
     pub bits_for_samples: u8,
+    /// Segments per pulse when not stored per pulse.
     pub n_segments: u16,
+    /// Samples per segment when not stored per pulse.
     pub n_samples: u32,
+    /// Bits per sample (8 or 16 are read).
     pub bits_per_sample: u16,
+    /// Index of the lookup table that turns samples into physical units; 0 for none.
     pub lookup_table: u16,
     /// Sampling unit (ns).
     pub units: f32,
@@ -73,31 +83,48 @@ pub struct Sampling {
 /// A pulse descriptor: composition and samplings.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Descriptor {
+    /// Distance from the scanner's optical centre to the anchor along the beam, in sampling units; `0x8FFFFFFF` when it varies and is not given.
     pub optical_center_to_anchor: i32,
+    /// Bytes of extra data at the start of each pulse's waves, skipped on reading.
     pub extra_waves_bytes: u16,
+    /// Index of the scanner VLR this descriptor refers to.
     pub scanner: u32,
     /// Sampling unit of the composition (ns).
     pub units: f32,
+    /// The samplings (outgoing shot, returning channels) that make up each pulse's waves.
     pub samplings: Vec<Sampling>,
 }
 
 /// What a `.pls` header says.
 #[derive(Debug, Clone)]
 pub struct PlsInfo {
+    /// PulseWaves version as `(major, minor)`.
     pub version: (u8, u8),
+    /// Pulse records in the file.
     pub n_pulses: u64,
+    /// Bytes per pulse record (48 for format 0).
     pub pulse_size: u32,
+    /// Pulse record format; 0 is the only one read.
     pub pulse_format: u32,
+    /// Pulse compression type; 0 for none (the only kind read).
     pub pulse_compression: u32,
+    /// Byte offset of the first pulse record.
     pub offset_to_pulses: u64,
+    /// Scale of the stored pulse times: `gps_time = t_scale * stored + t_offset` (s).
     pub t_scale: f64,
+    /// Offset of the stored pulse times (s).
     pub t_offset: f64,
+    /// Coordinate quantisation per axis (m per stored unit) of the anchor and target points.
     pub scale: [f64; 3],
+    /// Coordinate offset per axis (m): a stored integer `i` is `i * scale + offset`.
     pub offset: [f64; 3],
     /// `[min_x, min_y, min_z, max_x, max_y, max_z]`.
     pub bounds: [f64; 6],
+    /// System identifier text of the header (the scanner).
     pub system: String,
+    /// Generating software text of the header.
     pub software: String,
+    /// Pulse descriptors by index (VLR record id minus 200000).
     pub descriptors: BTreeMap<u32, Descriptor>,
     /// First lookup table of each table VLR, by index.
     pub tables: BTreeMap<u32, Vec<f32>>,
@@ -186,7 +213,9 @@ fn waves_path(path: &Path) -> Option<PathBuf> {
 /// Read the header, descriptors and lookup tables of a `.pls` file.
 pub fn read_info(path: impl AsRef<Path>) -> Result<PlsInfo> {
     let path = path.as_ref();
-    let mut f = BufReader::new(File::open(path).map_err(|e| file_err(path, e.to_string()))?);
+    let file = File::open(path).map_err(|e| file_err(path, e.to_string()))?;
+    let file_len = file.metadata()?.len();
+    let mut f = BufReader::new(file);
     let mut h = [0u8; HEADER];
     f.read_exact(&mut h).map_err(|_| file_err(path, "not a PulseWaves file (header too short)"))?;
     if &h[0..15] != b"PulseWavesPulse" {
@@ -225,7 +254,13 @@ pub fn read_info(path: impl AsRef<Path>) -> Result<PlsInfo> {
         f.read_exact(&mut vh).map_err(|e| file_err(path, format!("truncated VLR: {e}")))?;
         let user = text(&vh[0..16]);
         let id = LE::read_u32(&vh[16..]);
-        let len = LE::read_i64(&vh[24..]).max(0) as usize;
+        let len = LE::read_i64(&vh[24..]).max(0) as u64;
+        // The length is the file's word: check it against the bytes that
+        // are there before allocating for it.
+        if len > file_len.saturating_sub(pos + VLR_HEADER as u64) {
+            return Err(file_err(path, format!("truncated VLR: record {id} declares {len} bytes and the file ends before that")));
+        }
+        let len = len as usize;
         let mut data = vec![0u8; len];
         f.read_exact(&mut data).map_err(|e| file_err(path, format!("truncated VLR: {e}")))?;
         pos += (VLR_HEADER + len) as u64;
@@ -248,16 +283,22 @@ pub fn read_info(path: impl AsRef<Path>) -> Result<PlsInfo> {
 /// Which waveforms to read.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Kinds {
+    /// Only returning waveforms (sampling kind 2).
     Returning,
+    /// Only outgoing (emitted pulse) waveforms (sampling kind 1).
     Outgoing,
+    /// Every sampling, outgoing and returning.
     All,
 }
 
 /// Options for [`read_waveforms`].
 #[derive(Debug, Clone)]
 pub struct PlsReadOptions {
+    /// Index of the first pulse record to read.
     pub start: u64,
+    /// Pulse records to read; None for all from `start`.
     pub count: Option<u64>,
+    /// Which samplings of each pulse to keep.
     pub kinds: Kinds,
     /// Turn sample values into physical units with the lookup tables.
     pub lookup: bool,
@@ -371,8 +412,16 @@ pub fn read_waveforms(path: impl AsRef<Path>, opts: &PlsReadOptions) -> Result<(
     let count = opts.count.unwrap_or(info.n_pulses - start).min(info.n_pulses - start);
     let ps = info.pulse_size as usize;
     let mut f = File::open(path).map_err(|e| file_err(path, e.to_string()))?;
-    f.seek(SeekFrom::Start(info.offset_to_pulses + start * ps as u64))?;
-    let mut buf = vec![0u8; count as usize * ps];
+    // The pulse count is the header's word: check it against the file's
+    // length before allocating for it.
+    let at = info.offset_to_pulses.checked_add(start.saturating_mul(ps as u64));
+    let bytes = count.checked_mul(ps as u64);
+    let file_len = f.metadata()?.len();
+    let (Some(at), Some(bytes)) = (at, bytes.filter(|&b| at.is_some_and(|a| a.saturating_add(b) <= file_len))) else {
+        return Err(file_err(path, format!("truncated pulse records: the header declares {} pulses of {ps} bytes and the file has {file_len} bytes", info.n_pulses)));
+    };
+    f.seek(SeekFrom::Start(at))?;
+    let mut buf = vec![0u8; bytes as usize];
     f.read_exact(&mut buf).map_err(|e| file_err(path, format!("truncated pulse records: {e}")))?;
     let pulses: Vec<PulseRec> = buf
         .chunks_exact(ps)
@@ -813,5 +862,25 @@ mod tests {
         let mut w = sample();
         w.samples[0] = -3.0;
         assert!(write_waveforms(&w, tmp("bad"), &PlsWriteOptions::default()).is_err());
+    }
+
+    #[test]
+    fn counts_beyond_the_file_are_errors() {
+        let p = tmp("counts");
+        write_waveforms(&sample(), &p, &PlsWriteOptions::default()).unwrap();
+        let good = std::fs::read(&p).unwrap();
+        // The first VLR's length, then the header's pulse count.
+        let mut b = good.clone();
+        LE::write_i64(&mut b[HEADER + 24..], 1 << 50);
+        std::fs::write(&p, &b).unwrap();
+        let e = read_waveforms(&p, &PlsReadOptions::default()).unwrap_err().to_string();
+        assert!(e.contains("truncated VLR"), "{e}");
+        let mut b = good.clone();
+        LE::write_i64(&mut b[184..], 1 << 50);
+        std::fs::write(&p, &b).unwrap();
+        let e = read_waveforms(&p, &PlsReadOptions::default()).unwrap_err().to_string();
+        assert!(e.contains("truncated pulse records"), "{e}");
+        std::fs::write(&p, &good).unwrap();
+        assert_eq!(read_waveforms(&p, &PlsReadOptions::default()).unwrap().0.len(), 3);
     }
 }

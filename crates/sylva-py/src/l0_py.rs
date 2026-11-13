@@ -5,8 +5,7 @@
 //! Bindings for the L0 view, the moments' candidates and the ray likelihood (sylva_rs::shots::view, ::moments,
 //! ::rays).
 //!
-//! - **Error model and scene:** flat dicts whose keys are the structs' fields (`beam_exit` and `beam_divergence` for
-//!   the beam; arrays as lists). `l0_error_model()` returns the defaults.
+//! - **Error model and scene:** flat dicts whose keys are the structs' fields (arrays as lists). `l0_error_model()` returns the defaults.
 //! - **Elements:** a dict of arrays, one row per element: `a`, `b` (n, 3) and `r` (n,) are required; `opacity` (n,)
 //!   defaults to 1, `misfit` (n,) to the error model's prior `misfit[0] + misfit[1] r`, and `patch` (n,) bool to
 //!   false. A patch is a ball about `a` of radius `r` (its extent); its `b` is ignored.
@@ -35,8 +34,8 @@ fn error_model(d: Option<&Bound<'_, PyDict>>) -> PyResult<ErrorModel> {
         let k: String = k.extract()?;
         let x = |v: &Bound<'_, PyAny>| v.extract::<f64>();
         match k.as_str() {
-            "beam_exit" => m.beam.exit = x(&v)?,
-            "beam_divergence" => m.beam.divergence = x(&v)?,
+            "exit" => m.exit = x(&v)?,
+            "divergence" => m.divergence = x(&v)?,
             "step" => m.step = x(&v)?,
             "class_edges" => m.class_edges = v.extract()?,
             "sigma_e" => m.sigma_e = v.extract()?,
@@ -64,7 +63,7 @@ fn error_model(d: Option<&Bound<'_, PyDict>>) -> PyResult<ErrorModel> {
 fn l0_error_model<'py>(py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
     let m = ErrorModel::default();
     let d = PyDict::new(py);
-    for (k, v) in [("beam_exit", m.beam.exit), ("beam_divergence", m.beam.divergence), ("step", m.step), ("nu_e", m.nu_e), ("bias_ref", m.bias_ref),
+    for (k, v) in [("exit", m.exit), ("divergence", m.divergence), ("step", m.step), ("nu_e", m.nu_e), ("bias_ref", m.bias_ref),
                    ("field_spacing", m.field_spacing), ("cut_db", m.cut_db), ("refl_noise_db", m.refl_noise_db), ("p_drop", m.p_drop),
                    ("p_outlier", m.p_outlier), ("dispersion", m.dispersion)] {
         d.set_item(k, v)?;

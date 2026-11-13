@@ -4,11 +4,10 @@ import numpy as np
 import pytest
 
 from sylva import PointCloud
-from sylva.qsm import EchoPath, JointParams, ScanIndex, SupportBasis, SupportDiag, SupportFlag, support_tree
+from sylva.qsm import JointParams, ScanIndex, SupportBasis, SupportDiag, SupportFlag, support_tree
 
-# the synthetic VZ-400i beam's detection share, calibrated on its vertical stems (3dtrees research 93 §10), and its
-# echo character: wood reflects 0.5 (-3 dB) and these scenes hold no leaf
-PARAMS = JointParams(tau=0.094, refl_wood=-3.0, refl_leaf=-60.0)
+# the synthetic VZ-400i beam's echo character: wood reflects 0.5 (-3 dB) and these scenes hold no leaf
+PARAMS = JointParams(refl_wood=-3.0, refl_leaf=-60.0)
 
 
 def scanned(tmp_path, a, b, r, scanners, zenith=(80.0, 100.0)):
@@ -27,18 +26,11 @@ def scanned(tmp_path, a, b, r, scanners, zenith=(80.0, 100.0)):
 
 
 def inside_own_bounds(f):
-    """Each row and node of a fit lies inside the bounds it reports (those that entered the tree), but where PINNED
-    says the rays contradict themselves; a node measured by its own circle reports none (3dtrees research 127)."""
-    for x in (f, f["pieces"]):
-        lo, hi = np.nan_to_num(x["r_lo"]), np.nan_to_num(x["r_hi"], nan=np.inf)
-        ok = (x["r"] >= lo * (1 - 1e-9)) & (x["r"] <= hi * (1 + 1e-9)) | ((x["diag"] & SupportDiag.PINNED) > 0)
-        assert ok.all(), (x["r"], x["r_lo"], x["r_hi"], x["diag"])
-    p = f["pieces"]
-    # a point circle's passes bound it about its own centre, so they don't pin it far under itself
-    pts = p["basis"] == SupportBasis.POINTS
-    assert (p["r"][pts] >= 0.5 * p["r_points"][pts]).all(), (p["r"][pts], p["r_points"][pts])
-    own = p["basis"] == SupportBasis.MEASURED
-    assert np.isnan(p["r_lo"][own]).all() and np.isnan(p["r_hi"][own]).all()
+    """Each row of a fit lies inside the bounds it reports (those that entered the tree), but where PINNED says the
+    rays contradict themselves (3dtrees research 127)."""
+    lo, hi = np.nan_to_num(f["r_lo"]), np.nan_to_num(f["r_hi"], nan=np.inf)
+    ok = (f["r"] >= lo * (1 - 1e-9)) & (f["r"] <= hi * (1 + 1e-9)) | ((f["diag"] & SupportDiag.PINNED) > 0)
+    assert ok.all(), (f["r"], f["r_lo"], f["r_hi"], f["diag"])
 
 
 def test_separated_stems_upright_and_leaning_are_measured(tmp_path):
@@ -63,7 +55,7 @@ def test_separated_stems_upright_and_leaning_are_measured(tmp_path):
             lean.append(u[:2])
     ra, rb = np.array(ra), np.array(rb)
     f = support_tree(scans, ra, rb, rr, np.full(len(ra), -1), params=PARAMS, threads=2)
-    assert (f["flags"] == 0).all() and (f["n_runs"] == 1).all() and (f["n_scans"] == 3).all()
+    assert (f["flags"] == 0).all() and (f["n_scans"] == 3).all()
     for k, (p, r) in enumerate(truth):
         mid = 0.5 * (f["a"][k] + f["b"][k])
         assert abs(np.log(f["r"][k] / r)) < 0.05, (k, f["r"][k], r)
@@ -71,10 +63,10 @@ def test_separated_stems_upright_and_leaning_are_measured(tmp_path):
         # the lean, along the row's frame, against the truth's
         t = f["lean"][k] @ np.c_[f["e1"][k], f["e2"][k]].T
         assert np.allclose(t[:2], lean[k], atol=0.01), (k, t, lean[k])
-    assert (f["sd_log_r"] < 0.2 * 2.1).all() and (np.isnan(f["chi2"]) | (f["chi2"] < 9)).all() and (f["chi2_front"] < 9).all()
+    assert (f["sd_log_r"] < 0.2 * 2.1).all()
     # seen from three sides, every edge: no diagnostic, and the rows' own data say most of their radii
     assert (f["diag"] & (SupportDiag.ONE_SIDED | SupportDiag.SHADOWED | SupportDiag.TUBE_EDGE)).sum() == 0, f["diag"]
-    assert (f["data_share"] > 0.5).all() and (f["data_share"] <= 1).all() and (f["deleted"] == 0).all(), f["data_share"]
+    assert (f["data_share"] > 0.5).all() and (f["data_share"] <= 1).all(), f["data_share"]
 
 
 def test_a_bent_stem_is_a_chain_of_straight_pieces(tmp_path):
@@ -90,14 +82,11 @@ def test_a_bent_stem_is_a_chain_of_straight_pieces(tmp_path):
     a = np.c_[rho - np.sqrt(rho ** 2 - z0 ** 2), np.zeros(2), z0]
     b = np.c_[rho - np.sqrt(rho ** 2 - (z0 + 0.6) ** 2), np.zeros(2), z0 + 0.6]
     f = support_tree(scans, a, b, [1.5 * r] * 2, [-1, 0], params=PARAMS, threads=2)
-    p = f["pieces"]
-    assert (f["flags"] == 0).all() and (p["flags"] == 0).all() and list(p["row"]) == [0, 0, 0, 1, 1, 1]
-    assert np.abs(np.log(p["r"] / r)).max() < 0.05 and np.abs(np.log(f["r"] / r)).max() < 0.05
-    # each piece's middle lies on the arc, though the chord is up to 2.2 cm off it
-    for k in range(len(p["r"])):
-        mid = 0.5 * (p["a"][k] + p["b"][k])
-        assert abs(mid[0] - (rho - np.sqrt(rho ** 2 - mid[2] ** 2))) < 0.003, (k, mid)
-    assert (p["p_wood"] > 0.9).all() and (f["p_wood"] > 0.9).all()
+    assert (f["flags"] == 0).all() and np.abs(np.log(f["r"] / r)).max() < 0.05
+    # each row runs from its first piece's start to its last's end, both on the arc
+    for x in np.r_[f["a"], f["b"]]:
+        assert abs(x[0] - (rho - np.sqrt(rho ** 2 - x[2] ** 2))) < 0.004, x
+    assert (f["p_wood"] > 0.9).all()
 
 
 def test_thin_stems_far_away_are_bounded_around_their_truth(tmp_path):
@@ -112,53 +101,37 @@ def test_thin_stems_far_away_are_bounded_around_their_truth(tmp_path):
     f = support_tree(scans, a, a + [0, 0, 0.3], 1.5 * radii, np.full(4, -1), params=PARAMS, threads=2)
     bounded = (f["flags"] & (SupportFlag.BOUNDS | SupportFlag.POROUS)) > 0
     assert bounded.sum() >= 2 and not (f["flags"] & (SupportFlag.RUNS | SupportFlag.HULL)).any()
-    assert np.isnan(f["r_row"][bounded]).all() and np.isfinite(f["r_hi"][bounded]).all()
+    assert (f["basis"][bounded] != SupportBasis.MEASURED).all() and np.isfinite(f["r_hi"][bounded]).all()
     lo_ok = np.isnan(f["r_lo"]) | (f["r_lo"] <= radii)
-    held = (lo_ok & (f["r_floor"] <= radii) & (radii <= f["r_hi"]))[bounded]
-    assert held.all() and f["converged"], (f["r_lo"], f["r_floor"], f["r_hi"])
+    held = (lo_ok & (radii <= f["r_hi"]))[bounded]
+    assert held.all() and f["converged"], (f["r_lo"], f["r_hi"])
     lo, hi = f["r"] * np.exp(-1.96 * f["sd_log_r"]), f["r"] * np.exp(1.96 * f["sd_log_r"])
     # two scans that each see opaque wood: as sure as two scans can make it (exist_scale)
     assert ((lo <= radii) & (radii <= hi)).all() and (f["p_wood"] > 0.8).all()
 
 
 def test_a_clump_of_stems_is_flagged_as_runs(tmp_path):
-    # three solid stems inside one envelope claim (as joint_tree's clump test): the profiles show them apart
+    # three solid stems inside one envelope claim: the profiles show them apart
     stems = np.array([[0.0, 0.0, 0.045], [0.075, 0.025, 0.04], [0.02, 0.085, 0.035]])
     scans = scanned(tmp_path, np.c_[stems[:, :2], np.zeros(3)], np.c_[stems[:, :2], np.full(3, 1.6)], stems[:, 2],
                     [(8.0, -1.0), (-5.5, 7.0), (1.5, -9.5)])
     centre = stems[:, :2].mean(0)
     a, b = np.array([[*centre, 0.5], [*centre, 0.8]]), np.array([[*centre, 0.8], [*centre, 1.1]])
     f = support_tree(scans, a, b, [0.093, 0.093], [-1, 0], params=PARAMS)
-    assert ((f["flags"] & SupportFlag.RUNS) > 0).all() and (f["n_runs"] >= 2).all() and f["a"].shape == (2, 3)
-    # routed, each piece is fitted exactly from its runs' seeds: its stems are nodes (the piece's own, then the
-    # further ones beside it), each within a centimetre of a stem and its radius within a quarter
-    p = f["pieces"]
-    assert (p["k_stems"][:2] >= 2).all() and (p["split_gain"][:2] > 0).all() and len(p["r"]) == 2 + (p["k_stems"][:2] - 1).sum()
-    assert (p["src"][2:] < 2).all() and (p["stem"][2:] > 0).all() and (p["stem"][:2] == 0).all()
-    mid = 0.5 * (p["a"] + p["b"])[:, :2]
-    for s in stems:
-        d = np.hypot(*(mid - s[:2]).T)
+    assert ((f["flags"] & SupportFlag.RUNS) > 0).all() and f["a"].shape == (2, 3)
+    # routed, each piece is fitted exactly from its runs' seeds: several stems, and the one each row serves within a
+    # centimetre of a stem and its radius within a quarter
+    assert (f["k_stems"] >= 2).all()
+    for k, m in enumerate(0.5 * (f["a"] + f["b"])[:, :2]):
+        d = np.hypot(*(stems[:, :2] - m).T)
         j = np.argmin(d)
-        assert d[j] < 0.012 and abs(np.log(p["r"][j] / s[2])) < 0.25, (s, d[j], p["r"][j])
-    # near the budget of passes per pair (research 93 §18: <= 60, set when every other pulse was fitted). Fitting every
-    # pulse (§19) counts the whole ladder's Newton work per pair: this clump climbs three rungs and takes ~65-69 passes;
-    # real routed pieces average ~26 on the bench, where most stop at one or two rungs
-    passes = (p["evals_value"] + p["evals_deriv"])[:2] / p["n_exact"][:2]
-    assert (passes <= 75).all(), passes
+        assert d[j] < 0.012 and abs(np.log(f["r"][k] / stems[j, 2])) < 0.25, (k, d[j], f["r"][k])
     # every stop classified once, by the exact likelihood here, and the stems' echoes are wood
     e = f["echoes"]
     key = np.c_[e["scan"], e["pulse"], e["echo"]]
-    assert len(np.unique(key, axis=0)) == len(key) and (e["path"] == EchoPath.EXACT).all()
-    assert np.median(e["p_wood"][e["dist"] < 0.01]) > 0.9
-    # both fits were accepted; each node is one (piece, stem)
-    assert (p["refused"] == 0).all() and (f["refused"] == 0).all() and "phases" not in f
-    # each fitted stem reports its own foliage rate (NaN off the exact path), and the solve its rounds
-    assert np.isfinite(p["lam"][p["k_stems"] > 0]).all() and (p["lam"][p["k_stems"] > 0] > 0).all() and 3 <= f["rounds"] <= 300
-    assert len(set(zip(p["src"].tolist(), p["stem"].tolist()))) == len(p["src"])
+    assert len(np.unique(key, axis=0)) == len(key) and np.median(e["p_wood"]) > 0.9, np.median(e["p_wood"])
     # the runs' spans don't bound the stems measured in them, so they aren't reported as their bounds
     inside_own_bounds(f)
-    with pytest.raises(ValueError, match="version"):
-        support_tree(scans, a, b, [0.093, 0.093], [-1, 0], params=dataclasses.replace(PARAMS, version=0))
     with pytest.raises(ValueError, match="parent"):
         support_tree(scans, a, b, [0.093, 0.093], [0, 0], params=PARAMS)
     with pytest.raises(TypeError):
@@ -176,9 +149,7 @@ def test_a_tree_reports_how_its_radii_are_known_and_its_volume_with_an_interval(
     f = support_tree(scans, a, a + [0, 0, 0.3], 1.5 * radii, np.full(4, -1), params=PARAMS, threads=2)
     measured = f["basis"] == SupportBasis.MEASURED
     assert set(f["basis"]) <= set(SupportBasis) and np.isnan(f["r_cap"]).all()
-    assert (measured == ((f["flags"] == 0) & np.isfinite(f["r_row"]))).all()
-    # a row's point circle only where the rays gave none of its own, and entered where its basis says so
-    assert np.isnan(f["r_points"][measured]).all() and np.isfinite(f["r_points"][f["basis"] == SupportBasis.POINTS]).all()
+    assert (measured == (f["flags"] == 0)).all(), (f["basis"], f["flags"])
     assert not (f["diag"] & SupportDiag.REFUTED).any() and (np.isnan(f["pass_share"]) | (f["pass_share"] < 0.25)).all()
     v = f["volume"]
     parts = v["measured"] + v["points"] + v["bounded"] + v["prior"] + v["capped"]

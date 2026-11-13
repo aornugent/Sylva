@@ -3,7 +3,7 @@
 ## Destructive harvest
 
 Single-tree QSMs are scored against felled-tree
-volumes: 72 trees from [Momo Takoudjou et al. (2018)](../references.md), [Gonzalez de
+volumes: the 72 trees that every compared method reconstructed, from [Momo Takoudjou et al. (2018)](../references.md), [Gonzalez de
 Tanago et al. (2018)](../references.md) and [Burt et al. (2021)](../references.md), with wood density assigned per tree and agreement statistics computed
 the same way for every method; rayextract is raycloudtools' tree
 reconstruction ([Devereux et al. 2026](../references.md)):
@@ -16,12 +16,16 @@ reconstruction ([Devereux et al. 2026](../references.md)):
 Study
 biases are Momo −5 %, GdtM −3 %, Burt +1 %. The remaining scatter is a handful of
 co-dominant Peruvian trees whose second limb is barely sampled: the pipe
-model has to guess it. Never cap or anchor stem radii on a breast-height
-slice: at 1.3 m the big tropical trees are 3 m-wide buttress stars where a
-circle explains 15 % of the points.
+model has to guess it. For single trees, never cap or anchor stem radii on
+a breast-height slice: at 1.3 m the big tropical trees are 3 m-wide
+buttress stars where a circle explains 15 % of the points. (On plots the
+cap and the stem table are what keep unanchored leafy stems to size; see
+the [QSM guide](../guide/qsm.md).)
 
 Fitting on other wood inputs (graph-based labels, and all points weighted by
-a wood confidence) was scored the same way on 73 of these trees; none beat
+a wood confidence) was scored the same way on the 73 trees with a cloud at
+hand (one more than above: that tree is left out of the method comparison
+because rayextract did not reconstruct it); none beat
 the passage filter (22.0 % rRMSE on that set, against 22.6-26.6 %); the
 table is in the [QSM guide](../guide/qsm.md#wood-labels-and-wood-weights).
 
@@ -35,7 +39,7 @@ plots gained ten times as many cylinders per tree and branch orders 4–5
 instead of 1–3. QSM DBH agrees with the detected DBH to within ~15 % on
 the temperate plots; on the rainforest saplings the wood filter's medium
 step lowers it (Litchfield 0.72, Robson 0.49 against 0.83 / 0.62 with
-`medium_threshold=1.0`). The big Robson trees that sylva models at a
+`qsm.wood_points(medium_threshold=1.0)`). The big Robson trees that sylva models at a
 tenth of rayextract's volume are detection failures (a 0.08 m stem
 candidate on a 0.8 m tree) and truncated segments, not QSM ones. Segmentation
 leaves points below 0.5 m unassigned unless they sit within 1 m (1.5 DBH)
