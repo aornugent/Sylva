@@ -43,7 +43,6 @@ fn error_model(d: Option<&Bound<'_, PyDict>>) -> PyResult<ErrorModel> {
             "nu_e" => m.nu_e = x(&v)?,
             "bias" => m.bias = v.extract()?,
             "bias_ref" => m.bias_ref = x(&v)?,
-            "field" => m.field = v.extract()?,
             "field_spacing" => m.field_spacing = x(&v)?,
             "field_along" => m.field_along = v.extract()?,
             "field_epoch" => m.field_epoch = v.extract()?,
@@ -71,7 +70,6 @@ fn error_model_defaults<'py>(py: Python<'py>) -> PyResult<Bound<'py, PyDict>> { 
     d.set_item("class_edges", m.class_edges.to_vec())?;
     d.set_item("sigma_e", m.sigma_e.to_vec())?;
     d.set_item("bias", m.bias.to_vec())?;
-    d.set_item("field", m.field)?;
     d.set_item("field_along", m.field_along.to_vec())?;
     d.set_item("field_epoch", m.field_epoch.to_vec())?;
     d.set_item("misfit", m.misfit.to_vec())?;
@@ -164,9 +162,8 @@ impl PyRangeImage {
         self.inner.deletion
     }
 
-    /// The cell arrays, each (n_lines, n_cols[, k]): state, range, pulse (-1 none), normal, cos_inc, excess, run
-    /// (along, across), surface_id (-1 for none); and from the error model `err`, surface (class) and across
-    /// (footprints across the shorter run).
+    /// The cell arrays, each (n_lines, n_cols[, k]): state, range, pulse (-1 none), normal, cos_inc, excess; and
+    /// from the error model `err`, surface (class).
     #[pyo3(signature = (err=None))]
     fn arrays<'py>(&self, py: Python<'py>, err: Option<&Bound<'_, PyDict>>) -> PyResult<Bound<'py, PyDict>> {
         let em = error_model(err)?;
@@ -179,11 +176,7 @@ impl PyRangeImage {
         d.set_item("normal", v.normal.iter().flatten().copied().collect::<Vec<f32>>().into_pyarray(py).reshape([sh[0], sh[1], 3])?)?;
         d.set_item("cos_inc", v.cos_inc.clone().into_pyarray(py).reshape(sh)?)?;
         d.set_item("excess", v.excess.clone().into_pyarray(py).reshape(sh)?)?;
-        d.set_item("run", v.run.iter().flatten().copied().collect::<Vec<u16>>().into_pyarray(py).reshape([sh[0], sh[1], 2])?)?;
-        d.set_item("surface_id", v.surface_id.iter().map(|&s| if s == u32::MAX { -1 } else { s as i64 }).collect::<Vec<_>>().into_pyarray(py).reshape(sh)?)?;
         d.set_item("surface", v.excess.iter().map(|&e| em.surface(e as f64)).collect::<Vec<u8>>().into_pyarray(py).reshape(sh)?)?;
-        let across: Vec<f32> = v.run.iter().zip(&v.range).map(|(r, &g)| em.across(r[0].min(r[1]) as f64, g as f64) as f32).collect();
-        d.set_item("across", across.into_pyarray(py).reshape(sh)?)?;
         Ok(d)
     }
 

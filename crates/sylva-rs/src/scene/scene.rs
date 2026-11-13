@@ -354,7 +354,7 @@ fn cell_ll(obs: f64, layers: &[(Layer, u8)], ground: Option<(f64, f64)>, delta: 
         beam *= 1.0 - ly.f * ly.op;
         let s = ly.op * sel(drop, em, sc.wood_db, e * ly.cos);
         if obs.is_finite() {
-            let sd = (em.sigma_e[k as usize].powi(2) + ly.spread * ly.spread).sqrt();
+            let sd = em.depth_sd(k, ly.spread);
             let mu = ly.t + em.depth_bias(k, ly.t) + delta;
             dens += (-sc.kappa * ly.t).exp() * none_kept * s * t_pdf((obs - mu) / sd, em.nu_e) / sd;
             if ly.t < obs {
@@ -452,11 +452,7 @@ fn scan_cost(v: &RangeImage, si: usize, rendered: &[Vec<(usize, Layer)>], elems:
         let k = cls[i];
         let mid = e.mid();
         let s_along = (em.field_along[k as usize].powi(2) + if other { em.field_epoch[k as usize].powi(2) } else { 0.0 }).sqrt();
-        let along = if em.field {
-            OffsetField::hats(&mid, em.field_spacing).into_iter().map(|(key, w)| (field.node(key), w * s_along)).collect()
-        } else {
-            Vec::new()
-        };
+        let along = OffsetField::hats(&mid, em.field_spacing).into_iter().map(|(key, w)| (field.node(key), w * s_along)).collect();
         by_elem.insert(i as u32, data.len());
         data.push(ElemData { elem: i, cells: Vec::new(), class: k, support: 0, across: 2.0 * e.r / em.footprint(norm(&sub(&mid, &v.origin))), along });
     }
@@ -473,7 +469,7 @@ fn scan_cost(v: &RangeImage, si: usize, rendered: &[Vec<(usize, Layer)>], elems:
         let ground = (sc.ground_z.is_finite() && w[2] < -1e-6).then(|| ((sc.ground_z - v.origin[2]) / w[2], -w[2]));
         let wt = 1.0 / (em.dispersion * em.multiplicity(if obs.is_finite() { obs } else { front.t }));
         let el = &mut data[d];
-        let sd = (em.sigma_e[el.class as usize].powi(2) + front.spread.powi(2)).sqrt();
+        let sd = em.depth_sd(el.class, front.spread);
         el.support += (Outcome::of(obs, front.t, sd) == Outcome::On) as u32;
         el.cells.push((obs, layers, ground, wt, cell_ll(obs, &[], ground, 0.0, drop, em, sc)));
     }
@@ -666,11 +662,11 @@ impl Scene {
         per.insert(0, mine);
         let buf = kbuffer(&per, MIN_FILL);
         let k = classes(v, &buf, per.len(), em)[0];
-        let off = if em.field { em.field_along[k as usize] } else { 0.0 };
+        let off = em.field_along[k as usize];
         let mut out: Vec<CellPrediction> = buf.iter().filter(|(_, ls)| ls[0].elem == 0).map(|(&cell, ls)| {
             let ly = ls[0];
             let depth = ly.t + em.depth_bias(k, ly.t);
-            let sd = (em.sigma_e[k as usize].powi(2) + ly.spread.powi(2) + off * off).sqrt();
+            let sd = em.depth_sd(k, ly.spread.hypot(off));
             let obs = if v.state[cell] == state::ECHO { v.range[cell] as f64 } else { f64::NAN };
             CellPrediction {
                 cell, elem: 0, fill: ly.f, kept: ly.op * sel(drop_of(em, v), em, self.sc.wood_db, ly.f * ly.cos), surface: k,
@@ -741,7 +737,7 @@ impl Scene {
         let mut owner: HashMap<(u8, [i64; 3]), usize> = HashMap::new();
         for (k, &id) in ids.iter().enumerate() {
             let e = self.elems[id as usize].as_ref().unwrap();
-            let nodes = if self.em.field { OffsetField::hats(&e.mid(), self.em.field_spacing).into_iter().map(|(n, _)| (0u8, n)).collect() } else { Vec::new() };
+            let nodes: Vec<(u8, [i64; 3])> = OffsetField::hats(&e.mid(), self.em.field_spacing).into_iter().map(|(n, _)| (0u8, n)).collect();
             let cells = self.rendered[s][id as usize].iter().filter(|(_, l)| l.f >= MIN_FILL).map(|&(c, _)| (1u8, [c as i64, 0, 0]));
             for key in nodes.into_iter().chain(cells) {
                 match owner.get(&key) {
@@ -994,8 +990,6 @@ mod tests {
         let rendered = render_all(&v, &[el], &em);
         let (u_lap, out) = cost(&v, &[el], &em, &sc);
         assert_eq!(out.len(), 1);
-        let em_off = ErrorModel { field: false, ..em };
-        let u_off = cost(&v, &[el], &em_off, &sc).0;
         // the element sits on one node set: its along shift has prior sd s_along (√Σŵ² = 1)
         let (gh_x, gh_w) = ([-2.0201828704560856, -0.9585724646138185, 0.0, 0.9585724646138185, 2.0201828704560856],
                             [0.019953242059045913, 0.39361932315224116, 0.9453087204829419, 0.39361932315224116, 0.019953242059045913]);
@@ -1013,7 +1007,7 @@ mod tests {
         let m = gh_x.iter().map(|&x| ed(std::f64::consts::SQRT_2 * s_along * x)).fold(f64::NEG_INFINITY, f64::max);
         let quad = -(m + (gh_x.iter().zip(&gh_w).map(|(&x, &w)| w * (ed(std::f64::consts::SQRT_2 * s_along * x) - m).exp()).sum::<f64>()
             / std::f64::consts::PI.sqrt()).ln());
-        assert!((u_lap - quad).abs() < 0.1 * quad.abs().max(1.0), "laplace {u_lap} quadrature {quad} off {u_off}");
+        assert!((u_lap - quad).abs() < 0.1 * quad.abs().max(1.0), "laplace {u_lap} quadrature {quad}");
     }
 
     /// A patch renders as a disc: full fill at its centre, none beyond its rim; a patch of the pole's size where the

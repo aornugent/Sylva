@@ -26,12 +26,10 @@ pub struct ErrorModel {
     /// Measured between views, so a bias common to every view is not in it.
     pub bias: [[f64; 2]; 3],
     pub bias_ref: f64,
-    /// The offset field (research 130 offset-field-design.md): on (else every scan's offset is 0), its node
-    /// spacing ℓ (m), its along-beam spread per class within the reference epoch (σ_u ≈ 0.57 σ_L,same, from
+    /// The offset field (research 130 offset-field-design.md): its node spacing ℓ (m), its along-beam spread per class within the reference epoch (σ_u ≈ 0.57 σ_L,same, from
     /// alignment-rca's pair spreads and their +0.32 same-near-scan correlation) and the other-epoch part added in
     /// quadrature (σ_E² = (σ_L,other² − σ_L,same²) / 2). Along the beam only: an across-beam part didn't help
     /// same-day held-out calibration (slice 7b).
-    pub field: bool,
     pub field_spacing: f64,
     pub field_along: [f64; 3],
     pub field_epoch: [f64; 3],
@@ -66,7 +64,6 @@ impl Default for ErrorModel {
             nu_e: 4.0,
             bias: [[-0.0007, -0.00003], [-0.00175, -0.000055], [-0.00235, -0.000135]],
             bias_ref: 4.0,
-            field: true,
             field_spacing: 2.0,
             field_along: [0.0011, 0.00165, 0.0021],
             field_epoch: [0.0014, 0.0023, 0.0035],
@@ -91,9 +88,9 @@ impl ErrorModel {
         (self.footprint(range) / (self.step * range)).powi(2).max(1.0)
     }
 
-    /// Footprints across a run of `cells` at a range.
-    pub fn across(&self, cells: f64, range: f64) -> f64 {
-        cells * self.step * range / self.footprint(range)
+    /// An echo's depth sd for a surface of class `k` whose depth spreads by `spread` over the footprint (m).
+    pub fn depth_sd(&self, k: u8, spread: f64) -> f64 {
+        (self.sigma_e[k as usize].powi(2) + spread * spread).sqrt()
     }
 
     /// The surface class (0 solid, 1 mid, 2 fragmented) of an excess; NaN reads fragmented.

@@ -17,11 +17,6 @@
 //!   neighbours beyond a `jump` left out, one refit without 3-MAD outliers;
 //!   `cos ι = 1/√(1 + |∇ ln r|²)`. Where the window's cells lie in a row,
 //!   only the gradient along it is known.
-//! - **runs:** along each lattice axis, cells within `jump` of their
-//!   neighbour are one run; each cell keeps its run's length. Footprints
-//!   across a run are [`ErrorModel::across`](super::model::ErrorModel::across).
-//! - **surfaces:** echo cells connected through neighbours within `jump`
-//!   (union-find), numbered per scan.
 //! - **in-surface deletion:** of the cells inside a continuous surface facing
 //!   the beam, the share without an echo ([`RangeImage::deletion`]): the export's
 //!   loss, measured on the scan.
@@ -86,16 +81,11 @@ pub struct RangeImage {
     pub normal: Vec<[f32; 3]>,
     pub cos_inc: Vec<f32>,
     pub excess: Vec<f32>,
-    /// Run length (cells) along and across.
-    pub run: Vec<[u16; 2]>,
     /// The export's in-surface deletion: of the cells inside a continuous surface facing the beam (their four
     /// neighbours echoes within `jump` of one another, each a surfel with cos ι > `min_cos`, so grazing ground the
     /// reflectance cut thins is left out), the share without an echo. An export property, measured on the scan; the
     /// likelihood takes it as the chance a kept echo is lost anyway (`ErrorModel::p_drop` NaN).
     pub deletion: f64,
-    /// The surface each echo cell belongs to: connected through neighbours (4-connected) within `jump`, numbered
-    /// from 0 in cell order (`u32::MAX` for no echo).
-    pub surface_id: Vec<u32>,
 }
 
 fn rot_t(r: &[[f64; 3]; 3], d: &Point) -> Point {
@@ -167,15 +157,13 @@ impl RangeImage {
         drop(sat);
         let mut v = RangeImage {
             lat, c0, n_lines: nl, n_cols: nc, rot, origin, epoch, state: state_, range: rng, pulse,
-            normal: Vec::new(), cos_inc: Vec::new(), excess: Vec::new(), run: Vec::new(), surface_id: Vec::new(),
+            normal: Vec::new(), cos_inc: Vec::new(), excess: Vec::new(),
             deletion: 0.0,
         };
         let fits: Vec<([f32; 3], f32)> = (0..n).into_par_iter().map(|k| v.fit(k, direction, p)).collect();
         (v.normal, v.cos_inc) = fits.into_iter().unzip();
         v.excess = (0..n).into_par_iter().map(|k| v.excess_at(k, direction, p)).collect();
         v.deletion = v.in_surface_deletion(p.jump, p.min_cos);
-        v.runs(p.jump);
-        v.segment(p.jump);
         v
     }
 
@@ -310,44 +298,6 @@ impl RangeImage {
         empty as f64 / inside.max(1) as f64
     }
 
-    /// Surfaces: union-find over echo neighbours within `jump`.
-    fn segment(&mut self, jump: f64) {
-        let (nl, nc) = (self.n_lines, self.n_cols);
-        let mut parent: Vec<u32> = (0..(nl * nc) as u32).collect();
-        fn find(p: &mut [u32], mut i: u32) -> u32 {
-            while p[i as usize] != i {
-                p[i as usize] = p[p[i as usize] as usize];
-                i = p[i as usize];
-            }
-            i
-        }
-        let near = |a: usize, b: usize| self.state[a] == state::ECHO && self.state[b] == state::ECHO && ((self.range[a] - self.range[b]).abs() as f64) <= jump;
-        for k in 0..nl * nc {
-            for j in [(k % nc + 1 < nc).then(|| k + 1), (k + nc < nl * nc).then(|| k + nc)].into_iter().flatten() {
-                if near(k, j) {
-                    let (a, b) = (find(&mut parent, k as u32), find(&mut parent, j as u32));
-                    if a != b {
-                        parent[a.max(b) as usize] = a.min(b);
-                    }
-                }
-            }
-        }
-        let mut id = vec![u32::MAX; nl * nc];
-        let mut next = 0u32;
-        for k in 0..nl * nc {
-            if self.state[k] != state::ECHO {
-                continue;
-            }
-            let r = find(&mut parent, k as u32) as usize;
-            if id[r] == u32::MAX {
-                id[r] = next;
-                next += 1;
-            }
-            id[k] = id[r];
-        }
-        self.surface_id = id;
-    }
-
     /// The surfels of this scan's echo cells with a normal whose echo lies inside the box `lo`-`hi` (world positions
     /// along the cell centre's ray, and normals), for the moments.
     pub fn surfels(&self, lo: &Point, hi: &Point) -> (Vec<Point>, Vec<Point>) {
@@ -363,33 +313,6 @@ impl RangeImage {
             .unzip()
     }
 
-    /// Run lengths along both axes.
-    fn runs(&mut self, jump: f64) {
-        let (nl, nc) = (self.n_lines, self.n_cols);
-        self.run = vec![[0u16; 2]; nl * nc];
-        // axis 0: along a mirror line (stride 1, nc cells per line); axis 1: across lines (stride nc)
-        for (axis, (lines, len, stride, step)) in [(nl, nc, nc, 1), (nc, nl, 1, nc)].into_iter().enumerate() {
-            for s in 0..lines {
-                let at = |i: usize| s * stride + i * step;
-                let mut i = 0;
-                while i < len {
-                    let k = at(i);
-                    if self.state[k] != state::ECHO {
-                        i += 1;
-                        continue;
-                    }
-                    let mut j = i + 1;
-                    while j < len && self.state[at(j)] == state::ECHO && (self.range[at(j)] - self.range[at(j - 1)]).abs() as f64 <= jump {
-                        j += 1;
-                    }
-                    for m in i..j {
-                        self.run[at(m)][axis] = (j - i).min(u16::MAX as usize) as u16;
-                    }
-                    i = j;
-                }
-            }
-        }
-    }
 }
 
 #[cfg(test)]
@@ -399,7 +322,7 @@ mod tests {
 
     /// A scan of a vertical wall 5 m away (the y = 5 plane), lines 0.03° apart in azimuth, a hole of deleted
     /// pulses in it, and a pole 1 m in front of part of it: normals face the scanner, the hole reads deleted, and
-    /// the pole and the wall are separate surfaces with their own runs.
+    /// the wall beside the hole is less continuous.
     #[test]
     fn a_wall_with_a_hole_and_a_pole() {
         let (period, interval, zstep) = (6.6e-3, 0.825e-6, 0.03);
@@ -430,12 +353,7 @@ mod tests {
         let n = v.normal[k];
         assert!(n[1] < -0.999, "{n:?}");
         assert!((v.excess[k] - 1.0).abs() < 1e-6);
-        // the pole: a run 20 lines across
-        assert_eq!(v.run[cell(50, 100)][1], 20);
         // beside the hole, the wall is less continuous
         assert!(v.excess[cell(95, 203)] > 1.1);
-        // the pole and the wall are two surfaces; the wall stays one around its hole
-        assert_ne!(v.surface_id[cell(50, 100)], v.surface_id[cell(39, 100)]);
-        assert_eq!(v.surface_id[cell(150, 100)], v.surface_id[cell(95, 203)]);
     }
 }
