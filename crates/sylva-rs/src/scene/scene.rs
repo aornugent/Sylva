@@ -181,6 +181,13 @@ fn t_pdf(x: f64, nu: f64) -> f64 {
     (c - 0.5 * (nu + 1.0) * (1.0 + x * x / nu).ln()).exp()
 }
 
+/// What links an element to others in one view's components: its offset-field nodes and the cells it fronts.
+fn links(e: &Element, layers: &[(usize, Layer)]) -> Vec<(u8, [i64; 3])> {
+    OffsetField::hats(&e.mid(), FIELD_SPACING).into_iter().map(|(n, _)| (0u8, n))
+        .chain(layers.iter().filter(|(_, l)| l.fronts()).map(|&(c, _)| (1u8, [c as i64, 0, 0])))
+        .collect()
+}
+
 /// One element's layers in one view, out to the beam's edge and two cells past its section.
 fn render(v: &RangeImage, e: &Element, id: u32, em: &ErrorModel) -> Vec<(usize, Layer)> {
     let mut out = Vec::new();
@@ -755,6 +762,11 @@ impl Scene {
         self.cost() - before
     }
 
+    /// How many scans the scene holds.
+    pub fn n_scans(&self) -> usize {
+        self.views.len()
+    }
+
     /// The diffuse field.
     pub fn extinction(&self) -> &Extinction {
         &self.ext
@@ -951,9 +963,7 @@ impl Scene {
         let mut owner: HashMap<(u8, [i64; 3]), usize> = HashMap::new();
         for (k, &id) in ids.iter().enumerate() {
             let e = self.elems[id as usize].as_ref().unwrap();
-            let nodes: Vec<(u8, [i64; 3])> = OffsetField::hats(&e.mid(), FIELD_SPACING).into_iter().map(|(n, _)| (0u8, n)).collect();
-            let cells = self.rendered[s][id as usize].iter().filter(|(_, l)| l.fronts()).map(|&(c, _)| (1u8, [c as i64, 0, 0]));
-            for key in nodes.into_iter().chain(cells) {
+            for key in links(e, &self.rendered[s][id as usize]) {
                 match owner.get(&key) {
                     Some(&j) => {
                         let (a, b) = (find(&mut parent, k), find(&mut parent, j));
@@ -973,6 +983,49 @@ impl Scene {
             groups[g].push(ids[k]);
         }
         groups
+    }
+
+    /// Each hypothesis's cost to add alone (one or more elements), per scan: (hypotheses × scans), in parallel, the
+    /// scene unchanged and its diffuse field held. Equal to `cost_to_add` per scan: a hypothesis joins the scan's
+    /// components it shares a field node or a fronted cell with, and its cost is that union's against theirs.
+    pub fn costs_to_add(&self, hyps: &[Vec<Element>]) -> Vec<Vec<f64>> {
+        let n = self.views.len();
+        // per scan: its components and which component owns each link key
+        let comps: Vec<(Vec<Vec<u32>>, HashMap<(u8, [i64; 3]), usize>)> = (0..n).into_par_iter().map(|s| {
+            let cs = self.components(s);
+            let mut owner = HashMap::new();
+            for (g, m) in cs.iter().enumerate() {
+                for &id in m {
+                    for key in links(self.elems[id as usize].as_ref().unwrap(), &self.rendered[s][id as usize]) {
+                        owner.insert(key, g);
+                    }
+                }
+            }
+            (cs, owner)
+        }).collect();
+        hyps.par_iter().map(|h| (0..n).map(|s| {
+            let v = &self.views[s];
+            let extra: Vec<Vec<(usize, Layer)>> = h.iter().map(|e| render(v, e, 0, &self.em)).collect();
+            if extra.iter().all(|l| l.is_empty()) {
+                return 0.0;
+            }
+            let (cs, owner) = &comps[s];
+            let mut touched: Vec<usize> = h.iter().zip(&extra).flat_map(|(e, l)| links(e, l)).filter_map(|k| owner.get(&k).copied()).collect();
+            touched.sort_unstable();
+            touched.dedup();
+            let members: Vec<u32> = touched.iter().flat_map(|&g| cs[g].iter().copied()).collect();
+            let mut elems: Vec<Element> = members.iter().map(|&i| self.elems[i as usize].unwrap()).collect();
+            let mut rendered: Vec<Vec<(usize, Layer)>> = members.iter().enumerate()
+                .map(|(k, &i)| self.rendered[s][i as usize].iter().map(|&(c, l)| (c, Layer { elem: k as u32, ..l })).collect())
+                .collect();
+            for (e, l) in h.iter().zip(extra) {
+                let k = elems.len() as u32;
+                elems.push(*e);
+                rendered.push(l.into_iter().map(|(c, ly)| (c, Layer { elem: k, ..ly })).collect());
+            }
+            let with = scan_cost(v, s, &rendered, &elems, self.ref_epoch, &self.em, &self.sc, &self.ext).0;
+            with - touched.iter().map(|&g| self.memo[s][&cs[g]].0).sum::<f64>()
+        }).collect()).collect()
     }
 
     /// Recompute the scans `touched` (their new components, from the memo where it holds them) and return the cost
@@ -1162,6 +1215,30 @@ mod tests {
         assert!(sigma(&c) < 0.5 * dense, "{} vs {dense}", sigma(&c));
         c.demote(id);
         assert!(c.cost().abs() < 1e-9, "{}", c.cost());
+    }
+
+    /// Many hypotheses at once: each one's cost per scan equals adding then removing it, the scene unchanged.
+    #[test]
+    fn costs_to_add_match_add_then_remove() {
+        let v = pole_view();
+        let (em, sc) = (ErrorModel::default(), Background::default());
+        let mut c = Scene::new(vec![v.clone(), v.clone()], &[stick(0.0, 4.0, 0.03)], em, sc, None);
+        let hyps = vec![vec![stick(0.0, 4.0, 0.02)], vec![stick(0.2, 6.0, 0.03), stick(0.25, 6.0, 0.01)], vec![stick(5.0, 4.0, 0.03)]];
+        let e0 = c.cost();
+        let all = c.costs_to_add(&hyps);
+        assert_eq!(c.cost(), e0);
+        for (h, per) in hyps.iter().zip(&all) {
+            let (ids, d): (Vec<u32>, f64) = h.iter().fold((Vec::new(), 0.0), |(mut ids, d), e| {
+                let (id, de) = c.add(*e);
+                ids.push(id);
+                (ids, d + de)
+            });
+            for id in ids {
+                c.remove(id);
+            }
+            let total: f64 = per.iter().sum();
+            assert!((total - d).abs() < 1e-6 * d.abs().max(1.0), "{total} vs {d}");
+        }
     }
 
     /// A scene's moves: adding then removing an element restores its cost exactly (synthesis §18

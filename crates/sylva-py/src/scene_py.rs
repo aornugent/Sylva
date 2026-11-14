@@ -378,6 +378,16 @@ impl PyScene {
         Ok(py.detach(|| c.change(id, e)))
     }
 
+    /// Many hypotheses' costs to add, each alone, per scan: `hypotheses` a list of element dicts (one or more elements
+    /// each); returns (hypotheses, scans), the scene unchanged.
+    fn costs_to_add<'py>(&self, py: Python<'py>, hypotheses: Vec<Bound<'py, PyDict>>) -> PyResult<Bound<'py, numpy::PyArray2<f64>>> {
+        let hs: Vec<Vec<Element>> = hypotheses.iter().map(|d| elements_from_py(d, &self.em)).collect::<PyResult<_>>()?;
+        let c = &self.inner;
+        let out = py.detach(|| c.costs_to_add(&hs));
+        let (n, m) = (out.len(), self.inner.n_scans());
+        Ok(out.into_iter().flatten().collect::<Vec<f64>>().into_pyarray(py).reshape([n, m])?)
+    }
+
     /// The cost change of adding one element, the scene left as it was.
     fn cost_to_add(&mut self, py: Python<'_>, element: &Bound<'_, PyDict>) -> PyResult<f64> {
         let e = one(elements_from_py(element, &self.em)?)?;
