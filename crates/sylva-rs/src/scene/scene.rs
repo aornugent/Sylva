@@ -1147,7 +1147,7 @@ mod tests {
     fn the_field_is_a_residual_and_its_moves_are_exact() {
         let v = pole_view();
         let (em, sc) = (ErrorModel::default(), Background::default());
-        let spec = Some(ExtinctionSpec { lo: [-0.5, 2.9, -0.3], hi: [0.5, 8.9, 0.3], voxel: 0.1, prior_path: 1.0, multi_echo: false });
+        let spec = Some(ExtinctionSpec { lo: [-0.5, 2.9, -0.3], hi: [0.5, 8.9, 0.3], voxel: 0.1, prior_path: 1.0, multi_echo: false, omega: 1.0 });
         let pole = stick(0.0, 4.0, 0.03);
         let sigma = |c: &Scene| c.field().1.iter().find(|x| x.0 == [5, 10, 3]).map_or(f64::NAN, |x| x.1);
         let mut c = Scene::new(vec![v.clone()], &[], em, sc, spec);

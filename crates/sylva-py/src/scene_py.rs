@@ -14,7 +14,7 @@
 //!   (`counts`) and cell predictions (`predict`).
 //! - **The diffuse field:** `extinction` is a dict `lo`, `hi` (the box, 3 each), `voxel` and `prior_path` (m), and
 //!   `multi_echo` (default false, the first echo, which predicted held-out transmission as well or better on the
-//!   stand; true reads each pulse's echo sequence); the
+//!   stand; true reads each pulse's echo sequence) and `omega` (clumping, default 1); the
 //!   field is then the elements' residual there. `refit_field()`, `promote(element)` and `demote(id)` move mass
 //!   between the field and the elements; `field()` gives it per voxel and `transmission(image, cells)` its optical
 //!   depth across the box along other images' rays.
@@ -264,8 +264,9 @@ impl PyScene {
         let spec = extinction.map(|d| -> PyResult<ExtinctionSpec> {
             let req = |k: &str| d.get_item(k)?.ok_or_else(|| bad(k));
             let multi_echo = match d.get_item("multi_echo")? { Some(x) => x.extract()?, None => false };
+            let omega = match d.get_item("omega")? { Some(x) => x.extract()?, None => 1.0 };
             Ok(ExtinctionSpec { lo: req("lo")?.extract()?, hi: req("hi")?.extract()?, voxel: req("voxel")?.extract()?,
-                                prior_path: req("prior_path")?.extract()?, multi_echo })
+                                prior_path: req("prior_path")?.extract()?, multi_echo, omega })
         }).transpose()?;
         let vs: Vec<Arc<RangeImage>> = images.iter().map(|v| v.inner.clone()).collect();
         Ok(PyScene { inner: py.detach(|| Scene::new(vs, &el, em, bg, spec)), em })

@@ -82,6 +82,8 @@ pub struct RangeImage {
     pub pulse: Vec<u32>,
     pub echo_start: Vec<u32>,
     pub echo_range: Vec<f32>,
+    /// Each echo's reflectance (dB), beside `echo_range`; empty where the source has none.
+    pub echo_refl: Vec<f32>,
     /// Unit normal toward the scanner (world), `cos ι` and excess; NaN where no fit.
     pub normal: Vec<[f32; 3]>,
     pub cos_inc: Vec<f32>,
@@ -115,13 +117,15 @@ impl RangeImage {
         let f = ShotsFile::open(path)?;
         let groups: Vec<_> = (0..f.n_groups()).into_par_iter().map(|g| -> Result<_> {
             let f = f.reopen()?;
-            Ok((f.read_rays(g, &[])?, f.read_echo_f64(g, "gps_time")?))
+            Ok((f.read_rays(g, &[])?, f.read_echo_f64(g, "gps_time")?, f.read_echo_f64(g, "reflectance").ok()))
         }).collect::<Result<_>>()?;
         // pulses that returned, each with its first echo's time; the pattern's zenith range from every row
         let (mut zmin, mut zmax) = (f64::INFINITY, f64::NEG_INFINITY);
         let mut pulses: Vec<(f64, Point, usize, usize)> = Vec::new();
         let mut echoes: Vec<f32> = Vec::new();
-        for (rays, time) in &groups {
+        let mut refls: Vec<f32> = Vec::new();
+        let has_refl = groups.iter().all(|g| g.2.is_some());
+        for (rays, time, refl) in &groups {
             let mut e = 0usize;
             for (i, &n) in rays.echo_count.iter().enumerate() {
                 let (z, a) = (rays.zenith[i] as f64, rays.azimuth[i] as f64);
@@ -130,11 +134,14 @@ impl RangeImage {
                     let d = [z.sin() * a.sin(), z.sin() * a.cos(), z.cos()];
                     pulses.push((time[e], d, echoes.len(), n));
                     echoes.extend_from_slice(&rays.range[e..e + n]);
+                    if let (true, Some(r)) = (has_refl, refl) {
+                        refls.extend(r[e..e + n].iter().map(|&x| x as f32));
+                    }
                 }
                 e += n;
             }
         }
-        for (rays, _) in &groups {
+        for (rays, _, _) in &groups {
             for i in 0..rays.zenith.len() {
                 let d = rot_t(&rot, &{
                     let (z, a) = (rays.zenith[i] as f64, rays.azimuth[i] as f64);
@@ -151,12 +158,18 @@ impl RangeImage {
         let dir: Vec<Point> = pulses.iter().map(|q| q.1).collect();
         let mut echo_start = Vec::with_capacity(pulses.len() + 1);
         let mut echo_range = Vec::with_capacity(echoes.len());
+        let mut echo_refl = Vec::with_capacity(refls.len());
         echo_start.push(0u32);
         for q in &pulses {
             echo_range.extend_from_slice(&echoes[q.2..q.2 + q.3]);
+            if has_refl {
+                echo_refl.extend_from_slice(&refls[q.2..q.2 + q.3]);
+            }
             echo_start.push(echo_range.len() as u32);
         }
-        Ok(RangeImage::new(&time, &dir, echo_start, echo_range, (zmin, zmax), rot, origin, epoch, p))
+        let mut v = RangeImage::new(&time, &dir, echo_start, echo_range, (zmin, zmax), rot, origin, epoch, p);
+        v.echo_refl = echo_refl;
+        Ok(v)
     }
 
     /// One scan's range image from pulses with at most one echo each: `range` NaN for a pulse fired with no echo;
@@ -211,7 +224,7 @@ impl RangeImage {
             }
         }
         let mut v = RangeImage {
-            lat, c0, n_lines: nl, n_cols: nc, rot, origin, epoch, cell, range: rng, pulse, echo_start, echo_range,
+            lat, c0, n_lines: nl, n_cols: nc, rot, origin, epoch, cell, range: rng, pulse, echo_start, echo_range, echo_refl: Vec::new(),
             normal: Vec::new(), cos_inc: Vec::new(), excess: Vec::new(),
         };
         let fits: Vec<([f32; 3], f32)> = (0..n).into_par_iter().map(|k| v.fit(k, direction, p)).collect();
@@ -336,6 +349,15 @@ impl RangeImage {
             }
         }
         (25.0 / n.max(1) as f64).sqrt() as f32
+    }
+
+    /// The reflectances (dB) of cell `k`'s echoes, beside [`RangeImage::echoes`]; empty where unknown.
+    pub fn echo_refls(&self, k: usize) -> &[f32] {
+        if self.echo_refl.is_empty() || self.pulse[k] == u32::MAX {
+            return &[];
+        }
+        let p = self.pulse[k] as usize;
+        &self.echo_refl[self.echo_start[p] as usize..self.echo_start[p + 1] as usize]
     }
 
     /// The most echoes any pulse recorded: the instrument's cap on targets per pulse, read from the data (AM's VZ-2000i

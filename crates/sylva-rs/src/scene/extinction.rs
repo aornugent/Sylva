@@ -16,14 +16,21 @@
 //!   origin for the first and from the previous echo plus the receiver's resolution after that (a surface closer
 //!   behind an echo would have merged with it). After the last echo, the path on is transmission only if the pulse
 //!   returned fewer echoes than the instrument records ([`RangeImage::max_targets`]): a pulse at its cap says
-//!   nothing about what lies beyond. Without `multi_echo`, only the first echo and the path to it count. Each ray counts `1 / (φ m(ρ))`, as a cell does in the ray
+//!   nothing about what lies beyond. Without `multi_echo`, only the first echo and the path to it count.
+//! - **Energy after an echo.** A pulse's echo energies are bounded by its emitted energy (synthesis §4): an echo's
+//!   reflectance against a full-footprint hit on wood ([`WOOD_DB`]) is the share of the beam it took, and only the rest
+//!   goes on. So each stretch after an echo counts as transmission in proportion to the beam left: none past an
+//!   opaque hit, most past a sliver. Where echoes carry no reflectance, the beam is taken to go on whole.
+//! - **Clumping** (`omega`, Nilson's Ω ≤ 1): a ray's optical depth through the field is Ω times the voxels' mean
+//!   extinction, so gaps inside a voxel and gaps that line up along a ray let more through than `exp(−∫σ)`. Ω is
+//!   declared, estimated on held-out directions. Each ray counts `1 / (φ m(ρ))`, as a cell does in the ray
 //!   likelihood. The dispersion φ is a compound Poisson's clump size: mulga's leaf hits are clumped, and their
 //!   dispersion is flat in cell size (synthesis §2).
 //! - **A residual.** The field is estimated from the rays no element fronts, so an element and the field never
 //!   explain the same echoes. Its log-likelihood over every ray, `Σ_v h ln σ_v − σ_v L` with all rays' counts, is
 //!   the part of the scene's cost the elements' cells don't hold.
 
-use super::model::{ErrorModel, RESOLUTION};
+use super::model::{ErrorModel, RESOLUTION, WOOD_DB};
 use super::range_image::{Cell, RangeImage};
 use crate::Point;
 use rayon::prelude::*;
@@ -38,6 +45,7 @@ pub struct ExtinctionSpec {
     pub voxel: f64,
     pub prior_path: f64,
     pub multi_echo: bool,
+    pub omega: f64,
 }
 
 /// Weighted counts per voxel: (first echoes in it, ray length through it).
@@ -93,7 +101,7 @@ impl Extinction {
     pub fn tau(&self, o: &Point, w: &Point, t: f64) -> f64 {
         let mut tau = self.kappa * t;
         if let Some(sp) = self.spec {
-            traverse(&sp, o, w, 0.0, t, |k, a, b| tau += (self.sigma.get(&k).unwrap_or(&self.kappa) - self.kappa) * (b - a));
+            traverse(&sp, o, w, 0.0, t, |k, a, b| tau += (sp.omega * self.sigma.get(&k).unwrap_or(&self.kappa) - self.kappa) * (b - a));
         }
         tau
     }
@@ -193,20 +201,26 @@ fn ray(v: &RangeImage, sp: &ExtinctionSpec, em: &ErrorModel, cap: usize, weighte
     let w = v.direction((k / v.n_cols) as f64, (k % v.n_cols) as f64);
     let Some((_, t1)) = clip(sp, &v.origin, &w) else { return };
     let echoes: &[f32] = if v.cell[k] == Cell::Echoes { v.echoes(k) } else { &[] };
+    let refls = if v.cell[k] == Cell::Echoes { v.echo_refls(k) } else { &[] };
     let wt = if weighted { 1.0 / (em.dispersion * em.multiplicity(echoes.first().map_or(t1, |&r| r as f64))) } else { 1.0 };
     let used = if sp.multi_echo { echoes.len() } else { echoes.len().min(1) };
-    let mut start = 0.0;
-    for &r in &echoes[..used] {
+    let (mut start, mut beam) = (0.0, 1.0);
+    for (i, &r) in echoes[..used].iter().enumerate() {
         let r = r as f64;
-        traverse(sp, &v.origin, &w, start, r, |key, a, b| add(key, 0.0, wt * (b - a)));
+        let b0 = beam;
+        traverse(sp, &v.origin, &w, start, r, |key, a, b| add(key, 0.0, wt * b0 * (b - a)));
         let x = [0, 1, 2].map(|a| v.origin[a] + w[a] * r);
         if inside(sp, &x) {
-            add(key(sp, &x), wt, 0.0);
+            add(key(sp, &x), wt * b0, 0.0);
+        }
+        if let Some(&db) = refls.get(i) {
+            beam *= (1.0 - 10f64.powf((db as f64 - WOOD_DB) / 10.0)).clamp(0.0, 1.0);
         }
         start = r + RESOLUTION;
     }
     if echoes.is_empty() || (sp.multi_echo && echoes.len() < cap) {
-        traverse(sp, &v.origin, &w, start, f64::INFINITY, |key, a, b| add(key, 0.0, wt * (b - a)));
+        let b0 = beam;
+        traverse(sp, &v.origin, &w, start, f64::INFINITY, |key, a, b| add(key, 0.0, wt * b0 * (b - a)));
     }
 }
 
@@ -324,7 +338,7 @@ mod tests {
     /// A ray through a box of 1 m voxels: the segments tile the clipped ray, and a uniform field's optical depth is κ t.
     #[test]
     fn the_traversal_tiles_the_ray() {
-        let sp = ExtinctionSpec { lo: [0.0, 0.0, 0.0], hi: [4.0, 4.0, 4.0], voxel: 1.0, prior_path: 1.0, multi_echo: true };
+        let sp = ExtinctionSpec { lo: [0.0, 0.0, 0.0], hi: [4.0, 4.0, 4.0], voxel: 1.0, prior_path: 1.0, multi_echo: true, omega: 1.0 };
         let (o, w) = ([-1.0, 0.5, 0.5], [0.8, 0.6, 0.0]);
         let mut len = 0.0;
         let mut keys = Vec::new();
@@ -347,7 +361,7 @@ mod tests {
     /// empty space.
     #[test]
     fn an_open_tip_prefers_field_ahead_that_holds_its_flux() {
-        let sp = ExtinctionSpec { lo: [0.0, 0.0, 0.0], hi: [4.0, 4.0, 4.0], voxel: 0.5, prior_path: 1.0, multi_echo: true };
+        let sp = ExtinctionSpec { lo: [0.0, 0.0, 0.0], hi: [4.0, 4.0, 4.0], voxel: 0.5, prior_path: 1.0, multi_echo: true, omega: 1.0 };
         let mut f = Extinction::from_counts(0.0, sp, &Counts::new());
         for i in 0..8 {
             f.sigma.insert([i, 2, 2], 0.15);
