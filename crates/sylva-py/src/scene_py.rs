@@ -12,9 +12,7 @@
 //! - **Scenes:** `Scene(images, elements, err, background, extinction)` holds elements against range images: `cost()`,
 //!   `rows()`, the cost change of each move (`add`, `remove`, `change`, `cost_to_add`), and an element's counts
 //!   (`counts`) and cell predictions (`predict`).
-//! - **The diffuse field:** `extinction` is a dict `lo`, `hi` (the box, 3 each), `voxel` and `prior_path` (m), and
-//!   `multi_echo` (default false, the first echo, which predicted held-out transmission as well or better on the
-//!   stand; true reads each pulse's echo sequence) and `omega` (clumping, default 1); the
+//! - **The diffuse field:** `extinction` is a dict `lo`, `hi` (the box, 3 each), `voxel` and `prior_path` (m); the
 //!   field is then the elements' residual there. `refit_field()`, `promote(element)` and `demote(id)` move mass
 //!   between the field and the elements; `field()` gives it per voxel and `transmission(image, cells)` its optical
 //!   depth across the box along other images' rays.
@@ -263,10 +261,8 @@ impl PyScene {
         let el = elements_from_py(elements, &em)?;
         let spec = extinction.map(|d| -> PyResult<ExtinctionSpec> {
             let req = |k: &str| d.get_item(k)?.ok_or_else(|| bad(k));
-            let multi_echo = match d.get_item("multi_echo")? { Some(x) => x.extract()?, None => false };
-            let omega = match d.get_item("omega")? { Some(x) => x.extract()?, None => 1.0 };
             Ok(ExtinctionSpec { lo: req("lo")?.extract()?, hi: req("hi")?.extract()?, voxel: req("voxel")?.extract()?,
-                                prior_path: req("prior_path")?.extract()?, multi_echo, omega })
+                                prior_path: req("prior_path")?.extract()? })
         }).transpose()?;
         let vs: Vec<Arc<RangeImage>> = images.iter().map(|v| v.inner.clone()).collect();
         Ok(PyScene { inner: py.detach(|| Scene::new(vs, &el, em, bg, spec)), em })
@@ -312,20 +308,6 @@ impl PyScene {
         d.set_item("sigma", rows.iter().map(|r| r.1).collect::<Vec<f64>>().into_pyarray(py))?;
         d.set_item("hits", rows.iter().map(|r| r.2 .0).collect::<Vec<f64>>().into_pyarray(py))?;
         d.set_item("path", rows.iter().map(|r| r.2 .1).collect::<Vec<f64>>().into_pyarray(py))?;
-        Ok(d)
-    }
-
-    /// The field's dispersion per voxel in scan `s`, rays in tiles of `tile` × `tile` cells: voxel (n, 3), dispersion
-    /// (Pearson χ² per degree of freedom; 1 for Poisson), tiles.
-    fn field_dispersion<'py>(&self, py: Python<'py>, s: usize, tile: usize) -> PyResult<Bound<'py, PyDict>> {
-        let c = &self.inner;
-        let mut rows: Vec<([i32; 3], (f64, usize))> = py.detach(|| c.field_dispersion(s, tile)).into_iter().collect();
-        rows.sort_by_key(|r| r.0);
-        let d = PyDict::new(py);
-        let n = rows.len();
-        d.set_item("voxel", rows.iter().flat_map(|r| r.0).collect::<Vec<i32>>().into_pyarray(py).reshape([n, 3])?)?;
-        d.set_item("dispersion", rows.iter().map(|r| r.1 .0).collect::<Vec<f64>>().into_pyarray(py))?;
-        d.set_item("tiles", rows.iter().map(|r| r.1 .1 as u32).collect::<Vec<u32>>().into_pyarray(py))?;
         Ok(d)
     }
 

@@ -34,14 +34,10 @@ pub const FLOOR_SLOPE: f64 = 15.0;
 pub const FLOOR_REF: f64 = 7.0;
 pub const DETECT_SD: f64 = 2.0;
 // The instrument: the beam (EXIT, DIVERGENCE), the lattice (STEP), the detection floor and the receiver's resolution
-// below are AM's VZ-2000i, as is the default resolution curve (`ErrorModel::res_*`, a setting since the stand's
+// are AM's VZ-2000i, as is the default resolution curve (`ErrorModel::res_*`, a setting since the stand's
 // simulator has its own); its cap on targets per pulse is read from the data (`RangeImage::max_targets`). Another
 // scanner is a change of these constants and settings, not of code.
 
-/// The receiver's range resolution (m): returns closer than this along one pulse merge into one echo at their
-/// energy-weighted range (research 130 slice 11); the field's counts use it as each echo's dead zone. The likelihood's
-/// soft form is [`ErrorModel::p_resolve`].
-pub const RESOLUTION: f64 = 0.8;
 /// Echo densities carry a uniform outlier share.
 pub const P_OUTLIER: f64 = 0.01;
 /// The elements' and the ground's reflectance (dB at full fill, face-on).
@@ -134,6 +130,12 @@ impl ErrorModel {
     /// recorded: above the detection floor.
     pub fn p_detect(&self, db: f64, e: f64, range: f64) -> f64 {
         0.5 * libm::erfc(-((db + 10.0 * e.max(1e-12).log10() - floor_db(range)) / DETECT_SD) / std::f64::consts::SQRT_2)
+    }
+
+    /// The receiver's resolution (m): the separation at which two equal returns come back as two echoes half the
+    /// time (the 50 % point of [`ErrorModel::p_resolve`]).
+    pub fn resolution(&self) -> f64 {
+        -self.res_a / self.res_b
     }
 
     /// The chance two returns `d` m apart, energies `e` dB apart (nearer over farther), come back as two echoes.

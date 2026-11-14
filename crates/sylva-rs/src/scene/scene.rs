@@ -784,11 +784,6 @@ impl Scene {
         d + self.refit_field()
     }
 
-    /// The diffuse field's dispersion per voxel in image `s` (tiles of `tile` × `tile` cells; [`extinction::dispersion`]).
-    pub fn field_dispersion(&self, s: usize, tile: usize) -> HashMap<[i32; 3], (f64, usize)> {
-        extinction::dispersion(&self.views[s], &self.ext, &self.em, tile)
-    }
-
     /// The diffuse field and its counts: per voxel with data, (voxel, σ, residual counts, every ray's counts).
     pub fn field(&self) -> (Option<ExtinctionSpec>, Vec<([i32; 3], f64, (f64, f64))>) {
         let mut out: Vec<([i32; 3], f64, (f64, f64))> = self.ext_all.iter().map(|(&k, &c)| (k, *self.ext.sigma.get(&k).unwrap_or(&self.ext.kappa), c)).collect();
@@ -1062,7 +1057,10 @@ mod tests {
     use super::*;
     use crate::shots::reconstruct::dir;
     use crate::scene::range_image::RangeImageParams;
-    use crate::scene::model::{floor_db, RESOLUTION};
+    use crate::scene::model::floor_db;
+
+    /// The test scan's receiver: returns closer than this merge (m).
+    const RESOLUTION: f64 = 0.8;
 
     /// A scan of a vertical pole (R = 3 cm, 4 m away, centred on the y axis) in front of a wall at 8 m (see
     /// [`pole_scan`]).
@@ -1200,7 +1198,7 @@ mod tests {
     fn the_field_is_a_residual_and_its_moves_are_exact() {
         let v = pole_view();
         let (em, sc) = (ErrorModel::default(), Background::default());
-        let spec = Some(ExtinctionSpec { lo: [-0.5, 2.9, -0.3], hi: [0.5, 8.9, 0.3], voxel: 0.1, prior_path: 1.0, multi_echo: false, omega: 1.0 });
+        let spec = Some(ExtinctionSpec { lo: [-0.5, 2.9, -0.3], hi: [0.5, 8.9, 0.3], voxel: 0.1, prior_path: 1.0 });
         let pole = stick(0.0, 4.0, 0.03);
         let sigma = |c: &Scene| c.field().1.iter().find(|x| x.0 == [5, 10, 3]).map_or(f64::NAN, |x| x.1);
         let mut c = Scene::new(vec![v.clone()], &[], em, sc, spec);
