@@ -9,8 +9,10 @@
 //! - [`range_image`]: one scan's observations on its lattice, and the signals read off them.
 //! - [`moments`]: surfel moments per (voxel, scan), and the candidate elements read off them.
 //! - [`model`]: the error model and the background.
+//! - [`extinction`]: the diffuse field, a residual extinction on voxels.
 //! - [`scene`]: elements, their rendering, the per-scan offset field and the [`scene::Scene`] that holds them.
 
+pub mod extinction;
 pub mod lattice;
 pub mod model;
 pub mod moments;

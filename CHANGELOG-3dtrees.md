@@ -49,7 +49,8 @@ branch `3dtrees/125-rebase`.
   class); `scene.moments` keeps surfel moments per (voxel, scan), silhouette cells left out, and reads candidate
   elements off them;
   `scene.model` holds the calibration as constants (the beam, the surface classes, the per-echo noise, the detection
-  floor rising with range, the receiver's 0.8 m resolution) and what a caller may set as two `params!` records (`ErrorModel`, `Background`); `scene.scene`'s `Scene` holds elements against range
+  floor rising with range, the receiver's 0.8 m resolution) and what a caller may set as two `params!` records (`ErrorModel`, `Background`); `scene.extinction` is the diffuse
+  field, a residual extinction per voxel in a box that every cell's ray likelihood reads (with a declared strand-bridge factor kept out of the cost); `scene.scene`'s `Scene` holds elements against range
   images, each rendered once with a uniform-disc beam (returns within the resolution merge), with a per-scan along-beam offset field over which each scan's ray likelihood is
   integrated by a Laplace marginal, and returns its cost, the cost change of a move, and each element's counts and
   cell predictions. Bound as `_core.RangeImage`, `_core.Scene`, `_core.candidates` and `_core.error_model_defaults`

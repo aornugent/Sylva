@@ -9,15 +9,20 @@
 //! - **Elements:** a dict of arrays, one row per element: `a`, `b` (n, 3) and `r` (n,) are required; `opacity` (n,)
 //!   defaults to 1, `misfit` (n,) to the error model's prior `misfit_base + misfit_slope r`, and `patch` (n,) bool to
 //!   false. A patch is a ball about `a` of radius `r` (its extent); its `b` is ignored.
-//! - **Scenes:** `Scene(images, elements, err, background)` holds elements against range images: `cost()`, `rows()`,
-//!   the cost change of each move (`add`, `remove`, `change`, `cost_to_add`), and an element's counts (`counts`)
-//!   and cell predictions (`predict`).
+//! - **Scenes:** `Scene(images, elements, err, background, extinction)` holds elements against range images: `cost()`,
+//!   `rows()`, the cost change of each move (`add`, `remove`, `change`, `cost_to_add`), and an element's counts
+//!   (`counts`) and cell predictions (`predict`).
+//! - **The diffuse field:** `extinction` is a dict `lo`, `hi` (the box, 3 each), `voxel` and `prior_path` (m); the
+//!   field is then the elements' residual there. `refit_field()`, `promote(element)` and `demote(id)` move mass
+//!   between the field and the elements; `field()` gives it per voxel and `transmission(image, cells)` its optical
+//!   depth across the box along other images' rays.
 
 use numpy::{IntoPyArray, PyArray1, PyArrayMethods, PyReadonlyArray1, PyReadonlyArray2};
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
 use std::sync::Arc;
+use sylva_rs::scene::extinction::ExtinctionSpec;
 use sylva_rs::scene::model::{Background, ErrorModel};
 use sylva_rs::scene::moments::{Candidate, Moments};
 use sylva_rs::scene::range_image::{RangeImage, RangeImageParams};
@@ -177,7 +182,7 @@ fn predictions_dict<'py>(py: Python<'py>, p: &[CellPrediction]) -> PyResult<Boun
     d.set_item("surface", p.iter().map(|x| x.surface).collect::<Vec<_>>().into_pyarray(py))?;
     d.set_item("outcome", p.iter().map(|x| x.outcome as u8).collect::<Vec<_>>().into_pyarray(py))?;
     type F = fn(&CellPrediction) -> f64;
-    for (k, f) in [("fill", (|x| x.fill) as F), ("kept", |x| x.kept), ("depth", |x| x.depth), ("sd", |x| x.sd), ("obs", |x| x.obs),
+    for (k, f) in [("fill", (|x| x.fill) as F), ("kept", |x| x.kept), ("reach", |x| x.reach), ("depth", |x| x.depth), ("sd", |x| x.sd), ("obs", |x| x.obs),
                    ("weight", |x| x.weight), ("footprint", |x| x.footprint), ("x", |x| x.x), ("s", |x| x.s)] {
         d.set_item(k, p.iter().map(f).collect::<Vec<_>>().into_pyarray(py))?;
     }
@@ -249,13 +254,68 @@ struct PyScene {
 #[pymethods]
 impl PyScene {
     #[new]
-    #[pyo3(signature = (images, elements, err=None, background=None))]
+    #[pyo3(signature = (images, elements, err=None, background=None, extinction=None))]
     fn new(py: Python<'_>, images: Vec<PyRef<'_, PyRangeImage>>, elements: &Bound<'_, PyDict>, err: Option<&Bound<'_, PyDict>>,
-           background: Option<&Bound<'_, PyDict>>) -> PyResult<Self> {
+           background: Option<&Bound<'_, PyDict>>, extinction: Option<&Bound<'_, PyDict>>) -> PyResult<Self> {
         let (em, bg) = (error_model(err)?, self::background(background)?);
         let el = elements_from_py(elements, &em)?;
+        let spec = extinction.map(|d| -> PyResult<ExtinctionSpec> {
+            let req = |k: &str| d.get_item(k)?.ok_or_else(|| bad(k));
+            Ok(ExtinctionSpec { lo: req("lo")?.extract()?, hi: req("hi")?.extract()?, voxel: req("voxel")?.extract()?,
+                                prior_path: req("prior_path")?.extract()? })
+        }).transpose()?;
         let vs: Vec<Arc<RangeImage>> = images.iter().map(|v| v.inner.clone()).collect();
-        Ok(PyScene { inner: py.detach(|| Scene::new(vs, &el, em, bg)), em })
+        Ok(PyScene { inner: py.detach(|| Scene::new(vs, &el, em, bg, spec)), em })
+    }
+
+    /// Re-estimate the diffuse field from the rays the elements leave: the cost change.
+    fn refit_field(&mut self, py: Python<'_>) -> f64 {
+        let c = &mut self.inner;
+        py.detach(|| c.refit_field())
+    }
+
+    /// Add one element and take the mass it explains out of the diffuse field: its id and the cost change.
+    fn promote(&mut self, py: Python<'_>, element: &Bound<'_, PyDict>) -> PyResult<(u32, f64)> {
+        let e = one(elements_from_py(element, &self.em)?)?;
+        let c = &mut self.inner;
+        Ok(py.detach(|| c.promote(e)))
+    }
+
+    /// Remove an element and give its mass back to the diffuse field: the cost change.
+    fn demote(&mut self, py: Python<'_>, id: u32) -> f64 {
+        let c = &mut self.inner;
+        py.detach(|| c.demote(id))
+    }
+
+    /// The diffuse field per voxel with data: voxel (n, 3, its index in the box), centre (n, 3), sigma (1/m), and every
+    /// ray's weighted counts, hits and path (m).
+    fn field<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
+        let (spec, rows) = self.inner.field();
+        let d = PyDict::new(py);
+        let n = rows.len();
+        d.set_item("voxel", rows.iter().flat_map(|r| r.0).collect::<Vec<i32>>().into_pyarray(py).reshape([n, 3])?)?;
+        if let Some(sp) = spec {
+            d.set_item("centre", rows.iter().flat_map(|r| [0, 1, 2].map(|a| sp.lo[a] + (r.0[a] as f64 + 0.5) * sp.voxel)).collect::<Vec<f64>>()
+                .into_pyarray(py).reshape([n, 3])?)?;
+        }
+        d.set_item("sigma", rows.iter().map(|r| r.1).collect::<Vec<f64>>().into_pyarray(py))?;
+        d.set_item("hits", rows.iter().map(|r| r.2 .0).collect::<Vec<f64>>().into_pyarray(py))?;
+        d.set_item("path", rows.iter().map(|r| r.2 .1).collect::<Vec<f64>>().into_pyarray(py))?;
+        Ok(d)
+    }
+
+    /// For flat `cells` of another image: the diffuse field's optical depth across its box along each cell's ray
+    /// (tau), and the ray's entry and exit ranges (t_in, t_out); NaN where the ray misses the box.
+    fn transmission<'py>(&self, py: Python<'py>, image: PyRef<'py, PyRangeImage>, cells: PyReadonlyArray1<i64>) -> PyResult<Bound<'py, PyDict>> {
+        let cs: Vec<usize> = cells.as_array().iter().map(|&k| k as usize).collect();
+        let v = image.inner.clone();
+        let c = &self.inner;
+        let t = py.detach(|| c.transmission(&v, &cs));
+        let d = PyDict::new(py);
+        d.set_item("tau", t.iter().map(|x| x.0).collect::<Vec<f64>>().into_pyarray(py))?;
+        d.set_item("t_in", t.iter().map(|x| x.1).collect::<Vec<f64>>().into_pyarray(py))?;
+        d.set_item("t_out", t.iter().map(|x| x.2).collect::<Vec<f64>>().into_pyarray(py))?;
+        Ok(d)
     }
 
     /// The scene's cost: −log of its likelihood ratio against the empty scene.

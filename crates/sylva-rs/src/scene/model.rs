@@ -82,9 +82,8 @@ params! {
 }
 
 params! {
-    /// What lies behind the elements, crudely: a diffuse echo hazard `kappa` (1/m) along every ray and a ground
-    /// plane's height (NaN for none). The ray likelihood reads the hazard only through [`Background::survival`] and
-    /// [`Background::density`], per cell.
+    /// What lies behind the elements, crudely: a diffuse extinction `kappa` (1/m) along every ray (the diffuse field
+    /// outside its box, and its prior mean inside: [`super::extinction`]) and a ground plane's height (NaN for none).
     #[derive(Debug, Clone, Copy)]
     pub struct Background {
         pub kappa: f64 = 0.05,
@@ -150,14 +149,3 @@ pub fn floor_db(range: f64) -> f64 {
     FLOOR_DB + FLOOR_SLOPE * (range.max(FLOOR_REF) / FLOOR_REF).log10()
 }
 
-impl Background {
-    /// The chance a pulse in `cell` meets no background echo before range `t`.
-    pub fn survival(&self, _cell: usize, t: f64) -> f64 {
-        (-self.kappa * t).exp()
-    }
-
-    /// The density (1/m) of the pulse's first background echo at range `t` in `cell`.
-    pub fn density(&self, cell: usize, t: f64) -> f64 {
-        self.kappa * self.survival(cell, t)
-    }
-}
