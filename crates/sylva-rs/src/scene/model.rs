@@ -33,9 +33,14 @@ pub const FLOOR_DB: f64 = -40.5;
 pub const FLOOR_SLOPE: f64 = 15.0;
 pub const FLOOR_REF: f64 = 7.0;
 pub const DETECT_SD: f64 = 2.0;
+// The instrument: the beam (EXIT, DIVERGENCE), the lattice (STEP), the detection floor and the receiver's resolution
+// below are AM's VZ-2000i, as is the default resolution curve (`ErrorModel::res_*`, a setting since the stand's
+// simulator has its own); its cap on targets per pulse is read from the data (`RangeImage::max_targets`). Another
+// scanner is a change of these constants and settings, not of code.
+
 /// The receiver's range resolution (m): returns closer than this along one pulse merge into one echo at their
-/// energy-weighted range (AM's raw scans: half the edges with a surface 0.5-0.8 m behind resolve two echoes, 94 % past
-/// 1.2 m; research 130 slice 11).
+/// energy-weighted range (research 130 slice 11); the field's counts use it as each echo's dead zone. The likelihood's
+/// soft form is [`ErrorModel::p_resolve`].
 pub const RESOLUTION: f64 = 0.8;
 /// Echo densities carry a uniform outlier share.
 pub const P_OUTLIER: f64 = 0.01;
@@ -78,6 +83,13 @@ params! {
         /// disagree by √φ times their per-view sd (research 130 slice 7d; 10.5 on raw). The simulated stand takes 4, from its
         /// injected-field coverage.
         pub dispersion: f64 = 10.0,
+        /// The receiver resolving two returns `d` m apart whose energies differ by `e` dB (the nearer's over the
+        /// farther's): `logit p = res_a + res_b d + res_c e`. AM's VZ-2000i, fitted on its raw edges with a single-echo
+        /// surface behind (research 130 slice 12b, `pulses.py resolution`); the stand's simulator resolves at 0.8 m
+        /// sharp, a step.
+        pub res_a: f64 = -2.591,
+        pub res_b: f64 = 2.601,
+        pub res_c: f64 = -0.131,
     }
 }
 
@@ -122,6 +134,11 @@ impl ErrorModel {
     /// recorded: above the detection floor.
     pub fn p_detect(&self, db: f64, e: f64, range: f64) -> f64 {
         0.5 * libm::erfc(-((db + 10.0 * e.max(1e-12).log10() - floor_db(range)) / DETECT_SD) / std::f64::consts::SQRT_2)
+    }
+
+    /// The chance two returns `d` m apart, energies `e` dB apart (nearer over farther), come back as two echoes.
+    pub fn p_resolve(&self, d: f64, e: f64) -> f64 {
+        1.0 / (1.0 + (-(self.res_a + self.res_b * d + self.res_c * e)).exp())
     }
 
     /// A stick's misfit sd (m) at radius r.

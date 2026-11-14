@@ -20,9 +20,10 @@
 //!   - The beam reaches layer i with energy `e_i = f_i Π_{j<i} (1 − op_j f_j)`, and its echo is recorded with
 //!     `op_i det_i`, where `det_i` is the chance it clears the detection floor ([`ErrorModel::p_detect`]):
 //!     `Φ((ρ_dB + 10 log10(e_i cos ι_i) − floor(t_i)) / σ)`.
-//!   - Returns closer than the receiver's resolution ([`RESOLUTION`]) merge: consecutive layers (and the ground)
-//!     within it of the first form one return, recorded if any member is, at their energy-weighted depth
-//!     (energy: op · e · cos · reflectance), its spread their spread about it.
+//!   - Adjacent returns (layers and the ground) resolve into two echoes with the instrument's
+//!     [`ErrorModel::p_resolve`] of their separation and energy ratio; else they merge into one, recorded if any
+//!     member is, at their energy-weighted depth (energy: op · e · cos · reflectance), its spread their spread about
+//!     it. A cell's likelihood is the mixture over these merge patterns.
 //!   - An echo at r has density `Σ_i P_i op_i det_i t_ν(r − t_i − bias_k − δ; σ_k ⊕ spread_i)` over the returns, plus
 //!     `κ e^{−κr} Π_{t_j<r} (1 − op_j det_j)`, where P_i is the chance that nothing nearer was kept, plus a uniform
 //!     outlier share. An empty cell has probability `e^{−κ t_end} Π (1 − op_j det_j)`.
@@ -51,7 +52,7 @@
 //!
 //! Cells no element touches cancel. Context (neighbours, competitors) enters as more elements in the set.
 
-use super::model::{Background, ErrorModel, FIELD_SPACING, GROUND_DB, NU_E, P_OUTLIER, RESOLUTION, SIGMA_E, STEP, T_MAX, WOOD_DB};
+use super::model::{Background, ErrorModel, FIELD_SPACING, GROUND_DB, NU_E, P_OUTLIER, SIGMA_E, STEP, T_MAX, WOOD_DB};
 use super::extinction::{self, Counts, Extinction, ExtinctionSpec, RayBg};
 use super::range_image::{Cell, RangeImage};
 use std::sync::Arc;
@@ -373,10 +374,12 @@ struct Return {
     surv: f64,
 }
 
-/// The returns a cell's layers (each with its element's surface class) and the ground at `ground` = (range, cos)
-/// give, nearest first, with every layer shifted by `delta`; and the range the beam ends at. `taus` are the diffuse
+/// The ways a cell's layers (each with its element's surface class) and the ground at `ground` = (range, cos) come
+/// back, with every layer shifted by `delta`: each a set of returns, nearest first, and its chance; and the range the
+/// beam ends at. Adjacent members resolve into two echoes with [`ErrorModel::p_resolve`] of their separation and
+/// energy ratio, else merge at their energy-weighted depth; patterns under 1e-4 are dropped. `taus` are the diffuse
 /// field's optical depths to each layer and then to the ground ([`RayBg`]).
-fn returns(layers: &[(Layer, u8)], ground: Option<(f64, f64)>, delta: f64, em: &ErrorModel, taus: &[f64]) -> (Vec<Return>, f64) {
+fn returns(layers: &[(Layer, u8)], ground: Option<(f64, f64)>, delta: f64, em: &ErrorModel, taus: &[f64]) -> (Vec<(f64, Vec<Return>)>, f64) {
     let t_end = ground.map_or(T_MAX, |g| g.0);
     let mut beam = 1.0;
     // members: (range, depth, depth sd, chance recorded, energy, optical depth)
@@ -393,26 +396,40 @@ fn returns(layers: &[(Layer, u8)], ground: Option<(f64, f64)>, delta: f64, em: &
     if let Some((tg, cg)) = ground {
         m.push((tg, tg, SIGMA_E[2], em.p_detect(GROUND_DB, beam * cg, tg), beam * cg * 10f64.powf(GROUND_DB / 10.0), taus[layers.len()]));
     }
-    let mut out = Vec::with_capacity(m.len());
-    let mut i = 0;
-    while i < m.len() {
-        let mut j = i + 1;
-        while j < m.len() && m[j].0 - m[i].0 < RESOLUTION {
-            j += 1;
+    let n = m.len();
+    // each adjacent pair's chance of resolving into two echoes
+    let pr: Vec<f64> = (1..n).map(|j| {
+        let e = 10.0 * (m[j - 1].4.max(1e-300) / m[j].4.max(1e-300)).log10();
+        em.p_resolve(m[j].0 - m[j - 1].0, e.clamp(-60.0, 60.0))
+    }).collect();
+    let group = |g: &[(f64, f64, f64, f64, f64, f64)]| {
+        if g.len() == 1 {
+            return Return { t: g[0].0, mu: g[0].1, sd: g[0].2, s: g[0].3, surv: (-g[0].5).exp() };
         }
-        if j == i + 1 {
-            out.push(Return { t: m[i].0, mu: m[i].1, sd: m[i].2, s: m[i].3, surv: (-m[i].5).exp() });
-        } else {
-            let g = &m[i..j];
-            // energy weights; members the beam no longer reaches weigh alike (the return is never recorded then)
-            let total: f64 = g.iter().map(|x| x.4).sum();
-            let wt = |x: &(f64, f64, f64, f64, f64, f64)| if total > 0.0 { x.4 / total } else { 1.0 / g.len() as f64 };
-            let mu = g.iter().map(|x| wt(x) * x.1).sum::<f64>();
-            let var = g.iter().map(|x| wt(x) * (x.2 * x.2 + (x.1 - mu).powi(2))).sum::<f64>();
-            let none: f64 = g.iter().map(|x| 1.0 - x.3).product();
-            out.push(Return { t: m[i].0, mu, sd: var.sqrt(), s: 1.0 - none, surv: (-m[i].5).exp() });
+        // energy weights; members the beam no longer reaches weigh alike (the return is never recorded then)
+        let total: f64 = g.iter().map(|x| x.4).sum();
+        let wt = |x: &(f64, f64, f64, f64, f64, f64)| if total > 0.0 { x.4 / total } else { 1.0 / g.len() as f64 };
+        let mu = g.iter().map(|x| wt(x) * x.1).sum::<f64>();
+        let var = g.iter().map(|x| wt(x) * (x.2 * x.2 + (x.1 - mu).powi(2))).sum::<f64>();
+        let none: f64 = g.iter().map(|x| 1.0 - x.3).product();
+        Return { t: g[0].0, mu, sd: var.sqrt(), s: 1.0 - none, surv: (-g[0].5).exp() }
+    };
+    let mut out = Vec::new();
+    for mask in 0u32..(1 << n.saturating_sub(1)) {
+        // bit j set: members j and j + 1 resolve
+        let prob: f64 = (0..n.saturating_sub(1)).map(|j| if mask >> j & 1 == 1 { pr[j] } else { 1.0 - pr[j] }).product();
+        if prob < 1e-4 {
+            continue;
         }
-        i = j;
+        let mut rets = Vec::with_capacity(n);
+        let mut i = 0;
+        for j in 0..n {
+            if j + 1 == n || mask >> j & 1 == 1 {
+                rets.push(group(&m[i..=j]));
+                i = j + 1;
+            }
+        }
+        out.push((prob, rets));
     }
     (out, t_end)
 }
@@ -422,24 +439,30 @@ fn returns(layers: &[(Layer, u8)], ground: Option<(f64, f64)>, delta: f64, em: &
 fn cell_ll(echoes: &[f32], layers: &[(Layer, u8)], ground: Option<(f64, f64)>, delta: f64, em: &ErrorModel, bg: &RayBg) -> f64 {
     // the first echo only, for now
     let obs = echoes.first().map_or(f64::NAN, |&r| r as f64);
-    let (rets, t_end) = returns(layers, ground, delta, em, &bg.taus);
-    let (mut none_kept, mut none_before_obs, mut dens) = (1.0, 1.0, 0.0);
-    for r in &rets {
-        if obs.is_finite() {
-            dens += r.surv * none_kept * r.s * t_pdf((obs - r.mu) / r.sd, NU_E) / r.sd;
-            if r.t < obs {
-                none_before_obs *= 1.0 - r.s;
+    let (patterns, t_end) = returns(layers, ground, delta, em, &bg.taus);
+    let lik = |rets: &[Return]| {
+        let (mut none_kept, mut none_before_obs, mut dens) = (1.0, 1.0, 0.0);
+        for r in rets {
+            if obs.is_finite() {
+                dens += r.surv * none_kept * r.s * t_pdf((obs - r.mu) / r.sd, NU_E) / r.sd;
+                if r.t < obs {
+                    none_before_obs *= 1.0 - r.s;
+                }
             }
+            none_kept *= 1.0 - r.s;
         }
-        none_kept *= 1.0 - r.s;
+        if !obs.is_finite() {
+            return (-bg.tau_end).exp() * none_kept;
+        }
+        if obs < t_end {
+            dens += bg.sig_obs * (-bg.tau_obs).exp() * none_before_obs;
+        }
+        (1.0 - P_OUTLIER) * dens + P_OUTLIER / T_MAX
+    };
+    if patterns.len() == 1 {
+        return lik(&patterns[0].1).max(1e-300).ln();
     }
-    if !obs.is_finite() {
-        return ((-bg.tau_end).exp() * none_kept).max(1e-300).ln();
-    }
-    if obs < t_end {
-        dens += bg.sig_obs * (-bg.tau_obs).exp() * none_before_obs;
-    }
-    ((1.0 - P_OUTLIER) * dens + P_OUTLIER / T_MAX).ln()
+    patterns.iter().map(|(p, rets)| p * lik(rets)).sum::<f64>().max(1e-300).ln()
 }
 
 /// One element's data in one scan: the cells it fronts (its A cells) and the along-beam shift δ of their depths, a
@@ -704,7 +727,7 @@ impl Scene {
     /// Re-estimate the diffuse field from the rays the elements leave (a move: its cost change). Moves that change
     /// elements hold the field as it is; after this one the scene's cost is a fresh scene's.
     pub fn refit_field(&mut self) -> f64 {
-        if self.ext.spec.is_none() {
+        if self.ext.spec.is_none() || self.ext_all.is_empty() {
             return 0.0;
         }
         let before = self.cost();
@@ -717,6 +740,26 @@ impl Scene {
         self.cost() - before
     }
 
+    /// Hold a diffuse field estimated elsewhere (another scene's, from other scans) fixed: the cost then has no field
+    /// term, and `refit_field` leaves it. The cost change.
+    pub fn hold_field(&mut self, ext: &Extinction) -> f64 {
+        let before = self.cost();
+        self.ext = ext.clone();
+        self.ext0 = ext.clone();
+        self.ext_all.clear();
+        for m in self.memo.iter_mut() {
+            m.clear();
+        }
+        let n = self.views.len();
+        self.refresh(&(0..n).collect::<Vec<_>>());
+        self.cost() - before
+    }
+
+    /// The diffuse field.
+    pub fn extinction(&self) -> &Extinction {
+        &self.ext
+    }
+
     /// Promote: add an element and take the mass it explains out of the diffuse field. Its id and the cost change.
     pub fn promote(&mut self, e: Element) -> (u32, f64) {
         let (id, d) = self.add(e);
@@ -727,6 +770,11 @@ impl Scene {
     pub fn demote(&mut self, id: u32) -> f64 {
         let d = self.remove(id);
         d + self.refit_field()
+    }
+
+    /// The diffuse field's dispersion per voxel in image `s` (tiles of `tile` × `tile` cells; [`extinction::dispersion`]).
+    pub fn field_dispersion(&self, s: usize, tile: usize) -> HashMap<[i32; 3], (f64, usize)> {
+        extinction::dispersion(&self.views[s], &self.ext, &self.em, tile)
     }
 
     /// The diffuse field and its counts: per voxel with data, (voxel, σ, residual counts, every ray's counts).
@@ -824,9 +872,14 @@ impl Scene {
             // its return: the element's echo, merged with any layer behind within the receiver's resolution
             let layers: Vec<(Layer, u8)> = ls.iter().map(|l| (*l, cls[l.elem as usize])).collect();
             let w = v.direction((cell / v.n_cols) as f64, (cell % v.n_cols) as f64);
-            let mut taus: Vec<f64> = layers.iter().map(|(l, _)| self.ext.tau(&v.origin, &w, l.t)).collect();
+            // the field in front of it: up to a voxel short of its front (a voxel's mean can't place mass within it,
+            // and the voxel at the front holds the element's own edges)
+            let short = self.ext.spec.map_or(0.0, |sp| sp.voxel);
+            let mut taus: Vec<f64> = layers.iter().map(|(l, _)| self.ext.tau(&v.origin, &w, (l.t - short).max(0.0))).collect();
             taus.push(0.0);
-            let r = returns(&layers, None, 0.0, em, &taus).0[0];
+            // the most likely way it comes back
+            let pats = returns(&layers, None, 0.0, em, &taus).0;
+            let r = pats.iter().max_by(|a, b| a.0.total_cmp(&b.0)).unwrap().1[0];
             let (depth, sd) = (r.mu, r.sd.hypot(off));
             let obs = if v.cell[cell] == Cell::Echoes { v.range[cell] as f64 } else { f64::NAN };
             CellPrediction {
@@ -956,7 +1009,7 @@ mod tests {
     use super::*;
     use crate::shots::reconstruct::dir;
     use crate::scene::range_image::RangeImageParams;
-    use crate::scene::model::floor_db;
+    use crate::scene::model::{floor_db, RESOLUTION};
 
     /// A scan of a vertical pole (R = 3 cm, 4 m away, centred on the y axis) in front of a wall at 8 m (see
     /// [`pole_scan`]).
@@ -1094,7 +1147,7 @@ mod tests {
     fn the_field_is_a_residual_and_its_moves_are_exact() {
         let v = pole_view();
         let (em, sc) = (ErrorModel::default(), Background::default());
-        let spec = Some(ExtinctionSpec { lo: [-0.5, 2.9, -0.3], hi: [0.5, 8.9, 0.3], voxel: 0.1, prior_path: 1.0 });
+        let spec = Some(ExtinctionSpec { lo: [-0.5, 2.9, -0.3], hi: [0.5, 8.9, 0.3], voxel: 0.1, prior_path: 1.0, multi_echo: false });
         let pole = stick(0.0, 4.0, 0.03);
         let sigma = |c: &Scene| c.field().1.iter().find(|x| x.0 == [5, 10, 3]).map_or(f64::NAN, |x| x.1);
         let mut c = Scene::new(vec![v.clone()], &[], em, sc, spec);

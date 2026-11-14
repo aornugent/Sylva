@@ -338,6 +338,12 @@ impl RangeImage {
         (25.0 / n.max(1) as f64).sqrt() as f32
     }
 
+    /// The most echoes any pulse recorded: the instrument's cap on targets per pulse, read from the data (AM's VZ-2000i
+    /// at 1.2 MHz records 4; the stand's simulator 3).
+    pub fn max_targets(&self) -> usize {
+        self.echo_start.windows(2).map(|w| (w[1] - w[0]) as usize).max().unwrap_or(0)
+    }
+
     /// The surfels of this scan's echo cells with a normal whose echo lies inside the box `lo`-`hi` (world positions
     /// along the cell centre's ray, and normals), for the moments. Silhouette cells are left out: those with a
     /// 4-neighbour that is empty or more than 5 cm behind. Their echoes are partial hits, often merged with the

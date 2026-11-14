@@ -10,28 +10,34 @@
 //!   sub-resolution wood both fold into it (σ alone can't separate them). Outside the box, and where the box has no
 //!   data, σ is the background's κ. A ray's survival to range t is `exp(−∫₀ᵗ σ)` and its first echo's density at t
 //!   is `σ(t) exp(−∫₀ᵗ σ)`, so a miss is evidence of transmission.
-//! - **Its estimate.** Each voxel's weighted counts, first echoes in it (h) and ray length through it (L), give the
-//!   posterior mean `(h + κ b) / (L + b)` under a Gamma prior worth `b` metres of ray at mean κ. This is the
-//!   first-echo likelihood's maximiser with the prior. Each ray counts `1 / (φ m(ρ))`, as a cell does in the ray
+//! - **Its estimate.** Each voxel's weighted counts, echoes in it (h) and ray length through it (L), give the
+//!   posterior mean `(h + κ b) / (L + b)` under a Gamma prior worth `b` metres of ray at mean κ.
+//! - **A pulse's echo sequence** (`multi_echo`): every echo is a hit, and the path up to it is transmission, from the
+//!   origin for the first and from the previous echo plus the receiver's resolution after that (a surface closer
+//!   behind an echo would have merged with it). After the last echo, the path on is transmission only if the pulse
+//!   returned fewer echoes than the instrument records ([`RangeImage::max_targets`]): a pulse at its cap says
+//!   nothing about what lies beyond. Without `multi_echo`, only the first echo and the path to it count. Each ray counts `1 / (φ m(ρ))`, as a cell does in the ray
 //!   likelihood. The dispersion φ is a compound Poisson's clump size: mulga's leaf hits are clumped, and their
 //!   dispersion is flat in cell size (synthesis §2).
 //! - **A residual.** The field is estimated from the rays no element fronts, so an element and the field never
 //!   explain the same echoes. Its log-likelihood over every ray, `Σ_v h ln σ_v − σ_v L` with all rays' counts, is
 //!   the part of the scene's cost the elements' cells don't hold.
 
-use super::model::ErrorModel;
+use super::model::{ErrorModel, RESOLUTION};
 use super::range_image::{Cell, RangeImage};
 use crate::Point;
 use rayon::prelude::*;
 use std::collections::{HashMap, HashSet};
 
-/// Where the field is estimated: a box `lo`-`hi`, its voxel (m), and the prior's worth `prior_path` (m of ray).
+/// Where the field is estimated: a box `lo`-`hi`, its voxel (m), the prior's worth `prior_path` (m of ray), and
+/// whether each pulse's whole echo sequence counts (`multi_echo`) or its first echo only.
 #[derive(Debug, Clone, Copy)]
 pub struct ExtinctionSpec {
     pub lo: Point,
     pub hi: Point,
     pub voxel: f64,
     pub prior_path: f64,
+    pub multi_echo: bool,
 }
 
 /// Weighted counts per voxel: (first echoes in it, ray length through it).
@@ -87,7 +93,7 @@ impl Extinction {
     pub fn tau(&self, o: &Point, w: &Point, t: f64) -> f64 {
         let mut tau = self.kappa * t;
         if let Some(sp) = self.spec {
-            traverse(&sp, o, w, t, |k, a, b| tau += (self.sigma.get(&k).unwrap_or(&self.kappa) - self.kappa) * (b - a));
+            traverse(&sp, o, w, 0.0, t, |k, a, b| tau += (self.sigma.get(&k).unwrap_or(&self.kappa) - self.kappa) * (b - a));
         }
         tau
     }
@@ -142,10 +148,10 @@ pub fn clip(sp: &ExtinctionSpec, o: &Point, w: &Point) -> Option<(f64, f64)> {
     (t1 > t0).then_some((t0, t1))
 }
 
-/// Each voxel segment of the ray inside the box up to range `t_max`: `f(voxel, from, to)`, in order.
-fn traverse(sp: &ExtinctionSpec, o: &Point, w: &Point, t_max: f64, mut f: impl FnMut([i32; 3], f64, f64)) {
+/// Each voxel segment of the ray inside the box between ranges `t_min` and `t_max`: `f(voxel, from, to)`, in order.
+fn traverse(sp: &ExtinctionSpec, o: &Point, w: &Point, t_min: f64, t_max: f64, mut f: impl FnMut([i32; 3], f64, f64)) {
     let Some((t0, t1)) = clip(sp, o, w) else { return };
-    let t1 = t1.min(t_max);
+    let (t0, t1) = (t0.max(t_min), t1.min(t_max));
     if t1 <= t0 {
         return;
     }
@@ -181,22 +187,37 @@ fn traverse(sp: &ExtinctionSpec, o: &Point, w: &Point, t_max: f64, mut f: impl F
     }
 }
 
-/// The weighted counts of image `v`'s cells in `cells` (every cell when `None`), each cell's ray weighted
-/// `1 / (φ m(ρ))`: its path through the box up to its first echo (or through it, for a miss) and that echo.
-pub fn counts(v: &RangeImage, sp: &ExtinctionSpec, em: &ErrorModel, cells: Option<&HashSet<usize>>) -> Counts {
-    let one = |k: usize, acc: &mut Counts| {
-        let w = v.direction((k / v.n_cols) as f64, (k % v.n_cols) as f64);
-        let Some((_, t1)) = clip(sp, &v.origin, &w) else { return };
-        let obs = if v.cell[k] == Cell::Echoes { v.range[k] as f64 } else { f64::NAN };
-        let wt = 1.0 / (em.dispersion * em.multiplicity(if obs.is_finite() { obs } else { t1 }));
-        traverse(sp, &v.origin, &w, if obs.is_finite() { obs } else { f64::INFINITY }, |key, a, b| acc.entry(key).or_insert((0.0, 0.0)).1 += wt * (b - a));
-        if obs.is_finite() {
-            let x = [0, 1, 2].map(|a| v.origin[a] + w[a] * obs);
-            if inside(sp, &x) {
-                acc.entry(key(sp, &x)).or_insert((0.0, 0.0)).0 += wt;
-            }
+/// One cell's ray through the box: `add(voxel, hits, path)` for each echo and each stretch of transmission, weighted
+/// `1 / (φ m(ρ))` if `weighted` (see the module docs for which stretches count).
+fn ray(v: &RangeImage, sp: &ExtinctionSpec, em: &ErrorModel, cap: usize, weighted: bool, k: usize, mut add: impl FnMut([i32; 3], f64, f64)) {
+    let w = v.direction((k / v.n_cols) as f64, (k % v.n_cols) as f64);
+    let Some((_, t1)) = clip(sp, &v.origin, &w) else { return };
+    let echoes: &[f32] = if v.cell[k] == Cell::Echoes { v.echoes(k) } else { &[] };
+    let wt = if weighted { 1.0 / (em.dispersion * em.multiplicity(echoes.first().map_or(t1, |&r| r as f64))) } else { 1.0 };
+    let used = if sp.multi_echo { echoes.len() } else { echoes.len().min(1) };
+    let mut start = 0.0;
+    for &r in &echoes[..used] {
+        let r = r as f64;
+        traverse(sp, &v.origin, &w, start, r, |key, a, b| add(key, 0.0, wt * (b - a)));
+        let x = [0, 1, 2].map(|a| v.origin[a] + w[a] * r);
+        if inside(sp, &x) {
+            add(key(sp, &x), wt, 0.0);
         }
-    };
+        start = r + RESOLUTION;
+    }
+    if echoes.is_empty() || (sp.multi_echo && echoes.len() < cap) {
+        traverse(sp, &v.origin, &w, start, f64::INFINITY, |key, a, b| add(key, 0.0, wt * (b - a)));
+    }
+}
+
+/// The weighted counts of image `v`'s cells in `cells` (every cell when `None`).
+pub fn counts(v: &RangeImage, sp: &ExtinctionSpec, em: &ErrorModel, cells: Option<&HashSet<usize>>) -> Counts {
+    let cap = v.max_targets();
+    let one = |k: usize, acc: &mut Counts| ray(v, sp, em, cap, true, k, |key, h, l| {
+        let e = acc.entry(key).or_insert((0.0, 0.0));
+        e.0 += h;
+        e.1 += l;
+    });
     let merge = |mut a: Counts, b: Counts| {
         for (k, (h, l)) in b {
             let e = a.entry(k).or_insert((0.0, 0.0));
@@ -215,6 +236,41 @@ pub fn counts(v: &RangeImage, sp: &ExtinctionSpec, em: &ErrorModel, cells: Optio
         }
         None => (0..v.cell.len()).into_par_iter().fold(Counts::new, |mut acc, k| { one(k, &mut acc); acc }).reduce(Counts::new, merge),
     }
+}
+
+/// Each voxel's dispersion against the field: image `v`'s rays grouped in tiles of `tile` × `tile` cells, Pearson's
+/// `Σ_t (h_t − σ L_t)² / (σ L_t)` over the tiles that cross the voxel, per degree of freedom (1 for a Poisson
+/// process with mean σ L; above 1, hits come in clumps), with the tiles counted. Unweighted counts.
+pub fn dispersion(v: &RangeImage, ext: &Extinction, em: &ErrorModel, tile: usize) -> HashMap<[i32; 3], (f64, usize)> {
+    let Some(sp) = ext.spec else { return HashMap::new() };
+    let cap = v.max_targets();
+    let nt = v.n_cols.div_ceil(tile);
+    let tiles: HashMap<([i32; 3], usize), (f64, f64)> = (0..v.cell.len()).into_par_iter().fold(HashMap::new, |mut acc: HashMap<([i32; 3], usize), (f64, f64)>, k| {
+        let t = (k / v.n_cols / tile) * nt + (k % v.n_cols) / tile;
+        ray(v, &sp, em, cap, false, k, |key, h, l| {
+            let e = acc.entry((key, t)).or_insert((0.0, 0.0));
+            e.0 += h;
+            e.1 += l;
+        });
+        acc
+    }).reduce(HashMap::new, |mut a, b| {
+        for (k, (h, l)) in b {
+            let e = a.entry(k).or_insert((0.0, 0.0));
+            e.0 += h;
+            e.1 += l;
+        }
+        a
+    });
+    let mut per: HashMap<[i32; 3], (f64, usize)> = HashMap::new();
+    for ((key, _), (h, l)) in tiles {
+        let mu = ext.sigma.get(&key).unwrap_or(&ext.kappa) * l;
+        if mu > 1e-9 {
+            let e = per.entry(key).or_insert((0.0, 0));
+            e.0 += (h - mu).powi(2) / mu;
+            e.1 += 1;
+        }
+    }
+    per.into_iter().filter(|(_, (_, n))| *n >= 3).map(|(k, (x2, n))| (k, (x2 / (n - 1) as f64, n))).collect()
 }
 
 /// `a − b`, voxel by voxel.
@@ -268,11 +324,11 @@ mod tests {
     /// A ray through a box of 1 m voxels: the segments tile the clipped ray, and a uniform field's optical depth is κ t.
     #[test]
     fn the_traversal_tiles_the_ray() {
-        let sp = ExtinctionSpec { lo: [0.0, 0.0, 0.0], hi: [4.0, 4.0, 4.0], voxel: 1.0, prior_path: 1.0 };
+        let sp = ExtinctionSpec { lo: [0.0, 0.0, 0.0], hi: [4.0, 4.0, 4.0], voxel: 1.0, prior_path: 1.0, multi_echo: true };
         let (o, w) = ([-1.0, 0.5, 0.5], [0.8, 0.6, 0.0]);
         let mut len = 0.0;
         let mut keys = Vec::new();
-        traverse(&sp, &o, &w, 100.0, |k, a, b| {
+        traverse(&sp, &o, &w, 0.0, 100.0, |k, a, b| {
             len += b - a;
             keys.push(k);
         });
@@ -291,7 +347,7 @@ mod tests {
     /// empty space.
     #[test]
     fn an_open_tip_prefers_field_ahead_that_holds_its_flux() {
-        let sp = ExtinctionSpec { lo: [0.0, 0.0, 0.0], hi: [4.0, 4.0, 4.0], voxel: 0.5, prior_path: 1.0 };
+        let sp = ExtinctionSpec { lo: [0.0, 0.0, 0.0], hi: [4.0, 4.0, 4.0], voxel: 0.5, prior_path: 1.0, multi_echo: true };
         let mut f = Extinction::from_counts(0.0, sp, &Counts::new());
         for i in 0..8 {
             f.sigma.insert([i, 2, 2], 0.15);
