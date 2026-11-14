@@ -79,6 +79,12 @@ params! {
         /// disagree by √φ times their per-view sd (research 130 slice 7d; 10.5 on raw). The simulated stand takes 4, from its
         /// injected-field coverage.
         pub dispersion: f64 = 10.0,
+        /// The shape latent (research 130 slice 14): a section's departure from round, as each view sees it, is an
+        /// along-beam shift of its front per (element, scan), with prior sd `shape_base + shape_slope R` (m),
+        /// marginalised with the offset field. AM's stems need it (slice 14: same-day held-out coverage near 0.43 /
+        /// 0.78 → 0.53 / 0.82, sure cells read behind halved); the stand's round tubes don't (0 there).
+        pub shape_base: f64 = 0.001,
+        pub shape_slope: f64 = 0.1,
         /// The receiver resolving two returns `d` m apart whose energies differ by `e` dB (the nearer's over the
         /// farther's): `logit p = res_a + res_b d + res_c e`. AM's VZ-2000i, fitted on its raw edges with a single-echo
         /// surface behind (research 130 slice 12b, `pulses.py resolution`); the stand's simulator resolves at 0.8 m
@@ -141,6 +147,11 @@ impl ErrorModel {
     /// The chance two returns `d` m apart, energies `e` dB apart (nearer over farther), come back as two echoes.
     pub fn p_resolve(&self, d: f64, e: f64) -> f64 {
         1.0 / (1.0 + (-(self.res_a + self.res_b * d + self.res_c * e)).exp())
+    }
+
+    /// The shape latent's sd (m) at radius r.
+    pub fn shape_sd(&self, r: f64) -> f64 {
+        self.shape_base + self.shape_slope * r
     }
 
     /// A stick's misfit sd (m) at radius r.

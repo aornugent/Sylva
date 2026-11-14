@@ -543,7 +543,11 @@ fn scan_cost(v: &RangeImage, si: usize, rendered: &[Vec<(usize, Layer)>], elems:
         let k = cls[i];
         let mid = e.mid();
         let s_along = em.field_sd(k, other);
-        let along = OffsetField::hats(&mid, FIELD_SPACING).into_iter().map(|(key, w)| (field.node(key), w * s_along)).collect();
+        let mut along: Vec<(usize, f64)> = OffsetField::hats(&mid, FIELD_SPACING).into_iter().map(|(key, w)| (field.node(key), w * s_along)).collect();
+        if em.shape_sd(e.r) > 0.0 {
+            // the element's own node: its shape, as this view sees it
+            along.push((field.node([i64::MIN, i as i64, 0]), em.shape_sd(e.r)));
+        }
         by_elem.insert(i as u32, data.len());
         data.push(ElemData { elem: i, cells: Vec::new(), class: k, support: 0, across: 2.0 * e.r / em.footprint(norm(&sub(&mid, &v.origin))), along });
     }
@@ -887,7 +891,7 @@ impl Scene {
             // the most likely way it comes back
             let pats = returns(&layers, None, 0.0, em, &taus).0;
             let r = pats.iter().max_by(|a, b| a.0.total_cmp(&b.0)).unwrap().1[0];
-            let (depth, sd) = (r.mu, r.sd.hypot(off));
+            let (depth, sd) = (r.mu, r.sd.hypot(off).hypot(em.shape_sd(e.r)));
             let obs = if v.cell[cell] == Cell::Echoes { v.range[cell] as f64 } else { f64::NAN };
             CellPrediction {
                 cell, elem: 0, fill: ly.f, kept: r.s, reach: r.surv, surface: k,
