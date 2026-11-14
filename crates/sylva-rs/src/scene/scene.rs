@@ -483,6 +483,8 @@ struct ElemData {
     across: f64,
     /// Its row over the field's nodes: the along shift, scaled by its class's along spread (and the other-epoch part).
     along: Vec<(usize, f64)>,
+    /// Its photometry in this scan, for term D: [n, Σ reflectance, Σ albedo, Σ multi-return, Σ cos] over its on-echoes.
+    photo: [f64; 5],
 }
 
 impl ElemData {
@@ -549,7 +551,7 @@ fn scan_cost(v: &RangeImage, si: usize, rendered: &[Vec<(usize, Layer)>], elems:
             along.push((field.node([i64::MIN, i as i64, 0]), em.shape_sd(e.r)));
         }
         by_elem.insert(i as u32, data.len());
-        data.push(ElemData { elem: i, cells: Vec::new(), class: k, support: 0, across: 2.0 * e.r / em.footprint(norm(&sub(&mid, &v.origin))), along });
+        data.push(ElemData { elem: i, cells: Vec::new(), class: k, support: 0, across: 2.0 * e.r / em.footprint(norm(&sub(&mid, &v.origin))), along, photo: [0.0; 5] });
     }
     // cells in index order, so an element's sums run in the same order in every run (the k-buffer is a hash map)
     let mut order: Vec<usize> = buf.keys().copied().collect();
@@ -565,8 +567,16 @@ fn scan_cost(v: &RangeImage, si: usize, rendered: &[Vec<(usize, Layer)>], elems:
         let wt = 1.0 / (em.dispersion * em.multiplicity(if obs.is_finite() { obs } else { front.t }));
         let el = &mut data[d];
         let sd = em.depth_sd(el.class, front.spread);
-        el.support += (Outcome::of(obs, front.t, sd) == Outcome::On) as u32;
+        let on = Outcome::of(obs, front.t, sd) == Outcome::On;
+        el.support += on as u32;
         let echoes = v.echoes(cell);
+        if let (true, true, Some(&db)) = (on, front.f > 0.5, v.echo_refls(cell).first()) {
+            let c = if v.cos_inc[cell].is_finite() { (v.cos_inc[cell] as f64).clamp(0.05, 1.0) } else { 0.5 };
+            let db = db as f64;
+            for (a, x) in el.photo.iter_mut().zip([1.0, db, db - 10.0 * c.log10(), (echoes.len() > 1) as u8 as f64, c]) {
+                *a += x;
+            }
+        }
         let ts: Vec<f64> = layers.iter().map(|(l, _)| l.t).collect();
         let bg = ext.ray_bg(&v.origin, &w, &ts, ground.map(|g| g.0), ground.map_or(T_MAX, |g| g.0), obs);
         let base = cell_ll(echoes, &[], ground, 0.0, em, &bg.base());
@@ -629,12 +639,17 @@ fn scan_cost(v: &RangeImage, si: usize, rendered: &[Vec<(usize, Layer)>], elems:
     };
     let shared = 0.5 * z.iter().map(|x| x * x).sum::<f64>() + 0.5 * logdet;
     let lls: Vec<f64> = data.par_iter().map(|el| el.ll(x_of(el, &z), em)).collect();
-    let u = shared - lls.iter().sum::<f64>();
-    let rows = data.iter().zip(&lls).map(|(el, l)| {
+    // term D: the element's form is its class hypothesis (a stick wood, a patch leaf)
+    let class: Vec<f64> = data.iter().map(|el| {
+        let llr = em.class_llr(&el.photo);
+        match elems[el.elem].form { Form::Stick { .. } => -llr, Form::Patch { .. } => llr }
+    }).collect();
+    let u = shared - lls.iter().sum::<f64>() + class.iter().sum::<f64>();
+    let rows = data.iter().zip(&lls).zip(&class).map(|((el, l), d)| {
         let var: f64 = el.along.iter().map(|&(i, wi)| el.along.iter().map(|&(j, wj)| wi * wj * cov[(i, j)]).sum::<f64>()).sum();
         ElementScan {
             elem: el.elem as u32, scan: si as u32, cells: el.cells.len() as u32, support: el.support, across: el.across, surface: el.class,
-            cost: -l + shared / data.len() as f64, shift_along: x_of(el, &z), sd_along: var.max(0.0).sqrt(),
+            cost: -l + d + shared / data.len() as f64, shift_along: x_of(el, &z), sd_along: var.max(0.0).sqrt(),
         }
     }).collect();
     (u, rows)

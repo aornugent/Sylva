@@ -43,6 +43,9 @@ pub const P_OUTLIER: f64 = 0.01;
 /// The elements' and the ground's reflectance (dB at full fill, face-on).
 pub const WOOD_DB: f64 = -13.8;
 pub const GROUND_DB: f64 = -20.0;
+/// The dimmest canopy surface's full hit (leaf, dB): the reference an echo's energy share is read against, so a
+/// full hit on leaf or wood reads as the whole beam (a partial hit on wood reads up to 0.6 dB high).
+pub const LEAF_DB: f64 = -14.4;
 /// The longest range (m).
 pub const T_MAX: f64 = 80.0;
 
@@ -85,6 +88,21 @@ params! {
         /// 0.78 → 0.53 / 0.82, sure cells read behind halved); the stand's round tubes don't (0 there).
         pub shape_base: f64 = 0.001,
         pub shape_slope: f64 = 0.1,
+        /// Class evidence (term D, research 130 slice 15), per (element, scan): from the first echoes on the element
+        /// (fill > 0.5, on its front), their mean reflectance (dB), albedo (reflectance less 10 log10 cos ι), share of
+        /// pulses with more than one return and mean cos ι, a log likelihood ratio wood against leaf,
+        /// `class_b + Σ class_w · features`, fitted on the stand. `class_temper` scales it so an element's sum over
+        /// its scans is calibrated (the scans of one element are correlated); 0 leaves D out.
+        /// The stand's fit (slice 15): per-element AUC 0.95. The temper that calibrates an element's sum is 0.386 (the
+        /// element-level scale 0.94 over the design effect `1 + (S − 1) ρ` at ρ 0.71 and a typical S of 3 views); it
+        /// defaults to 0 (D off), since among sticks of one form D only adds noise to radius comparisons (the stand's
+        /// truth beats R × 0.7 falls from 0.967 to 0.95 with it on). A caller weighing forms turns it on.
+        pub class_b: f64 = 11.262,
+        pub class_w_refl: f64 = 1.0747,
+        pub class_w_albedo: f64 = -0.5962,
+        pub class_w_multi: f64 = -3.4553,
+        pub class_w_cos: f64 = -0.4111,
+        pub class_temper: f64 = 0.0,
         /// The receiver resolving two returns `d` m apart whose energies differ by `e` dB (the nearer's over the
         /// farther's): `logit p = res_a + res_b d + res_c e`. AM's VZ-2000i, fitted on its raw edges with a single-echo
         /// surface behind (research 130 slice 12b, `pulses.py resolution`); the stand's simulator resolves at 0.8 m
@@ -147,6 +165,16 @@ impl ErrorModel {
     /// The chance two returns `d` m apart, energies `e` dB apart (nearer over farther), come back as two echoes.
     pub fn p_resolve(&self, d: f64, e: f64) -> f64 {
         1.0 / (1.0 + (-(self.res_a + self.res_b * d + self.res_c * e)).exp())
+    }
+
+    /// Class evidence from one scan's echoes on an element, `[n, Σ reflectance, Σ albedo, Σ multi-return, Σ cos]`:
+    /// the tempered log likelihood ratio, wood against leaf (0 under 5 echoes).
+    pub fn class_llr(&self, f: &[f64; 5]) -> f64 {
+        if f[0] < 5.0 || self.class_temper == 0.0 {
+            return 0.0;
+        }
+        let m = [f[1] / f[0], f[2] / f[0], f[3] / f[0], f[4] / f[0]];
+        self.class_temper * (self.class_b + self.class_w_refl * m[0] + self.class_w_albedo * m[1] + self.class_w_multi * m[2] + self.class_w_cos * m[3])
     }
 
     /// The shape latent's sd (m) at radius r.

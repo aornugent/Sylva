@@ -18,7 +18,7 @@
 //!   12b), so after the last echo the path on is transmission only if the pulse returned fewer echoes than the
 //!   instrument records ([`RangeImage::max_targets`]): a pulse at its cap says nothing about what lies beyond.
 //! - **Energy after an echo.** A pulse's echo energies are bounded by its emitted energy (synthesis §4): an echo's
-//!   reflectance against a full-footprint hit on wood ([`WOOD_DB`]) is the share of the beam it took, and only the rest
+//!   reflectance against a full-footprint hit on the dimmest canopy surface ([`LEAF_DB`]: leaf) is the share of the beam it took, so a full hit on leaf or wood reads as the whole beam, and only the rest
 //!   goes on. So each stretch after an echo counts as transmission in proportion to the beam left: none past an
 //!   opaque hit, most past a sliver. Where echoes carry no reflectance, the beam is taken to go on whole. (On held-out
 //!   transmission this reading is as good as the first echo's alone or better: research 130 slices 12c, 13b. A
@@ -29,7 +29,7 @@
 //!   explain the same echoes. Its log-likelihood over every ray, `Σ_v h ln σ_v − σ_v L` with all rays' counts, is
 //!   the part of the scene's cost the elements' cells don't hold.
 
-use super::model::{ErrorModel, WOOD_DB};
+use super::model::{ErrorModel, LEAF_DB};
 use super::range_image::{Cell, RangeImage};
 use crate::Point;
 use rayon::prelude::*;
@@ -210,7 +210,7 @@ fn ray(v: &RangeImage, sp: &ExtinctionSpec, em: &ErrorModel, cap: usize, k: usiz
             add(key(sp, &x), wt * b0, 0.0);
         }
         if let Some(&db) = refls.get(i) {
-            beam *= (1.0 - 10f64.powf((db as f64 - WOOD_DB) / 10.0)).clamp(0.0, 1.0);
+            beam *= (1.0 - 10f64.powf((db as f64 - LEAF_DB) / 10.0)).clamp(0.0, 1.0);
         }
         start = r + em.resolution();
     }
