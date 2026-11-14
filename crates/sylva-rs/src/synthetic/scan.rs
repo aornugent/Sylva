@@ -739,33 +739,19 @@ pub fn scan_beam(cloud: &PointCloud, p: &BeamScan) -> Result<Shots> {
     Ok(Shots { origin: vec![o; n_pulses], direction, echo_start, echo_count: count, echo_range: flat.iter().map(|e| e.1).collect(), echo_attrs })
 }
 
-/// What a scanner's export keeps of a scan, and the systematic errors it
-/// carries ([`export`]); lengths in metres.
+/// What a scanner records of a scan, and the systematic errors it carries
+/// ([`export`]); lengths in metres.
 #[derive(Debug, Clone)]
 pub struct Export {
-    /// Partial hits are deleted: an echo is kept with probability
-    /// `1 / (1 + exp(-(footprint_fraction - min_fraction) / fraction_width))`
-    /// (a hard cut at `min_fraction` when the width is 0), the stand-in for a
-    /// filter on pulse-shape deviation.
-    pub min_fraction: f64,
-    pub fraction_width: f64,
     /// Echoes below the detection floor are deleted: `min_reflectance` (dB) out
     /// to `floor_ref` m, rising by `floor_slope` dB a decade of range beyond
     /// (a scanner's floor is in amplitude, so in reflectance it rises with range).
     pub min_reflectance: f64,
     pub floor_slope: f64,
     pub floor_ref: f64,
-    /// Broadened echoes are deleted, the stand-in for a filter on pulse-shape
-    /// deviation: an echo is also kept only with probability
-    /// `1 / (1 + exp(-(max_spread - range_spread) / spread_width))` (a hard
-    /// cut when the width is 0; infinite keeps all).
-    pub max_spread: f64,
-    pub spread_width: f64,
     /// Standard deviation (dB) of a per-echo reflectance error, drawn before
     /// the cut and kept in the exported `reflectance`.
     pub refl_noise: f64,
-    /// Drop the pulses left without an echo, as an echoes-only export does.
-    pub echoes_only: bool,
     /// The range law along the beam: every range grows by `range_a + range_b * range`.
     pub range_a: f64,
     pub range_b: f64,
@@ -782,7 +768,7 @@ pub struct Export {
 impl Default for Export {
     /// Keep everything, add nothing.
     fn default() -> Self {
-        Export { min_fraction: 0.0, fraction_width: 0.0, min_reflectance: f64::NEG_INFINITY, floor_slope: 0.0, floor_ref: 7.0, max_spread: f64::INFINITY, spread_width: 0.0, refl_noise: 0.0, echoes_only: false, range_a: 0.0, range_b: 0.0, yaw_mrad: 0.0, offset_sd: 0.0, offset_length: 0.5, seed: 0 }
+        Export { min_reflectance: f64::NEG_INFINITY, floor_slope: 0.0, floor_ref: 7.0, refl_noise: 0.0, range_a: 0.0, range_b: 0.0, yaw_mrad: 0.0, offset_sd: 0.0, offset_length: 0.5, seed: 0 }
     }
 }
 
@@ -796,47 +782,33 @@ fn unit_hash(a: u64, b: u64, c: u64) -> f64 {
     (z >> 11) as f64 / (1u64 << 53) as f64
 }
 
-/// What an export of scan `s` ([`scan_beam`]'s output, which carries
-/// `footprint_fraction` and `reflectance`) holds, under `p` (see [`Export`]).
-///
-/// The deletion acts per echo, then a pulse left with none is dropped if
-/// `echoes_only`. The errors act on what is kept: the direction turns by
+/// What a scanner records of scan `s` ([`scan_beam`]'s output, which carries
+/// `reflectance`), under `p` (see [`Export`]). Every pulse is kept, with or
+/// without echoes. The detection floor acts per echo; the errors act on what
+/// is kept: the direction turns by
 /// `yaw_mrad`; the first echo's point moves by the displacement field there
 /// (random Fourier features: 64 cosines whose wave vectors are drawn from
 /// the field's spectrum), which sets the pulse's new direction and adds the
 /// same range to all its echoes; then every range grows by the range law.
 pub fn export(s: &Shots, p: &Export) -> Result<Shots> {
-    let fraction = s.echo_attrs.get("footprint_fraction").ok_or_else(|| Error::invalid("export needs the scan's footprint_fraction"))?;
     let refl = s.echo_attrs.get("reflectance").ok_or_else(|| Error::invalid("export needs the scan's reflectance"))?;
-    let spread = s.echo_attrs.get("range_spread");
-    if p.max_spread.is_finite() && spread.is_none() {
-        return Err(Error::invalid("export with max_spread needs the scan's range_spread"));
-    }
-    if !(p.fraction_width >= 0.0 && p.spread_width >= 0.0 && p.offset_sd >= 0.0 && p.offset_length > 0.0) {
-        return Err(Error::invalid("fraction_width and offset_sd must be zero or more, offset_length positive"));
+    if !(p.offset_sd >= 0.0 && p.offset_length > 0.0) {
+        return Err(Error::invalid("offset_sd must be zero or more, offset_length positive"));
     }
     let mut keep_echo = vec![false; s.echo_range.len()];
     let mut refl_out: Vec<f32> = vec![0.0; s.echo_range.len()];
     for i in 0..s.n_shots() {
         for k in 0..s.echo_count[i] as usize {
             let e = s.echo_start[i] + k;
-            let (f, mut r) = (fraction.get_f64(e), refl.get_f64(e));
+            let mut r = refl.get_f64(e);
             if p.refl_noise > 0.0 {
                 // a normal draw from two hashed uniforms (Box-Muller), independent of the deletion's
                 let (u1, u2) = (unit_hash(p.seed ^ 0x0DB0_0DB0, i as u64, k as u64).max(1e-300), unit_hash(p.seed ^ 0x0DB1_0DB1, i as u64, k as u64));
                 r += p.refl_noise * (-2.0 * u1.ln()).sqrt() * (2.0 * PI * u2).cos();
             }
             refl_out[e] = r as f32;
-            let pk = if p.fraction_width > 0.0 { 1.0 / (1.0 + (-(f - p.min_fraction) / p.fraction_width).exp()) } else { f64::from(u8::from(f >= p.min_fraction)) };
-            let ps = match &spread {
-                Some(sp) if p.max_spread.is_finite() => {
-                    let d = p.max_spread - sp.get_f64(e);
-                    if p.spread_width > 0.0 { 1.0 / (1.0 + (-d / p.spread_width).exp()) } else { f64::from(u8::from(d >= 0.0)) }
-                }
-                _ => 1.0,
-            };
             let floor = p.min_reflectance + p.floor_slope * (f64::from(s.echo_range[e]).max(p.floor_ref) / p.floor_ref).log10();
-            keep_echo[e] = r >= floor && unit_hash(p.seed, i as u64, k as u64) < pk * ps;
+            keep_echo[e] = r >= floor;
         }
     }
     const K: usize = 64;
@@ -863,9 +835,6 @@ pub fn export(s: &Shots, p: &Export) -> Result<Shots> {
     for i in 0..s.n_shots() {
         let a = s.echo_start[i];
         let kept: Vec<usize> = (a..a + s.echo_count[i] as usize).filter(|&e| keep_echo[e]).collect();
-        if kept.is_empty() && p.echoes_only {
-            continue;
-        }
         let (o, d0) = (s.origin[i], s.direction[i]);
         let mut d = [cy * d0[0] - sy * d0[1], sy * d0[0] + cy * d0[1], d0[2]];
         let mut shift = 0.0;
@@ -1180,12 +1149,9 @@ mod tests {
         p.footprint_samples = 19;
         p.echo_separation = 0.1;
         let s = scan_beam(&cloud, &p).unwrap();
-        let partial = |s: &Shots| match &s.echo_attrs["footprint_fraction"] { Attr::F32(v) => v.iter().filter(|&&f| f < 0.5).count(), _ => unreachable!() };
-        assert!(partial(&s) > 0);
-        let e = Export { min_fraction: 0.5, echoes_only: true, range_a: 0.002, range_b: 0.001, ..Export::default() };
+        let e = Export { range_a: 0.002, range_b: 0.001, ..Export::default() };
         let x = export(&s, &e).unwrap();
-        assert_eq!(partial(&x), 0);
-        assert!(x.echo_count.iter().all(|&c| c > 0) && x.n_shots() < s.n_shots());
+        assert_eq!(x.n_shots(), s.n_shots());
         // the wall at 10 m straight ahead now reads 2 mm + 1 mm/m x 10 m = 12 mm long
         let c = (0..x.n_shots()).filter(|&c| x.direction[c][1] > 0.99999).find(|&c| x.echo_range[x.echo_start[c]] < 10.2).unwrap();
         let r = x.echo_range[x.echo_start[c]] * x.direction[c][1];
@@ -1197,13 +1163,9 @@ mod tests {
         let sd = (dy.iter().map(|v| v * v).sum::<f64>() / dy.len() as f64).sqrt();
         assert!(sd > 0.0005 && sd < 0.009, "{sd}");
         assert!(export(&s, &Export { offset_length: 0.0, ..Export::default() }).is_err());
-        // a spread cut deletes the echoes that straddle the step, whatever their fraction
-        let spread = |s: &Shots| match &s.echo_attrs["range_spread"] { Attr::F32(v) => v.iter().filter(|&&f| f > 0.05).count(), _ => unreachable!() };
-        let s2 = scan_beam(&cloud, &BeamScan { echo_separation: 0.5, ..p.clone() }).unwrap();
-        assert!(spread(&s2) > 0);
-        let x = export(&s2, &Export { max_spread: 0.05, ..Export::default() }).unwrap();
-        assert_eq!(spread(&x), 0);
-        assert!(x.echo_range.len() < s2.echo_range.len());
+        // a detection floor deletes the faint echoes (here all of them) and keeps every pulse
+        let x = export(&s, &Export { min_reflectance: 100.0, ..Export::default() }).unwrap();
+        assert!(x.echo_range.is_empty() && x.n_shots() == s.n_shots());
         // a reflectance error of 2 dB, kept in the export
         let x = export(&s, &Export { refl_noise: 2.0, seed: 3, ..Export::default() }).unwrap();
         let (a, b) = match (&s.echo_attrs["reflectance"], &x.echo_attrs["reflectance"]) { (Attr::F32(a), Attr::F32(b)) => (a.clone(), b.clone()), _ => unreachable!() };

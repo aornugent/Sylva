@@ -322,33 +322,20 @@ def scan(cloud: PointCloud, origin=(10.0, 10.0, 1.5), resolution_deg: float = 0.
     return Shots._from_core(d)
 
 
-def export(shots: Shots, *, min_fraction: float = 0.0, fraction_width: float = 0.0,
-           min_reflectance: float = float("-inf"), floor_slope: float = 0.0, floor_ref: float = 7.0, max_spread: float = float("inf"), spread_width: float = 0.0,
-           refl_noise: float = 0.0,
-           echoes_only: bool = False, range_a: float = 0.0,
-           range_b: float = 0.0, yaw_mrad: float = 0.0, offset_sd: float = 0.0, offset_length: float = 0.5,
-           seed: int = 0) -> Shots:
-    """What a scanner's export holds of a beam scan from :func:`scan`.
+def export(shots: Shots, *, min_reflectance: float = float("-inf"), floor_slope: float = 0.0, floor_ref: float = 7.0,
+           refl_noise: float = 0.0, range_a: float = 0.0, range_b: float = 0.0, yaw_mrad: float = 0.0, offset_sd: float = 0.0,
+           offset_length: float = 0.5, seed: int = 0) -> Shots:
+    """What a scanner records of a beam scan from :func:`scan`.
 
-    Partial hits are deleted (an echo is kept with probability
-    ``1 / (1 + exp(-(footprint_fraction - min_fraction) / fraction_width))``,
-    a hard cut when the width is 0), and so are echoes below
-    the detection floor (``min_reflectance`` dB to ``floor_ref`` m, then
-    ``floor_slope`` dB a decade of range), and broadened ones (kept with probability
-    ``1 / (1 + exp(-(max_spread - range_spread) / spread_width))``, the
-    stand-in for a pulse-shape deviation filter), after a per-echo reflectance
-    error of ``refl_noise`` dB (kept in the export); ``echoes_only`` drops pulses
-    left without one.
-    The kept echoes then carry the scan's systematic errors: directions
-    turned about the vertical by ``yaw_mrad``, a smooth random displacement
-    field (``offset_sd`` m per axis, correlation length ``offset_length`` m,
-    drawn from ``seed``) at each pulse's first echo, and the range law
+    Every pulse is kept, with or without echoes. Echoes under the detection floor (``min_reflectance`` dB to
+    ``floor_ref`` m, then ``floor_slope`` dB a decade of range) after a per-echo reflectance error of ``refl_noise`` dB
+    (kept in the record) are deleted. The kept echoes then carry the scan's systematic errors: directions turned about
+    the vertical by ``yaw_mrad``, a smooth random displacement field (``offset_sd`` m per axis, correlation length
+    ``offset_length`` m, drawn from ``seed``) at each pulse's first echo, and the range law
     ``range += range_a + range_b * range``.
     """
-    d = _core.synthetic_export(shots._to_core(), float(min_fraction), float(fraction_width), float(min_reflectance),
-                               float(floor_slope), float(floor_ref),
-                               float(max_spread), float(spread_width), float(refl_noise),
-                               bool(echoes_only), float(range_a), float(range_b), float(yaw_mrad), float(offset_sd),
+    d = _core.synthetic_export(shots._to_core(), float(min_reflectance), float(floor_slope), float(floor_ref),
+                               float(refl_noise), float(range_a), float(range_b), float(yaw_mrad), float(offset_sd),
                                float(offset_length), int(seed))
     return Shots._from_core(d)
 
