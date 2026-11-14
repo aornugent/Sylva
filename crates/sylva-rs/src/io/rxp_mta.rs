@@ -84,7 +84,8 @@ pub struct MtaOptions {
     pub shim: Option<PathBuf>,
     /// Zone hypotheses asked from RiVLib (1..=8).
     pub max_zone: usize,
-    /// Keep MTA-uncertain echoes (flagged `mta_uncertain_point`) instead of dropping them.
+    /// Keep MTA-uncertain echoes (flagged `mta_uncertain_point`) in zone 1, on the pulse they were recorded
+    /// after, instead of dropping them.
     pub keep_uncertain: bool,
     /// Dynamic-trigger rule: drop echoes below this amplitude (dB) ...
     pub weak_amplitude: f32,
@@ -580,11 +581,11 @@ impl Pipeline<'_> {
                 continue;
             }
             let d = dec[e_i];
-            if d.zone == 0 || (d.stage == 0 && !keep_unc) {
+            let uncertain = d.zone == 0 || d.stage == 0;
+            let Some(k) = emit_zone(&d, keep_unc) else {
                 self.n.uncertain += 1;
                 continue;
-            }
-            let k = d.zone as usize;
+            };
             let r = e.zr[k - 1] as f64;
             if !r.is_finite() {
                 self.n.uncertain += 1;
@@ -628,11 +629,22 @@ impl Pipeline<'_> {
             o.line.push(-(pl as i32) - 1); // RiSCAN's convention: negative, -1 is the first line
             o.shot.push(ps as i32);
             o.facet.push(shot.facet);
-            o.uncertain.push((d.stage == 0) as u8);
+            o.uncertain.push(uncertain as u8);
             o.range.push(r as f32);
             o.pulse.push(((pl as u64) << 24) | ps as u64);
             self.n.kept += 1;
         }
+    }
+}
+
+/// The zone an echo is emitted in, or None to drop it: a confident decision's zone; an uncertain echo (no
+/// zone, or no pass accepted it) is dropped, or with `keep_uncertain` stays on the pulse it was recorded after
+/// (zone 1), as RiSCAN keeps unresolved echoes. Only a confident decision moves an echo to a farther zone.
+fn emit_zone(d: &Decision, keep_uncertain: bool) -> Option<usize> {
+    if d.zone == 0 || d.stage == 0 {
+        keep_uncertain.then_some(1)
+    } else {
+        Some(d.zone as usize)
     }
 }
 
@@ -847,6 +859,17 @@ mod tests {
     fn struct_layouts_match_the_shim() {
         assert_eq!(std::mem::size_of::<ShimShot>(), 44);
         assert_eq!(std::mem::size_of::<ShimEcho>(), 92);
+    }
+
+    #[test]
+    fn kept_uncertain_echoes_take_zone_one() {
+        let d = |zone, stage| Decision { zone, stage, ..Default::default() };
+        assert_eq!(emit_zone(&d(2, 0), true), Some(1)); // uncertain, model's best zone 2: stays on its pulse
+        assert_eq!(emit_zone(&d(0, 0), true), Some(1));
+        assert_eq!(emit_zone(&d(2, 0), false), None);
+        assert_eq!(emit_zone(&d(2, 4), true), Some(2)); // a confident zone-2 call stands
+        assert_eq!(emit_zone(&d(2, 4), false), Some(2));
+        assert_eq!(emit_zone(&d(1, 1), true), Some(1));
     }
 
     #[test]
