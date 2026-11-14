@@ -339,11 +339,21 @@ impl RangeImage {
     }
 
     /// The surfels of this scan's echo cells with a normal whose echo lies inside the box `lo`-`hi` (world positions
-    /// along the cell centre's ray, and normals), for the moments.
+    /// along the cell centre's ray, and normals), for the moments. Silhouette cells are left out: those with a
+    /// 4-neighbour that is empty or more than 5 cm behind. Their echoes are partial hits, often merged with the
+    /// surface behind into a point between the two (research 130 slice 11), which the export used to delete.
     pub fn surfels(&self, lo: &Point, hi: &Point) -> (Vec<Point>, Vec<Point>) {
         let inside = |p: &Point| (0..3).all(|a| p[a] >= lo[a] && p[a] < hi[a]);
+        let (nl, nc) = (self.n_lines, self.n_cols);
+        let silhouette = |k: usize| {
+            let (l, c, r) = (k / nc, k % nc, self.range[k]);
+            [(l > 0).then(|| k - nc), (l + 1 < nl).then(|| k + nc), (c > 0).then(|| k - 1), (c + 1 < nc).then(|| k + 1)]
+                .into_iter()
+                .flatten()
+                .any(|j| self.cell[j] != Cell::Echoes || self.range[j] > r + 0.05)
+        };
         (0..self.cell.len())
-            .filter(|&k| self.cos_inc[k].is_finite())
+            .filter(|&k| self.cos_inc[k].is_finite() && self.cell[k] == Cell::Echoes && !silhouette(k))
             .filter_map(|k| {
                 let d = self.direction((k / self.n_cols) as f64, (k % self.n_cols) as f64);
                 let r = self.range[k] as f64;

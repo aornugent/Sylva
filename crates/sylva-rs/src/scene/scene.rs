@@ -11,15 +11,19 @@
 //!   fills meets solid there, its gaps wider than the footprint (synthesis §1's "extent, opacity"). Misfit is the
 //!   sd of the section's and axis's departure from the form, which blurs the fill and spreads the depth.
 //! - **The k-buffer:** each element renders into each view's cells. A cell keeps up to [`K`] layers, nearest
-//!   first, each with a depth, a depth spread, a fill and a cosine. Fill is the footprint (a Gaussian, sd =
-//!   footprint / 4, and the misfit) convolved with the section. Along a stick's axis it is cut square, so a chain of
+//!   first, each with a depth, a depth spread, a fill and a cosine. Fill is the beam (a uniform disc of the
+//!   footprint's diameter, as AM's raw edges measure it) convolved with the section, at three section radii over
+//!   the misfit; an echo's chance is the detection's mean over them. Along a stick's axis it is cut square, so a chain of
 //!   sticks joins without seams.
 //! - **The ray likelihood, one cell:** its first echo, or none, against a diffuse echo hazard κ along the ray (the
 //!   background), the layers in depth order, then a ground plane.
 //!   - The beam reaches layer i with energy `e_i = f_i Π_{j<i} (1 − op_j f_j)`, and its echo is recorded with
 //!     `op_i det_i`, where `det_i` is the chance it clears the detection floor ([`ErrorModel::p_detect`]):
 //!     `Φ((ρ_dB + 10 log10(e_i cos ι_i) − floor(t_i)) / σ)`.
-//!   - An echo at r has density `Σ_i P_i op_i sel_i t_ν(r − t_i − bias_k − δ; σ_k ⊕ spread_i)` plus
+//!   - Returns closer than the receiver's resolution ([`RESOLUTION`]) merge: consecutive layers (and the ground)
+//!     within it of the first form one return, recorded if any member is, at their energy-weighted depth
+//!     (energy: op · e · cos · reflectance), its spread their spread about it.
+//!   - An echo at r has density `Σ_i P_i op_i det_i t_ν(r − t_i − bias_k − δ; σ_k ⊕ spread_i)` over the returns, plus
 //!     `κ e^{−κr} Π_{t_j<r} (1 − op_j det_j)`, where P_i is the chance that nothing nearer was kept, plus a uniform
 //!     outlier share. An empty cell has probability `e^{−κ t_end} Π (1 − op_j det_j)`.
 //!   - Every cell an element fronts at fill [`MIN_FILL`] or more counts, partial hits included, so every
@@ -47,7 +51,7 @@
 //!
 //! Cells no element touches cancel. Context (neighbours, competitors) enters as more elements in the set.
 
-use super::model::{Background, ErrorModel, FIELD_SPACING, GROUND_DB, NU_E, P_OUTLIER, SIGMA_E, STEP, T_MAX, WOOD_DB};
+use super::model::{Background, ErrorModel, FIELD_SPACING, GROUND_DB, NU_E, P_OUTLIER, RESOLUTION, SIGMA_E, STEP, T_MAX, WOOD_DB};
 use super::range_image::{Cell, RangeImage};
 use std::sync::Arc;
 use crate::transform::{cross, dot, norm, normalize, sub};
@@ -120,7 +124,10 @@ impl Outcome {
 struct Layer {
     t: f64,
     spread: f64,
+    /// The fill: its mean over the misfit (`f`), and at section radii r − √3 m, r and r + √3 m (`fq`, the misfit's
+    /// three-point Gauss–Hermite rule, weights 1/6, 2/3, 1/6).
     f: f64,
+    fq: [f64; 3],
     cos: f64,
     elem: u32,
     op: f64,
@@ -128,6 +135,13 @@ struct Layer {
     /// for a patch, the distance from the centre and 0.
     x: f64,
     s: f64,
+}
+
+impl Layer {
+    /// Whether the layer enters the k-buffer: its widest fill reaches [`MIN_FILL`].
+    fn fronts(&self) -> bool {
+        self.fq[2] >= MIN_FILL
+    }
 }
 
 /// What one scan says about one element. `cells`: cells where it is the nearest layer (at [`MIN_FILL`] or more);
@@ -148,8 +162,16 @@ pub struct ElementScan {
     pub sd_along: f64,
 }
 
-fn phi(x: f64) -> f64 {
-    0.5 * libm::erfc(-x / std::f64::consts::SQRT_2)
+/// The share of a uniform disc's energy (radius 1) nearer than a line `z` radii from its centre: the CDF of its 1-D
+/// marginal, a semicircle.
+fn disc_cdf(z: f64) -> f64 {
+    let z = z.clamp(-1.0, 1.0);
+    0.5 + (z * (1.0 - z * z).sqrt() + z.asin()) / std::f64::consts::PI
+}
+
+/// The beam's radius (m) at range `tm`.
+fn beam_radius(em: &ErrorModel, tm: f64) -> f64 {
+    0.5 * em.footprint(tm)
 }
 
 fn t_pdf(x: f64, nu: f64) -> f64 {
@@ -157,7 +179,7 @@ fn t_pdf(x: f64, nu: f64) -> f64 {
     (c - 0.5 * (nu + 1.0) * (1.0 + x * x / nu).ln()).exp()
 }
 
-/// One element's layers in one view, out to 3 fill sds and two cells past its section.
+/// One element's layers in one view, out to the beam's edge and two cells past its section.
 fn render(v: &RangeImage, e: &Element, id: u32, em: &ErrorModel) -> Vec<(usize, Layer)> {
     let mut out = Vec::new();
     if !(e.r > 0.0) {
@@ -214,19 +236,24 @@ fn render(v: &RangeImage, e: &Element, id: u32, em: &ErrorModel) -> Vec<(usize, 
             if tm <= 0.0 || along.abs() > half {
                 continue;
             }
-            let fp = 0.25 * em.footprint(tm);
-            let sd = (fp * fp + e.misfit * e.misfit).sqrt();
-            let f = phi((e.r - d) / sd) - phi((-e.r - d) / sd);
-            if d > e.r + 3.0 * sd + 2.0 * STEP * tm {
+            let a = beam_radius(em, tm);
+            let wide = e.r + 3f64.sqrt() * e.misfit;
+            if d > wide + a + 2.0 * STEP * tm {
                 continue;
             }
-            let (t, spread, cos) = footprint_depth(tm, d, e.r, sin, fp);
+            let fq = [-1.0, 0.0, 1.0].map(|z: f64| {
+                let r = (e.r + z * 3f64.sqrt() * e.misfit).max(0.0);
+                disc_cdf((r - d) / a) - disc_cdf((-r - d) / a)
+            });
+            let f = (fq[0] + 4.0 * fq[1] + fq[2]) / 6.0;
+            let (t, spread, cos) = footprint_depth(tm, d, e.r, sin, a);
             out.push((
                 l as usize * v.n_cols + k as usize,
                 Layer {
                     t,
                     spread: (spread * spread + e.misfit * e.misfit).sqrt(),
                     f,
+                    fq,
                     cos: (cos * sin).max(0.05),
                     elem: id,
                     op: e.opacity,
@@ -239,15 +266,17 @@ fn render(v: &RangeImage, e: &Element, id: u32, em: &ErrorModel) -> Vec<(usize, 
     out
 }
 
-/// The echo's depth over a footprint (Gaussian across the section, sd `fp`) whose centre passes `d` from the axis
-/// at range `tm`: the mean of the section's depth over the part it meets, each part weighted by its energy (the
-/// cosine of incidence, Lambertian); the spread of those depths; and the mean cosine. The misfit stays out: it
-/// spreads the depth about the form but doesn't move it.
-fn footprint_depth(tm: f64, d: f64, r: f64, sin: f64, fp: f64) -> (f64, f64, f64) {
-    const GH: [(f64, f64); 5] = [(0.0, 0.533333), (1.355626, 0.222076), (-1.355626, 0.222076), (2.856970, 0.011257), (-2.856970, 0.011257)];
+/// The echo's depth over a footprint (a disc of radius `a`, across the section its semicircle marginal) whose centre
+/// passes `d` from the axis at range `tm`: the mean of the section's depth over the part it meets, each part weighted
+/// by its energy (the cosine of incidence, Lambertian); the spread of those depths; and the mean cosine. The misfit
+/// stays out: it spreads the depth about the form but doesn't move it. Quadrature: Gauss–Chebyshev of the second
+/// kind, 9 nodes.
+fn footprint_depth(tm: f64, d: f64, r: f64, sin: f64, a: f64) -> (f64, f64, f64) {
     let (mut sw, mut swc, mut sz, mut szz) = (0.0, 0.0, 0.0, 0.0);
-    for (u, w) in GH {
-        let x = d + u * fp;
+    for j in 1..=9 {
+        let th = j as f64 * std::f64::consts::PI / 10.0;
+        let (u, w) = (th.cos(), th.sin().powi(2));
+        let x = d + u * a;
         if x.abs() < r {
             let c = (1.0 - (x / r).powi(2)).sqrt();
             let z = -r * c / sin;
@@ -275,7 +304,7 @@ fn render_all(v: &RangeImage, elems: &[Element], em: &ErrorModel) -> Vec<Vec<(us
 fn kbuffer(per: &[Vec<(usize, Layer)>], min_f: f64) -> HashMap<usize, Vec<Layer>> {
     let mut buf: HashMap<usize, Vec<Layer>> = HashMap::new();
     for &(cell, ly) in per.iter().flatten() {
-        if ly.f >= min_f {
+        if ly.fq[2] >= min_f {
             buf.entry(cell).or_default().push(ly);
         }
     }
@@ -329,37 +358,74 @@ pub struct CellPrediction {
 }
 
 
-/// One cell's log-likelihood: its first echo (or none) against the background, its layers (each with its element's
-/// surface class) and the ground at `ground` = (range, cos), with every layer shifted by `delta`.
-fn cell_ll(cell: usize, echoes: &[f32], layers: &[(Layer, u8)], ground: Option<(f64, f64)>, delta: f64, em: &ErrorModel, sc: &Background) -> f64 {
-    // the first echo only, for now
-    let obs = echoes.first().map_or(f64::NAN, |&r| r as f64);
+/// One return a pulse can record: a run of layers (and the ground) within the receiver's resolution of its first,
+/// merged. `s` is the chance it is recorded, `mu` and `sd` its echo's depth and spread, `t` its first member's range.
+#[derive(Clone, Copy)]
+struct Return {
+    t: f64,
+    mu: f64,
+    sd: f64,
+    s: f64,
+}
+
+/// The returns a cell's layers (each with its element's surface class) and the ground at `ground` = (range, cos)
+/// give, nearest first, with every layer shifted by `delta`; and the range the beam ends at.
+fn returns(layers: &[(Layer, u8)], ground: Option<(f64, f64)>, delta: f64, em: &ErrorModel) -> (Vec<Return>, f64) {
     let t_end = ground.map_or(T_MAX, |g| g.0);
-    let (mut beam, mut none_kept, mut none_before_obs, mut dens) = (1.0, 1.0, 1.0, 0.0);
+    let mut beam = 1.0;
+    // members: (range, depth, depth sd, chance recorded, energy)
+    let mut m: Vec<(f64, f64, f64, f64, f64)> = Vec::with_capacity(layers.len() + 1);
     for &(ly, k) in layers {
         if ly.t >= t_end {
             break;
         }
         let e = ly.f * beam;
+        let s = ly.op * ([1.0, 4.0, 1.0].iter().zip(ly.fq).map(|(w, f)| w * em.p_detect(WOOD_DB, f * beam * ly.cos, ly.t)).sum::<f64>() / 6.0);
         beam *= 1.0 - ly.f * ly.op;
-        let s = ly.op * em.p_detect(WOOD_DB, e * ly.cos, ly.t);
-        if obs.is_finite() {
-            let sd = em.depth_sd(k, ly.spread);
-            let mu = ly.t + em.depth_bias(k, ly.t) + delta;
-            dens += sc.survival(cell, ly.t) * none_kept * s * t_pdf((obs - mu) / sd, NU_E) / sd;
-            if ly.t < obs {
-                none_before_obs *= 1.0 - s;
-            }
-        }
-        none_kept *= 1.0 - s;
+        m.push((ly.t, ly.t + em.depth_bias(k, ly.t) + delta, em.depth_sd(k, ly.spread), s, ly.op * e * ly.cos * 10f64.powf(WOOD_DB / 10.0)));
     }
     if let Some((tg, cg)) = ground {
-        let s = em.p_detect(GROUND_DB, beam * cg, tg);
-        if obs.is_finite() {
-            let sd = SIGMA_E[2];
-            dens += sc.survival(cell, tg) * none_kept * s * t_pdf((obs - tg) / sd, NU_E) / sd;
+        m.push((tg, tg, SIGMA_E[2], em.p_detect(GROUND_DB, beam * cg, tg), beam * cg * 10f64.powf(GROUND_DB / 10.0)));
+    }
+    let mut out = Vec::with_capacity(m.len());
+    let mut i = 0;
+    while i < m.len() {
+        let mut j = i + 1;
+        while j < m.len() && m[j].0 - m[i].0 < RESOLUTION {
+            j += 1;
         }
-        none_kept *= 1.0 - s;
+        if j == i + 1 {
+            out.push(Return { t: m[i].0, mu: m[i].1, sd: m[i].2, s: m[i].3 });
+        } else {
+            let g = &m[i..j];
+            // energy weights; members the beam no longer reaches weigh alike (the return is never recorded then)
+            let total: f64 = g.iter().map(|x| x.4).sum();
+            let wt = |x: &(f64, f64, f64, f64, f64)| if total > 0.0 { x.4 / total } else { 1.0 / g.len() as f64 };
+            let mu = g.iter().map(|x| wt(x) * x.1).sum::<f64>();
+            let var = g.iter().map(|x| wt(x) * (x.2 * x.2 + (x.1 - mu).powi(2))).sum::<f64>();
+            let none: f64 = g.iter().map(|x| 1.0 - x.3).product();
+            out.push(Return { t: m[i].0, mu, sd: var.sqrt(), s: 1.0 - none });
+        }
+        i = j;
+    }
+    (out, t_end)
+}
+
+/// One cell's log-likelihood: its first echo (or none) against the background and the returns its layers and the
+/// ground give ([`returns`]).
+fn cell_ll(cell: usize, echoes: &[f32], layers: &[(Layer, u8)], ground: Option<(f64, f64)>, delta: f64, em: &ErrorModel, sc: &Background) -> f64 {
+    // the first echo only, for now
+    let obs = echoes.first().map_or(f64::NAN, |&r| r as f64);
+    let (rets, t_end) = returns(layers, ground, delta, em);
+    let (mut none_kept, mut none_before_obs, mut dens) = (1.0, 1.0, 0.0);
+    for r in &rets {
+        if obs.is_finite() {
+            dens += sc.survival(cell, r.t) * none_kept * r.s * t_pdf((obs - r.mu) / r.sd, NU_E) / r.sd;
+            if r.t < obs {
+                none_before_obs *= 1.0 - r.s;
+            }
+        }
+        none_kept *= 1.0 - r.s;
     }
     if !obs.is_finite() {
         return (sc.survival(cell, t_end) * none_kept).max(1e-300).ln();
@@ -652,15 +718,18 @@ impl Scene {
         }
         per.insert(0, mine);
         let buf = kbuffer(&per, MIN_FILL);
-        let k = classes(v, &buf, per.len(), em)[0];
+        let cls = classes(v, &buf, per.len(), em);
+        let k = cls[0];
         let off = em.field_sd(k, false);
         let mut out: Vec<CellPrediction> = buf.iter().filter(|(_, ls)| ls[0].elem == 0).map(|(&cell, ls)| {
             let ly = ls[0];
-            let depth = ly.t + em.depth_bias(k, ly.t);
-            let sd = em.depth_sd(k, ly.spread.hypot(off));
+            // its return: the element's echo, merged with any layer behind within the receiver's resolution
+            let layers: Vec<(Layer, u8)> = ls.iter().map(|l| (*l, cls[l.elem as usize])).collect();
+            let r = returns(&layers, None, 0.0, em).0[0];
+            let (depth, sd) = (r.mu, r.sd.hypot(off));
             let obs = if v.cell[cell] == Cell::Echoes { v.range[cell] as f64 } else { f64::NAN };
             CellPrediction {
-                cell, elem: 0, fill: ly.f, kept: ly.op * em.p_detect(WOOD_DB, ly.f * ly.cos, ly.t), surface: k,
+                cell, elem: 0, fill: ly.f, kept: r.s, surface: k,
                 depth, sd, obs, outcome: Outcome::of(obs, depth, sd), weight: 1.0 / em.multiplicity(ly.t), footprint: em.footprint(ly.t), x: ly.x, s: ly.s,
             }
         }).collect();
@@ -729,7 +798,7 @@ impl Scene {
         for (k, &id) in ids.iter().enumerate() {
             let e = self.elems[id as usize].as_ref().unwrap();
             let nodes: Vec<(u8, [i64; 3])> = OffsetField::hats(&e.mid(), FIELD_SPACING).into_iter().map(|(n, _)| (0u8, n)).collect();
-            let cells = self.rendered[s][id as usize].iter().filter(|(_, l)| l.f >= MIN_FILL).map(|&(c, _)| (1u8, [c as i64, 0, 0]));
+            let cells = self.rendered[s][id as usize].iter().filter(|(_, l)| l.fronts()).map(|&(c, _)| (1u8, [c as i64, 0, 0]));
             for key in nodes.into_iter().chain(cells) {
                 match owner.get(&key) {
                     Some(&j) => {
@@ -788,27 +857,28 @@ mod tests {
     use crate::scene::range_image::RangeImageParams;
     use crate::scene::model::floor_db;
 
-    /// A scan of a vertical pole (R = 3 cm, 4 m away, centred on the y axis) in front of a wall at 8 m, with a finite
-    /// beam (as [`thin_pole_view`]).
+    /// A scan of a vertical pole (R = 3 cm, 4 m away, centred on the y axis) in front of a wall at 8 m (see
+    /// [`pole_scan`]).
     fn pole_image() -> RangeImage {
-        pole_scan(0.03, 4.0)
+        pole_scan(0.03, 4.0, 4.0)
     }
 
-    /// A scan of a thin vertical pole (radius `r`, `y` m away on the y axis) in front of a wall at 2y, with a
-    /// finite beam: a pulse's footprint (Gaussian, sd footprint / 4) meets the pole over a fraction f of its
-    /// energy; its echo is recorded where it clears the detection floor (wood at −13.8 dB against the error model's
-    /// floor, within its 2 dB spread),
-    /// at the footprint's Lambertian-weighted depth; otherwise the wall's echo. Sub-footprint widths leave partial
-    /// hits, as a real scan does.
     fn thin_pole_view(r_pole: f64, y_pole: f64) -> Arc<RangeImage> {
-        Arc::new(pole_scan(r_pole, y_pole))
+        Arc::new(pole_scan(r_pole, y_pole, y_pole))
     }
 
-    fn pole_scan(r_pole: f64, y_pole: f64) -> RangeImage {
+    /// A scan of a vertical pole (radius `r`, `y` m away on the y axis) in front of a wall `gap` m behind it, with the
+    /// measured beam (research 130 slice 11): a uniform disc of the footprint's diameter, sampled here across the
+    /// pole by 401 lines (its 1-D marginal, a semicircle), each part's energy its cosine (Lambertian). The pole's echo
+    /// sits at its parts' energy-weighted depth and is recorded where it clears the detection floor (wood at
+    /// −13.8 dB, 2 dB spread); the wall (−20 dB, face-on) takes the rest of the beam. Returns closer than the
+    /// receiver's resolution (0.8 m) merge into one echo at their energy-weighted range; otherwise the first is the
+    /// pole's if recorded, else the wall's.
+    fn pole_scan(r_pole: f64, y_pole: f64, gap: f64) -> RangeImage {
         let (period, interval, zstep) = (6.6e-3, 0.825e-6, 0.03);
         let em = ErrorModel::default();
-        let fp = 0.25 * em.footprint(y_pole);
         let (mut t, mut d, mut r) = (Vec::new(), Vec::new(), Vec::new());
+        let u = |s: u64| ((s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407) >> 11) as f64 + 0.5) / (1u64 << 53) as f64;
         for l in 0..200usize {
             for k in 0..400usize {
                 let (zen, az) = (84.0 + zstep * k as f64, -3.0 + zstep * l as f64);
@@ -816,15 +886,31 @@ mod tests {
                 let h = (w[0] * w[0] + w[1] * w[1]).sqrt();
                 let miss = y_pole * w[0] / h;
                 let tm = y_pole * w[1] / (h * h);
-                let f = phi((r_pole - miss) / fp) - phi((-r_pole - miss) / fp);
-                let (depth, _, cos) = footprint_depth(tm, miss.abs(), r_pole, h, fp);
-                // the detection's spread (2 dB), drawn per pulse from a fixed hash
-                let u = |s: u64| ((s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407) >> 11) as f64 + 0.5) / (1u64 << 53) as f64;
+                let a = 0.5 * em.footprint(tm);
+                let (mut f, mut ec, mut ez) = (0.0, 0.0, 0.0);
+                for q in 0..401 {
+                    let z = -1.0 + 2.0 * (q as f64 + 0.5) / 401.0;
+                    let wt = (1.0 - z * z).sqrt() * 2.0 / 401.0 * 2.0 / std::f64::consts::PI;
+                    let x = miss + z * a;
+                    if x.abs() < r_pole {
+                        let c = (1.0 - (x / r_pole).powi(2)).sqrt();
+                        f += wt;
+                        ec += wt * c;
+                        ez += wt * c * (tm - r_pole * c / h);
+                    }
+                }
                 let seed = (l * 400 + k) as u64 * 2 + 1;
                 let n = 2.0 * (-2.0 * u(seed).ln()).sqrt() * (2.0 * std::f64::consts::PI * u(seed * 7919)).cos();
-                let floor = floor_db(tm);
-                let kept = -13.8 + 10.0 * (f * cos).max(1e-12).log10() + n > floor;
-                let range = if kept { depth } else { 2.0 * y_pole / w[1] };
+                let kept = ec > 0.0 && -13.8 + 10.0 * ec.max(1e-12).log10() + n > floor_db(tm);
+                let wall = (y_pole + gap) / w[1];
+                let range = if !kept {
+                    wall
+                } else if wall - ez / ec < RESOLUTION {
+                    let (ep, ew) = (ec * 10f64.powf(-1.38), (1.0 - f) * 10f64.powf(-2.0));
+                    (ep * ez / ec + ew * wall) / (ep + ew)
+                } else {
+                    ez / ec
+                };
                 t.push(l as f64 * period + k as f64 * interval);
                 d.push(w);
                 r.push(range as f32);
@@ -869,6 +955,35 @@ mod tests {
         assert!((delta - (both.0 - truth)).abs() < 1e-6, "{delta} vs {}", both.0 - truth);
         let sum: f64 = both.1.iter().map(|r| r.cost).sum();
         assert!((sum - both.0).abs() < 1e-6);
+    }
+
+    /// A stick barely wider than the footprint, under the measured (disc) beam: the true radius beats a thinner and a
+    /// thicker one (research 130 slice 11: a Gaussian beam's tails expected edge echoes the disc doesn't return, so
+    /// a thinner stick won).
+    #[test]
+    fn a_thin_stick_under_the_disc_beam_beats_thinner_and_thicker() {
+        let (em, sc) = (ErrorModel::default(), Background::default());
+        let v = thin_pole_view(0.006, 6.0);
+        let e = |r: f64| cost(&v, &[stick(0.0, 6.0, r)], &em, &sc).0;
+        let truth = e(0.006);
+        for r in [0.0042, 0.0084] {
+            assert!(e(r) > truth + 0.5, "r {r}: {} vs {truth}", e(r));
+        }
+    }
+
+    /// A pole 0.5 m in front of a wall, closer than the pulse's resolution: its edge echoes merge with the wall's
+    /// into one at their energy-weighted range. With the wall in the scene (the front of a ball 2 m in radius), the
+    /// true radius beats a thinner and a thicker one.
+    #[test]
+    fn a_stick_just_before_a_wall_merges_its_edges() {
+        let (em, sc) = (ErrorModel::default(), Background::default());
+        let v = Arc::new(pole_scan(0.02, 4.0, 0.5));
+        let wall = Element { form: Form::Patch { centre: [0.0, 6.5, 0.0] }, r: 2.0, opacity: 1.0, misfit: 0.002 };
+        let e = |r: f64| cost(&v, &[wall, stick(0.0, 4.0, r)], &em, &sc).0;
+        let truth = e(0.02);
+        for r in [0.014, 0.028] {
+            assert!(e(r) > truth + 0.5, "r {r}: {} vs {truth}", e(r));
+        }
     }
 
     /// A scene's moves: adding then removing an element restores its cost exactly (synthesis §18
@@ -995,7 +1110,7 @@ mod tests {
     }
 
     /// A patch renders as a disc: full fill at its centre, none beyond its rim; a patch of the pole's size where the
-    /// pole is beats one off to the side; `predict` codes the pole's front cells on and the wall beside it behind.
+    /// pole is beats one off to the side; `predict` codes the pole's front cells on, and a stick beside it behind.
     #[test]
     fn patches_render_as_discs_and_predict_codes_cells() {
         let v = pole_view();
@@ -1009,7 +1124,8 @@ mod tests {
         assert!(e(patch(0.0)) < e(patch(0.1)));
         let p = Scene::new(vec![v.clone()], &[], em, sc).predict(stick(0.0, 4.0, 0.03), 0);
         let on = p.iter().filter(|q| q.fill > 0.9).all(|q| q.outcome == Outcome::On);
-        let behind = p.iter().filter(|q| q.fill < 0.05 && q.x.abs() > 0.035).any(|q| q.outcome == Outcome::Behind);
+        let beside = Scene::new(vec![v.clone()], &[], em, sc).predict(stick(0.1, 4.0, 0.03), 0);
+        let behind = beside.iter().filter(|q| q.fill > 0.9).all(|q| q.outcome == Outcome::Behind);
         assert!(on && behind);
         assert!(p.iter().all(|q| q.weight > 0.0 && q.weight <= 1.0));
     }

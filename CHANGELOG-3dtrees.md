@@ -46,10 +46,11 @@ branch `3dtrees/125-rebase`.
   likelihood (3dtrees research 130). `scene.lattice` places every pulse in its native (line, col) cell from its time;
   `scene.range_image` is one scan's observations on that lattice, read from a raw shots file (every echo; a cell
   without a pulse inside the pattern is a miss), and the signals read off them (normals, surface continuity and
-  class); `scene.moments` keeps surfel moments per (voxel, scan) and reads candidate elements off them;
+  class); `scene.moments` keeps surfel moments per (voxel, scan), silhouette cells left out, and reads candidate
+  elements off them;
   `scene.model` holds the calibration as constants (the beam, the surface classes, the per-echo noise, the detection
-  floor rising with range) and what a caller may set as two `params!` records (`ErrorModel`, `Background`); `scene.scene`'s `Scene` holds elements against range
-  images, each rendered once, with a per-scan along-beam offset field over which each scan's ray likelihood is
+  floor rising with range, the receiver's 0.8 m resolution) and what a caller may set as two `params!` records (`ErrorModel`, `Background`); `scene.scene`'s `Scene` holds elements against range
+  images, each rendered once with a uniform-disc beam (returns within the resolution merge), with a per-scan along-beam offset field over which each scan's ray likelihood is
   integrated by a Laplace marginal, and returns its cost, the cost change of a move, and each element's counts and
   cell predictions. Bound as `_core.RangeImage`, `_core.Scene`, `_core.candidates` and `_core.error_model_defaults`
   in `scene_py.rs`, with `ShotsFile::read_echo_f64` for per-echo attributes. 3dtrees needs them to score geometry and class hypotheses from the rays. Additive.

@@ -33,6 +33,10 @@ pub const FLOOR_DB: f64 = -40.5;
 pub const FLOOR_SLOPE: f64 = 15.0;
 pub const FLOOR_REF: f64 = 7.0;
 pub const DETECT_SD: f64 = 2.0;
+/// The receiver's range resolution (m): returns closer than this along one pulse merge into one echo at their
+/// energy-weighted range (AM's raw scans: half the edges with a surface 0.5-0.8 m behind resolve two echoes, 94 % past
+/// 1.2 m; research 130 slice 11).
+pub const RESOLUTION: f64 = 0.8;
 /// Echo densities carry a uniform outlier share.
 pub const P_OUTLIER: f64 = 0.01;
 /// The elements' and the ground's reflectance (dB at full fill, face-on).

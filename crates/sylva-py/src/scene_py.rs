@@ -159,6 +159,16 @@ impl PyRangeImage {
         let out: Vec<f64> = p.iter().flat_map(|x| self.inner.cell_of(x).map_or([f64::NAN; 3], |(l, c, r)| [l, c, r])).collect();
         Ok(out.into_pyarray(py))
     }
+
+    /// Each cell's beam direction (world unit vector) for flat cell indices, flat (n × 3).
+    fn directions<'py>(&self, py: Python<'py>, cells: PyReadonlyArray1<i64>) -> PyResult<Bound<'py, PyArray1<f64>>> {
+        let v = &self.inner;
+        let out: Vec<f64> = cells.as_array().iter().flat_map(|&k| {
+            let k = k as usize;
+            v.direction((k / v.n_cols) as f64, (k % v.n_cols) as f64)
+        }).collect();
+        Ok(out.into_pyarray(py))
+    }
 }
 
 fn predictions_dict<'py>(py: Python<'py>, p: &[CellPrediction]) -> PyResult<Bound<'py, PyDict>> {
