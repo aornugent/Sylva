@@ -22,7 +22,7 @@
 //!   12b), so after the last echo the path on is transmission only if the pulse returned fewer echoes than the
 //!   instrument records ([`RangeImage::max_targets`]): a pulse at its cap says nothing about what lies beyond.
 //! - **Energy after an echo.** A pulse's echo energies are bounded by its emitted energy (synthesis §4): an echo's
-//!   reflectance against a full-footprint hit on the dimmest canopy surface (leaf, [`Settings`]'s `refl_leaf`) is the
+//!   reflectance against a full-footprint hit on the dimmest canopy surface ([`Settings::refl_full_hit`]) is the
 //!   share of the beam it took, so a full hit on leaf or wood reads as the whole beam, and only the rest goes on. So
 //!   each stretch after an echo counts as transmission in proportion to the beam left: none past an opaque hit, most
 //!   past a sliver. Where echoes carry no reflectance, the beam is taken to go on whole. (On held-out transmission
@@ -223,7 +223,7 @@ fn ray(v: &RangeImage, sp: &FoliageBox, em: &Settings, cap: usize, k: usize, mut
             add(key(sp, &x), wt * b0, 0.0);
         }
         if let Some(&db) = refls.get(i) {
-            beam *= (1.0 - 10f64.powf((db as f64 - em.refl_leaf) / 10.0)).clamp(0.0, 1.0);
+            beam *= (1.0 - 10f64.powf((db as f64 - em.refl_full_hit()) / 10.0)).clamp(0.0, 1.0);
         }
         start = r + em.resolution();
     }

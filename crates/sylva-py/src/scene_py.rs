@@ -13,7 +13,8 @@
 //!   scored (a radius that isn't positive, an opacity outside (0, 1], a stick of no length) raises.
 //! - **Scenes:** `Scene(images, elements, settings, background, foliage, ref_epoch)` holds elements against range
 //!   images, the alignment error's spread stated for the scans of epoch `ref_epoch` (another epoch's add `align_epoch_*`): `cost()`, `rows()`, the cost change of each move (`add`,
-//!   `remove`, `change`, `costs_to_add`), an element's counts (`counts`), cell predictions (`predict`) and how well
+//!   `remove`, `change`, `costs_to_add`, `costs_to_remove`) with the alignment held, `refit_alignment()` and
+//!   `exact_cost()`, which hypotheses interact (`interactions`), an element's counts (`counts`), cell predictions (`predict`) and how well
 //!   the scans pin it down (`information`). A bad element id or scan index raises.
 //! - **The foliage field:** `foliage` is a dict `lo`, `hi` (the box, 3 each), `voxel` and `prior_path` (m); the
 //!   field is then the elements' residual there. `refit_foliage()`, `promote(element)` and `demote(id)` move mass
@@ -277,8 +278,9 @@ pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     Ok(())
 }
 
-/// A scene of elements held against range images (scene::Scene). Each element is rendered once per image, and a
-/// move recomputes only the alignment components it touches.
+/// A scene of elements held against range images (scene::Scene). Each element is rendered once per image; moves and
+/// queries hold the scan alignment error (its mode and precision) and recompute only the elements whose cells they
+/// touch, and `refit_alignment` re-solves it.
 #[pyclass(name = "Scene")]
 struct PyScene {
     inner: Scene,
@@ -373,14 +375,29 @@ impl PyScene {
         Ok(d)
     }
 
-    /// The scene's cost: −log of its likelihood ratio against the empty scene.
+    /// The scene's cost: −log of its likelihood ratio against the empty scene, the alignment held.
     fn cost(&self) -> f64 {
         self.inner.cost()
     }
 
+    /// The scene's exact cost: the alignment re-solved for the elements as they are (the referee for `cost`; the scene
+    /// unchanged).
+    fn exact_cost(&self, py: Python<'_>) -> f64 {
+        let c = &self.inner;
+        py.detach(|| c.exact_cost())
+    }
+
+    /// Re-solve the scan alignment error for the elements as they are: the cost change (after it, `cost` is
+    /// `exact_cost`).
+    fn refit_alignment(&mut self, py: Python<'_>) -> f64 {
+        let c = &mut self.inner;
+        py.detach(|| c.refit_alignment())
+    }
+
     /// Per (element, scan) (scene::ElementScan): elem, scan, cells, cells_on, footprints_across, surface; its cost
-    /// and the parts it sums (ray_on, ray_empty, ray_in_front, ray_behind, class, alignment); the evidence discount
-    /// (discount); the posterior along the beam at it: align_shift, align_sd, front_shift, front_shift_sd (m); and
+    /// and the parts it sums (ray_on, ray_empty, ray_in_front, ray_behind, class, and alignment: its own nodes' prior and
+    /// log-determinant and an equal share of its scan's alignment part); the evidence discount (discount); the
+    /// posterior along the beam at it, the alignment held: align_shift, align_sd, front_shift, front_shift_sd (m); and
     /// its reflectance level's: refl_level, refl_level_sd (dB).
     fn rows<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
         rows_dict(py, &self.inner.rows())
@@ -419,7 +436,7 @@ impl PyScene {
     }
 
     /// Many hypotheses' costs to add, each alone, per scan: `hypotheses` a list of element dicts (one or more elements
-    /// each); returns (hypotheses, scans), the scene unchanged.
+    /// each); returns (hypotheses, scans), the scene unchanged and its alignment held.
     fn costs_to_add<'py>(&self, py: Python<'py>, hypotheses: Vec<Bound<'py, PyDict>>) -> PyResult<Bound<'py, numpy::PyArray2<f64>>> {
         let hs: Vec<Vec<Element>> = hypotheses.iter().map(|d| elements_from_py(d, &self.em)).collect::<PyResult<_>>()?;
         let c = &self.inner;
@@ -428,9 +445,36 @@ impl PyScene {
         Ok(out.into_iter().flatten().collect::<Vec<f64>>().into_pyarray(py).reshape([n, m])?)
     }
 
+    /// Each element's cost to remove, per scan: `ids` live element ids; returns (ids, scans), the scene unchanged.
+    fn costs_to_remove<'py>(&self, py: Python<'py>, ids: Vec<u32>) -> PyResult<Bound<'py, numpy::PyArray2<f64>>> {
+        for &id in &ids {
+            self.inner.check_id(id).map_err(scene_err)?;
+        }
+        let c = &self.inner;
+        let out = py.detach(|| c.costs_to_remove(&ids));
+        let (n, m) = (out.len(), self.inner.n_scans());
+        Ok(out.into_iter().flatten().collect::<Vec<f64>>().into_pyarray(py).reshape([n, m])?)
+    }
+
+    /// Which hypotheses interact per scan (scene::Scene::interactions), each pair once: i, j (i < j), scan, cells
+    /// (they front a cell, or cells one scene element owns, in common) and nodes (they share an alignment node).
+    fn interactions<'py>(&self, py: Python<'py>, hypotheses: Vec<Bound<'py, PyDict>>) -> PyResult<Bound<'py, PyDict>> {
+        let hs: Vec<Vec<Element>> = hypotheses.iter().map(|d| elements_from_py(d, &self.em)).collect::<PyResult<_>>()?;
+        let c = &self.inner;
+        let out = py.detach(|| c.interactions(&hs));
+        let d = PyDict::new(py);
+        d.set_item("i", out.iter().map(|x| x.0).collect::<Vec<u32>>().into_pyarray(py))?;
+        d.set_item("j", out.iter().map(|x| x.1).collect::<Vec<u32>>().into_pyarray(py))?;
+        d.set_item("scan", out.iter().map(|x| x.2).collect::<Vec<u32>>().into_pyarray(py))?;
+        d.set_item("cells", out.iter().map(|x| x.3).collect::<Vec<bool>>().into_pyarray(py))?;
+        d.set_item("nodes", out.iter().map(|x| x.4).collect::<Vec<bool>>().into_pyarray(py))?;
+        Ok(d)
+    }
+
     /// How well the scans pin element `id` down (scene::Scene::information): per scan, the cost's slope `gradient`
     /// (scans, n) and curvature `hessian` (scans, n, n) in its parameters: a stick's ln r, its axis moved across itself
-    /// (two directions, m) and tilted (rad); a patch's ln r and its centre moved (x, y, z, m).
+    /// (two directions, m) and tilted (rad); a patch's ln r and its centre moved (x, y, z, m). Beside them the
+    /// expected information `expected` (scans, n, n): what its cells would tell on average, positive semi-definite.
     fn information<'py>(&self, py: Python<'py>, id: u32) -> PyResult<Bound<'py, PyDict>> {
         self.inner.check_id(id).map_err(scene_err)?;
         let c = &self.inner;
@@ -438,7 +482,8 @@ impl PyScene {
         let (s, n) = (out.len(), out.first().map_or(0, |m| m.0.len()));
         let d = PyDict::new(py);
         d.set_item("gradient", out.iter().flat_map(|x| x.0.clone()).collect::<Vec<f64>>().into_pyarray(py).reshape([s, n])?)?;
-        d.set_item("hessian", out.into_iter().flat_map(|x| x.1).collect::<Vec<f64>>().into_pyarray(py).reshape([s, n, n])?)?;
+        d.set_item("hessian", out.iter().flat_map(|x| x.1.clone()).collect::<Vec<f64>>().into_pyarray(py).reshape([s, n, n])?)?;
+        d.set_item("expected", out.into_iter().flat_map(|x| x.2).collect::<Vec<f64>>().into_pyarray(py).reshape([s, n, n])?)?;
         Ok(d)
     }
 

@@ -56,6 +56,7 @@ def test_an_empty_scene_costs_nothing_and_a_pole_is_pinned_down():
     assert np.allclose(parts, rows['cost']) and rows['cost'][0] < 0
     info = sc.information(0)
     assert info['hessian'].shape == (1, 5, 5) and np.isfinite(info['hessian']).all() and np.diag(info['hessian'][0]).max() > 0
+    assert info['expected'].shape == (1, 5, 5) and np.linalg.eigvalsh(info['expected'][0]).min() > -1e-6 * np.abs(info['expected'][0]).max()
     assert np.isclose(sc.costs_to_add([pole(r=0.02)]).sum(), sc.costs_to_add([pole(r=0.02)])[0, 0])
 
 
@@ -69,3 +70,20 @@ def test_located_edges_cross_the_binding():
     assert {'refl_level', 'refl_level_sd'} <= set(rows) and rows['refl_level_sd'][0] == 0.0
     assert {'refl', 'cos', 'obs_refl'} <= set(p) and np.isfinite(p['refl'][p['fill'] > 0.5]).all() and np.isnan(p['obs_refl']).all()
     assert np.isnan(v.arrays()['refl']).all()
+
+
+def test_the_held_alignment_crosses_the_binding():
+    """Moves hold the alignment: `exact_cost` re-solves it without changing the scene, `refit_alignment` makes `cost`
+    the exact one, `costs_to_remove` equals removing, and `interactions` names hypotheses sharing cells and nodes."""
+    v = pole_image()
+    sc = _core.Scene([v], pole())
+    assert sc.cost() == sc.exact_cost()
+    ids, _ = sc.add(pole(r=0.02))
+    held = sc.cost()
+    assert np.isclose(held, sc.exact_cost(), rtol=0.01, atol=0.05) and sc.cost() == held
+    sc.refit_alignment()
+    assert sc.cost() == sc.exact_cost()
+    out = sc.costs_to_remove(ids)
+    assert out.shape == (1, 1) and np.isclose(out[0, 0], sc.remove(ids))
+    pairs = sc.interactions([pole(), pole(r=0.02)])
+    assert list(pairs['i']) == [0] and list(pairs['j']) == [1] and pairs['cells'][0] and pairs['nodes'][0]

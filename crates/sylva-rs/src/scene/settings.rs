@@ -57,8 +57,8 @@ params! {
         pub floor_ref: f64 = 7.0,
         pub detect_sd: f64 = 2.0,
         /// The surfaces' reflectance (dB at full fill, face-on): wood (a stick renders with it), leaf (a patch) and
-        /// the ground. Leaf, the dimmest canopy surface, is also the reference an echo's energy share is read against,
-        /// so a full hit on leaf or wood reads as the whole beam. AM's wood is measured on its candidates' interior
+        /// the ground. The dimmer of wood and leaf is the reference the foliage field reads an echo's energy share
+        /// against ([`Settings::refl_full_hit`]), so a full hit on either reads as the whole beam. AM's wood is measured on its candidates' interior
         /// echoes (`reflectance.py am`); leaf and ground are the stand's materials (sim-mulga's sim-clumps), AM's not
         /// measured yet (`photometry.py` reads the stand's per element).
         pub refl_wood: f64 = -15.0,
@@ -243,6 +243,13 @@ impl Settings {
         }
         let m = [f[1] / f[0], f[2] / f[0], f[3] / f[0], f[4] / f[0]];
         self.class_temper * (self.class_b + self.class_w_refl * m[0] + self.class_w_albedo * m[1] + self.class_w_multi * m[2] + self.class_w_cos * m[3])
+    }
+
+    /// The reflectance (dB) the foliage field reads a full hit at, an echo's energy share being its reflectance
+    /// against this: the dimmer canopy surface, wood or leaf, so a full hit on either reads as the whole beam (on AM
+    /// the measured wood, −15.0 dB, is dimmer than the declared leaf, −14.4: research 130 step 3a).
+    pub fn refl_full_hit(&self) -> f64 {
+        self.refl_wood.min(self.refl_leaf)
     }
 
     /// The stem front shift's prior sd (m) at radius r.

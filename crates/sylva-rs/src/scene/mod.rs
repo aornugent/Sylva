@@ -23,7 +23,7 @@
 //! | a cell's nearest echo | first echo | the one the ray likelihood reads |
 //! | a proposed part of the scene | element | a stick (an axis and radius; wood) or a patch (a ball; leaf) |
 //! | elements held against scans | scene | `Scene` |
-//! | `−log` likelihood ratio against the empty scene | cost | also of a move: `add`, `remove`, `change`, `costs_to_add` |
+//! | `−log` likelihood ratio against the empty scene | cost | also of a move: `add`, `remove`, `change`, `costs_to_add`, `costs_to_remove` |
 //! | a cell's likelihood of its first echo | ray likelihood | the scene's data term |
 //! | an element's coverage of a cell's beam | fill | the beam (a uniform disc) convolved with the section |
 //! | what a cell's first echo says about an element | outcome | on it, empty (none), in front, behind (passed through) |
@@ -34,6 +34,7 @@
 //! | φ, for correlation the model leaves out | evidence discount | `discount` |
 //! | beams overlapping a spot | footprints per cell | `m`, `multiplicity` |
 //! | an along-beam error per (scan, place) | scan alignment error | `align_*`; its value at an element, `align_shift` |
+//! | the scan alignment error's mode and precision kept between refits, a move's change to them a rank-k correction | held alignment | `refit_alignment` re-solves it; `exact_cost` is the exact marginal |
 //! | a section's departure from round, per (element, scan) | stem front shift | `front_shift_*` |
 //! | an element's departure from its form | shape mismatch | `mismatch`, `mismatch_*` |
 //! | the chance a pulse its section fills meets solid | opacity | `opacity` |
@@ -49,6 +50,7 @@
 //! | the epoch (scanning day) the alignment error's spread is stated for | reference epoch | `ref_epoch`; a scan of another epoch adds `align_epoch_*` |
 //! | elements read off the moments | candidates | `candidates` |
 //! | sticks and paths not seen, scored per scan | hidden links | |
+//! | hypotheses whose cost together isn't the sum of their costs alone | interacting hypotheses | `interactions`: a shared cell or front element, or a shared alignment node |
 //! | a measurement against the stand's truth or AM's held-out scans | check | |
 
 pub mod foliage;
