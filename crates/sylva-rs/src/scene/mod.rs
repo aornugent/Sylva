@@ -8,13 +8,50 @@
 //! - [`lattice`]: each pulse's native (line, col) cell from its time.
 //! - [`range_image`]: one scan's observations on its lattice, and the signals read off them.
 //! - [`moments`]: surfel moments per (voxel, scan), and the candidate elements read off them.
-//! - [`model`]: the error model and the background.
-//! - [`extinction`]: the diffuse field, a residual extinction on voxels.
-//! - [`scene`]: elements, their rendering, the per-scan offset field and the [`scene::Scene`] that holds them.
+//! - [`settings`]: the instrument and site settings and the background.
+//! - [`foliage`]: the foliage field, a residual extinction on voxels.
+//! - [`scene`]: elements, their rendering, the scan alignment error and the [`scene::Scene`] that holds them.
+//!
+//! # Glossary
+//!
+//! One name per concept, the same in Rust, the bindings, 3dtrees' drivers and its notes.
+//!
+//! | concept | name | meaning |
+//! |---|---|---|
+//! | one scanner position's pulses | scan | its range image is the scan on its lattice |
+//! | a lattice position | cell | holds a pulse's echoes, a miss (a pulse with no echo) or no pulse |
+//! | a cell's nearest echo | first echo | the one the ray likelihood reads |
+//! | a proposed part of the scene | element | a stick (an axis and radius; wood) or a patch (a ball; leaf) |
+//! | elements held against scans | scene | `Scene` |
+//! | `−log` likelihood ratio against the empty scene | cost | also of a move: `add`, `remove`, `change`, `costs_to_add` |
+//! | a cell's likelihood of its first echo | ray likelihood | the scene's data term |
+//! | an element's coverage of a cell's beam | fill | the beam (a uniform disc) convolved with the section |
+//! | what a cell's first echo says about an element | outcome | on it, empty (none), in front, behind (passed through) |
+//! | the element's predicted echo in a cell | the element's echo | `front_echo`; [`scene::Outcome::of`] against it |
+//! | the cost from pulses that passed through | evidence against | `ray_behind` (and `ray_empty`, pulses with no echo) |
+//! | cells the element mostly fills but whose first echo isn't its | expected hits with no echo | |
+//! | the weight a cell's evidence counts with | cell weight | `1 / (φ m)`, [`settings::Settings::cell_weight`] |
+//! | φ, for correlation the model leaves out | evidence discount | `discount` |
+//! | beams overlapping a spot | footprints per cell | `m`, `multiplicity` |
+//! | an along-beam error per (scan, place) | scan alignment error | `align_*`; its value at an element, `align_shift` |
+//! | a section's departure from round, per (element, scan) | stem front shift | `front_shift_*` |
+//! | an element's departure from its form | shape mismatch | `mismatch`, `mismatch_*` |
+//! | the chance a pulse its section fills meets solid | opacity | `opacity` |
+//! | a cell's surface continuity | excess; surface class | solid, mid, fragmented |
+//! | wood-or-leaf evidence from photometry | class evidence | `class_*`, the row's `class` |
+//! | what elements don't explain: extinction σ per voxel | foliage field | `Foliage`, `foliage()`, `refit_foliage` |
+//! | κ outside the field, and a ground plane | background | `Background` |
+//! | the chance the pulse meets no foliage before a return | chance a pulse arrives | `arrives` |
+//! | the cost's curvature in an element's geometry | information | how well a scan pins the element down |
+//! | the instrument and site values | settings | `Settings`; a site's settings file in research 130 |
+//! | the scans taken together | reference epoch | `ref_epoch`; others add `align_epoch_*` |
+//! | elements read off the moments | candidates | `candidates` |
+//! | sticks and paths not seen, scored per scan | hidden links | |
+//! | a measurement against the stand's truth or AM's held-out scans | check | |
 
-pub mod extinction;
+pub mod foliage;
 pub mod lattice;
-pub mod model;
+pub mod settings;
 pub mod moments;
 pub mod range_image;
 pub mod scene;

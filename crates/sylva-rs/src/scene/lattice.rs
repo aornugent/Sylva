@@ -5,7 +5,7 @@
 //! A scan's native angular lattice: every pulse the scanner fired has a cell
 //! `(line, col)`, so a cell no recorded pulse falls in is a known missing
 //! pulse (no echo, or an echo deleted in export). From 3dtrees research 128
-//! (`lattice.md`); the L0 view (research 130) builds on it.
+//! (`lattice.md`); the scene (research 130) builds on it.
 //!
 //! A RIEGL scanner sweeps the zenith at constant speed along each mirror
 //! line and steps the head in azimuth between lines; each line's pulses are
@@ -37,12 +37,6 @@ pub struct Lattice {
     pub line: Vec<u32>,
     /// Column of each pulse along its line.
     pub col: Vec<u32>,
-    /// Pulse time from its slot, in pulse intervals, in `[-0.5, 0.5)`.
-    pub slot_residual: Vec<f32>,
-    /// Recorded zenith from the cell centre's, in zenith steps.
-    pub zenith_residual: Vec<f32>,
-    /// Recorded azimuth from the cell centre's, in azimuth steps.
-    pub azimuth_residual: Vec<f32>,
     pub n_lines: usize,
     pub n_cols: usize,
     /// Pulse interval (s).
@@ -57,10 +51,6 @@ pub struct Lattice {
     pub zenith0: f64,
     /// Per line, its slots' offset from the common columns, in steps (NaN for a line without pulses).
     pub line_phase: Vec<f64>,
-    /// Per line, its epoch's offset from a regular line clock, in line periods (NaN without pulses).
-    pub line_jitter: Vec<f64>,
-    /// Per line, its azimuth off the uniform head turn, in azimuth steps (NaN without pulses).
-    pub line_azimuth: Vec<f64>,
     /// Per column, the cell centre's zenith and azimuth beyond the linear
     /// sweep and head turn (degrees), shared by every line.
     pub zenith_profile: Vec<f64>,
@@ -201,7 +191,7 @@ pub fn scan_lattice(time: &[f64], direction: &[Point]) -> Lattice {
         line_slot[l as usize] = (sn.atan2(c) / TAU).rem_euclid(1.0);
         s = e;
     }
-    // A regular line clock through the epochs, for the jitter report.
+    // A regular line clock through the epochs: the line period.
     let (mut sx, mut sy, mut sxx, mut sxy, mut m) = (0.0, 0.0, 0.0, 0.0, 0.0);
     for (l, &e) in line_epoch.iter().enumerate() {
         if e.is_finite() {
@@ -214,15 +204,12 @@ pub fn scan_lattice(time: &[f64], direction: &[Point]) -> Lattice {
         }
     }
     let slope = if m > 1.0 { (m * sxy - sx * sy) / (m * sxx - sx * sx) } else { period };
-    let icpt = (sy - slope * sx) / m.max(1.0);
-    out.line_jitter = line_epoch.iter().enumerate().map(|(l, &e)| (e - icpt - slope * l as f64) / slope).collect();
     period = slope;
 
     let step = omega * interval;
     // Per pulse: line, slot relative to the slot nearest the epoch.
     let mut line_of = vec![u32::MAX; n];
     let mut rel = vec![0i64; n];
-    let mut slot_res = vec![0f32; n];
     let mut phase = vec![f64::NAN; n_lines];
     for (seg, w) in starts.windows(2).enumerate() {
         let l = seg_line[seg] as usize;
@@ -234,7 +221,6 @@ pub fn scan_lattice(time: &[f64], direction: &[Point]) -> Lattice {
             let k = x.round();
             line_of[i] = l as u32;
             rel[i] = (k - m0) as i64;
-            slot_res[i] = (x - k) as f32;
         }
     }
     let lo = *rel.iter().min().unwrap();
@@ -313,11 +299,6 @@ pub fn scan_lattice(time: &[f64], direction: &[Point]) -> Lattice {
         ares[i] -= line_az[line_of[i] as usize] as f32;
     }
     let (zp, ap) = (profile(&zres), profile(&ares));
-    for i in 0..n {
-        let c = col[i] as usize;
-        zres[i] = ((zres[i] as f64 - zp[c]) / step) as f32;
-        ares[i] = ((ares[i] as f64 - ap[c]) / az_step) as f32;
-    }
     // Column 0's azimuth per line, before the profile: the head turn at its slot plus the line's own offset;
     // lines without pulses on the uniform turn.
     out.line_azimuth0 = (0..n_lines)
@@ -337,14 +318,10 @@ pub fn scan_lattice(time: &[f64], direction: &[Point]) -> Lattice {
         }
     }
     out.azimuth_per_col = az_rate * interval;
-    out.line_azimuth = line_az.iter().map(|a| a / az_step).collect();
     out.zenith_profile = zp;
     out.azimuth_profile = ap;
     out.line = line_of;
     out.col = col;
-    out.slot_residual = slot_res;
-    out.zenith_residual = zres;
-    out.azimuth_residual = ares;
     out.n_lines = n_lines;
     out.n_cols = n_cols;
     out.pulse_interval = interval;
@@ -404,8 +381,6 @@ mod tests {
         let shift = truth[0].1 as i64 - lat.col[0] as i64;
         for (i, &(l, k)) in truth.iter().enumerate() {
             assert_eq!((lat.line[i] as usize, lat.col[i] as i64 + shift), (l, k as i64), "pulse {i}");
-            assert!(lat.slot_residual[i].abs() < 0.2);
-            assert!(lat.zenith_residual[i].abs() < 0.3 && lat.azimuth_residual[i].abs() < 0.6);
         }
         // Each recorded pulse fills one cell; the rest are exactly the dropped ones.
         assert!(lat.count.iter().all(|&c| c <= 1));

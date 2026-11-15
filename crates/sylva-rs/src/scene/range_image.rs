@@ -20,9 +20,9 @@
 //!   facing within 60° of the beam) of the 5 × 5 window, itself included,
 //!   within `plane_tol` of the cell's tangent plane. 1 on a solid face, 2
 //!   where three quarters of it is holes, texture or other surfaces.
-//!   [`ErrorModel::surface`](super::model::ErrorModel::surface) turns it into the surface class (solid, mid,
+//!   [`Settings::surface`](super::settings::Settings::surface) turns it into the surface class (solid, mid,
 //!   fragmented) that sets the per-echo noise, the depth bias and the
-//!   offset's spread.
+//!   scan alignment error's spread.
 
 use super::lattice::{scan_lattice, Lattice};
 use crate::error::{Error, Result};
@@ -358,6 +358,11 @@ impl RangeImage {
         }
         let p = self.pulse[k] as usize;
         &self.echo_refl[self.echo_start[p] as usize..self.echo_start[p + 1] as usize]
+    }
+
+    /// The lattice step (rad), the zenith step between a line's slots, as this scan's timing measures it.
+    pub fn step(&self) -> f64 {
+        self.lat.zenith_step.abs().to_radians()
     }
 
     /// The most echoes any pulse recorded: the instrument's cap on targets per pulse, read from the data (AM's VZ-2000i

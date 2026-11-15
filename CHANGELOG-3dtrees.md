@@ -43,15 +43,19 @@ branch `3dtrees/125-rebase`.
 - Our bindings live in `crates/sylva-py/src/fork_py.rs`, reached from upstream's `lib.rs` by one `mod` line and one
   `register` line, so a merge from upstream meets them nowhere else. No outputs.
 - `scene` scores proposed elements (sticks, and leaf patches as balls) against scans' range images by the ray
-  likelihood (3dtrees research 130). `scene.lattice` places every pulse in its native (line, col) cell from its time;
-  `scene.range_image` is one scan's observations on that lattice, read from a raw shots file (every echo; a cell
-  without a pulse inside the pattern is a miss), and the signals read off them (normals, surface continuity and
-  class); `scene.moments` keeps surfel moments per (voxel, scan), silhouette cells left out, and reads candidate
-  elements off them;
-  `scene.model` holds the calibration as constants (the beam, the surface classes, the per-echo noise, the detection
-  floor rising with range, the receiver's 0.8 m resolution) and what a caller may set as two `params!` records (`ErrorModel`, `Background`); `scene.extinction` is the diffuse
-  field, a residual extinction per voxel in a box that every cell's ray likelihood reads (with a declared strand-bridge factor kept out of the cost); `scene.scene`'s `Scene` holds elements against range
-  images, each rendered once with a uniform-disc beam (returns within the resolution merge), with a per-scan along-beam offset field over which each scan's ray likelihood is
-  integrated by a Laplace marginal, and returns its cost, the cost change of a move, and each element's counts and
-  cell predictions. Bound as `_core.RangeImage`, `_core.Scene`, `_core.candidates` and `_core.error_model_defaults`
-  in `scene_py.rs`, with `ShotsFile::read_echo_f64` for per-echo attributes. 3dtrees needs them to score geometry and class hypotheses from the rays. Additive.
+  likelihood (3dtrees research 130); its module documentation holds the glossary its names follow. `scene.lattice`
+  places every pulse in its native (line, col) cell from its time; `scene.range_image` is one scan's observations on
+  that lattice, read from a raw shots file (every echo; a cell without a pulse inside the pattern is a miss), and the
+  signals read off them (normals, surface continuity and class); `scene.moments` keeps surfel moments per (voxel,
+  scan), silhouette cells left out, and reads candidate elements off them. `scene.settings` holds the instrument and
+  site settings (`Settings`: the beam, the per-echo noise, the detection floor rising with range, the receiver's
+  resolution, 0.95 m at equal energies on AM's VZ-2000i, the class edges, the reflectances and the declared priors)
+  and `Background`, both `params!` records whose defaults are AM's. `scene.foliage` is the foliage field, a residual
+  extinction per voxel in a box that every cell's ray likelihood reads. `scene.scene`'s `Scene` holds elements
+  against range images, each rendered once with a uniform-disc beam (returns within the resolution merge), with a
+  per-scan alignment error and a per-(element, scan) stem front shift over which each scan's ray likelihood is
+  integrated by a Laplace marginal. It returns its cost, the cost change of a move, rows splitting each (element,
+  scan)'s cost into its parts, how well the scans pin an element's geometry down (`information`), and each element's
+  counts and cell predictions. Bound as `_core.RangeImage`, `_core.Scene`, `_core.candidates` and
+  `_core.settings_defaults` in `scene_py.rs`, with `ShotsFile::read_echo_f64` for per-echo attributes. 3dtrees needs
+  them to score geometry and class hypotheses from the rays. Additive.

@@ -3,25 +3,26 @@
 // Free software under the GNU General Public License v3.0 or later;
 // see the LICENSE file. There is no warranty, to the extent permitted by law.
 //! A scene of elements scored against scans' range images by the ray likelihood (3dtrees research 130): its cost,
-//! `−log` of its likelihood ratio against the empty scene, the cost change of a move, and what an element predicts
-//! in an image.
+//! `−log` of its likelihood ratio against the empty scene, the cost change of a move, what an element predicts in an
+//! image, and how well the scans pin an element's geometry down.
 //!
 //! - **Elements** ([`Element`]): a stick (an axis, its section's mean radius a₀) or a leaf patch (a ball with its
-//!   extent, a disc in every view), each with an opacity and a misfit. Opacity is the chance a pulse the section
-//!   fills meets solid there, its gaps wider than the footprint (synthesis §1's "extent, opacity"). Misfit is the
-//!   sd of the section's and axis's departure from the form, which blurs the fill and spreads the depth.
+//!   extent, a disc in every view), each with an opacity and a shape mismatch. Opacity is the chance a pulse the
+//!   section fills meets solid there, its gaps wider than the footprint (synthesis §1's "extent, opacity"). The
+//!   mismatch is the sd of the section's and axis's departure from the form, which blurs the fill and spreads the
+//!   depth. A stick reflects as wood, a patch as leaf ([`Settings`]'s `refl_wood`, `refl_leaf`).
 //! - **The k-buffer:** each element renders into each view's cells. A cell keeps up to [`K`] layers, nearest
 //!   first, each with a depth, a depth spread, a fill and a cosine. Fill is the beam (a uniform disc of the
 //!   footprint's diameter, as AM's raw edges measure it) convolved with the section, at three section radii over
-//!   the misfit; an echo's chance is the detection's mean over them. Along a stick's axis it is cut square, so a chain of
-//!   sticks joins without seams.
+//!   the mismatch; an echo's chance is the detection's mean over them. Along a stick's axis it is cut square, so a
+//!   chain of sticks joins without seams.
 //! - **The ray likelihood, one cell:** its first echo, or none, against a diffuse echo hazard κ along the ray (the
 //!   background), the layers in depth order, then a ground plane.
 //!   - The beam reaches layer i with energy `e_i = f_i Π_{j<i} (1 − op_j f_j)`, and its echo is recorded with
-//!     `op_i det_i`, where `det_i` is the chance it clears the detection floor ([`ErrorModel::p_detect`]):
+//!     `op_i det_i`, where `det_i` is the chance it clears the detection floor ([`Settings::p_detect`]):
 //!     `Φ((ρ_dB + 10 log10(e_i cos ι_i) − floor(t_i)) / σ)`.
 //!   - Adjacent returns (layers and the ground) resolve into two echoes with the instrument's
-//!     [`ErrorModel::p_resolve`] of their separation and energy ratio; else they merge into one, recorded if any
+//!     [`Settings::p_resolve`] of their separation and energy ratio; else they merge into one, recorded if any
 //!     member is, at their energy-weighted depth (energy: op · e · cos · reflectance), its spread their spread about
 //!     it. A cell's likelihood is the mixture over these merge patterns.
 //!   - An echo at r has density `Σ_i P_i op_i det_i t_ν(r − t_i − bias_k − δ; σ_k ⊕ spread_i)` over the returns, plus
@@ -30,30 +31,36 @@
 //!   - Every cell an element fronts at fill [`MIN_FILL`] or more counts, partial hits included, so every
 //!     hypothesis is scored on the same echoes (slice 7c: a gate at fill 0.5, with the band below it scored by
 //!     located edges, let a wider stick move echoes from the edges into the gate, where each is worth far more).
+//! - **The element's echo** ([`front_echo`]): the first return of the most likely way a cell comes back, its sd
+//!   widened by the alignment error and the stem front shift. [`Outcome::of`] against it is the one rule for "the
+//!   cell's first echo is the element's", used by the surface class, the cells_on, class evidence, `predict` and
+//!   `counts`; a cell mostly filled ([`MOSTLY`]) is where an echo reads the element's surface.
 //! - **Depth over a footprint:** a layer's depth is the mean of the section's depth over the part of the footprint
 //!   it meets, weighted by each part's energy (the cosine of incidence), as a scanner's mixed echo is
-//!   ([`footprint_depth`]). The misfit spreads the depth but doesn't move it (slice 7b).
-//! - **The offset field** (research 130 offset-field-design.md, slices 7 and 7b): per scan, an along-beam offset
-//!   on nodes ℓ apart (trilinear hats, normalised) with a unit Gaussian prior, scaled at each element by its surface
-//!   class's spread (and the other-epoch part for a scan off the reference epoch). A cell's depths shift by the
-//!   field at its front element. Neighbours sharing nodes share one offset, and one scan's joint evidence on a
-//!   place is capped by the prior. (An across-beam part didn't help held-out calibration; slice 7b dropped it.)
-//!   The surface class k (which sets the along spread, the bias and the noise) is the median class of the view's
-//!   echoes on the element's front. A scan's cost is the Laplace marginal of its data over its field
-//!   ([`scan_cost`]).
-//! - **Weights:** each cell counts `1 / (φ m(ρ))`, with m the footprints per cell (overlapping footprints) and φ
-//!   the error model's `dispersion`: one constant for every cell and every hypothesis, so it widens posteriors
-//!   without favouring any hypothesis (a quasi-likelihood). It replaced slice 7's ρ_res, `1 + (n − 1) ρ` with n an
-//!   element's own footprints, which differed between hypotheses and, once every fronted cell counted, favoured
-//!   the thinner (slice 7c).
+//!   ([`footprint_depth`]). The mismatch spreads the depth but doesn't move it (slice 7b).
+//! - **The scan alignment error** (research 130 offset-field-design.md, slices 7 and 7b): per scan, an along-beam
+//!   shift on nodes ℓ apart (trilinear hats, normalised) with a unit Gaussian prior, scaled at each element by its
+//!   surface class's spread (and the other-epoch part for a scan off the reference epoch, which the caller
+//!   declares). A cell's depths move by the shift at its front element. Neighbours sharing nodes share one shift,
+//!   and one scan's joint evidence on a place is capped by the prior. The surface class k (which sets the along
+//!   spread, the bias and the noise) is the median class of the view's echoes on the element. With it, the **stem
+//!   front shift** (slice 14): a node of the element's own per scan, its section's departure from round as that view
+//!   sees it. A scan's cost is the Laplace marginal of its data over both ([`scan_cost`]).
+//! - **Weights:** each cell counts [`Settings::cell_weight`], `1 / (φ m(ρ))`, with m the footprints per cell
+//!   (overlapping footprints, on the image's own lattice step) and φ the evidence discount per cell: one constant
+//!   for every cell and every hypothesis, so it widens posteriors without favouring any hypothesis (a
+//!   quasi-likelihood). It replaced slice 7's ρ_res, `1 + (n − 1) ρ` with n an element's own footprints, which
+//!   differed between hypotheses and, once every fronted cell counted, favoured the thinner (slice 7c).
 //!
 //! - **The scene** ([`Scene`]) holds elements against range images, each rendered once. A move (add, remove,
-//!   change) returns its cost change, and recomputes only the field components the touched element joins or leaves.
+//!   change) returns its cost change, and recomputes only the alignment components the touched element joins or
+//!   leaves. Its rows ([`ElementScan`]) split each (element, scan)'s cost into its parts, and
+//!   [`Scene::information`] gives the curvature of an element's cost in its geometry.
 //!
 //! Cells no element touches cancel. Context (neighbours, competitors) enters as more elements in the set.
 
-use super::model::{Background, ErrorModel, FIELD_SPACING, GROUND_DB, NU_E, P_OUTLIER, SIGMA_E, STEP, T_MAX, WOOD_DB};
-use super::extinction::{self, Counts, Extinction, ExtinctionSpec, RayBg};
+use super::settings::{Background, Settings, ALIGN_SPACING, P_OUTLIER, T_MAX};
+use super::foliage::{self, Counts, Foliage, FoliageBox, RayFoliage};
 use super::range_image::{Cell, RangeImage};
 use std::sync::Arc;
 use crate::transform::{cross, dot, norm, normalize, sub};
@@ -68,6 +75,10 @@ pub const K: usize = 3;
 /// or more.
 pub const MIN_FILL: f64 = 0.01;
 
+/// The fill over which a cell is mostly the element's: its echo there reads the element's surface (its class, class
+/// evidence and shape mismatch).
+pub const MOSTLY: f64 = 0.5;
+
 /// An element's form.
 #[derive(Debug, Clone, Copy)]
 pub enum Form {
@@ -78,13 +89,13 @@ pub enum Form {
 }
 
 /// An element hypothesis: its form, its section's radius (a stick's a₀; a patch's extent), its opacity (1 solid)
-/// and its misfit sd (m). Opacity and misfit are latents the caller supplies.
+/// and its shape mismatch sd (m). The caller supplies opacity and mismatch (each with a declared default).
 #[derive(Debug, Clone, Copy)]
 pub struct Element {
     pub form: Form,
     pub r: f64,
     pub opacity: f64,
-    pub misfit: f64,
+    pub mismatch: f64,
 }
 
 impl Element {
@@ -94,9 +105,31 @@ impl Element {
             Form::Patch { centre } => centre,
         }
     }
+
+    /// Why the element can't be scored, if it can't: a radius that isn't positive, an opacity outside (0, 1], a
+    /// negative mismatch, a point that isn't finite, or a stick of no length.
+    pub fn invalid(&self) -> Option<&'static str> {
+        let finite = |p: &Point| p.iter().all(|x| x.is_finite());
+        if !(self.r > 0.0 && self.r.is_finite()) {
+            return Some("its radius must be positive");
+        }
+        if !(self.opacity > 0.0 && self.opacity <= 1.0) {
+            return Some("its opacity must be in (0, 1]");
+        }
+        if !(self.mismatch >= 0.0 && self.mismatch.is_finite()) {
+            return Some("its mismatch must be finite and not negative");
+        }
+        match self.form {
+            Form::Stick { a, b } if !(finite(&a) && finite(&b)) => Some("its ends must be finite"),
+            Form::Stick { a, b } if !(norm(&sub(&b, &a)) > 0.0) => Some("a stick needs length"),
+            Form::Patch { centre } if !finite(&centre) => Some("its centre must be finite"),
+            _ => None,
+        }
+    }
 }
 
-/// What a cell's first echo says about a layer: on it, none, in front of it, or behind it (the pulse went through).
+/// What a cell's first echo says about an element: on it, none, in front of it, or behind it (the pulse passed
+/// through).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum Outcome {
@@ -107,8 +140,8 @@ pub enum Outcome {
 }
 
 impl Outcome {
-    /// The outcome of a first echo `obs` (NaN for none) against a layer whose echo is predicted at `depth` with sd
-    /// `sd`: on within `3 sd + 1 cm`, in front beyond `3 sd + 3 cm`, else behind. The margins every consumer uses.
+    /// The outcome of a first echo `obs` (NaN for none) against the element's echo predicted at `depth` with sd `sd`
+    /// ([`front_echo`]): on within `3 sd + 1 cm`, in front beyond `3 sd + 3 cm`, else behind.
     pub fn of(obs: f64, depth: f64, sd: f64) -> Outcome {
         if !obs.is_finite() {
             Outcome::Empty
@@ -126,11 +159,13 @@ impl Outcome {
 struct Layer {
     t: f64,
     spread: f64,
-    /// The fill: its mean over the misfit (`f`), and at section radii r − √3 m, r and r + √3 m (`fq`, the misfit's
-    /// three-point Gauss–Hermite rule, weights 1/6, 2/3, 1/6).
+    /// The fill: its mean over the mismatch (`f`), and at section radii r − √3 m, r and r + √3 m (`fq`, the
+    /// mismatch's three-point Gauss–Hermite rule, weights 1/6, 2/3, 1/6).
     f: f64,
     fq: [f64; 3],
     cos: f64,
+    /// The surface's reflectance (dB at full fill, face-on), by the element's form.
+    db: f64,
     elem: u32,
     op: f64,
     /// Where the cell's ray passes the axis: across it (signed, m, positive on `u × (c − o)`'s side) and along it;
@@ -146,22 +181,37 @@ impl Layer {
     }
 }
 
-/// What one scan says about one element. `cells`: cells where it is the nearest layer (at [`MIN_FILL`] or more);
-/// `support`: those with an echo on it; `across`: footprints across its diameter; `cost`: its share of the scan's
-/// cost (its ray likelihood at the field's mode, plus an equal share of the field's prior and log-determinant terms), so
-/// the rows sum to the total.
+/// What one scan says about one element, its cost split into parts that sum to `cost`.
+/// - `cells`: cells where it is the nearest layer (at [`MIN_FILL`] or more); `cells_on`: those whose first echo is
+///   its ([`Outcome::On`]); `across`: footprints across its diameter; `surface`: its surface class in this scan.
+/// - The ray likelihood's cost at the alignment's mode, by what each cell's first echo says about the element:
+///   `ray_on` (its echoes), `ray_empty` (pulses with no echo), `ray_in_front` (hidden by something nearer) and
+///   `ray_behind` (pulses that passed through it: evidence against).
+/// - `class`: class evidence's cost (0 while it is off); `alignment`: an equal share of the alignment's prior and
+///   log-determinant terms.
+/// - `discount`: the evidence discount φ every cell's evidence was divided by.
+/// - The posterior at the element in this scan, along the beam (m): the scan alignment error's shift and sd, and the
+///   stem front shift's (0 when it is off).
 #[derive(Debug, Clone, Copy)]
 pub struct ElementScan {
     pub elem: u32,
     pub scan: u32,
     pub cells: u32,
-    pub support: u32,
-    pub across: f64,
+    pub cells_on: u32,
+    pub footprints_across: f64,
     pub surface: u8,
     pub cost: f64,
-    /// The offset field's posterior at the element in this scan: the along-beam shift and its sd (m).
-    pub shift_along: f64,
-    pub sd_along: f64,
+    pub ray_on: f64,
+    pub ray_empty: f64,
+    pub ray_in_front: f64,
+    pub ray_behind: f64,
+    pub class: f64,
+    pub alignment: f64,
+    pub discount: f64,
+    pub align_shift: f64,
+    pub align_sd: f64,
+    pub front_shift: f64,
+    pub front_shift_sd: f64,
 }
 
 /// The share of a uniform disc's energy (radius 1) nearer than a line `z` radii from its centre: the CDF of its 1-D
@@ -171,39 +221,31 @@ fn disc_cdf(z: f64) -> f64 {
     0.5 + (z * (1.0 - z * z).sqrt() + z.asin()) / std::f64::consts::PI
 }
 
-/// The beam's radius (m) at range `tm`.
-fn beam_radius(em: &ErrorModel, tm: f64) -> f64 {
-    0.5 * em.footprint(tm)
-}
-
 fn t_pdf(x: f64, nu: f64) -> f64 {
     let c = libm::lgamma(0.5 * (nu + 1.0)) - libm::lgamma(0.5 * nu) - 0.5 * (nu * std::f64::consts::PI).ln();
     (c - 0.5 * (nu + 1.0) * (1.0 + x * x / nu).ln()).exp()
 }
 
-/// What links an element to others in one view's components: its offset-field nodes and the cells it fronts.
+/// What links an element to others in one view's components: its alignment nodes and the cells it fronts.
 fn links(e: &Element, layers: &[(usize, Layer)]) -> Vec<(u8, [i64; 3])> {
-    OffsetField::hats(&e.mid(), FIELD_SPACING).into_iter().map(|(n, _)| (0u8, n))
+    Alignment::hats(&e.mid(), ALIGN_SPACING).into_iter().map(|(n, _)| (0u8, n))
         .chain(layers.iter().filter(|(_, l)| l.fronts()).map(|&(c, _)| (1u8, [c as i64, 0, 0])))
         .collect()
 }
 
 /// One element's layers in one view, out to the beam's edge and two cells past its section.
-fn render(v: &RangeImage, e: &Element, id: u32, em: &ErrorModel) -> Vec<(usize, Layer)> {
+fn render(v: &RangeImage, e: &Element, id: u32, em: &Settings) -> Vec<(usize, Layer)> {
     let mut out = Vec::new();
-    if !(e.r > 0.0) {
+    if e.invalid().is_some() {
         return out;
     }
-    let (u, half) = match e.form {
+    let (u, half, db) = match e.form {
         Form::Stick { a, b } => {
             let ax = sub(&b, &a);
             let len = norm(&ax);
-            if !(len > 0.0) {
-                return out;
-            }
-            (Some(ax.map(|x| x / len)), 0.5 * len)
+            (Some(ax.map(|x| x / len)), 0.5 * len, em.refl_wood)
         }
-        Form::Patch { .. } => (None, 0.0),
+        Form::Patch { .. } => (None, 0.0, em.refl_leaf),
     };
     let mid = e.mid();
     let c = sub(&mid, &v.origin);
@@ -245,13 +287,13 @@ fn render(v: &RangeImage, e: &Element, id: u32, em: &ErrorModel) -> Vec<(usize, 
             if tm <= 0.0 || along.abs() > half {
                 continue;
             }
-            let a = beam_radius(em, tm);
-            let wide = e.r + 3f64.sqrt() * e.misfit;
-            if d > wide + a + 2.0 * STEP * tm {
+            let a = 0.5 * em.footprint(tm);
+            let wide = e.r + 3f64.sqrt() * e.mismatch;
+            if d > wide + a + 2.0 * v.step() * tm {
                 continue;
             }
             let fq = [-1.0, 0.0, 1.0].map(|z: f64| {
-                let r = (e.r + z * 3f64.sqrt() * e.misfit).max(0.0);
+                let r = (e.r + z * 3f64.sqrt() * e.mismatch).max(0.0);
                 disc_cdf((r - d) / a) - disc_cdf((-r - d) / a)
             });
             let f = (fq[0] + 4.0 * fq[1] + fq[2]) / 6.0;
@@ -260,10 +302,11 @@ fn render(v: &RangeImage, e: &Element, id: u32, em: &ErrorModel) -> Vec<(usize, 
                 l as usize * v.n_cols + k as usize,
                 Layer {
                     t,
-                    spread: (spread * spread + e.misfit * e.misfit).sqrt(),
+                    spread: (spread * spread + e.mismatch * e.mismatch).sqrt(),
                     f,
                     fq,
                     cos: (cos * sin).max(0.05),
+                    db,
                     elem: id,
                     op: e.opacity,
                     x,
@@ -277,7 +320,7 @@ fn render(v: &RangeImage, e: &Element, id: u32, em: &ErrorModel) -> Vec<(usize, 
 
 /// The echo's depth over a footprint (a disc of radius `a`, across the section its semicircle marginal) whose centre
 /// passes `d` from the axis at range `tm`: the mean of the section's depth over the part it meets, each part weighted
-/// by its energy (the cosine of incidence, Lambertian); the spread of those depths; and the mean cosine. The misfit
+/// by its energy (the cosine of incidence, Lambertian); the spread of those depths; and the mean cosine. The mismatch
 /// stays out: it spreads the depth about the form but doesn't move it. Quadrature: Gauss–Chebyshev of the second
 /// kind, 9 nodes.
 fn footprint_depth(tm: f64, d: f64, r: f64, sin: f64, a: f64) -> (f64, f64, f64) {
@@ -305,15 +348,15 @@ fn footprint_depth(tm: f64, d: f64, r: f64, sin: f64, a: f64) -> (f64, f64, f64)
 }
 
 /// Every element rendered into one view.
-fn render_all(v: &RangeImage, elems: &[Element], em: &ErrorModel) -> Vec<Vec<(usize, Layer)>> {
+fn render_all(v: &RangeImage, elems: &[Element], em: &Settings) -> Vec<Vec<(usize, Layer)>> {
     elems.par_iter().enumerate().map(|(i, e)| render(v, e, i as u32, em)).collect()
 }
 
-/// The k-buffer of one view: per touched cell, its layers of fill `min_f` or more, nearest first.
-fn kbuffer(per: &[Vec<(usize, Layer)>], min_f: f64) -> HashMap<usize, Vec<Layer>> {
+/// The k-buffer of one view: per touched cell, its layers that front it ([`MIN_FILL`] or more), nearest first.
+fn kbuffer(per: &[Vec<(usize, Layer)>]) -> HashMap<usize, Vec<Layer>> {
     let mut buf: HashMap<usize, Vec<Layer>> = HashMap::new();
     for &(cell, ly) in per.iter().flatten() {
-        if ly.fq[2] >= min_f {
+        if ly.fronts() {
             buf.entry(cell).or_default().push(ly);
         }
     }
@@ -324,13 +367,56 @@ fn kbuffer(per: &[Vec<(usize, Layer)>], min_f: f64) -> HashMap<usize, Vec<Layer>
     buf
 }
 
-/// Each element's surface class in one view: the median class of the view's echoes on its front (mid where none).
-fn classes(v: &RangeImage, buf: &HashMap<usize, Vec<Layer>>, n: usize, em: &ErrorModel) -> Vec<u8> {
-    let mut ex: Vec<Vec<f64>> = vec![Vec::new(); n];
+/// A cell's first echo (NaN for none) and the ground along its ray (range, cos), if the background has one.
+fn obs_ground(v: &RangeImage, cell: usize, sc: &Background) -> (f64, Option<(f64, f64)>, Point) {
+    let obs = if v.cell[cell] == Cell::Echoes { v.range[cell] as f64 } else { f64::NAN };
+    let w = v.direction((cell / v.n_cols) as f64, (cell % v.n_cols) as f64);
+    let ground = (sc.ground_z.is_finite() && w[2] < -1e-6).then(|| ((sc.ground_z - v.origin[2]) / w[2], -w[2]));
+    (obs, ground, w)
+}
+
+/// A cell as the likelihood reads it: its first echo (NaN for none), the ground along its ray, its weight
+/// ([`Settings::cell_weight`], at its first echo's range or else its front layer's) and what its ray meets of the
+/// foliage field to each layer (ranges `ts`, nearest first), the ground, the beam's end and its first echo.
+struct CellView {
+    obs: f64,
+    ground: Option<(f64, f64)>,
+    wt: f64,
+    bg: RayFoliage,
+}
+
+fn cell_view(v: &RangeImage, cell: usize, ts: &[f64], em: &Settings, sc: &Background, ext: &Foliage) -> CellView {
+    let (obs, ground, w) = obs_ground(v, cell, sc);
+    let wt = em.cell_weight(if obs.is_finite() { obs } else { ts[0] }, v.step());
+    let bg = ext.ray_bg(&v.origin, &w, ts, ground.map(|g| g.0), ground.map_or(T_MAX, |g| g.0), obs);
+    CellView { obs, ground, wt, bg }
+}
+
+/// The front element's echo in a cell as the likelihood reads it: the first return of the most likely way the cell's
+/// layers (each with its surface class) and the ground come back ([`returns`]), with its sd widened by the alignment
+/// error's and the stem front shift's prior spreads (an element of radius `r`; `other` for a scan off the reference
+/// epoch). [`Outcome::of`] against it is the one rule for "the cell's first echo is the element's".
+fn front_echo(layers: &[(Layer, u8)], ground: Option<(f64, f64)>, em: &Settings, taus: &[f64], r: f64, other: bool) -> Return {
+    let pats = returns(layers, ground, 0.0, em, taus).0;
+    let first = pats.iter().max_by(|a, b| a.0.total_cmp(&b.0)).and_then(|p| p.1.first().copied());
+    let mut f = first.unwrap_or(Return { t: f64::NAN, mu: f64::NAN, sd: f64::NAN, s: 0.0, surv: 0.0 });
+    f.sd = f.sd.hypot(em.align_sd(layers[0].1, other)).hypot(em.front_shift_sd(r));
+    f
+}
+
+/// Each element's surface class in one view: the median class of the view's echoes on it, in cells it mostly fills
+/// (mid where none). The class isn't known yet when these echoes are chosen, so they are read under the mid class.
+fn classes(v: &RangeImage, buf: &HashMap<usize, Vec<Layer>>, elems: &[Element], em: &Settings, sc: &Background, other: bool) -> Vec<u8> {
+    let mut ex: Vec<Vec<f64>> = vec![Vec::new(); elems.len()];
     for (&cell, ls) in buf {
         let ly = ls[0];
-        let r = v.range[cell] as f64;
-        if ly.f > 0.5 && v.cell[cell] == Cell::Echoes && (r - ly.t).abs() < 0.03 && v.excess[cell].is_finite() {
+        if ly.f <= MOSTLY || v.cell[cell] != Cell::Echoes || !v.excess[cell].is_finite() {
+            continue;
+        }
+        let (obs, ground, _) = obs_ground(v, cell, sc);
+        let layers: Vec<(Layer, u8)> = ls.iter().map(|l| (*l, 1)).collect();
+        let fe = front_echo(&layers, ground, em, &vec![0.0; layers.len() + 1], elems[ly.elem as usize].r, other);
+        if Outcome::of(obs, fe.mu, fe.sd) == Outcome::On {
             ex[ly.elem as usize].push(v.excess[cell] as f64);
         }
     }
@@ -346,17 +432,17 @@ fn classes(v: &RangeImage, buf: &HashMap<usize, Vec<Layer>>, n: usize, em: &Erro
         .collect()
 }
 
-/// What an element predicts in one cell it fronts ([`Scene::predict`]): its fill, the chance its echo is kept, the
-/// echo's predicted depth with the bias and its sd (noise, spread, misfit and the offset field's along spread), the
-/// element's surface class, the observed first echo (NaN for none), the [`Outcome`], the cell's weight `1/m(ρ)`, the
-/// footprint (m) and where its ray passes the axis (across, along).
+/// What an element predicts in one cell it fronts ([`Scene::predict`]), on the path the likelihood scores: its fill,
+/// the chance its echo is recorded, the chance the pulse arrives (meets nothing of the foliage field before the
+/// element's return), the echo's predicted depth and sd ([`front_echo`]), the element's surface class, the observed
+/// first echo (NaN for none), the [`Outcome`], the cell's weight ([`Settings::cell_weight`]), the footprint (m) and
+/// where its ray passes the axis (across, along).
 pub struct CellPrediction {
     pub cell: usize,
     pub elem: u32,
     pub fill: f64,
-    pub kept: f64,
-    /// The chance the pulse meets nothing of the diffuse field before the element's return.
-    pub reach: f64,
+    pub recorded: f64,
+    pub arrives: f64,
     pub depth: f64,
     pub sd: f64,
     pub surface: u8,
@@ -364,14 +450,14 @@ pub struct CellPrediction {
     pub outcome: Outcome,
     pub weight: f64,
     pub footprint: f64,
-    pub x: f64,
-    pub s: f64,
+    pub across: f64,
+    pub along: f64,
 }
 
 
 /// One return a pulse can record: a run of layers (and the ground) within the receiver's resolution of its first,
 /// merged. `s` is the chance it is recorded, `mu` and `sd` its echo's depth and spread, `t` its first member's range
-/// and `surv` the chance the pulse meets nothing of the diffuse field before it.
+/// and `surv` the chance the pulse meets nothing of the foliage field before it.
 #[derive(Clone, Copy)]
 struct Return {
     t: f64,
@@ -382,11 +468,11 @@ struct Return {
 }
 
 /// The ways a cell's layers (each with its element's surface class) and the ground at `ground` = (range, cos) come
-/// back, with every layer shifted by `delta`: each a set of returns, nearest first, and its chance; and the range the
-/// beam ends at. Adjacent members resolve into two echoes with [`ErrorModel::p_resolve`] of their separation and
-/// energy ratio, else merge at their energy-weighted depth; patterns under 1e-4 are dropped. `taus` are the diffuse
-/// field's optical depths to each layer and then to the ground ([`RayBg`]).
-fn returns(layers: &[(Layer, u8)], ground: Option<(f64, f64)>, delta: f64, em: &ErrorModel, taus: &[f64]) -> (Vec<(f64, Vec<Return>)>, f64) {
+/// back, with every layer shifted by `shift`: each a set of returns, nearest first, and its chance; and the range the
+/// beam ends at. Adjacent members resolve into two echoes with [`Settings::p_resolve`] of their separation and
+/// energy ratio, else merge at their energy-weighted depth; patterns under 1e-4 are dropped. `taus` are the foliage
+/// field's optical depths to each layer and then to the ground ([`RayFoliage`]).
+fn returns(layers: &[(Layer, u8)], ground: Option<(f64, f64)>, shift: f64, em: &Settings, taus: &[f64]) -> (Vec<(f64, Vec<Return>)>, f64) {
     let t_end = ground.map_or(T_MAX, |g| g.0);
     let mut beam = 1.0;
     // members: (range, depth, depth sd, chance recorded, energy, optical depth)
@@ -396,12 +482,12 @@ fn returns(layers: &[(Layer, u8)], ground: Option<(f64, f64)>, delta: f64, em: &
             break;
         }
         let e = ly.f * beam;
-        let s = ly.op * ([1.0, 4.0, 1.0].iter().zip(ly.fq).map(|(w, f)| w * em.p_detect(WOOD_DB, f * beam * ly.cos, ly.t)).sum::<f64>() / 6.0);
+        let s = ly.op * ([1.0, 4.0, 1.0].iter().zip(ly.fq).map(|(w, f)| w * em.p_detect(ly.db, f * beam * ly.cos, ly.t)).sum::<f64>() / 6.0);
         beam *= 1.0 - ly.f * ly.op;
-        m.push((ly.t, ly.t + em.depth_bias(k, ly.t) + delta, em.depth_sd(k, ly.spread), s, ly.op * e * ly.cos * 10f64.powf(WOOD_DB / 10.0), taus[li]));
+        m.push((ly.t, ly.t + em.depth_bias(k, ly.t) + shift, em.depth_sd(k, ly.spread), s, ly.op * e * ly.cos * 10f64.powf(ly.db / 10.0), taus[li]));
     }
     if let Some((tg, cg)) = ground {
-        m.push((tg, tg, SIGMA_E[2], em.p_detect(GROUND_DB, beam * cg, tg), beam * cg * 10f64.powf(GROUND_DB / 10.0), taus[layers.len()]));
+        m.push((tg, tg, em.noise(2), em.p_detect(em.refl_ground, beam * cg, tg), beam * cg * 10f64.powf(em.refl_ground / 10.0), taus[layers.len()]));
     }
     let n = m.len();
     // each adjacent pair's chance of resolving into two echoes
@@ -441,17 +527,17 @@ fn returns(layers: &[(Layer, u8)], ground: Option<(f64, f64)>, delta: f64, em: &
     (out, t_end)
 }
 
-/// One cell's log-likelihood: its first echo (or none) against the diffuse field along its ray (`bg`) and the
+/// One cell's log-likelihood: its first echo (or none) against the foliage field along its ray (`bg`) and the
 /// returns its layers and the ground give ([`returns`]).
-fn cell_ll(echoes: &[f32], layers: &[(Layer, u8)], ground: Option<(f64, f64)>, delta: f64, em: &ErrorModel, bg: &RayBg) -> f64 {
+fn cell_ll(echoes: &[f32], layers: &[(Layer, u8)], ground: Option<(f64, f64)>, shift: f64, em: &Settings, bg: &RayFoliage) -> f64 {
     // the first echo only, for now
     let obs = echoes.first().map_or(f64::NAN, |&r| r as f64);
-    let (patterns, t_end) = returns(layers, ground, delta, em, &bg.taus);
+    let (patterns, t_end) = returns(layers, ground, shift, em, &bg.taus);
     let lik = |rets: &[Return]| {
         let (mut none_kept, mut none_before_obs, mut dens) = (1.0, 1.0, 0.0);
         for r in rets {
             if obs.is_finite() {
-                dens += r.surv * none_kept * r.s * t_pdf((obs - r.mu) / r.sd, NU_E) / r.sd;
+                dens += r.surv * none_kept * r.s * t_pdf((obs - r.mu) / r.sd, em.noise_dof) / r.sd;
                 if r.t < obs {
                     none_before_obs *= 1.0 - r.s;
                 }
@@ -472,35 +558,68 @@ fn cell_ll(echoes: &[f32], layers: &[(Layer, u8)], ground: Option<(f64, f64)>, d
     patterns.iter().map(|(p, rets)| p * lik(rets)).sum::<f64>().max(1e-300).ln()
 }
 
-/// One element's data in one scan: the cells it fronts (its A cells) and the along-beam shift δ of their depths, a
-/// row over the scan's field nodes.
+/// One cell an element fronts, as its ray likelihood scores it: its ray through the foliage field, echoes, layers,
+/// ground and weight, its log-likelihood under the empty scene, and what its first echo says about the element.
+struct CellData {
+    bg: RayFoliage,
+    echoes: Vec<f32>,
+    layers: Vec<(Layer, u8)>,
+    ground: Option<(f64, f64)>,
+    wt: f64,
+    base: f64,
+    outcome: Outcome,
+}
+
+/// One element's data in one scan: the cells it fronts and the along-beam shift δ of their depths, a row over the
+/// scan's alignment nodes (and, last, its own stem front shift node when that is on).
 struct ElemData {
     elem: usize,
-    /// (its ray's diffuse field, echoes, layers, ground, weight, the cell's log-likelihood against the empty scene)
-    cells: Vec<(RayBg, Vec<f32>, Vec<(Layer, u8)>, Option<(f64, f64)>, f64, f64)>,
+    cells: Vec<CellData>,
     class: u8,
-    support: u32,
+    cells_on: u32,
     across: f64,
-    /// Its row over the field's nodes: the along shift, scaled by its class's along spread (and the other-epoch part).
+    /// Its row over the alignment's nodes: the along shift, scaled by its class's along spread (and the other-epoch
+    /// part); then its stem front shift node, scaled by that prior's sd, if `front`.
     along: Vec<(usize, f64)>,
-    /// Its photometry in this scan, for term D: [n, Σ reflectance, Σ albedo, Σ multi-return, Σ cos] over its on-echoes.
+    front: bool,
+    /// Its photometry in this scan, for class evidence: [n, Σ reflectance, Σ albedo, Σ multi-return, Σ cos] over its
+    /// echoes in cells it mostly fills.
     photo: [f64; 5],
 }
 
 impl ElemData {
     /// Its ray likelihood with its cells' depths shifted by δ.
-    fn ll(&self, delta: f64, em: &ErrorModel) -> f64 {
-        self.cells.iter().map(|(bg, echoes, layers, ground, wt, base)| wt * (cell_ll(echoes, layers, *ground, delta, em, bg) - base)).sum()
+    fn ll(&self, shift: f64, em: &Settings) -> f64 {
+        self.cells.iter().map(|c| c.wt * (cell_ll(&c.echoes, &c.layers, c.ground, shift, em, &c.bg) - c.base)).sum()
+    }
+
+    /// Its ray likelihood with its cells' depths shifted by δ, in total and by [`Outcome`] (in its order).
+    fn ll_parts(&self, shift: f64, em: &Settings) -> (f64, [f64; 4]) {
+        let (mut total, mut parts) = (0.0, [0.0; 4]);
+        for c in &self.cells {
+            let x = c.wt * (cell_ll(&c.echoes, &c.layers, c.ground, shift, em, &c.bg) - c.base);
+            total += x;
+            parts[c.outcome as usize] += x;
+        }
+        (total, parts)
+    }
+
+    /// The shift its row gives from the nodes `z`: the alignment's part and the stem front shift's.
+    fn shifts(&self, z: &[f64]) -> (f64, f64) {
+        let n = self.along.len() - self.front as usize;
+        let part = |r: &[(usize, f64)]| r.iter().map(|&(j, w)| w * z[j]).sum::<f64>();
+        (part(&self.along[..n]), part(&self.along[n..]))
     }
 }
 
-/// A scan's offset-field nodes: trilinear hats on a grid of spacing ℓ, normalised so the field's variance is the
-/// same everywhere (`t(x) = Σ w_j z_j / √Σ w_j²`); each node carries the along-beam offset.
-struct OffsetField {
+/// A scan's alignment nodes: trilinear hats on a grid of spacing ℓ, normalised so the alignment error's variance is
+/// the same everywhere (`t(x) = Σ w_j z_j / √Σ w_j²`); each node carries the along-beam shift. Elements' own stem
+/// front shift nodes are keyed apart.
+struct Alignment {
     nodes: HashMap<[i64; 3], usize>,
 }
 
-impl OffsetField {
+impl Alignment {
     fn hats(x: &Point, l: f64) -> Vec<([i64; 3], f64)> {
         let g = x.map(|v| v / l);
         let f = g.map(|v| v.floor());
@@ -526,16 +645,16 @@ impl OffsetField {
 /// Newton steps at most per cost.
 const MAX_NEWTON: usize = 40;
 
-/// One scan's cost for a set of elements: the Laplace marginal of its data over
-/// the field's nodes, `U = −Σ_e A_e(δ̂_e) + ½ ẑᵀẑ + ½ log|Λ|`, Λ the posterior precision at the mode ẑ (the prior is
-/// unit; each element's spread is in its row), and a row per element.
-fn scan_cost(v: &RangeImage, si: usize, rendered: &[Vec<(usize, Layer)>], elems: &[Element], ref_epoch: u32, em: &ErrorModel, sc: &Background, ext: &Extinction)
+/// One scan's cost for a set of elements: the Laplace marginal of its data over the alignment nodes (and the stem
+/// front shifts), `U = −Σ_e A_e(δ̂_e) + ½ ẑᵀẑ + ½ log|Λ|`, Λ the posterior precision at the mode ẑ (the prior is
+/// unit; each element's spread is in its row), plus class evidence; and a row per element.
+fn scan_cost(v: &RangeImage, si: usize, rendered: &[Vec<(usize, Layer)>], elems: &[Element], ref_epoch: u32, em: &Settings, sc: &Background, ext: &Foliage)
                -> (f64, Vec<ElementScan>) {
     let per = rendered;
-    let buf = kbuffer(per, MIN_FILL);
-    let cls = classes(v, &buf, elems.len(), em);
+    let buf = kbuffer(per);
     let other = v.epoch != ref_epoch;
-    let mut field = OffsetField { nodes: HashMap::new() };
+    let cls = classes(v, &buf, elems, em, sc, other);
+    let mut align = Alignment { nodes: HashMap::new() };
     let mut data: Vec<ElemData> = Vec::new();
     let mut by_elem: HashMap<u32, usize> = HashMap::new();
     for (i, e) in elems.iter().enumerate() {
@@ -544,14 +663,16 @@ fn scan_cost(v: &RangeImage, si: usize, rendered: &[Vec<(usize, Layer)>], elems:
         }
         let k = cls[i];
         let mid = e.mid();
-        let s_along = em.field_sd(k, other);
-        let mut along: Vec<(usize, f64)> = OffsetField::hats(&mid, FIELD_SPACING).into_iter().map(|(key, w)| (field.node(key), w * s_along)).collect();
-        if em.shape_sd(e.r) > 0.0 {
+        let s_along = em.align_sd(k, other);
+        let mut along: Vec<(usize, f64)> = Alignment::hats(&mid, ALIGN_SPACING).into_iter().map(|(key, w)| (align.node(key), w * s_along)).collect();
+        let front = em.front_shift_sd(e.r) > 0.0;
+        if front {
             // the element's own node: its shape, as this view sees it
-            along.push((field.node([i64::MIN, i as i64, 0]), em.shape_sd(e.r)));
+            along.push((align.node([i64::MIN, i as i64, 0]), em.front_shift_sd(e.r)));
         }
         by_elem.insert(i as u32, data.len());
-        data.push(ElemData { elem: i, cells: Vec::new(), class: k, support: 0, across: 2.0 * e.r / em.footprint(norm(&sub(&mid, &v.origin))), along, photo: [0.0; 5] });
+        data.push(ElemData { elem: i, cells: Vec::new(), class: k, cells_on: 0, across: 2.0 * e.r / em.footprint(norm(&sub(&mid, &v.origin))), along, front,
+                             photo: [0.0; 5] });
     }
     // cells in index order, so an element's sums run in the same order in every run (the k-buffer is a hash map)
     let mut order: Vec<usize> = buf.keys().copied().collect();
@@ -560,29 +681,28 @@ fn scan_cost(v: &RangeImage, si: usize, rendered: &[Vec<(usize, Layer)>], elems:
         let ls = &buf[&cell];
         let front = ls[0];
         let Some(&d) = by_elem.get(&front.elem) else { continue };
+        if v.cell[cell] == Cell::NoPulse {
+            continue; // no pulse was placed here: nothing observed, neither echo nor miss
+        }
         let layers: Vec<(Layer, u8)> = ls.iter().map(|l| (*l, cls[l.elem as usize])).collect();
-        let obs = if v.cell[cell] == Cell::Echoes { v.range[cell] as f64 } else { f64::NAN };
-        let w = v.direction((cell / v.n_cols) as f64, (cell % v.n_cols) as f64);
-        let ground = (sc.ground_z.is_finite() && w[2] < -1e-6).then(|| ((sc.ground_z - v.origin[2]) / w[2], -w[2]));
-        let wt = 1.0 / (em.dispersion * em.multiplicity(if obs.is_finite() { obs } else { front.t }));
+        let ts: Vec<f64> = layers.iter().map(|(l, _)| l.t).collect();
+        let cv = cell_view(v, cell, &ts, em, sc, ext);
+        let fe = front_echo(&layers, cv.ground, em, &cv.bg.taus, elems[front.elem as usize].r, other);
+        let outcome = Outcome::of(cv.obs, fe.mu, fe.sd);
         let el = &mut data[d];
-        let sd = em.depth_sd(el.class, front.spread);
-        let on = Outcome::of(obs, front.t, sd) == Outcome::On;
-        el.support += on as u32;
+        el.cells_on += (outcome == Outcome::On) as u32;
         let echoes = v.echoes(cell);
-        if let (true, true, Some(&db)) = (on, front.f > 0.5, v.echo_refls(cell).first()) {
+        if let (true, true, Some(&db)) = (outcome == Outcome::On, front.f > MOSTLY, v.echo_refls(cell).first()) {
             let c = if v.cos_inc[cell].is_finite() { (v.cos_inc[cell] as f64).clamp(0.05, 1.0) } else { 0.5 };
             let db = db as f64;
             for (a, x) in el.photo.iter_mut().zip([1.0, db, db - 10.0 * c.log10(), (echoes.len() > 1) as u8 as f64, c]) {
                 *a += x;
             }
         }
-        let ts: Vec<f64> = layers.iter().map(|(l, _)| l.t).collect();
-        let bg = ext.ray_bg(&v.origin, &w, &ts, ground.map(|g| g.0), ground.map_or(T_MAX, |g| g.0), obs);
-        let base = cell_ll(echoes, &[], ground, 0.0, em, &bg.base());
-        el.cells.push((bg, echoes.to_vec(), layers, ground, wt, base));
+        let base = cell_ll(echoes, &[], cv.ground, 0.0, em, &cv.bg.base());
+        el.cells.push(CellData { bg: cv.bg, echoes: echoes.to_vec(), layers, ground: cv.ground, wt: cv.wt, base, outcome });
     }
-    let n = field.nodes.len();
+    let n = align.nodes.len();
     let x_of = |el: &ElemData, z: &[f64]| el.along.iter().map(|&(j, w)| w * z[j]).sum::<f64>();
     // sums in a fixed order, so the same elements always give the same cost to the bit
     let objective = |z: &[f64]| 0.5 * z.iter().map(|x| x * x).sum::<f64>() - data.par_iter().map(|el| el.ll(x_of(el, z), em)).collect::<Vec<f64>>().iter().sum::<f64>();
@@ -638,56 +758,76 @@ fn scan_cost(v: &RangeImage, si: usize, rendered: &[Vec<(usize, Layer)>], elems:
         None => (0.0, nalgebra::DMatrix::zeros(n, n)),
     };
     let shared = 0.5 * z.iter().map(|x| x * x).sum::<f64>() + 0.5 * logdet;
-    let lls: Vec<f64> = data.par_iter().map(|el| el.ll(x_of(el, &z), em)).collect();
-    // term D: the element's form is its class hypothesis (a stick wood, a patch leaf)
+    let lls: Vec<(f64, [f64; 4])> = data.par_iter().map(|el| el.ll_parts(x_of(el, &z), em)).collect();
+    // class evidence: the element's form is its class hypothesis (a stick wood, a patch leaf)
     let class: Vec<f64> = data.iter().map(|el| {
         let llr = em.class_llr(&el.photo);
         match elems[el.elem].form { Form::Stick { .. } => -llr, Form::Patch { .. } => llr }
     }).collect();
-    let u = shared - lls.iter().sum::<f64>() + class.iter().sum::<f64>();
-    let rows = data.iter().zip(&lls).zip(&class).map(|((el, l), d)| {
-        let var: f64 = el.along.iter().map(|&(i, wi)| el.along.iter().map(|&(j, wj)| wi * wj * cov[(i, j)]).sum::<f64>()).sum();
+    let u = shared - lls.iter().map(|x| x.0).sum::<f64>() + class.iter().sum::<f64>();
+    let share = shared / data.len().max(1) as f64;
+    let rows = data.iter().zip(&lls).zip(&class).map(|((el, (l, parts)), d)| {
+        let var = |r: &[(usize, f64)]| r.iter().map(|&(i, wi)| r.iter().map(|&(j, wj)| wi * wj * cov[(i, j)]).sum::<f64>()).sum::<f64>().max(0.0).sqrt();
+        let n_align = el.along.len() - el.front as usize;
+        let (align_shift, front_shift) = el.shifts(&z);
         ElementScan {
-            elem: el.elem as u32, scan: si as u32, cells: el.cells.len() as u32, support: el.support, across: el.across, surface: el.class,
-            cost: -l + d + shared / data.len() as f64, shift_along: x_of(el, &z), sd_along: var.max(0.0).sqrt(),
+            elem: el.elem as u32, scan: si as u32, cells: el.cells.len() as u32, cells_on: el.cells_on, footprints_across: el.across, surface: el.class,
+            cost: -l + d + share, ray_on: -parts[0], ray_empty: -parts[1], ray_in_front: -parts[2], ray_behind: -parts[3], class: *d,
+            alignment: share, discount: em.discount, align_shift, align_sd: var(&el.along[..n_align]), front_shift, front_shift_sd: var(&el.along[n_align..]),
         }
     }).collect();
     (u, rows)
 }
 
-/// An element's counts in one view (the latents' sufficient statistics), each cell weighted `1/m(ρ)`.
-/// - **Misfit:** over its front cells at fill > 0.5 with an echo within `3 sd + 3 cm` of its sharp depth (its own
-///   misfit left out of sd), the weighted sum of `max(r² − sd², 0)`, the weights' sum and the cells.
-/// - **Opacity:** over its front cells at fill > 0.9, the weighted counts coded on, empty and behind.
+/// An element's counts in one view (the sufficient statistics of its shape mismatch and opacity), each cell counted in footprints (its
+/// [`Settings::cell_weight`] times φ):
+/// - **Shape mismatch:** over the cells it mostly fills ([`MOSTLY`]) whose first echo is its, from its sharp depth
+///   (its own mismatch left out of the sd), the weighted sum of `max(r² − sd², 0)`, the weights' sum and the cells.
+/// - **Opacity:** over its cells at fill > 0.9, the weighted counts with its echo, none, and one behind.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct ElementCounts {
     pub scan: u32,
-    pub misfit_ss: f64,
-    pub misfit_w: f64,
-    pub misfit_cells: u32,
+    pub mismatch_ss: f64,
+    pub mismatch_w: f64,
+    pub mismatch_cells: u32,
     pub on: f64,
     pub empty: f64,
     pub behind: f64,
 }
 
+/// What a scene call can't do: an element id that isn't live, a scan index out of range, or an element that can't be
+/// scored ([`Element::invalid`]).
+#[derive(Debug, Clone, PartialEq)]
+pub struct SceneError(pub String);
+
+impl std::fmt::Display for SceneError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for SceneError {}
+
 /// A scene: elements held against some range images, and the cost of a move (synthesis §16's incremental form).
 ///
 /// - Each element is rendered once per image, and re-rendered only when it is added or changed.
-/// - A scan's cost is a sum over its components: the elements linked by a shared field node or a shared cell. Their
-///   Laplace marginals are independent (the field's prior is diagonal, and an element's terms touch only its nodes
-///   and cells), so the sum is the scan's whole marginal.
+/// - A scan's cost is a sum over its components: the elements linked by a shared alignment node or a shared cell.
+///   Their Laplace marginals are independent (the alignment's prior is diagonal, and an element's terms touch only
+///   its nodes and cells), so the sum is the scan's whole marginal.
 /// - Component energies are memoised by membership. A move recomputes only the components the touched element joins
 ///   or leaves, and removing an element restores the cost exactly (synthesis §18 invariant 7).
 /// - Element ids are stable and never reused.
+/// - The reference epoch (the scans scanned together) is declared: a scan of another epoch adds the other-epoch part
+///   to its alignment error.
 pub struct Scene {
     views: Vec<Arc<RangeImage>>,
-    em: ErrorModel,
+    em: Settings,
     sc: Background,
-    /// The diffuse field (a residual: estimated from the rays no element fronts), every ray's counts and the field
+    /// The foliage field (a residual: estimated from the rays no element fronts), every ray's counts and the field
     /// estimated from them all (the empty scene's).
-    ext: Extinction,
+    ext: Foliage,
     ext_all: Counts,
-    ext0: Extinction,
+    ext0: Foliage,
     ref_epoch: u32,
     elems: Vec<Option<Element>>,
     /// [image][id]: the element's layers (empty when removed or unseen).
@@ -698,13 +838,12 @@ pub struct Scene {
 }
 
 impl Scene {
-    /// A scene of `elems` against `views`; with `spec`, the diffuse field is estimated in its box as the residual
-    /// of the elements, otherwise it is the background's κ.
-    pub fn new(views: Vec<Arc<RangeImage>>, elems: &[Element], em: ErrorModel, sc: Background, spec: Option<ExtinctionSpec>) -> Self {
-        let ref_epoch = views.first().map_or(0, |v| v.epoch);
+    /// A scene of `elems` against `views`, the scans of epoch `ref_epoch` taken together; with `spec`, the foliage
+    /// field is estimated in its box as the residual of the elements, otherwise it is the background's κ.
+    pub fn new(views: Vec<Arc<RangeImage>>, elems: &[Element], em: Settings, sc: Background, spec: Option<FoliageBox>, ref_epoch: u32) -> Self {
         let n = views.len();
         let ext_all = spec.map_or_else(Counts::new, |sp| {
-            views.iter().map(|v| extinction::counts(v, &sp, &em, None)).fold(Counts::new(), |mut a, b| {
+            views.iter().map(|v| foliage::counts(v, &sp, &em, None)).fold(Counts::new(), |mut a, b| {
                 for (k, (h, l)) in b {
                     let e = a.entry(k).or_insert((0.0, 0.0));
                     e.0 += h;
@@ -713,7 +852,7 @@ impl Scene {
                 a
             })
         });
-        let ext0 = spec.map_or_else(|| Extinction::uniform(sc.kappa), |sp| Extinction::from_counts(sc.kappa, sp, &ext_all));
+        let ext0 = spec.map_or_else(|| Foliage::uniform(sc.kappa), |sp| Foliage::from_counts(sc.kappa, sp, &ext_all));
         let mut c = Scene { views, em, sc, ext: ext0.clone(), ext_all, ext0, ref_epoch, elems: elems.iter().map(|e| Some(*e)).collect(),
                              rendered: Vec::new(), memo: vec![HashMap::new(); n], scan_u: vec![0.0; n] };
         c.rendered = c.views.par_iter().map(|v| render_all(v, elems, &c.em)).collect();
@@ -722,7 +861,7 @@ impl Scene {
         c
     }
 
-    /// The scene's cost against the empty scene: its elements' cells, and the diffuse field over every ray against
+    /// The scene's cost against the empty scene: its elements' cells, and the foliage field over every ray against
     /// the empty scene's field.
     pub fn cost(&self) -> f64 {
         self.scan_u.iter().sum::<f64>() + self.field_cost()
@@ -735,24 +874,24 @@ impl Scene {
         self.ext0.log_lik(&self.ext_all) - self.ext.log_lik(&self.ext_all)
     }
 
-    /// The diffuse field estimated from the rays no element fronts.
-    fn residual(&self) -> Extinction {
+    /// The foliage field estimated from the rays no element fronts.
+    fn residual(&self) -> Foliage {
         let Some(sp) = self.ext.spec else { return self.ext.clone() };
         let mut fronted = Counts::new();
         for (s, v) in self.views.iter().enumerate() {
             let cells: HashSet<usize> = self.rendered[s].iter().flatten().filter(|(_, l)| l.fronts()).map(|&(c, _)| c).collect();
-            for (k, (h, l)) in extinction::counts(v, &sp, &self.em, Some(&cells)) {
+            for (k, (h, l)) in foliage::counts(v, &sp, &self.em, Some(&cells)) {
                 let e = fronted.entry(k).or_insert((0.0, 0.0));
                 e.0 += h;
                 e.1 += l;
             }
         }
-        Extinction::from_counts(self.sc.kappa, sp, &extinction::minus(&self.ext_all, &fronted))
+        Foliage::from_counts(self.sc.kappa, sp, &foliage::minus(&self.ext_all, &fronted))
     }
 
-    /// Re-estimate the diffuse field from the rays the elements leave (a move: its cost change). Moves that change
+    /// Re-estimate the foliage field from the rays the elements leave (a move: its cost change). Moves that change
     /// elements hold the field as it is; after this one the scene's cost is a fresh scene's.
-    pub fn refit_field(&mut self) -> f64 {
+    pub fn refit_foliage(&mut self) -> f64 {
         if self.ext.spec.is_none() || self.ext_all.is_empty() {
             return 0.0;
         }
@@ -766,9 +905,9 @@ impl Scene {
         self.cost() - before
     }
 
-    /// Hold a diffuse field estimated elsewhere (another scene's, from other scans) fixed: the cost then has no field
-    /// term, and `refit_field` leaves it. The cost change.
-    pub fn hold_field(&mut self, ext: &Extinction) -> f64 {
+    /// Hold a foliage field estimated elsewhere (another scene's, from other scans) fixed: the cost then has no field
+    /// term, and `refit_foliage` leaves it. The cost change.
+    pub fn hold_foliage(&mut self, ext: &Foliage) -> f64 {
         let before = self.cost();
         self.ext = ext.clone();
         self.ext0 = ext.clone();
@@ -786,37 +925,50 @@ impl Scene {
         self.views.len()
     }
 
-    /// The diffuse field.
-    pub fn extinction(&self) -> &Extinction {
+    /// The foliage field.
+    pub fn foliage_field(&self) -> &Foliage {
         &self.ext
     }
 
-    /// Promote: add an element and take the mass it explains out of the diffuse field. Its id and the cost change.
+    /// An error unless `id` is a live element.
+    pub fn check_id(&self, id: u32) -> Result<(), SceneError> {
+        match self.elems.get(id as usize) {
+            Some(Some(_)) => Ok(()),
+            _ => Err(SceneError(format!("no element {id}"))),
+        }
+    }
+
+    /// An error unless `s` is one of the scene's scans.
+    pub fn check_scan(&self, s: usize) -> Result<(), SceneError> {
+        if s < self.views.len() { Ok(()) } else { Err(SceneError(format!("no scan {s}: the scene holds {}", self.views.len()))) }
+    }
+
+    /// Promote: add an element and take the mass it explains out of the foliage field. Its id and the cost change.
     pub fn promote(&mut self, e: Element) -> (u32, f64) {
         let (id, d) = self.add(e);
-        (id, d + self.refit_field())
+        (id, d + self.refit_foliage())
     }
 
-    /// Demote: remove an element and give the mass back to the diffuse field. The cost change.
+    /// Demote: remove an element and give the mass back to the foliage field. The cost change.
     pub fn demote(&mut self, id: u32) -> f64 {
         let d = self.remove(id);
-        d + self.refit_field()
+        d + self.refit_foliage()
     }
 
-    /// The diffuse field and its counts: per voxel with data, (voxel, σ, residual counts, every ray's counts).
-    pub fn field(&self) -> (Option<ExtinctionSpec>, Vec<([i32; 3], f64, (f64, f64))>) {
+    /// The foliage field and its counts: per voxel with data, (voxel, σ, residual counts, every ray's counts).
+    pub fn foliage(&self) -> (Option<FoliageBox>, Vec<([i32; 3], f64, (f64, f64))>) {
         let mut out: Vec<([i32; 3], f64, (f64, f64))> = self.ext_all.iter().map(|(&k, &c)| (k, *self.ext.sigma.get(&k).unwrap_or(&self.ext.kappa), c)).collect();
         out.sort_by_key(|x| x.0);
         (self.ext.spec, out)
     }
 
-    /// For each of image `v`'s `cells`: the optical depth of the diffuse field across its box, and the ray's entry and
+    /// For each of image `v`'s `cells`: the optical depth of the foliage field across its box, and the ray's entry and
     /// exit ranges (NaN where it misses the box).
     pub fn transmission(&self, v: &RangeImage, cells: &[usize]) -> Vec<(f64, f64, f64)> {
         let Some(sp) = self.ext.spec else { return vec![(0.0, f64::NAN, f64::NAN); cells.len()] };
         cells.par_iter().map(|&k| {
             let w = v.direction((k / v.n_cols) as f64, (k % v.n_cols) as f64);
-            match extinction::clip(&sp, &v.origin, &w) {
+            match foliage::clip(&sp, &v.origin, &w) {
                 Some((a, b)) => (self.ext.tau(&v.origin, &w, b) - self.ext.tau(&v.origin, &w, a), a, b),
                 None => (f64::NAN, f64::NAN, f64::NAN),
             }
@@ -845,7 +997,7 @@ impl Scene {
         (id, self.refresh(&touched))
     }
 
-    /// Remove an element: the cost change.
+    /// Remove a live element ([`Scene::check_id`]): the cost change.
     pub fn remove(&mut self, id: u32) -> f64 {
         let touched = self.seen_in(id);
         self.elems[id as usize] = None;
@@ -857,7 +1009,7 @@ impl Scene {
         d
     }
 
-    /// Replace an element: the cost change.
+    /// Replace a live element ([`Scene::check_id`]): the cost change.
     pub fn change(&mut self, id: u32, e: Element) -> f64 {
         let mut touched = self.seen_in(id);
         self.forget(id);
@@ -873,70 +1025,63 @@ impl Scene {
         self.refresh(&touched)
     }
 
-    /// What an element predicts in image `s` against the scene, per cell it fronts: it is rendered for this, not
-    /// added, and only the scene's layers in its
-    /// cells enter its k-buffer, so its front cells and class are those of the whole set.
+    /// What an element predicts in image `s` ([`Scene::check_scan`]) against the scene, per cell it fronts, on the
+    /// path the likelihood scores ([`front_echo`], [`cell_view`]): it is rendered for this, not added, and only the
+    /// scene's layers in its cells enter its k-buffer, so its front cells and class are those of the whole set.
     pub fn predict(&self, e: Element, s: usize) -> Vec<CellPrediction> {
         let (v, em) = (&*self.views[s], &self.em);
         let mine = render(v, &e, 0, em);
-        let cells: std::collections::HashSet<usize> = mine.iter().map(|&(c, _)| c).collect();
-        let mut per: Vec<Vec<(usize, Layer)>> = (0..self.elems.len())
-            .filter(|&i| self.elems[i].is_some())
-            .map(|i| self.rendered[s][i].iter().filter(|(c, _)| cells.contains(c)).copied().collect::<Vec<_>>())
-            .filter(|l| !l.is_empty())
-            .collect();
-        for (k, l) in per.iter_mut().enumerate() {
-            l.iter_mut().for_each(|(_, ly)| ly.elem = k as u32 + 1);
+        let cells: HashSet<usize> = mine.iter().map(|&(c, _)| c).collect();
+        let (mut els, mut per) = (vec![e], vec![mine]);
+        for (i, el) in self.elems.iter().enumerate() {
+            let Some(el) = el else { continue };
+            let k = per.len() as u32;
+            let l: Vec<(usize, Layer)> = self.rendered[s][i].iter().filter(|(c, _)| cells.contains(c)).map(|&(c, ly)| (c, Layer { elem: k, ..ly })).collect();
+            if !l.is_empty() {
+                els.push(*el);
+                per.push(l);
+            }
         }
-        per.insert(0, mine);
-        let buf = kbuffer(&per, MIN_FILL);
-        let cls = classes(v, &buf, per.len(), em);
-        let k = cls[0];
-        let off = em.field_sd(k, false);
-        let mut out: Vec<CellPrediction> = buf.iter().filter(|(_, ls)| ls[0].elem == 0).map(|(&cell, ls)| {
+        let buf = kbuffer(&per);
+        let other = v.epoch != self.ref_epoch;
+        let cls = classes(v, &buf, &els, em, &self.sc, other);
+        let mut out: Vec<CellPrediction> = buf.iter().filter(|(&cell, ls)| ls[0].elem == 0 && v.cell[cell] != Cell::NoPulse).map(|(&cell, ls)| {
             let ly = ls[0];
-            // its return: the element's echo, merged with any layer behind within the receiver's resolution
             let layers: Vec<(Layer, u8)> = ls.iter().map(|l| (*l, cls[l.elem as usize])).collect();
-            let w = v.direction((cell / v.n_cols) as f64, (cell % v.n_cols) as f64);
-            // the field in front of it: up to a voxel short of its front (a voxel's mean can't place mass within it,
-            // and the voxel at the front holds the element's own edges)
-            let short = self.ext.spec.map_or(0.0, |sp| sp.voxel);
-            let mut taus: Vec<f64> = layers.iter().map(|(l, _)| self.ext.tau(&v.origin, &w, (l.t - short).max(0.0))).collect();
-            taus.push(0.0);
-            // the most likely way it comes back
-            let pats = returns(&layers, None, 0.0, em, &taus).0;
-            let r = pats.iter().max_by(|a, b| a.0.total_cmp(&b.0)).unwrap().1[0];
-            let (depth, sd) = (r.mu, r.sd.hypot(off).hypot(em.shape_sd(e.r)));
-            let obs = if v.cell[cell] == Cell::Echoes { v.range[cell] as f64 } else { f64::NAN };
+            let ts: Vec<f64> = layers.iter().map(|(l, _)| l.t).collect();
+            let cv = cell_view(v, cell, &ts, em, &self.sc, &self.ext);
+            let fe = front_echo(&layers, cv.ground, em, &cv.bg.taus, e.r, other);
             CellPrediction {
-                cell, elem: 0, fill: ly.f, kept: r.s, reach: r.surv, surface: k,
-                depth, sd, obs, outcome: Outcome::of(obs, depth, sd), weight: 1.0 / em.multiplicity(ly.t), footprint: em.footprint(ly.t), x: ly.x, s: ly.s,
+                cell, elem: 0, fill: ly.f, recorded: fe.s, arrives: fe.surv, surface: cls[0], depth: fe.mu, sd: fe.sd, obs: cv.obs,
+                outcome: Outcome::of(cv.obs, fe.mu, fe.sd), weight: cv.wt, footprint: em.footprint(ly.t), across: ly.x, along: ly.s,
             }
         }).collect();
         out.sort_by_key(|p| p.cell);
         out
     }
 
-    /// An element's counts against the scene, per image, from its predictions
-    /// ([`Scene::predict`]). `shift` (m, per view; empty for none) is subtracted from the depth residuals.
+    /// An element's counts against the scene, per image, from its predictions ([`Scene::predict`]). `shift` (m, per
+    /// view; empty for none) is subtracted from the observed echoes first.
     pub fn counts(&self, e: Element, shift: &[f64]) -> Vec<ElementCounts> {
+        let phi = self.em.discount;
         (0..self.views.len()).into_par_iter().map(|s| {
             let mut out = ElementCounts { scan: s as u32, ..ElementCounts::default() };
-            // the misfit's from the element drawn sharp (its own misfit left out of the depths it is measured
+            let sh = shift.get(s).copied().unwrap_or(0.0);
+            // the mismatch's from the element drawn sharp (its own mismatch left out of the depths it is measured
             // from), the opacity's from the element as given
-            for p in self.predict(Element { misfit: 0.0, ..e }, s) {
-                let r = p.obs - p.depth - shift.get(s).copied().unwrap_or(0.0);
-                if p.fill > 0.5 && r.abs() < 3.0 * p.sd + 0.03 {
-                    out.misfit_ss += p.weight * (r * r - p.sd * p.sd).max(0.0);
-                    out.misfit_w += p.weight;
-                    out.misfit_cells += 1;
+            for p in self.predict(Element { mismatch: 0.0, ..e }, s) {
+                let r = p.obs - sh - p.depth;
+                if p.fill > MOSTLY && Outcome::of(p.obs - sh, p.depth, p.sd) == Outcome::On {
+                    out.mismatch_ss += phi * p.weight * (r * r - p.sd * p.sd).max(0.0);
+                    out.mismatch_w += phi * p.weight;
+                    out.mismatch_cells += 1;
                 }
             }
             for p in self.predict(e, s).into_iter().filter(|p| p.fill > 0.9) {
                 match p.outcome {
-                    Outcome::On => out.on += p.weight,
-                    Outcome::Empty => out.empty += p.weight,
-                    Outcome::Behind => out.behind += p.weight,
+                    Outcome::On => out.on += phi * p.weight,
+                    Outcome::Empty => out.empty += phi * p.weight,
+                    Outcome::Behind => out.behind += phi * p.weight,
                     _ => {}
                 }
             }
@@ -944,11 +1089,78 @@ impl Scene {
         }).collect()
     }
 
-    /// The cost change of adding an element, leaving the scene as it was.
-    pub fn cost_to_add(&mut self, e: Element) -> f64 {
-        let (id, d) = self.add(e);
-        self.remove(id);
-        d
+    /// How well the scans pin a live element's geometry down ([`Scene::check_id`]): per scan, the curvature of its
+    /// cost (nats; the observed information under the evidence discount) in its parameters, with the rest of the
+    /// scene held, by central differences about the element as it is. A stick's parameters are `ln r`, its axis moved
+    /// across itself (two directions perpendicular to it, m) and tilted about its middle (the same two directions, rad
+    /// at its ends' half-length); a patch's are `ln r` and its centre moved (x, y, z, m). The parameter frame is the
+    /// element's own, the same in every scan, so scans' information adds. Steps: 0.05 in `ln r`, 2 mm in place (about
+    /// the depth noise: wider steps read a heavy-tailed cost's secant) and that over the half-length in tilt. Per scan,
+    /// the cost's slope (n) and curvature (n × n, row-major; n 5 for a stick, 4 for a patch), so `−H⁻¹ g` is how far
+    /// the scan's best fit sits from the element; a scan that doesn't see it (or sees it only hidden) gives zeros.
+    pub fn information(&self, id: u32) -> Vec<(Vec<f64>, Vec<f64>)> {
+        let e = self.elems[id as usize].expect("a live element");
+        let hs = 0.002;
+        let (n, steps, perp, half) = match e.form {
+            Form::Stick { a, b } => {
+                let ax = sub(&b, &a);
+                let half = 0.5 * norm(&ax);
+                let u = ax.map(|x| x / (2.0 * half));
+                let p1 = normalize(&cross(&u, &if u[2].abs() < 0.9 { [0.0, 0.0, 1.0] } else { [1.0, 0.0, 0.0] }));
+                (5, vec![0.05, hs, hs, hs / half, hs / half], [p1, cross(&u, &p1)], half)
+            }
+            Form::Patch { .. } => (4, vec![0.05, hs, hs, hs], [[0.0; 3]; 2], 0.0),
+        };
+        let at = |th: &[f64]| -> Element {
+            let r = e.r * th[0].exp();
+            let form = match e.form {
+                Form::Stick { a, b } => {
+                    let mv = |p: &Point, sign: f64| [0, 1, 2].map(|k| p[k] + (th[1] + sign * half * th[3]) * perp[0][k] + (th[2] + sign * half * th[4]) * perp[1][k]);
+                    Form::Stick { a: mv(&a, -1.0), b: mv(&b, 1.0) }
+                }
+                Form::Patch { centre } => Form::Patch { centre: [centre[0] + th[1], centre[1] + th[2], centre[2] + th[3]] },
+            };
+            Element { form, r, ..e }
+        };
+        // the stencil: the centre, ± each step, and the four corners of each pair
+        let mut pts: Vec<Vec<f64>> = vec![vec![0.0; n]];
+        for i in 0..n {
+            for sg in [1.0, -1.0] {
+                let mut t = vec![0.0; n];
+                t[i] = sg * steps[i];
+                pts.push(t);
+            }
+        }
+        for i in 0..n {
+            for j in i + 1..n {
+                for (si, sj) in [(1.0, 1.0), (1.0, -1.0), (-1.0, 1.0), (-1.0, -1.0)] {
+                    let mut t = vec![0.0; n];
+                    t[i] = si * steps[i];
+                    t[j] = sj * steps[j];
+                    pts.push(t);
+                }
+            }
+        }
+        let hyps: Vec<Vec<Element>> = pts.iter().map(|t| vec![at(t)]).collect();
+        let c = self.costs_replacing(&hyps, Some(id));
+        (0..self.views.len()).map(|s| {
+            let f = |k: usize| c[k][s];
+            let g: Vec<f64> = (0..n).map(|i| (f(1 + 2 * i) - f(2 + 2 * i)) / (2.0 * steps[i])).collect();
+            let mut m = vec![0.0; n * n];
+            for i in 0..n {
+                m[i * n + i] = (f(1 + 2 * i) + f(2 + 2 * i) - 2.0 * f(0)) / (steps[i] * steps[i]);
+            }
+            let mut k = 1 + 2 * n;
+            for i in 0..n {
+                for j in i + 1..n {
+                    let x = (f(k) - f(k + 1) - f(k + 2) + f(k + 3)) / (4.0 * steps[i] * steps[j]);
+                    m[i * n + j] = x;
+                    m[j * n + i] = x;
+                    k += 4;
+                }
+            }
+            (g, m)
+        }).collect()
     }
 
     fn seen_in(&self, id: u32) -> Vec<usize> {
@@ -962,8 +1174,8 @@ impl Scene {
         }
     }
 
-    /// One scan's components: live elements it sees, linked by shared field nodes and shared cells, each sorted, in
-    /// order of their first id.
+    /// One scan's components: live elements it sees, linked by shared alignment nodes and shared cells, each sorted,
+    /// in order of their first id.
     fn components(&self, s: usize) -> Vec<Vec<u32>> {
         let ids: Vec<u32> = (0..self.elems.len() as u32).filter(|&i| self.elems[i as usize].is_some() && !self.rendered[s][i as usize].is_empty()).collect();
         let mut parent: Vec<usize> = (0..ids.len()).collect();
@@ -1000,9 +1212,15 @@ impl Scene {
     }
 
     /// Each hypothesis's cost to add alone (one or more elements), per scan: (hypotheses × scans), in parallel, the
-    /// scene unchanged and its diffuse field held. Equal to `cost_to_add` per scan: a hypothesis joins the scan's
-    /// components it shares a field node or a fronted cell with, and its cost is that union's against theirs.
+    /// scene unchanged and its foliage field held. Equal to adding it then removing it: a hypothesis joins the scan's
+    /// components it shares an alignment node or a fronted cell with, and its cost is that union's against theirs.
     pub fn costs_to_add(&self, hyps: &[Vec<Element>]) -> Vec<Vec<f64>> {
+        self.costs_replacing(hyps, None)
+    }
+
+    /// [`Scene::costs_to_add`] with the live element `without` (if any) taken out of the scene first: the cost of
+    /// replacing it by each hypothesis.
+    fn costs_replacing(&self, hyps: &[Vec<Element>], without: Option<u32>) -> Vec<Vec<f64>> {
         let n = self.views.len();
         // per scan: its components and which component owns each link key
         let comps: Vec<(Vec<Vec<u32>>, HashMap<(u8, [i64; 3]), usize>)> = (0..n).into_par_iter().map(|s| {
@@ -1019,15 +1237,16 @@ impl Scene {
         }).collect();
         hyps.par_iter().map(|h| (0..n).map(|s| {
             let v = &self.views[s];
+            let (cs, owner) = &comps[s];
             let extra: Vec<Vec<(usize, Layer)>> = h.iter().map(|e| render(v, e, 0, &self.em)).collect();
-            if extra.iter().all(|l| l.is_empty()) {
+            let home = without.and_then(|id| cs.iter().position(|m| m.contains(&id)));
+            if extra.iter().all(|l| l.is_empty()) && home.is_none() {
                 return 0.0;
             }
-            let (cs, owner) = &comps[s];
-            let mut touched: Vec<usize> = h.iter().zip(&extra).flat_map(|(e, l)| links(e, l)).filter_map(|k| owner.get(&k).copied()).collect();
+            let mut touched: Vec<usize> = h.iter().zip(&extra).flat_map(|(e, l)| links(e, l)).filter_map(|k| owner.get(&k).copied()).chain(home).collect();
             touched.sort_unstable();
             touched.dedup();
-            let members: Vec<u32> = touched.iter().flat_map(|&g| cs[g].iter().copied()).collect();
+            let members: Vec<u32> = touched.iter().flat_map(|&g| cs[g].iter().copied()).filter(|&i| Some(i) != without).collect();
             let mut elems: Vec<Element> = members.iter().map(|&i| self.elems[i as usize].unwrap()).collect();
             let mut rendered: Vec<Vec<(usize, Layer)>> = members.iter().enumerate()
                 .map(|(k, &i)| self.rendered[s][i as usize].iter().map(|&(c, l)| (c, Layer { elem: k as u32, ..l })).collect())
@@ -1071,13 +1290,13 @@ impl Scene {
 }
 
 
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::shots::reconstruct::dir;
     use crate::scene::range_image::RangeImageParams;
-    use crate::scene::model::floor_db;
-
+    
     /// The test scan's receiver: returns closer than this merge (m).
     const RESOLUTION: f64 = 0.8;
 
@@ -1100,7 +1319,7 @@ mod tests {
     /// pole's if recorded, else the wall's.
     fn pole_scan(r_pole: f64, y_pole: f64, gap: f64) -> RangeImage {
         let (period, interval, zstep) = (6.6e-3, 0.825e-6, 0.03);
-        let em = ErrorModel::default();
+        let em = Settings::default();
         let (mut t, mut d, mut r) = (Vec::new(), Vec::new(), Vec::new());
         let u = |s: u64| ((s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407) >> 11) as f64 + 0.5) / (1u64 << 53) as f64;
         for l in 0..200usize {
@@ -1125,7 +1344,7 @@ mod tests {
                 }
                 let seed = (l * 400 + k) as u64 * 2 + 1;
                 let n = 2.0 * (-2.0 * u(seed).ln()).sqrt() * (2.0 * std::f64::consts::PI * u(seed * 7919)).cos();
-                let kept = ec > 0.0 && -13.8 + 10.0 * ec.max(1e-12).log10() + n > floor_db(tm);
+                let kept = ec > 0.0 && -13.8 + 10.0 * ec.max(1e-12).log10() + n > em.floor(tm);
                 let wall = (y_pole + gap) / w[1];
                 let range = if !kept {
                     wall
@@ -1149,13 +1368,13 @@ mod tests {
     }
 
     /// A scene's cost and rows.
-    fn cost(v: &Arc<RangeImage>, els: &[Element], em: &ErrorModel, sc: &Background) -> (f64, Vec<ElementScan>) {
-        let s = Scene::new(vec![v.clone()], els, *em, *sc, None);
+    fn cost(v: &Arc<RangeImage>, els: &[Element], em: &Settings, sc: &Background) -> (f64, Vec<ElementScan>) {
+        let s = Scene::new(vec![v.clone()], els, *em, *sc, None, 0);
         (s.cost(), s.rows())
     }
 
     fn stick(x: f64, y: f64, r: f64) -> Element {
-        Element { form: Form::Stick { a: [x, y, -0.2], b: [x, y, 0.2] }, r, opacity: 1.0, misfit: 0.002 }
+        Element { form: Form::Stick { a: [x, y, -0.2], b: [x, y, 0.2] }, r, opacity: 1.0, mismatch: 0.002 }
     }
 
     /// The true pole has negative cost; a stick of the wrong radius, shifted, or porous has more; a stick where
@@ -1164,7 +1383,7 @@ mod tests {
     #[test]
     fn the_true_pole_wins() {
         let v = pole_view();
-        let (em, sc) = (ErrorModel::default(), Background::default());
+        let (em, sc) = (Settings::default(), Background::default());
         let e = |s: Element| cost(&v, &[s], &em, &sc).0;
         let truth = e(stick(0.0, 4.0, 0.03));
         assert!(truth < -3.0, "{truth}");
@@ -1175,7 +1394,7 @@ mod tests {
         assert!(e(stick(0.2, 6.0, 0.03)) > 1.0);
         let pair = [stick(0.0, 4.0, 0.03), stick(0.2, 6.0, 0.03)];
         let both = cost(&v, &pair, &em, &sc);
-        let delta = Scene::new(vec![v.clone()], &pair[..1], em, sc, None).cost_to_add(pair[1]);
+        let delta: f64 = Scene::new(vec![v.clone()], &pair[..1], em, sc, None, 0).costs_to_add(&[vec![pair[1]]])[0].iter().sum();
         assert!((delta - (both.0 - truth)).abs() < 1e-6, "{delta} vs {}", both.0 - truth);
         let sum: f64 = both.1.iter().map(|r| r.cost).sum();
         assert!((sum - both.0).abs() < 1e-6);
@@ -1186,7 +1405,7 @@ mod tests {
     /// a thinner stick won).
     #[test]
     fn a_thin_stick_under_the_disc_beam_beats_thinner_and_thicker() {
-        let (em, sc) = (ErrorModel::default(), Background::default());
+        let (em, sc) = (Settings::default(), Background::default());
         let v = thin_pole_view(0.006, 6.0);
         let e = |r: f64| cost(&v, &[stick(0.0, 6.0, r)], &em, &sc).0;
         let truth = e(0.006);
@@ -1200,9 +1419,9 @@ mod tests {
     /// true radius beats a thinner and a thicker one.
     #[test]
     fn a_stick_just_before_a_wall_merges_its_edges() {
-        let (em, sc) = (ErrorModel::default(), Background::default());
+        let (em, sc) = (Settings::default(), Background::default());
         let v = Arc::new(pole_scan(0.02, 4.0, 0.5));
-        let wall = Element { form: Form::Patch { centre: [0.0, 6.5, 0.0] }, r: 2.0, opacity: 1.0, misfit: 0.002 };
+        let wall = Element { form: Form::Patch { centre: [0.0, 6.5, 0.0] }, r: 2.0, opacity: 1.0, mismatch: 0.002 };
         let e = |r: f64| cost(&v, &[wall, stick(0.0, 4.0, r)], &em, &sc).0;
         let truth = e(0.02);
         for r in [0.014, 0.028] {
@@ -1210,22 +1429,22 @@ mod tests {
         }
     }
 
-    /// The diffuse field is a residual: the empty scene's field holds the pole's echoes (its voxel is dense), and
+    /// The foliage field is a residual: the empty scene's field holds the pole's echoes (its voxel is dense), and
     /// promoting the pole takes them out of the field. Promotion and demotion are exact: the cost after a promotion
     /// is a fresh scene's, its change is that cost, and demotion restores the empty scene.
     #[test]
     fn the_field_is_a_residual_and_its_moves_are_exact() {
         let v = pole_view();
-        let (em, sc) = (ErrorModel::default(), Background::default());
-        let spec = Some(ExtinctionSpec { lo: [-0.5, 2.9, -0.3], hi: [0.5, 8.9, 0.3], voxel: 0.1, prior_path: 1.0 });
+        let (em, sc) = (Settings::default(), Background::default());
+        let spec = Some(FoliageBox { lo: [-0.5, 2.9, -0.3], hi: [0.5, 8.9, 0.3], voxel: 0.1, prior_path: 1.0 });
         let pole = stick(0.0, 4.0, 0.03);
-        let sigma = |c: &Scene| c.field().1.iter().find(|x| x.0 == [5, 10, 3]).map_or(f64::NAN, |x| x.1);
-        let mut c = Scene::new(vec![v.clone()], &[], em, sc, spec);
+        let sigma = |c: &Scene| c.foliage().1.iter().find(|x| x.0 == [5, 10, 3]).map_or(f64::NAN, |x| x.1);
+        let mut c = Scene::new(vec![v.clone()], &[], em, sc, spec, 0);
         assert_eq!(c.cost(), 0.0);
         let dense = sigma(&c);
         assert!(dense > 1.0, "{dense}");
         let (id, d) = c.promote(pole);
-        let fresh = Scene::new(vec![v.clone()], &[pole], em, sc, spec);
+        let fresh = Scene::new(vec![v.clone()], &[pole], em, sc, spec, 0);
         assert!((c.cost() - fresh.cost()).abs() < 1e-6 * fresh.cost().abs().max(1.0), "{} vs {}", c.cost(), fresh.cost());
         assert!((d - fresh.cost()).abs() < 1e-6 * d.abs().max(1.0));
         assert!(d < 0.0, "{d}");
@@ -1238,8 +1457,8 @@ mod tests {
     #[test]
     fn costs_to_add_match_add_then_remove() {
         let v = pole_view();
-        let (em, sc) = (ErrorModel::default(), Background::default());
-        let mut c = Scene::new(vec![v.clone(), v.clone()], &[stick(0.0, 4.0, 0.03)], em, sc, None);
+        let (em, sc) = (Settings::default(), Background::default());
+        let mut c = Scene::new(vec![v.clone(), v.clone()], &[stick(0.0, 4.0, 0.03)], em, sc, None, 0);
         let hyps = vec![vec![stick(0.0, 4.0, 0.02)], vec![stick(0.2, 6.0, 0.03), stick(0.25, 6.0, 0.01)], vec![stick(5.0, 4.0, 0.03)]];
         let e0 = c.cost();
         let all = c.costs_to_add(&hyps);
@@ -1264,10 +1483,10 @@ mod tests {
     #[test]
     fn a_scenes_moves_match_full_recomputation() {
         let v = pole_view();
-        let (em, sc) = (ErrorModel::default(), Background::default());
+        let (em, sc) = (Settings::default(), Background::default());
         let full = |els: &[Element]| cost(&v, els, &em, &sc).0;
         let (pole, far, wide) = (stick(0.0, 4.0, 0.03), stick(0.6, 7.0, 0.03), stick(0.0, 4.0, 0.04));
-        let mut c = Scene::new(vec![v.clone()], &[far], em, sc, None);
+        let mut c = Scene::new(vec![v.clone()], &[far], em, sc, None, 0);
         let e0 = c.cost();
         assert!((e0 - full(&[far])).abs() < 1e-6 * e0.abs().max(1.0));
         let (id, d_add) = c.add(pole);
@@ -1276,22 +1495,22 @@ mod tests {
         assert!((d_alter - (full(&[far, wide]) - full(&[far, pole]))).abs() < 1e-6 * d_alter.abs().max(1.0), "{d_alter}");
         c.remove(id);
         assert_eq!(c.cost(), e0);
-        let t = c.cost_to_add(pole);
+        let t: f64 = c.costs_to_add(&[vec![pole]])[0].iter().sum();
         assert_eq!(c.cost(), e0);
         assert!((t - d_add).abs() < 1e-9 * t.abs().max(1.0));
     }
 
-    /// The latents' statistics: the true pole's full-fill cells are on it and its echoes fit its sharp depth (a small
+    /// The counts: the true pole's full-fill cells are on it and its echoes fit its sharp depth (a small
     /// excess over the noise); a stick where the pulses went through to the wall reads behind; the scene is
     /// left as it was.
     #[test]
     fn stats_read_on_for_the_pole_and_behind_for_a_phantom() {
         let v = pole_view();
-        let (em, sc) = (ErrorModel::default(), Background::default());
-        let c = Scene::new(vec![v.clone()], &[], em, sc, None);
+        let (em, sc) = (Settings::default(), Background::default());
+        let c = Scene::new(vec![v.clone()], &[], em, sc, None, 0);
         let pole = c.counts(stick(0.0, 4.0, 0.03), &[])[0];
         assert!(pole.on > 10.0 * (pole.behind + pole.empty).max(0.01), "{pole:?}");
-        assert!(pole.misfit_cells > 50 && pole.misfit_ss / pole.misfit_w < 1e-5, "{pole:?}");
+        assert!(pole.mismatch_cells > 50 && pole.mismatch_ss / pole.mismatch_w < 1e-5, "{pole:?}");
         let phantom = c.counts(stick(0.2, 6.0, 0.03), &[])[0];
         assert!(phantom.behind > 10.0 * phantom.on.max(0.01), "{phantom:?}");
         assert_eq!(c.cost(), 0.0);
@@ -1305,45 +1524,45 @@ mod tests {
     fn a_wider_thin_stick_gains_nothing() {
         for y in [4.0, 8.0] {
             let v = thin_pole_view(0.004, y);
-            let (em, sc) = (ErrorModel::default(), Background::default());
-            let e = |r: f64| cost(&v, &[Element { misfit: 0.0, ..stick(0.0, y, r) }], &em, &sc).0;
+            let (em, sc) = (Settings::default(), Background::default());
+            let e = |r: f64| cost(&v, &[Element { mismatch: 0.0, ..stick(0.0, y, r) }], &em, &sc).0;
             let (thin, truth, wide) = (e(0.0028), e(0.004), e(0.0056));
             assert!(wide > truth, "{y} m: wide {wide} truth {truth}");
             assert!(thin > truth - 0.02 * truth.abs(), "{y} m: thin {thin} truth {truth}");
         }
     }
 
-    /// The rendered depth is the footprint's mean on the section, which the misfit (a spread about the form, not a
+    /// The rendered depth is the footprint's mean on the section, which the mismatch (a spread about the form, not a
     /// bias) doesn't move: on the pole's front and halfway out it sits within 0.3 mm of the echoes, whatever the
-    /// misfit. (The misfit used to widen the depth band, which a section's edge clips, so the front was rendered
+    /// mismatch. (The mismatch used to widen the depth band, which a section's edge clips, so the front was rendered
     /// behind the echoes; slice 7b.)
     #[test]
-    fn misfit_does_not_move_the_rendered_front() {
+    fn mismatch_does_not_move_the_rendered_front() {
         let v = pole_view();
-        let em = ErrorModel::default();
-        for misfit in [0.0, 0.002, 0.008] {
-            for ly in render(&v, &Element { misfit, ..stick(0.0, 4.0, 0.03) }, 0, &em).iter().map(|(c, l)| (v.range[*c] as f64, l)) {
+        let em = Settings::default();
+        for mismatch in [0.0, 0.002, 0.008] {
+            for ly in render(&v, &Element { mismatch: mismatch, ..stick(0.0, 4.0, 0.03) }, 0, &em).iter().map(|(c, l)| (v.range[*c] as f64, l)) {
                 let (obs, l) = ly;
                 if l.x.abs() < 0.015 && obs.is_finite() && obs < 5.0 {
-                    assert!((obs - l.t).abs() < 3e-4, "misfit {misfit}: x {} obs {obs} t {}", l.x, l.t);
+                    assert!((obs - l.t).abs() < 3e-4, "mismatch {mismatch}: x {} obs {obs} t {}", l.x, l.t);
                 }
             }
         }
     }
 
-    /// The Laplace marginal over the field agrees with Gauss–Hermite quadrature on a single-element query (the
-    /// referee), a range offset in the data is recovered by the field's along part, and the field's hats are
+    /// The Laplace marginal over the alignment error agrees with Gauss–Hermite quadrature on a single-element query (the
+    /// check), a range shift in the data is recovered by the alignment error and the stem front shift, and the hats are
     /// normalised.
     #[test]
-    fn the_field_integral_matches_quadrature_and_finds_an_offset() {
+    fn the_alignment_integral_matches_quadrature_and_finds_a_shift() {
         for x in [[0.3, 4.1, -0.7], [1.0, 2.0, 3.0]] {
-            let h = OffsetField::hats(&x, 2.0);
+            let h = Alignment::hats(&x, 2.0);
             assert!((h.iter().map(|(_, w)| w * w).sum::<f64>() - 1.0).abs() < 1e-12);
         }
         let v = pole_view();
-        let (em, sc) = (ErrorModel::default(), Background::default());
+        let (em, sc) = (Settings::default(), Background::default());
         let el = stick(0.0, 4.0, 0.03);
-        // shift the pole's echoes 3 mm deeper: the field's along shift should find about that
+        // shift the pole's echoes 3 mm deeper: the alignment error and the stem front shift together should find about that
         let shifted = {
             let mut w = pole_image();
             for k in 0..w.cell.len() {
@@ -1356,26 +1575,26 @@ mod tests {
             Arc::new(w)
         };
         let (_, rows) = cost(&shifted, &[el], &em, &sc);
-        assert!((rows[0].shift_along - 0.003).abs() < 0.0015, "{}", rows[0].shift_along);
-        // the referee: a single element's data integrated by quadrature over the field's prior
+        assert!((rows[0].align_shift + rows[0].front_shift - 0.003).abs() < 0.0015, "{:?}", rows[0]);
+        // the check: a single element's data integrated by quadrature over the alignment error's prior
         let rendered = render_all(&v, &[el], &em);
         let (u_lap, out) = cost(&v, &[el], &em, &sc);
         assert_eq!(out.len(), 1);
         // the element sits on one node set: its along shift has prior sd s_along (√Σŵ² = 1)
         let (gh_x, gh_w) = ([-2.0201828704560856, -0.9585724646138185, 0.0, 0.9585724646138185, 2.0201828704560856],
                             [0.019953242059045913, 0.39361932315224116, 0.9453087204829419, 0.39361932315224116, 0.019953242059045913]);
-        let buf = kbuffer(&rendered, MIN_FILL);
-        let cls = classes(&v, &buf, 1, &em);
-        let s_along = em.field_sd(cls[0], false);
-        let ed = |delta: f64| -> f64 {
+        let buf = kbuffer(&rendered);
+        let cls = classes(&v, &buf, &[el], &em, &sc, false);
+        let s_along = em.align_sd(cls[0], false);
+        let ed = |shift: f64| -> f64 {
             buf.iter().map(|(&cell, ls)| {
                 let layers: Vec<(Layer, u8)> = ls.iter().map(|l| (*l, cls[0])).collect();
                 let echoes = v.echoes(cell);
-                let wt = 1.0 / (em.dispersion * em.multiplicity(echoes.first().map_or(ls[0].t, |&r| r as f64)));
+                let wt = em.cell_weight(echoes.first().map_or(ls[0].t, |&r| r as f64), v.step());
                 let w = v.direction((cell / v.n_cols) as f64, (cell % v.n_cols) as f64);
                 let ts: Vec<f64> = layers.iter().map(|(l, _)| l.t).collect();
-                let bg = Extinction::uniform(sc.kappa).ray_bg(&v.origin, &w, &ts, None, T_MAX, echoes.first().map_or(f64::NAN, |&r| r as f64));
-                wt * (cell_ll(echoes, &layers, None, delta, &em, &bg) - cell_ll(echoes, &[], None, 0.0, &em, &bg.base()))
+                let bg = Foliage::uniform(sc.kappa).ray_bg(&v.origin, &w, &ts, None, T_MAX, echoes.first().map_or(f64::NAN, |&r| r as f64));
+                wt * (cell_ll(echoes, &layers, None, shift, &em, &bg) - cell_ll(echoes, &[], None, 0.0, &em, &bg.base()))
             }).sum()
         };
         let m = gh_x.iter().map(|&x| ed(std::f64::consts::SQRT_2 * s_along * x)).fold(f64::NEG_INFINITY, f64::max);
@@ -1389,19 +1608,65 @@ mod tests {
     #[test]
     fn patches_render_as_discs_and_predict_codes_cells() {
         let v = pole_view();
-        let (em, sc) = (ErrorModel::default(), Background::default());
-        let patch = |x: f64| Element { form: Form::Patch { centre: [x, 4.0, 0.0] }, r: 0.03, opacity: 1.0, misfit: 0.0 };
+        let (em, sc) = (Settings::default(), Background::default());
+        let patch = |x: f64| Element { form: Form::Patch { centre: [x, 4.0, 0.0] }, r: 0.03, opacity: 1.0, mismatch: 0.0 };
         let layers = render(&v, &patch(0.0), 0, &em);
         let f_max = layers.iter().map(|(_, l)| l.f).fold(0.0, f64::max);
         assert!(f_max > 0.99, "{f_max}");
         assert!(layers.iter().all(|(_, l)| l.x < 0.03 + 0.012 || l.f < 0.01));
         let e = |s: Element| cost(&v, &[s], &em, &sc).0;
         assert!(e(patch(0.0)) < e(patch(0.1)));
-        let p = Scene::new(vec![v.clone()], &[], em, sc, None).predict(stick(0.0, 4.0, 0.03), 0);
+        let p = Scene::new(vec![v.clone()], &[], em, sc, None, 0).predict(stick(0.0, 4.0, 0.03), 0);
         let on = p.iter().filter(|q| q.fill > 0.9).all(|q| q.outcome == Outcome::On);
-        let beside = Scene::new(vec![v.clone()], &[], em, sc, None).predict(stick(0.1, 4.0, 0.03), 0);
+        let beside = Scene::new(vec![v.clone()], &[], em, sc, None, 0).predict(stick(0.1, 4.0, 0.03), 0);
         let behind = beside.iter().filter(|q| q.fill > 0.9).all(|q| q.outcome == Outcome::Behind);
         assert!(on && behind);
-        assert!(p.iter().all(|q| q.weight > 0.0 && q.weight <= 1.0));
+        assert!(p.iter().all(|q| q.weight > 0.0 && q.weight <= 1.0 / em.discount));
+    }
+
+    /// A patch renders with leaf's reflectance and a stick with wood's: the same disc's echo is recorded less often
+    /// as leaf (the review after slice 15: patches were rendered as wood).
+    #[test]
+    fn a_patch_reflects_as_leaf_and_a_stick_as_wood() {
+        let v = pole_view();
+        let em = Settings { refl_leaf: -30.0, ..Settings::default() };
+        let c = Scene::new(vec![v.clone()], &[], em, Background::default(), None, 0);
+        let patch = Element { form: Form::Patch { centre: [0.0, 4.0, 0.0] }, r: 0.03, opacity: 1.0, mismatch: 0.0 };
+        let mean = |p: Vec<CellPrediction>| p.iter().map(|q| q.recorded).sum::<f64>() / p.len() as f64;
+        let (leaf, wood) = (mean(c.predict(patch, 0)), mean(c.predict(Element { mismatch: 0.0, ..stick(0.0, 4.0, 0.03) }, 0)));
+        assert!(leaf < wood - 0.1, "leaf {leaf} wood {wood}");
+    }
+
+    /// The reference epoch is declared, not the first scan's: a scene of the same scans in either order costs the
+    /// same, and a scan off the reference epoch gets the wider, other-epoch alignment error.
+    #[test]
+    fn the_reference_epoch_is_declared_and_scan_order_does_not_matter() {
+        let (a, mut b) = (pole_image(), pole_image());
+        b.epoch = 1;
+        let (a, b) = (Arc::new(a), Arc::new(b));
+        let (em, sc) = (Settings::default(), Background::default());
+        let el = [stick(0.0, 4.0, 0.03)];
+        let ab = Scene::new(vec![a.clone(), b.clone()], &el, em, sc, None, 0);
+        let ba = Scene::new(vec![b.clone(), a.clone()], &el, em, sc, None, 0);
+        assert!((ab.cost() - ba.cost()).abs() < 1e-9, "{} vs {}", ab.cost(), ba.cost());
+        let rows = ab.rows();
+        assert!(rows[1].align_sd > rows[0].align_sd, "{:?}", rows);
+    }
+
+    /// How well a scan pins a pole down: its cost curves up in every direction of a stick's geometry about the truth,
+    /// most in place across the beam (the silhouette) and least in tilt; a row's parts sum to its cost.
+    #[test]
+    fn the_pole_is_pinned_down_and_rows_split_their_cost() {
+        let v = pole_view();
+        let (em, sc) = (Settings::default(), Background::default());
+        let c = Scene::new(vec![v.clone()], &[stick(0.0, 4.0, 0.03)], em, sc, None, 0);
+        let m = &c.information(0)[0].1;
+        for i in 0..3 {
+            assert!(m[i * 5 + i] > 0.0, "{i}: {m:?}");
+        }
+        let r = c.rows()[0];
+        let parts = r.ray_on + r.ray_empty + r.ray_in_front + r.ray_behind + r.class + r.alignment;
+        assert!((parts - r.cost).abs() < 1e-9, "{parts} vs {}", r.cost);
+        assert_eq!(r.discount, em.discount);
     }
 }

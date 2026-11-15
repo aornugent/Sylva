@@ -11,7 +11,7 @@
 //!   `Σp`, `Σppᵀ`, `Σpnᵀ` move as p + t does). A rotation R acts as `diag(R, R)`.
 //!   - **Invariant parts** (`Σnnᵀ`, so the normal tensor and the line complex's direction block) fuse across scans
 //!     whatever their offsets.
-//!   - **Covariant parts** (positions, moments of lines) stay per scan in [`Moments`], so a scan's offset field moves
+//!   - **Covariant parts** (positions, moments of lines) stay per scan in [`Moments`], so a scan's alignment error moves
 //!     them by `Ad(t)` before they fuse.
 //! - **Estimators in O(1)** from a sum of moments:
 //!   - **medial collapse** about u: `R* = B/C` (the spread of `P(p − Rn)` is `A − 2RB + R²C`);
