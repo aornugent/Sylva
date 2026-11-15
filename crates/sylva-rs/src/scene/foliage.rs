@@ -10,8 +10,12 @@
 //!   since a voxel is seen from a handful of near-horizontal directions (synthesis §15). Outside the box, and where
 //!   the box has no data, σ is the background's κ. A ray's survival to range t is `exp(−∫₀ᵗ σ)` and its first echo's
 //!   density at t is `σ(t) exp(−∫₀ᵗ σ)`, so a miss is evidence of transmission.
-//! - **Its estimate.** Each voxel's weighted counts, echoes in it (h) and ray length through it (L), give the
-//!   posterior mean `(h + κ b) / (L + b)` under a Gamma prior worth `b` metres of ray at mean κ.
+//! - **Its estimate.** Each voxel's weighted counts, echoes in it (h) and ray length through it (L), give σ a Gamma
+//!   posterior, shape `α = h + κ b` and rate `β = L + b`, under a Gamma prior worth `b` metres of ray at mean κ; its
+//!   mean is `α / β`.
+//! - **What a ray meets of it** is the Gamma–Poisson predictive, σ integrated out per voxel: a stretch ℓ through a
+//!   voxel survives with chance `(β / (β + ℓ))^α` (optical depth `α ln(1 + ℓ / β)`), and an echo after ℓ in it has
+//!   hazard `α / (β + ℓ)`. Only the scene's elements' cells are scored against it, from the rays they don't front.
 //! - **A pulse's echo sequence:** every echo is a hit, and the path up to it is transmission, from the origin for the
 //!   first and from the previous echo plus the receiver's resolution after that (a surface closer behind an echo would
 //!   have merged with it: [`Settings::resolution`]). The report is the first K returns in time (research 130 slice
@@ -27,9 +31,10 @@
 //!   range, or where it leaves the box. φ there is a compound Poisson's clump size: mulga's leaf hits are clumped,
 //!   and their dispersion is flat in cell size (synthesis §2).
 //! - **A residual.** The field is estimated from the rays no element fronts, so an element and the field never
-//!   explain the same echoes. Its log-likelihood over every ray, `Σ_v h ln σ_v − σ_v L` with all rays' counts, is
-//!   the part of the scene's cost the elements' cells don't hold. It is a plug-in estimate scored on the counts it
-//!   was fitted from (research 130's road: a Gamma–Poisson marginal would fix that).
+//!   explain the same echoes. It enters the scene's cost only as the background along the cells the elements front,
+//!   for the scene and for the empty scene alike: the rays it is fitted from are the same in both and cancel, so
+//!   it never scores the counts it was fitted from, and each ray is scored by one model (3dtrees research 130 step
+//!   2; before, every ray's counts were also scored by a plug-in Poisson term, the fronted ones twice).
 
 use super::settings::Settings;
 use super::range_image::{Cell, RangeImage};
@@ -50,12 +55,12 @@ pub struct FoliageBox {
 /// Weighted counts per voxel: (first echoes in it, ray length through it).
 pub type Counts = HashMap<[i32; 3], (f64, f64)>;
 
-/// The foliage field: σ per voxel of `spec`'s box, κ elsewhere.
+/// The foliage field: per voxel of `spec`'s box with data, σ's Gamma posterior (shape, rate); κ elsewhere.
 #[derive(Debug, Clone)]
 pub struct Foliage {
     pub kappa: f64,
     pub spec: Option<FoliageBox>,
-    pub sigma: HashMap<[i32; 3], f64>,
+    pub post: HashMap<[i32; 3], (f64, f64)>,
 }
 
 /// What a cell's ray meets of the foliage field: the optical depth to each of its layers and then the ground (`taus`), to the
@@ -78,31 +83,45 @@ impl RayFoliage {
 impl Foliage {
     /// The background alone: κ everywhere.
     pub fn uniform(kappa: f64) -> Self {
-        Foliage { kappa, spec: None, sigma: HashMap::new() }
+        Foliage { kappa, spec: None, post: HashMap::new() }
     }
 
-    /// The posterior mean field from counts.
+    /// The field's posterior from counts.
     pub fn from_counts(kappa: f64, spec: FoliageBox, counts: &Counts) -> Self {
         let b = spec.prior_path;
-        let sigma = counts.iter().map(|(&k, &(h, l))| (k, (h + kappa * b) / (l + b))).collect();
-        Foliage { kappa, spec: Some(spec), sigma }
+        let post = counts.iter().map(|(&k, &(h, l))| (k, (h + kappa * b, l + b))).collect();
+        Foliage { kappa, spec: Some(spec), post }
     }
 
-    /// σ at a point.
-    pub fn sigma_at(&self, x: &Point) -> f64 {
-        match self.spec {
-            Some(sp) if inside(&sp, x) => *self.sigma.get(&key(&sp, x)).unwrap_or(&self.kappa),
-            _ => self.kappa,
-        }
+    /// σ's posterior mean in voxel `k` (κ where it has no data).
+    pub fn sigma(&self, k: &[i32; 3]) -> f64 {
+        self.post.get(k).map_or(self.kappa, |&(a, b)| a / b)
     }
 
-    /// The optical depth `∫₀ᵗ σ` along the ray from `o` in direction `w`.
-    pub fn tau(&self, o: &Point, w: &Point, t: f64) -> f64 {
-        let mut tau = self.kappa * t;
+    /// The predictive optical depth along the ray from `o` in direction `w` to range `t`, and the hazard of an echo
+    /// at `t`.
+    pub fn tau_hazard(&self, o: &Point, w: &Point, t: f64) -> (f64, f64) {
+        let (mut tau, mut hazard) = (self.kappa * t, self.kappa);
         if let Some(sp) = self.spec {
-            traverse(&sp, o, w, 0.0, t, |k, a, b| tau += (self.sigma.get(&k).unwrap_or(&self.kappa) - self.kappa) * (b - a));
+            traverse(&sp, o, w, 0.0, t, |k, a, b| {
+                if let Some(&(al, be)) = self.post.get(&k) {
+                    tau += al * (1.0 + (b - a) / be).ln() - self.kappa * (b - a);
+                    hazard = if b >= t { al / (be + b - a) } else { self.kappa };
+                } else {
+                    hazard = self.kappa;
+                }
+            });
+            let x = [0, 1, 2].map(|j| o[j] + w[j] * t);
+            if !inside(&sp, &x) {
+                hazard = self.kappa;
+            }
         }
-        tau
+        (tau, hazard)
+    }
+
+    /// The predictive optical depth along the ray from `o` in direction `w` to range `t`.
+    pub fn tau(&self, o: &Point, w: &Point, t: f64) -> f64 {
+        self.tau_hazard(o, w, t).0
     }
 
     /// What a cell's ray from `o` along `w` meets: optical depths to its layers' ranges, its ground's, the beam's end
@@ -111,22 +130,11 @@ impl Foliage {
         let mut taus: Vec<f64> = layer_ts.iter().map(|&t| self.tau(o, w, t)).collect();
         taus.push(ground_t.map_or(0.0, |t| self.tau(o, w, t)));
         let (tau_obs, sig_obs) = if obs.is_finite() {
-            (self.tau(o, w, obs), self.sigma_at(&[0, 1, 2].map(|a| o[a] + w[a] * obs)))
+            self.tau_hazard(o, w, obs)
         } else {
             (f64::NAN, f64::NAN)
         };
         RayFoliage { taus, tau_end: self.tau(o, w, t_end), tau_obs, sig_obs }
-    }
-
-    /// The field's log-likelihood over `counts`: `Σ_v h ln σ_v − σ_v L`.
-    pub fn log_lik(&self, counts: &Counts) -> f64 {
-        let mut keys: Vec<&[i32; 3]> = counts.keys().collect();
-        keys.sort_unstable();
-        keys.into_iter().map(|k| {
-            let (h, l) = counts[k];
-            let s = *self.sigma.get(k).unwrap_or(&self.kappa);
-            if h > 0.0 { h * s.ln() - s * l } else { -s * l }
-        }).sum()
     }
 }
 
@@ -286,8 +294,13 @@ mod tests {
         let e = Foliage::uniform(0.05);
         assert_eq!(e.tau(&o, &w, 7.0), 0.05 * 7.0);
         let mut f = Foliage::from_counts(0.05, sp, &Counts::from([([0, 0, 0], (0.0, 0.0))]));
-        f.sigma.insert([0, 1, 0], 1.05);
+        f.post.insert([0, 1, 0], (1.05 * 1000.0, 1000.0));
         let through = f.tau(&o, &w, 100.0) - f.tau(&o, &w, 0.0);
         assert!(through > 0.05 * 100.0, "{through}");
+        // with much data the predictive is the plug-in; with little, a stretch survives more than σ's mean says
+        let seg = |f: &Foliage| f.tau(&o, &w, 100.0) - 0.05 * 100.0;
+        let plug = seg(&f);
+        f.post.insert([0, 1, 0], (1.05, 1.0));
+        assert!(seg(&f) < plug, "{} vs {plug}", seg(&f));
     }
 }

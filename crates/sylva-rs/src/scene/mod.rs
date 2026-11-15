@@ -37,6 +37,8 @@
 //! | a section's departure from round, per (element, scan) | stem front shift | `front_shift_*` |
 //! | an element's departure from its form | shape mismatch | `mismatch`, `mismatch_*` |
 //! | the chance a pulse its section fills meets solid | opacity | `opacity` |
+//! | an echo's reflectance against its return's energy share, placing a silhouette's edge within a cell | located edges | `refl_noise`, `refl`, `obs_refl` |
+//! | an element's reflectance offset from its surface's, per (element, scan) | reflectance level | `refl_level`, `refl_level_sd` |
 //! | a cell's surface continuity | excess; surface class | solid, mid, fragmented |
 //! | wood-or-leaf evidence from photometry | class evidence | `class_*`, the row's `class` |
 //! | what elements don't explain: extinction σ per voxel | foliage field | `Foliage`, `foliage()`, `refit_foliage` |
@@ -44,7 +46,7 @@
 //! | the chance the pulse meets no foliage before a return | chance a pulse arrives | `arrives` |
 //! | the cost's curvature in an element's geometry | information | how well a scan pins the element down |
 //! | the instrument and site values | settings | `Settings`; a site's settings file in research 130 |
-//! | the scans taken together | reference epoch | `ref_epoch`; others add `align_epoch_*` |
+//! | the epoch (scanning day) the alignment error's spread is stated for | reference epoch | `ref_epoch`; a scan of another epoch adds `align_epoch_*` |
 //! | elements read off the moments | candidates | `candidates` |
 //! | sticks and paths not seen, scored per scan | hidden links | |
 //! | a measurement against the stand's truth or AM's held-out scans | check | |

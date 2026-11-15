@@ -12,7 +12,7 @@
 //!   to false. A patch is a ball about `a` of radius `r` (its extent); its `b` is ignored. An element that can't be
 //!   scored (a radius that isn't positive, an opacity outside (0, 1], a stick of no length) raises.
 //! - **Scenes:** `Scene(images, elements, settings, background, foliage, ref_epoch)` holds elements against range
-//!   images, the scans of epoch `ref_epoch` taken together: `cost()`, `rows()`, the cost change of each move (`add`,
+//!   images, the alignment error's spread stated for the scans of epoch `ref_epoch` (another epoch's add `align_epoch_*`): `cost()`, `rows()`, the cost change of each move (`add`,
 //!   `remove`, `change`, `costs_to_add`), an element's counts (`counts`), cell predictions (`predict`) and how well
 //!   the scans pin it down (`information`). A bad element id or scan index raises.
 //! - **The foliage field:** `foliage` is a dict `lo`, `hi` (the box, 3 each), `voxel` and `prior_path` (m); the
@@ -164,8 +164,8 @@ impl PyRangeImage {
     }
 
     /// The cell arrays, each (n_lines, n_cols[, k]): cell (0 echoes, 1 miss, 2 no pulse), echoes (their count),
-    /// range (the first echo's), pulse (-1 none), normal, cos_inc, excess; and surface (its class under the
-    /// `settings`' class edges).
+    /// range and refl (the first echo's; refl in dB, NaN unknown), pulse (-1 none), normal, cos_inc, excess; and
+    /// surface (its class under the `settings`' class edges).
     #[pyo3(signature = (settings=None))]
     fn arrays<'py>(&self, py: Python<'py>, settings: Option<&Bound<'_, PyDict>>) -> PyResult<Bound<'py, PyDict>> {
         let em = self::settings(settings)?;
@@ -175,6 +175,7 @@ impl PyRangeImage {
         d.set_item("cell", v.cell.iter().map(|&c| c as u8).collect::<Vec<u8>>().into_pyarray(py).reshape(sh)?)?;
         d.set_item("echoes", (0..v.cell.len()).map(|k| v.echoes(k).len() as u32).collect::<Vec<u32>>().into_pyarray(py).reshape(sh)?)?;
         d.set_item("range", v.range.clone().into_pyarray(py).reshape(sh)?)?;
+        d.set_item("refl", (0..v.cell.len()).map(|k| v.echo_refls(k).first().copied().unwrap_or(f32::NAN)).collect::<Vec<f32>>().into_pyarray(py).reshape(sh)?)?;
         d.set_item("pulse", v.pulse.iter().map(|&p| if p == u32::MAX { -1 } else { p as i64 }).collect::<Vec<_>>().into_pyarray(py).reshape(sh)?)?;
         d.set_item("normal", v.normal.iter().flatten().copied().collect::<Vec<f32>>().into_pyarray(py).reshape([sh[0], sh[1], 3])?)?;
         d.set_item("cos_inc", v.cos_inc.clone().into_pyarray(py).reshape(sh)?)?;
@@ -213,7 +214,7 @@ fn predictions_dict<'py>(py: Python<'py>, p: &[CellPrediction]) -> PyResult<Boun
     d.set_item("outcome", p.iter().map(|x| x.outcome as u8).collect::<Vec<_>>().into_pyarray(py))?;
     type F = fn(&CellPrediction) -> f64;
     for (k, f) in [("fill", (|x| x.fill) as F), ("recorded", |x| x.recorded), ("arrives", |x| x.arrives), ("depth", |x| x.depth), ("sd", |x| x.sd),
-                   ("obs", |x| x.obs), ("weight", |x| x.weight), ("footprint", |x| x.footprint), ("across", |x| x.across), ("along", |x| x.along)] {
+                   ("refl", |x| x.refl), ("cos", |x| x.cos), ("obs", |x| x.obs), ("obs_refl", |x| x.obs_refl), ("weight", |x| x.weight), ("footprint", |x| x.footprint), ("across", |x| x.across), ("along", |x| x.along)] {
         d.set_item(k, p.iter().map(f).collect::<Vec<_>>().into_pyarray(py))?;
     }
     Ok(d)
@@ -230,7 +231,7 @@ fn rows_dict<'py>(py: Python<'py>, rows: &[ElementScan]) -> PyResult<Bound<'py, 
     for (k, f) in [("footprints_across", (|r| r.footprints_across) as F), ("cost", |r| r.cost), ("ray_on", |r| r.ray_on), ("ray_empty", |r| r.ray_empty),
                    ("ray_in_front", |r| r.ray_in_front), ("ray_behind", |r| r.ray_behind), ("class", |r| r.class), ("alignment", |r| r.alignment),
                    ("discount", |r| r.discount), ("align_shift", |r| r.align_shift), ("align_sd", |r| r.align_sd), ("front_shift", |r| r.front_shift),
-                   ("front_shift_sd", |r| r.front_shift_sd)] {
+                   ("front_shift_sd", |r| r.front_shift_sd), ("refl_level", |r| r.refl_level), ("refl_level_sd", |r| r.refl_level_sd)] {
         d.set_item(k, rows.iter().map(f).collect::<Vec<_>>().into_pyarray(py))?;
     }
     Ok(d)
@@ -379,7 +380,8 @@ impl PyScene {
 
     /// Per (element, scan) (scene::ElementScan): elem, scan, cells, cells_on, footprints_across, surface; its cost
     /// and the parts it sums (ray_on, ray_empty, ray_in_front, ray_behind, class, alignment); the evidence discount
-    /// (discount); and the posterior along the beam at it: align_shift, align_sd, front_shift, front_shift_sd (m).
+    /// (discount); the posterior along the beam at it: align_shift, align_sd, front_shift, front_shift_sd (m); and
+    /// its reflectance level's: refl_level, refl_level_sd (dB).
     fn rows<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
         rows_dict(py, &self.inner.rows())
     }
@@ -459,8 +461,10 @@ impl PyScene {
     }
 
     /// What one element predicts in scan `scan` against the scene, per cell it fronts (scene::CellPrediction): cell
-    /// (flat index), surface, outcome (0 on, 1 empty, 2 in front, 3 behind), fill, recorded, arrives, depth, sd, obs,
-    /// weight (the cell weight), footprint (m), across and along (where the ray passes the axis).
+    /// (flat index), surface, outcome (0 on, 1 empty, 2 in front, 3 behind), fill, recorded, arrives, depth, sd, refl
+    /// (the echo's predicted reflectance, dB), cos (the mean cos ι where the element meets the footprint), obs,
+    /// obs_refl (the first echo's reflectance, dB), weight (the cell weight), footprint (m), across and along (where
+    /// the ray passes the axis).
     #[pyo3(signature = (element, scan=0))]
     fn predict<'py>(&self, py: Python<'py>, element: &Bound<'_, PyDict>, scan: usize) -> PyResult<Bound<'py, PyDict>> {
         self.inner.check_scan(scan).map_err(scene_err)?;

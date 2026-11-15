@@ -57,3 +57,15 @@ def test_an_empty_scene_costs_nothing_and_a_pole_is_pinned_down():
     info = sc.information(0)
     assert info['hessian'].shape == (1, 5, 5) and np.isfinite(info['hessian']).all() and np.diag(info['hessian'][0]).max() > 0
     assert np.isclose(sc.costs_to_add([pole(r=0.02)]).sum(), sc.costs_to_add([pole(r=0.02)])[0, 0])
+
+
+
+def test_located_edges_cross_the_binding():
+    """Rows carry the reflectance level, predictions the echo's predicted and observed reflectance, and the image its
+    first echoes' reflectance (NaN here: the image has none)."""
+    v = pole_image()
+    sc = _core.Scene([v], pole())
+    rows, p = sc.rows(), sc.predict(pole(), 0)
+    assert {'refl_level', 'refl_level_sd'} <= set(rows) and rows['refl_level_sd'][0] == 0.0
+    assert {'refl', 'cos', 'obs_refl'} <= set(p) and np.isfinite(p['refl'][p['fill'] > 0.5]).all() and np.isnan(p['obs_refl']).all()
+    assert np.isnan(v.arrays()['refl']).all()

@@ -58,9 +58,10 @@ params! {
         pub detect_sd: f64 = 2.0,
         /// The surfaces' reflectance (dB at full fill, face-on): wood (a stick renders with it), leaf (a patch) and
         /// the ground. Leaf, the dimmest canopy surface, is also the reference an echo's energy share is read against,
-        /// so a full hit on leaf or wood reads as the whole beam. These are the stand's materials (sim-mulga's
-        /// sim-clumps); AM's aren't measured yet (`photometry.py` reads the stand's per element).
-        pub refl_wood: f64 = -13.8,
+        /// so a full hit on leaf or wood reads as the whole beam. AM's wood is measured on its candidates' interior
+        /// echoes (`reflectance.py am`); leaf and ground are the stand's materials (sim-mulga's sim-clumps), AM's not
+        /// measured yet (`photometry.py` reads the stand's per element).
+        pub refl_wood: f64 = -15.0,
         pub refl_leaf: f64 = -14.4,
         pub refl_ground: f64 = -20.0,
         /// The receiver resolving two returns `d` m apart whose energies differ by `e` dB (the nearer's over the
@@ -69,6 +70,24 @@ params! {
         pub res_a: f64 = -2.563,
         pub res_b: f64 = 2.693,
         pub res_c: f64 = -0.122,
+        /// Located edges (3dtrees research 130 step 2): an echo's reflectance (dB) is read beside its range. A return's
+        /// predicted reflectance is `10 log10` of its members' energy shares (each fill × the beam left × cos^k ι ×
+        /// the surface's reflectance, k `refl_incidence`, which sets the detection too; a merged return sums them), so
+        /// a silhouette's partial cells place its edge within a cell. About it an echo reads with a Student t of
+        /// `refl_dof` degrees of freedom and scale `refl_noise ⊕ refl_edge (1 − fill)` (dB: bark's own spread, and the
+        /// edge model's, growing as the return's fill falls), truncated where the detection floor cuts it;
+        /// `refl_noise` 0 leaves reflectance out. Each (element, scan) has its own reflectance level, an offset from
+        /// its surface's reflectance with prior sd `refl_level_sd` (dB), marginalised with the alignment error. An echo
+        /// nothing in the scene explains (the foliage field's, an outlier) reads `refl_background_mean` ±
+        /// `refl_background_sd` (dB). All are measured on single echoes against the scene's own predictions
+        /// (`reflectance.py`).
+        pub refl_noise: f64 = 0.27,
+        pub refl_dof: f64 = 2.7,
+        pub refl_edge: f64 = 9.06,
+        pub refl_incidence: f64 = 0.25,
+        pub refl_level_sd: f64 = 0.65,
+        pub refl_background_mean: f64 = -21.18,
+        pub refl_background_sd: f64 = 6.24,
         /// The scan alignment error (research 130 offset-field-design.md): an along-beam shift per (scan, place),
         /// its spread per class within the reference epoch (σ_u ≈ 0.57 σ_L,same, from alignment-rca's pair spreads
         /// and their +0.32 same-near-scan correlation), and the other-epoch part added in quadrature
@@ -175,6 +194,34 @@ impl Settings {
     /// recorded: above the detection floor.
     pub fn p_detect(&self, db: f64, e: f64, range: f64) -> f64 {
         0.5 * libm::erfc(-((db + 10.0 * e.max(1e-12).log10() - self.floor(range)) / self.detect_sd) / std::f64::consts::SQRT_2)
+    }
+
+    /// The density of an echo's reflectance `x` (dB) given its return's predicted reflectance `pred`, give or take
+    /// `spread` (dB, the element's own uncertainty), and fill `fill` at range `range`, as recorded: the per-echo noise,
+    /// truncated by the detection floor (its chance of clearing the floor is the return's own, so this is the
+    /// reflectance's density given that it was recorded; the truncation is read as a Gaussian's). 1 when `x` is
+    /// unknown or reflectance is off.
+    pub fn refl_density(&self, x: f64, pred: f64, spread: f64, fill: f64, range: f64) -> f64 {
+        if !x.is_finite() || self.refl_noise <= 0.0 {
+            return 1.0;
+        }
+        let s = self.refl_noise.hypot(self.refl_edge * (1.0 - fill.clamp(0.0, 1.0))).hypot(spread);
+        let fl = self.floor(range);
+        let phi = |z: f64| 0.5 * libm::erfc(-z / std::f64::consts::SQRT_2);
+        let nu = self.refl_dof;
+        let t = (libm::lgamma(0.5 * (nu + 1.0)) - libm::lgamma(0.5 * nu) - 0.5 * (nu * std::f64::consts::PI).ln()
+                 - 0.5 * (nu + 1.0) * (1.0 + ((x - pred) / s).powi(2) / nu).ln()).exp() / s;
+        t * phi((x - fl) / self.detect_sd) / phi((pred - fl) / (s * s + self.detect_sd * self.detect_sd).sqrt()).max(1e-12)
+    }
+
+    /// The density of the reflectance `x` (dB) of an echo nothing in the scene explains; 1 when `x` is unknown or
+    /// reflectance is off.
+    pub fn refl_background(&self, x: f64) -> f64 {
+        if !x.is_finite() || self.refl_noise <= 0.0 {
+            return 1.0;
+        }
+        let z = (x - self.refl_background_mean) / self.refl_background_sd;
+        (-0.5 * z * z).exp() / (self.refl_background_sd * (2.0 * std::f64::consts::PI).sqrt())
     }
 
     /// The receiver's resolution (m): the separation at which two equal returns come back as two echoes half the
