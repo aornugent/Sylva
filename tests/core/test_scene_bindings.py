@@ -23,6 +23,19 @@ def pole(r=0.03, **kw):
     return dict(a=np.array([[0.0, 4.0, -0.1]]), b=np.array([[0.0, 4.0, 0.1]]), r=np.array([r]), **kw)
 
 
+def test_a_saved_image_loads_as_the_same_image(tmp_path):
+    v = pole_image()
+    v.save(tmp_path / 'pole')
+    w = _core.RangeImage.load(tmp_path / 'pole')
+    a, b = v.arrays(), w.arrays()
+    assert w.shape == v.shape and w.step == v.step and a.keys() == b.keys()
+    assert all(np.array_equal(a[k], b[k], equal_nan=a[k].dtype.kind == 'f') for k in a)
+    assert _core.Scene([w], pole()).cost() == _core.Scene([v], pole()).cost()
+    (tmp_path / 'other').write_bytes(b'not an image')
+    with pytest.raises(ValueError):
+        _core.RangeImage.load(tmp_path / 'other')
+
+
 def test_settings_round_trip_and_unknown_keys_raise():
     d = _core.settings_defaults()
     assert d['discount'] > 0 and 'beam_exit' in d and 'refl_leaf' in d

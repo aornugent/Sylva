@@ -30,6 +30,8 @@ use crate::io::shots::ShotsFile;
 use crate::transform::{cross, dot, normalize};
 use crate::Point;
 use rayon::prelude::*;
+use std::fs::File;
+use std::io::{BufReader, BufWriter, Read, Write};
 use std::path::Path;
 
 /// What a cell holds.
@@ -401,6 +403,112 @@ impl RangeImage {
             .unzip()
     }
 
+    /// Writes the image to `path` for [`RangeImage::load`]: every field, raw and native-endian, after a header
+    /// naming [`build_version`]. A cache on the machine that built it, not an exchange format.
+    pub fn save(&self, path: impl AsRef<Path>) -> Result<()> {
+        let path = path.as_ref();
+        // destructured whole, so a new field fails to compile here until it is saved
+        let RangeImage { lat, c0, n_lines, n_cols, rot, origin, epoch, cell, range, pulse, echo_start, echo_range, echo_refl, max_targets,
+                         normal, cos_inc, excess } = self;
+        let Lattice { line, col, n_lines: lat_lines, n_cols: lat_cols, pulse_interval, line_period, zenith_step, azimuth_step, zenith0,
+                      line_phase, zenith_profile, azimuth_profile, count, line_azimuth0, azimuth_per_col } = lat;
+        let io = |e: std::io::Error| Error::file(path, e.to_string());
+        let mut w = BufWriter::with_capacity(1 << 22, File::create(path).map_err(io)?);
+        w.write_all(MAGIC).map_err(io)?;
+        let sizes = [build_version(), *c0 as u64, *n_lines as u64, *n_cols as u64, *epoch as u64, *max_targets as u64, *lat_lines as u64, *lat_cols as u64];
+        let reals = [*pulse_interval, *line_period, *zenith_step, *azimuth_step, *zenith0, *azimuth_per_col];
+        put(&mut w, &sizes).map_err(io)?;
+        put(&mut w, &reals).map_err(io)?;
+        put(&mut w, rot).map_err(io)?;
+        put(&mut w, origin).map_err(io)?;
+        put(&mut w, &cell.iter().map(|&c| c as u8).collect::<Vec<u8>>()).map_err(io)?;
+        put(&mut w, range).map_err(io)?;
+        put(&mut w, pulse).map_err(io)?;
+        put(&mut w, echo_start).map_err(io)?;
+        put(&mut w, echo_range).map_err(io)?;
+        put(&mut w, echo_refl).map_err(io)?;
+        put(&mut w, normal).map_err(io)?;
+        put(&mut w, cos_inc).map_err(io)?;
+        put(&mut w, excess).map_err(io)?;
+        put(&mut w, line).map_err(io)?;
+        put(&mut w, col).map_err(io)?;
+        put(&mut w, line_phase).map_err(io)?;
+        put(&mut w, zenith_profile).map_err(io)?;
+        put(&mut w, azimuth_profile).map_err(io)?;
+        put(&mut w, count).map_err(io)?;
+        put(&mut w, line_azimuth0).map_err(io)?;
+        w.flush().map_err(io)
+    }
+
+    /// An image [`RangeImage::save`] wrote, equal to the one saved. Refuses a file from another [`build_version`].
+    pub fn load(path: impl AsRef<Path>) -> Result<RangeImage> {
+        let path = path.as_ref();
+        let io = |e: std::io::Error| Error::file(path, e.to_string());
+        let mut r = BufReader::with_capacity(1 << 22, File::open(path).map_err(io)?);
+        let mut magic = [0u8; 8];
+        r.read_exact(&mut magic).map_err(io)?;
+        let sizes: Vec<u64> = if &magic == MAGIC { get(&mut r).map_err(io)? } else { Vec::new() };
+        if sizes.len() != 8 || sizes[0] != build_version() {
+            return Err(Error::file(path, "not a range image saved by this build"));
+        }
+        let reals: Vec<f64> = get(&mut r).map_err(io)?;
+        let rot: Vec<[f64; 3]> = get(&mut r).map_err(io)?;
+        let origin: Vec<f64> = get(&mut r).map_err(io)?;
+        let cell = get::<u8>(&mut r).map_err(io)?.into_iter().map(|c| match c {
+            0 => Ok(Cell::Echoes),
+            1 => Ok(Cell::Miss),
+            2 => Ok(Cell::NoPulse),
+            _ => Err(Error::file(path, "bad cell")),
+        }).collect::<Result<Vec<Cell>>>()?;
+        let mut v = RangeImage {
+            lat: Lattice::default(), c0: sizes[1] as usize, n_lines: sizes[2] as usize, n_cols: sizes[3] as usize,
+            rot: [rot[0], rot[1], rot[2]], origin: [origin[0], origin[1], origin[2]], epoch: sizes[4] as u32, cell,
+            range: get(&mut r).map_err(io)?, pulse: get(&mut r).map_err(io)?, echo_start: get(&mut r).map_err(io)?,
+            echo_range: get(&mut r).map_err(io)?, echo_refl: get(&mut r).map_err(io)?, max_targets: sizes[5] as usize,
+            normal: get(&mut r).map_err(io)?, cos_inc: get(&mut r).map_err(io)?, excess: get(&mut r).map_err(io)?,
+        };
+        v.lat = Lattice {
+            line: get(&mut r).map_err(io)?, col: get(&mut r).map_err(io)?, n_lines: sizes[6] as usize, n_cols: sizes[7] as usize,
+            pulse_interval: reals[0], line_period: reals[1], zenith_step: reals[2], azimuth_step: reals[3], zenith0: reals[4],
+            line_phase: get(&mut r).map_err(io)?, zenith_profile: get(&mut r).map_err(io)?, azimuth_profile: get(&mut r).map_err(io)?,
+            count: get(&mut r).map_err(io)?, line_azimuth0: get(&mut r).map_err(io)?, azimuth_per_col: reals[5],
+        };
+        Ok(v)
+    }
+}
+
+const MAGIC: &[u8; 8] = b"SYLVARI1";
+
+/// A hash of the source an image is built by (this file, the lattice, the shots reader and what they call): a saved
+/// image loads only into a build with the same hash, so a change to how images are built rebuilds them.
+pub fn build_version() -> u64 {
+    let src = [include_str!("range_image.rs"), include_str!("lattice.rs"), include_str!("../shots/reconstruct.rs"),
+               include_str!("../io/shots.rs"), include_str!("../transform.rs")];
+    src.iter().flat_map(|s| s.bytes()).fold(0xcbf29ce484222325u64, |h, b| (h ^ b as u64).wrapping_mul(0x100000001b3))
+}
+
+/// Types any bit pattern of which is a valid value, so [`put`] and [`get`] can move them as raw bytes.
+trait Plain: Copy + Default {}
+impl Plain for u8 {}
+impl Plain for u32 {}
+impl Plain for u64 {}
+impl Plain for f32 {}
+impl Plain for f64 {}
+impl<T: Plain, const N: usize> Plain for [T; N] where [T; N]: Default {}
+
+fn put<T: Plain>(w: &mut impl Write, v: &[T]) -> std::io::Result<()> {
+    w.write_all(&(v.len() as u64).to_ne_bytes())?;
+    // SAFETY: T is plain data (no padding, every byte initialised)
+    w.write_all(unsafe { std::slice::from_raw_parts(v.as_ptr() as *const u8, std::mem::size_of_val(v)) })
+}
+
+fn get<T: Plain>(r: &mut impl Read) -> std::io::Result<Vec<T>> {
+    let mut n = [0u8; 8];
+    r.read_exact(&mut n)?;
+    let mut v = vec![T::default(); u64::from_ne_bytes(n) as usize];
+    // SAFETY: T is plain data, so any bytes read are a valid T
+    r.read_exact(unsafe { std::slice::from_raw_parts_mut(v.as_mut_ptr() as *mut u8, std::mem::size_of_val(v.as_slice())) })?;
+    Ok(v)
 }
 
 #[cfg(test)]
@@ -444,5 +552,21 @@ mod tests {
         assert!((v.excess[k] - 1.0).abs() < 1e-6);
         // beside the hole, the wall is less continuous
         assert!(v.excess[cell(95, 203)] > 1.1);
+        // saved and loaded, it is the same image: `save` writes every field, so equal files mean equal images
+        let dir = std::env::temp_dir().join(format!("sylva-range-image-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (a, b) = (dir.join("a"), dir.join("b"));
+        v.save(&a).unwrap();
+        let w = RangeImage::load(&a).unwrap();
+        w.save(&b).unwrap();
+        assert_eq!(std::fs::read(&a).unwrap(), std::fs::read(&b).unwrap());
+        assert_eq!((w.n_lines, w.n_cols, w.lat.n_lines, w.cell[cell(95, 205)]), (v.n_lines, v.n_cols, v.lat.n_lines, Cell::Miss));
+        assert_eq!(w.direction(150.0, 100.0), v.direction(150.0, 100.0));
+        // a file from another build is refused
+        let mut f = std::fs::read(&a).unwrap();
+        f[16] ^= 1;
+        std::fs::write(&b, f).unwrap();
+        assert!(RangeImage::load(&b).is_err());
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

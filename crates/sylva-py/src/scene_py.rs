@@ -164,6 +164,24 @@ impl PyRangeImage {
         Ok(PyRangeImage { inner: Arc::new(inner) })
     }
 
+    /// Writes the image to `path`, a cache for `RangeImage.load` on this machine.
+    fn save(&self, py: Python<'_>, path: std::path::PathBuf) -> PyResult<()> {
+        py.detach(|| self.inner.save(&path)).map_err(|e| PyValueError::new_err(e.to_string()))
+    }
+
+    /// The image `save` wrote; raises for a file from a build with another `build_version`.
+    #[staticmethod]
+    fn load(py: Python<'_>, path: std::path::PathBuf) -> PyResult<Self> {
+        let inner = py.detach(|| RangeImage::load(&path)).map_err(|e| PyValueError::new_err(e.to_string()))?;
+        Ok(PyRangeImage { inner: Arc::new(inner) })
+    }
+
+    /// A hash of the code that builds images: a saved image loads only into a build with the same one.
+    #[staticmethod]
+    fn build_version() -> u64 {
+        sylva_rs::scene::range_image::build_version()
+    }
+
     /// The cell arrays, each (n_lines, n_cols[, k]): cell (0 echoes, 1 miss, 2 no pulse), echoes (their count),
     /// range and refl (the first echo's; refl in dB, NaN unknown), pulse (-1 none), normal, cos_inc, excess; and,
     /// under the `settings`, surface (its class by the class edges) and free_to (the range up to which its pulse shows
