@@ -45,7 +45,9 @@
 //! | what elements don't explain: extinction σ per voxel | foliage field | `Foliage`, `foliage()`, `refit_foliage` |
 //! | κ outside the field, and a ground plane | background | `Background` |
 //! | the chance the pulse meets no foliage before a return | chance a pulse arrives | `arrives` |
-//! | the cost's curvature in an element's geometry | information | how well a scan pins the element down |
+//! | the cost's curvature in an element's geometry | information | how well a scan pins the element down; `expected` its average over the cells' outcomes |
+//! | the variance of the cost's slope were the cells independent | gradient's variance | `gradient_variance`; with E, the sandwich `E⁻¹ J E⁻¹` |
+//! | the arc of a stick's outline a scan's echoes on it span | arc | the support function's coverage, per (element, scan) and per candidate |
 //! | the instrument and site values | settings | `Settings`; a site's settings file in research 130 |
 //! | the epoch (scanning day) the alignment error's spread is stated for | reference epoch | `ref_epoch`; a scan of another epoch adds `align_epoch_*` |
 //! | elements read off the moments | candidates | `candidates` |

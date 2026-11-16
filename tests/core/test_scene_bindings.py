@@ -57,6 +57,9 @@ def test_an_empty_scene_costs_nothing_and_a_pole_is_pinned_down():
     info = sc.information(0)
     assert info['hessian'].shape == (1, 5, 5) and np.isfinite(info['hessian']).all() and np.diag(info['hessian'][0]).max() > 0
     assert info['expected'].shape == (1, 5, 5) and np.linalg.eigvalsh(info['expected'][0]).min() > -1e-6 * np.abs(info['expected'][0]).max()
+    j = info['gradient_variance'][0]
+    assert j.shape == (5, 5) and np.linalg.eigvalsh(j).min() > -1e-6 * np.abs(j).max() and j[2, 2] < info['expected'][0][2, 2]
+    assert 0 < rows['arc'][0] <= np.pi
     assert np.isclose(sc.costs_to_add([pole(r=0.02)]).sum(), sc.costs_to_add([pole(r=0.02)])[0, 0])
 
 

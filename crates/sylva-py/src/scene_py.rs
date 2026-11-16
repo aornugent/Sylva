@@ -29,7 +29,7 @@ use std::sync::Arc;
 use sylva_rs::scene::foliage::FoliageBox;
 use sylva_rs::scene::moments::{Candidate, Moments};
 use sylva_rs::scene::range_image::{RangeImage, RangeImageParams};
-use sylva_rs::scene::scene::{CellPrediction, Element, ElementScan, Form, Scene, SceneError};
+use sylva_rs::scene::scene::{CellPrediction, Element, ElementScan, Form, Information, Scene, SceneError};
 use sylva_rs::scene::settings::{Background, Settings};
 
 use crate::xyz_from_py;
@@ -229,7 +229,7 @@ fn rows_dict<'py>(py: Python<'py>, rows: &[ElementScan]) -> PyResult<Bound<'py, 
     d.set_item("cells_on", rows.iter().map(|r| r.cells_on).collect::<Vec<_>>().into_pyarray(py))?;
     d.set_item("surface", rows.iter().map(|r| r.surface).collect::<Vec<_>>().into_pyarray(py))?;
     type F = fn(&ElementScan) -> f64;
-    for (k, f) in [("footprints_across", (|r| r.footprints_across) as F), ("cost", |r| r.cost), ("ray_on", |r| r.ray_on), ("ray_empty", |r| r.ray_empty),
+    for (k, f) in [("arc", (|r| r.arc) as F), ("footprints_across", |r| r.footprints_across), ("cost", |r| r.cost), ("ray_on", |r| r.ray_on), ("ray_empty", |r| r.ray_empty),
                    ("ray_in_front", |r| r.ray_in_front), ("ray_behind", |r| r.ray_behind), ("class", |r| r.class), ("alignment", |r| r.alignment),
                    ("discount", |r| r.discount), ("align_shift", |r| r.align_shift), ("align_sd", |r| r.align_sd), ("front_shift", |r| r.front_shift),
                    ("front_shift_sd", |r| r.front_shift_sd), ("refl_level", |r| r.refl_level), ("refl_level_sd", |r| r.refl_level_sd)] {
@@ -394,7 +394,7 @@ impl PyScene {
         py.detach(|| c.refit_alignment())
     }
 
-    /// Per (element, scan) (scene::ElementScan): elem, scan, cells, cells_on, footprints_across, surface; its cost
+    /// Per (element, scan) (scene::ElementScan): elem, scan, cells, cells_on, arc (rad), footprints_across, surface; its cost
     /// and the parts it sums (ray_on, ray_empty, ray_in_front, ray_behind, class, and alignment: its own nodes' prior and
     /// log-determinant and an equal share of its scan's alignment part); the evidence discount (discount); the
     /// posterior along the beam at it, the alignment held: align_shift, align_sd, front_shift, front_shift_sd (m); and
@@ -474,16 +474,20 @@ impl PyScene {
     /// How well the scans pin element `id` down (scene::Scene::information): per scan, the cost's slope `gradient`
     /// (scans, n) and curvature `hessian` (scans, n, n) in its parameters: a stick's ln r, its axis moved across itself
     /// (two directions, m) and tilted (rad); a patch's ln r and its centre moved (x, y, z, m). Beside them the
-    /// expected information `expected` (scans, n, n): what its cells would tell on average, positive semi-definite.
+    /// expected information `expected` (scans, n, n): what its cells would tell on average, positive semi-definite;
+    /// and `gradient_variance` (scans, n, n): the slope's variance were the cells independent, for the sandwich
+    /// `E⁻¹ J E⁻¹`.
     fn information<'py>(&self, py: Python<'py>, id: u32) -> PyResult<Bound<'py, PyDict>> {
         self.inner.check_id(id).map_err(scene_err)?;
         let c = &self.inner;
         let out = py.detach(|| c.information(id));
-        let (s, n) = (out.len(), out.first().map_or(0, |m| m.0.len()));
+        let (s, n) = (out.len(), out.first().map_or(0, |m| m.gradient.len()));
         let d = PyDict::new(py);
-        d.set_item("gradient", out.iter().flat_map(|x| x.0.clone()).collect::<Vec<f64>>().into_pyarray(py).reshape([s, n])?)?;
-        d.set_item("hessian", out.iter().flat_map(|x| x.1.clone()).collect::<Vec<f64>>().into_pyarray(py).reshape([s, n, n])?)?;
-        d.set_item("expected", out.into_iter().flat_map(|x| x.2).collect::<Vec<f64>>().into_pyarray(py).reshape([s, n, n])?)?;
+        d.set_item("gradient", out.iter().flat_map(|x| x.gradient.clone()).collect::<Vec<f64>>().into_pyarray(py).reshape([s, n])?)?;
+        let square = |f: fn(&Information) -> &Vec<f64>| out.iter().flat_map(|x| f(x).clone()).collect::<Vec<f64>>().into_pyarray(py).reshape([s, n, n]);
+        d.set_item("hessian", square(|x| &x.hessian)?)?;
+        d.set_item("expected", square(|x| &x.expected)?)?;
+        d.set_item("gradient_variance", square(|x| &x.gradient_variance)?)?;
         Ok(d)
     }
 

@@ -192,6 +192,9 @@ impl Layer {
 /// What one scan says about one element, its cost split into parts that sum to `cost`.
 /// - `cells`: cells where it is the nearest layer (at [`MIN_FILL`] or more); `cells_on`: those whose first echo is
 ///   its ([`Outcome::On`]); `across`: footprints across its diameter; `surface`: its surface class in this scan.
+/// - `arc`: the arc of a stick's outline its echoes span (rad, 0 to π; the support function's coverage, as the
+///   candidates' arcs): `asin(x_max / r) − asin(x_min / r)` over its `cells_on` rays' places across its axis, so π
+///   where the scan sees its whole near side, less where it is hidden or seen past the edge only.
 /// - The ray likelihood's cost at the alignment's mode, by what each cell's first echo says about the element:
 ///   `ray_on` (its echoes), `ray_empty` (pulses with no echo), `ray_in_front` (hidden by something nearer) and
 ///   `ray_behind` (pulses that passed through it: evidence against).
@@ -207,6 +210,7 @@ pub struct ElementScan {
     pub scan: u32,
     pub cells: u32,
     pub cells_on: u32,
+    pub arc: f64,
     pub footprints_across: f64,
     pub surface: u8,
     pub cost: f64,
@@ -652,6 +656,8 @@ struct ElemData {
     class: u8,
     /// Cells whose first echo is its.
     cells_on: u32,
+    /// The least and greatest of those cells' rays' place across its axis, in radii (clamped to ±1; a stick's).
+    on_across: [f64; 2],
     across: f64,
     align: Vec<([i64; 3], f64)>,
     own_sd: [f64; 2],
@@ -770,6 +776,10 @@ impl ElemData {
             ray: parts.map(|x| -x),
             cells: self.cells.len() as u32,
             cells_on: self.cells_on,
+            arc: match self.on_across {
+                [lo, hi] if lo <= hi => hi.asin() - lo.asin(),
+                _ => 0.0,
+            },
             across: self.across,
             surface: self.class,
         }
@@ -796,6 +806,7 @@ struct Term {
     ray: [f64; 4],
     cells: u32,
     cells_on: u32,
+    arc: f64,
     across: f64,
     surface: u8,
 }
@@ -848,7 +859,7 @@ fn elem_data(v: &RangeImage, rendered: &[Vec<(usize, Layer)>], elems: &[Element]
         let mid = e.mid();
         let s_along = em.align_sd(k, other);
         by_elem.insert(i as u32, data.len());
-        data.push(ElemData { elem: i, cells: Vec::new(), class: k, cells_on: 0, across: 2.0 * e.r / em.footprint(norm(&sub(&mid, &v.origin))),
+        data.push(ElemData { elem: i, cells: Vec::new(), class: k, cells_on: 0, on_across: [f64::INFINITY, f64::NEG_INFINITY], across: 2.0 * e.r / em.footprint(norm(&sub(&mid, &v.origin))),
                              align: hats(&mid, ALIGN_SPACING).into_iter().map(|(key, w)| (key, w * s_along)).collect(),
                              own_sd: [em.front_shift_sd(e.r), level], class_cost: 0.0 });
     }
@@ -870,6 +881,10 @@ fn elem_data(v: &RangeImage, rendered: &[Vec<(usize, Layer)>], elems: &[Element]
         let outcome = Outcome::of(cv.obs, fe.mu, fe.sd);
         let el = &mut data[d];
         el.cells_on += (outcome == Outcome::On) as u32;
+        if let (Outcome::On, Form::Stick { .. }) = (outcome, elems[front.elem as usize].form) {
+            let z = (front.x / elems[front.elem as usize].r).clamp(-1.0, 1.0);
+            el.on_across = [el.on_across[0].min(z), el.on_across[1].max(z)];
+        }
         let echoes = v.echoes(cell);
         if let (true, true, Some(&db)) = (outcome == Outcome::On, front.f > MOSTLY, v.echo_refls(cell).first()) {
             let c = if v.cos_inc[cell].is_finite() { (v.cos_inc[cell] as f64).clamp(0.05, 1.0) } else { 0.5 };
@@ -1050,6 +1065,17 @@ impl Fit {
         }
         cost + self.held.part(&cols)
     }
+}
+
+/// How well one scan pins an element's geometry down ([`Scene::information`]): in its parameters (n of them), the
+/// cost's slope (n) and observed curvature (n × n, row-major), the expected information (n × n) and the gradient's
+/// variance were the cells independent (n × n).
+#[derive(Debug, Clone)]
+pub struct Information {
+    pub gradient: Vec<f64>,
+    pub hessian: Vec<f64>,
+    pub expected: Vec<f64>,
+    pub gradient_variance: Vec<f64>,
 }
 
 /// An element's counts in one view (the sufficient statistics of its shape mismatch and opacity), each cell counted in footprints (its
@@ -1271,7 +1297,7 @@ impl Scene {
                 let var = fit.held.between(&t.align, &t.align);
                 let own_sd = |j: usize| t.own_sd[j] * (t.own_cov[j][j] + t.own_link[j] * t.own_link[j] * var).max(0.0).sqrt();
                 rows.push(ElementScan {
-                    elem: i as u32, scan: s as u32, cells: t.cells, cells_on: t.cells_on, footprints_across: t.across, surface: t.surface,
+                    elem: i as u32, scan: s as u32, cells: t.cells, cells_on: t.cells_on, arc: t.arc, footprints_across: t.across, surface: t.surface,
                     cost: t.cost() + share, ray_on: t.ray[0], ray_empty: t.ray[1], ray_in_front: t.ray[2], ray_behind: t.ray[3], class: t.class,
                     alignment: t.fit - t.ray.iter().sum::<f64>() + t.logdet + share, discount: self.em.discount,
                     align_shift: fit.held.shift(&t.align), align_sd: var.max(0.0).sqrt(), front_shift: t.own_sd[0] * t.own[0], front_shift_sd: own_sd(0),
@@ -1541,7 +1567,23 @@ impl Scene {
     /// front, and the reflectance level: a Schur complement). It is positive semi-definite and reads a direction the
     /// cells don't see as 0, where the observed curvature reads the cost's roughness (half the far views' pairs read
     /// a negative direction: step 2). It leaves out what other elements' cells say.
-    pub fn information(&self, id: u32) -> Vec<(Vec<f64>, Vec<f64>, Vec<f64>)> {
+    ///
+    /// **What it means under the evidence discount** (research 130 step 3b). Each cell's log-likelihood counts
+    /// `w_c = 1 / (φ m)`, so the cost is a quasi-likelihood and E is its curvature: an sd read from E⁻¹ is honest only
+    /// where the cells' errors are correlated as φ m declares. In general the estimate's variance is the sandwich
+    /// `E⁻¹ J E⁻¹`, J the gradient's actual variance (the inverse of Godambe's information `E J⁻¹ E`), and model
+    /// comparison by cost differences needs the composite-likelihood penalty `tr(J E⁻¹)`, not a parameter count. φ
+    /// enters E once, and J twice: beside E comes the **gradient's variance were the cells independent** (the same
+    /// sums at `w_c²`, its latents' share taken out as E's is, their priors' included), so `E⁻¹ J E⁻¹` is the variance
+    /// with no correlation between cells, a lower bound, and E⁻¹ the variance at the declared φ. On the stand's true
+    /// sticks (step3b.md), fits from the truth fall within 1.96 sd of E⁻¹ along the sloppiest direction 95 % of the
+    /// time at 3 footprints across or more, and within 1 sd 92–96 % (the core is narrower than E says, the tail as
+    /// wide); the sandwich's sds are 1.5–2.6 times too small (the cells are correlated); and below 1.5 footprints
+    /// across the cost has minima far from the truth that a local curvature can't see, so E's sds don't hold there.
+    ///
+    /// **ln r is the space radius is unbiased in:** the stand's fitted ln r sits −0.003 from the truth (median, R ≥
+    /// 1 cm); r's own mean is `exp(ln r + ½ sd²)`, so an average of radii should be taken in ln r.
+    pub fn information(&self, id: u32) -> Vec<Information> {
         let e = self.elems[id as usize].expect("a live element");
         let hs = 0.002;
         let (n, steps, perp, half) = match e.form {
@@ -1588,16 +1630,24 @@ impl Scene {
         let c = self.costs_replacing(&items);
         let em = &self.em;
         let (k_depth, k_refl) = ((em.noise_dof + 1.0) / (em.noise_dof + 3.0), (em.refl_dof + 1.0) / (em.refl_dof + 3.0));
-        let expected: Vec<Vec<f64>> = (0..self.views.len()).into_par_iter().map(|s| {
+        let expected: Vec<[Vec<f64>; 2]> = (0..self.views.len()).into_par_iter().map(|s| {
             let pred = |t: &[f64]| -> HashMap<usize, CellPrediction> { self.predict_without(at(t), s, Some(id)).into_iter().map(|p| (p.cell, p)).collect() };
             let sides: Vec<[HashMap<usize, CellPrediction>; 2]> = (0..n).map(|i| [pred(&pts[1 + 2 * i]), pred(&pts[2 + 2 * i])]).collect();
             let refl = em.refl_noise > 0.0 && !self.views[s].echo_refl.is_empty();
             let other = self.views[s].epoch != self.ref_epoch;
-            let mut m = vec![0.0; n * n];
+            // the expected information (m) and the gradient's variance with independent cells (j): each cell's
+            // information at its weight w, and at w²
+            let (mut m, mut j) = (vec![0.0; n * n], vec![0.0; n * n]);
             // the latents every cell shares, the depth's shift (alignment and stem front) and the reflectance level:
-            // each one's information (a), what it shares with the geometry (b) and its prior sd, to marginalise it out
+            // each one's information (a; a2 at w²), what it shares with the geometry (b; b2 at w²) and its prior sd,
+            // to marginalise it out
             let (mut a, mut b, mut prior) = ([0.0; 2], [vec![0.0; n], vec![0.0; n]], [0.0; 2]);
-            for (cell, p) in pred(&pts[0]) {
+            let (mut a2, mut b2) = ([0.0; 2], [vec![0.0; n], vec![0.0; n]]);
+            // cells in index order, so the sums run in the same order in every run
+            let mut centre: Vec<CellPrediction> = pred(&pts[0]).into_values().collect();
+            centre.sort_unstable_by_key(|p| p.cell);
+            for p in centre {
+                let cell = p.cell;
                 // each observable's slope over the steps (0 where a side doesn't hold it, or it isn't finite)
                 let slope = |f: &dyn Fn(&CellPrediction) -> f64, absent: Option<f64>| -> Vec<f64> {
                     (0..n).map(|i| {
@@ -1610,10 +1660,12 @@ impl Scene {
                 };
                 let echo = |q: &CellPrediction| q.arrives * q.recorded;
                 let pc = echo(&p).clamp(1e-3, 1.0 - 1e-3);
+                let w2 = p.weight * p.weight;
                 let mut add = |g: &[f64], w: f64| {
                     for i in 0..n {
-                        for j in 0..n {
-                            m[i * n + j] += p.weight * w * g[i] * g[j];
+                        for k in 0..n {
+                            m[i * n + k] += p.weight * w * g[i] * g[k];
+                            j[i * n + k] += w2 * w * g[i] * g[k];
                         }
                     }
                 };
@@ -1629,20 +1681,26 @@ impl Scene {
                 for (k, g, w) in obs {
                     add(&g, w);
                     a[k] += p.weight * w;
+                    a2[k] += w2 * w;
                     b[k].iter_mut().zip(&g).for_each(|(x, gi)| *x += p.weight * w * gi);
+                    b2[k].iter_mut().zip(&g).for_each(|(x, gi)| *x += w2 * w * gi);
                 }
             }
+            // marginalise each latent: the information's Schur complement, and the variance of the efficient gradient
+            // (the geometry's less β = b / d times the latent's, its prior's included)
             for k in 0..2 {
                 if prior[k] > 0.0 {
                     let d = a[k] + 1.0 / (prior[k] * prior[k]);
+                    let beta: Vec<f64> = b[k].iter().map(|x| x / d).collect();
                     for i in 0..n {
-                        for j in 0..n {
-                            m[i * n + j] -= b[k][i] * b[k][j] / d;
+                        for l in 0..n {
+                            m[i * n + l] -= b[k][i] * beta[l];
+                            j[i * n + l] += -beta[i] * b2[k][l] - b2[k][i] * beta[l] + (a2[k] + 1.0 / (prior[k] * prior[k])) * beta[i] * beta[l];
                         }
                     }
                 }
             }
-            m
+            [m, j]
         }).collect();
         (0..self.views.len()).map(|s| {
             let f = |k: usize| c[k][s];
@@ -1660,7 +1718,8 @@ impl Scene {
                     k += 4;
                 }
             }
-            (g, m, expected[s].clone())
+            let [expected, gradient_variance] = expected[s].clone();
+            Information { gradient: g, hessian: m, expected, gradient_variance }
         }).collect()
     }
 
@@ -2145,7 +2204,7 @@ mod tests {
         let (em, sc) = (Settings::default(), Background::default());
         let c = Scene::new(vec![v.clone()], &[stick(0.0, 4.0, 0.03)], em, sc, None, 0);
         let info = &c.information(0)[0];
-        let (m, x) = (&info.1, &info.2);
+        let (m, x) = (&info.hessian, &info.expected);
         for i in 0..3 {
             assert!(m[i * 5 + i] > 0.0, "{i}: {m:?}");
             // the expected information agrees with the observed where the pole is seen well
@@ -2157,6 +2216,29 @@ mod tests {
         assert_eq!(r.discount, em.discount);
     }
 
+    /// The evidence discount enters the information once (research 130 step 3b): in the pole's place across the beam
+    /// (read from misses and echoes; no shared latent's prior pins it), doubling φ halves the expected information E
+    /// and quarters the gradient's variance with independent cells J, so the sandwich `E⁻¹ J E⁻¹` (the variance were
+    /// the cells independent) doesn't depend on φ while E⁻¹ (the variance at φ) doubles. And the pole's echoes span
+    /// most of its near side's outline.
+    #[test]
+    fn the_sandwich_does_not_depend_on_the_discount() {
+        let v = pole_view();
+        let sc = Background::default();
+        let at = |phi: f64| {
+            let c = Scene::new(vec![v.clone()], &[stick(0.0, 4.0, 0.03)], Settings { discount: phi, ..Settings::default() }, sc, None, 0);
+            let i = c.information(0).remove(0);
+            (i.expected[12], i.gradient_variance[12], c.rows()[0].arc)
+        };
+        let ((e1, j1, arc), (e2, j2, _)) = (at(10.0), at(20.0));
+        assert!((e1 / e2 - 2.0).abs() < 0.2, "E {e1} at φ 10, {e2} at 20");
+        assert!((j1 / j2 - 4.0).abs() < 0.4, "J {j1} at φ 10, {j2} at 20");
+        let sandwich = |e: f64, j: f64| j / (e * e);
+        assert!((sandwich(e1, j1) / sandwich(e2, j2) - 1.0).abs() < 0.1, "{} vs {}", sandwich(e1, j1), sandwich(e2, j2));
+        assert!(j1 > 0.0 && j1 < e1 / 10.0, "J {j1} E {e1}: each cell's weight is at most 1/φ");
+        assert!(arc > 2.5 && arc <= std::f64::consts::PI, "arc {arc}");
+    }
+
     /// Located edges (research 130 step 2): the silhouette's partial cells, read through their echoes' reflectance
     /// against the beam's fill, pin a thin stick's radius down more than their depths and misses alone, from one view.
     #[test]
@@ -2164,7 +2246,7 @@ mod tests {
         let sc = Background::default();
         for (r, y) in [(0.01, 6.0), (0.006, 6.0)] {
             let v = thin_pole_view(r, y);
-            let info = |em: Settings| Scene::new(vec![v.clone()], &[stick(0.0, y, r)], em, sc, None, 0).information(0)[0].1[0];
+            let info = |em: Settings| Scene::new(vec![v.clone()], &[stick(0.0, y, r)], em, sc, None, 0).information(0)[0].hessian[0];
             let (with, without) = (info(Settings::default()), info(Settings { refl_noise: 0.0, ..Settings::default() }));
             assert!(with > 1.5 * without, "r {r}: with reflectance {with}, without {without}");
         }
