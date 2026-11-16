@@ -13,7 +13,7 @@
 //!   (its extent); its `b` is ignored. An element that can't be scored (a radius that isn't positive, an opacity
 //!   outside (0, 1], a stick of no length) raises.
 //! - **Scenes:** `Scene(images, elements, settings, background, foliage, ref_epoch)` holds elements against range
-//!   images, the alignment error's spread stated for the scans of epoch `ref_epoch` (another epoch's add `align_epoch_*`): `cost()`, `rows()`, the cost change of each move (`add`,
+//!   images, the alignment error's spread stated for the scans of epoch `ref_epoch` (another epoch's add `align_epoch_*`): `cost()`, `rows()` and each scan's `alignment_parts()`, the cost change of each move (`add`,
 //!   `remove`, `change`, `costs_to_add`, `costs_to_remove`) with the alignment held, `refit_alignment()` and
 //!   `exact_cost()`, which hypotheses interact (`interactions`), an element's counts (`counts`), cell predictions (`predict`), what one
 //!   hypothesis is expected to cost against another (`divergence`) and how well the scans pin elements down, one or
@@ -427,11 +427,16 @@ impl PyScene {
 
     /// Per (element, scan) (scene::ElementScan): elem, scan, cells, cells_on, arc (rad), footprints_across, surface; its cost
     /// and the parts it sums (ray_on, ray_empty, ray_in_front, ray_behind, class, and alignment: its own nodes' prior and
-    /// log-determinant and an equal share of its scan's alignment part); the evidence discount (discount); the
+    /// log-determinant; each scan's alignment part is `alignment_parts()`); the evidence discount (discount); the
     /// posterior along the beam at it, the alignment held: align_shift, align_sd, front_shift, front_shift_sd (m); and
     /// its reflectance level's: refl_level, refl_level_sd (dB).
     fn rows<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
         rows_dict(py, &self.inner.rows())
+    }
+
+    /// Each scan's alignment part (its cost less its rows'), so the rows and these sum to `cost()`.
+    fn alignment_parts<'py>(&self, py: Python<'py>) -> Bound<'py, PyArray1<f64>> {
+        self.inner.alignment_parts().into_pyarray(py)
     }
 
     /// Add elements: their ids and the cost change.

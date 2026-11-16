@@ -238,7 +238,8 @@ impl Layer {
 ///   `ray_on` (its echoes), `ray_empty` (pulses with no echo), `ray_in_front` (hidden by something nearer) and
 ///   `ray_behind` (pulses that passed through it: evidence against).
 /// - `class`: class evidence's cost (0 while it is off); `alignment`: its own nodes' (stem front shift, reflectance
-///   level) prior and log-determinant terms, and an equal share of its scan's alignment part ([`Held`]).
+///   level) prior and log-determinant terms. The scan's alignment part is the scan's, not shared out among its
+///   elements ([`Scene::alignment_parts`]), so the rows and those parts sum to the scene's cost.
 /// - `discount`: the evidence discount φ every cell's evidence was divided by.
 /// - The posterior at the element in this scan, along the beam (m): the scan alignment error's shift and sd, and the
 ///   stem front shift's (0 when it is off); and its reflectance level's (dB; 0 while reflectance isn't read). Shifts
@@ -1455,20 +1456,23 @@ impl Scene {
         }).collect()
     }
 
-    /// A row per (element, scan), by element id: its term, and an equal share of its scan's alignment part.
+    /// Each scan's alignment part ([`Held::part`]): its cost less its elements' terms.
+    pub fn alignment_parts(&self) -> Vec<f64> {
+        self.fits.iter().map(|fit| fit.cost - fit.terms.iter().flatten().map(Term::cost).sum::<f64>()).collect()
+    }
+
+    /// A row per (element, scan), by element id: its term (the scan's alignment part is [`Scene::alignment_parts`]).
     pub fn rows(&self) -> Vec<ElementScan> {
         let mut rows = Vec::new();
         for (s, fit) in self.fits.iter().enumerate() {
-            let terms: Vec<(usize, &Term)> = fit.terms.iter().enumerate().filter_map(|(i, t)| t.as_ref().map(|t| (i, t))).collect();
-            let share = (fit.cost - terms.iter().map(|(_, t)| t.cost()).sum::<f64>()) / terms.len().max(1) as f64;
-            for (i, t) in terms {
+            for (i, t) in fit.terms.iter().enumerate().filter_map(|(i, t)| t.as_ref().map(|t| (i, t))) {
                 // the shift's posterior from the held alignment, and the own nodes' with it marginalised
                 let var = fit.held.between(&t.align, &t.align);
                 let own_sd = |j: usize| t.own_sd[j] * (t.own_cov[j][j] + t.own_link[j] * t.own_link[j] * var).max(0.0).sqrt();
                 rows.push(ElementScan {
                     elem: i as u32, scan: s as u32, cells: t.cells, cells_on: t.cells_on, arc: t.arc, footprints_across: t.across, surface: t.surface,
-                    cost: t.cost() + share, ray_on: t.ray[0], ray_empty: t.ray[1], ray_in_front: t.ray[2], ray_behind: t.ray[3], class: t.class,
-                    alignment: t.fit - t.ray.iter().sum::<f64>() + t.logdet + share, discount: self.em.discount,
+                    cost: t.cost(), ray_on: t.ray[0], ray_empty: t.ray[1], ray_in_front: t.ray[2], ray_behind: t.ray[3], class: t.class,
+                    alignment: t.fit - t.ray.iter().sum::<f64>() + t.logdet, discount: self.em.discount,
                     align_shift: fit.held.shift(&t.align), align_sd: var.max(0.0).sqrt(), front_shift: t.own_sd[0] * t.own[0], front_shift_sd: own_sd(0),
                     refl_level: t.own_sd[1] * t.own[1], refl_level_sd: own_sd(1),
                 });
@@ -2090,7 +2094,8 @@ mod tests {
         let both = cost(&v, &pair, &em, &sc);
         let delta: f64 = Scene::new(vec![v.clone()], &pair[..1], em, sc, None, 0).costs_to_add(&[vec![pair[1]]])[0].iter().sum();
         assert!((delta - (both.0 - truth)).abs() < 1e-6, "{delta} vs {}", both.0 - truth);
-        let sum: f64 = both.1.iter().map(|r| r.cost).sum();
+        let parts: f64 = Scene::new(vec![v.clone()], &pair, em, sc, None, 0).alignment_parts().iter().sum();
+        let sum: f64 = both.1.iter().map(|r| r.cost).sum::<f64>() + parts;
         assert!((sum - both.0).abs() < 1e-6);
     }
 
@@ -2146,7 +2151,7 @@ mod tests {
         assert!(sigma(&c) < 0.5 * dense, "{} vs {dense}", sigma(&c));
         // each ray is scored once: the elements' cells hold the whole cost (the field's own rays cancel against the
         // empty scene's; before step 2 a plug-in Poisson term scored every ray's counts again)
-        let rows: f64 = c.rows().iter().map(|r| r.cost).sum();
+        let rows: f64 = c.rows().iter().map(|r| r.cost).sum::<f64>() + c.alignment_parts().iter().sum::<f64>();
         assert!((rows - c.cost()).abs() < 1e-9 * c.cost().abs().max(1.0), "{rows} vs {}", c.cost());
         c.demote(id);
         assert!(c.cost().abs() < 1e-9, "{}", c.cost());
@@ -2484,7 +2489,8 @@ mod tests {
 
     /// How well a scan pins a pole down: its cost curves up in every direction of a stick's geometry about the truth,
     /// most in place across the beam (the silhouette) and least in tilt, and the expected information agrees within a
-    /// factor 4 in ln r and place; a row's parts sum to its cost.
+    /// factor 4 in ln r and place; a row's parts sum to its cost, and the rows and the scans' alignment parts to the
+    /// scene's.
     #[test]
     fn the_pole_is_pinned_down_and_rows_split_their_cost() {
         let v = pole_view();
@@ -2500,6 +2506,7 @@ mod tests {
         let r = c.rows()[0];
         let parts = r.ray_on + r.ray_empty + r.ray_in_front + r.ray_behind + r.class + r.alignment;
         assert!((parts - r.cost).abs() < 1e-9, "{parts} vs {}", r.cost);
+        assert!((r.cost + c.alignment_parts()[0] - c.cost()).abs() < 1e-9);
         assert_eq!(r.discount, em.discount);
     }
 
