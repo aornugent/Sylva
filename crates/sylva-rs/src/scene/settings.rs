@@ -56,13 +56,14 @@ params! {
         pub floor_slope: f64 = 15.0,
         pub floor_ref: f64 = 7.0,
         pub detect_sd: f64 = 2.0,
-        /// The surfaces' reflectance (dB at full fill, face-on): wood (a stick renders with it), leaf (a patch) and
-        /// the ground. The dimmer of wood and leaf is the reference the foliage field reads an echo's energy share
-        /// against ([`Settings::refl_full_hit`]), so a full hit on either reads as the whole beam. AM's wood is measured on its candidates' interior
-        /// echoes (`reflectance.py am`); leaf and ground are the stand's materials (sim-mulga's sim-clumps), AM's not
-        /// measured yet (`photometry.py` reads the stand's per element).
+        /// The surfaces' reflectance (dB at full fill, face-on): wood and leaf (an element renders with its class's)
+        /// and the ground. The dimmer of wood and leaf is the reference the foliage field reads an echo's energy share
+        /// against ([`Settings::refl_full_hit`]), so a full hit on either reads as the whole beam. AM's wood is
+        /// measured on its candidates' interior echoes (`reflectance.py am`). AM's leaf is declared: `leaf.py` am's
+        /// single-echo peak in rank-3 voxels plus the stand's partial-fill offset (1.9 dB); not measured
+        /// (leaf-reflectance.md). The ground is the stand's material (sim-mulga's sim-clumps).
         pub refl_wood: f64 = -15.0,
-        pub refl_leaf: f64 = -14.4,
+        pub refl_leaf: f64 = -15.6,
         pub refl_ground: f64 = -20.0,
         /// The receiver resolving two returns `d` m apart whose energies differ by `e` dB (the nearer's over the
         /// farther's): `logit p = res_a + res_b d + res_c e`. AM's VZ-2000i, fitted on its raw edges with a
@@ -256,7 +257,7 @@ impl Settings {
 
     /// The reflectance (dB) the foliage field reads a full hit at, an echo's energy share being its reflectance
     /// against this: the dimmer canopy surface, wood or leaf, so a full hit on either reads as the whole beam (on AM
-    /// the measured wood, −15.0 dB, is dimmer than the declared leaf, −14.4: research 130 step 3a).
+    /// the declared leaf, −15.6 dB, is dimmer than the measured wood, −15.0: research 130 step 3a, slice 5b).
     pub fn refl_full_hit(&self) -> f64 {
         self.refl_wood.min(self.refl_leaf)
     }
