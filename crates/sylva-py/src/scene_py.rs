@@ -16,10 +16,10 @@
 //!   `remove`, `change`, `costs_to_add`, `costs_to_remove`) with the alignment held, `refit_alignment()` and
 //!   `exact_cost()`, which hypotheses interact (`interactions`), an element's counts (`counts`), cell predictions (`predict`) and how well
 //!   the scans pin it down (`information`). A bad element id or scan index raises.
-//! - **The foliage field:** `foliage` is a dict `lo`, `hi` (the box, 3 each), `voxel` and `prior_path` (m); the
-//!   field is then the elements' residual there. `refit_foliage()`, `promote(element)` and `demote(id)` move mass
-//!   between the field and the elements; `foliage_voxels()` gives it per voxel and `transmission(image, cells)` its
-//!   optical depth across the box along other images' rays.
+//! - **The foliage field:** `foliage` is a dict `lo`, `hi` (the box, 3 each), `voxel`, `prior_path` and `margin`
+//!   (m); the field is then the elements' residual there (`FoliageBox`), held through moves. `refit_foliage()`,
+//!   `promote(element)` and `demote(id)` move mass between the field and the elements; `foliage_voxels()` gives it
+//!   per voxel and `transmission(image, cells)` its optical depth across the box along other images' rays.
 
 use numpy::{IntoPyArray, PyArray1, PyArrayMethods, PyReadonlyArray1, PyReadonlyArray2};
 use pyo3::exceptions::PyValueError;
@@ -310,13 +310,13 @@ impl PyScene {
         let spec = foliage.map(|d| -> PyResult<FoliageBox> {
             let req = |k: &str| d.get_item(k)?.ok_or_else(|| bad(k));
             Ok(FoliageBox { lo: req("lo")?.extract()?, hi: req("hi")?.extract()?, voxel: req("voxel")?.extract()?,
-                            prior_path: req("prior_path")?.extract()? })
+                            prior_path: req("prior_path")?.extract()?, margin: req("margin")?.extract()? })
         }).transpose()?;
         let vs: Vec<Arc<RangeImage>> = images.iter().map(|v| v.inner.clone()).collect();
         Ok(PyScene { inner: py.detach(|| Scene::new(vs, &el, em, bg, spec, ref_epoch)), em })
     }
 
-    /// Re-estimate the foliage field from the rays the elements leave: the cost change.
+    /// Re-solve the foliage field from what the elements leave of the rays: the cost change.
     fn refit_foliage(&mut self, py: Python<'_>) -> f64 {
         let c = &mut self.inner;
         py.detach(|| c.refit_foliage())
@@ -343,8 +343,9 @@ impl PyScene {
         Ok(py.detach(|| c.demote(id)))
     }
 
-    /// The foliage field per voxel with data: voxel (n, 3, its index in the box), centre (n, 3), sigma (1/m), and
-    /// every ray's weighted counts, hits and path (m).
+    /// The foliage field per voxel with counts: voxel (n, 3, its index in the box), centre (n, 3), sigma (1/m, as
+    /// held), the weighted counts it is fitted from as the scene now is, hits and path (m), and whether an element's
+    /// margin claims it (claimed; then sigma is κ after a refit). Empty when the field is held from elsewhere.
     fn foliage_voxels<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
         let (spec, rows) = self.inner.foliage();
         let d = PyDict::new(py);
@@ -357,6 +358,7 @@ impl PyScene {
         d.set_item("sigma", rows.iter().map(|r| r.1).collect::<Vec<f64>>().into_pyarray(py))?;
         d.set_item("hits", rows.iter().map(|r| r.2 .0).collect::<Vec<f64>>().into_pyarray(py))?;
         d.set_item("path", rows.iter().map(|r| r.2 .1).collect::<Vec<f64>>().into_pyarray(py))?;
+        d.set_item("claimed", rows.iter().map(|r| r.3).collect::<Vec<bool>>().into_pyarray(py))?;
         Ok(d)
     }
 

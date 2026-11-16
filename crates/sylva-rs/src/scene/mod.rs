@@ -44,7 +44,8 @@
 //! | an element's reflectance offset from its surface's, per (element, scan) | reflectance level | `refl_level`, `refl_level_sd` |
 //! | a cell's surface continuity | excess; surface class | solid, mid, fragmented |
 //! | wood-or-leaf evidence from photometry | class evidence | `class_*`, the row's `class` |
-//! | what elements don't explain: extinction σ per voxel | foliage field | `Foliage`, `foliage()`, `refit_foliage` |
+//! | what elements don't explain: extinction σ per voxel | foliage field | `Foliage`, `foliage()`, `refit_foliage`; held through moves, as the alignment is (`FieldCounts`) |
+//! | what of a ray the foliage field is fitted from | the field's cut | a ray no element fronts counts whole; one an element fronts counts up to its front element's front surface (`cut`: its clear path and its echoes in front), never its echoes at or behind it; voxels within `margin` of an element's surface are left out (`foliage`'s module docs) |
 //! | κ outside the field, and a ground plane | background | `Background` |
 //! | the chance the pulse meets no foliage before a return | chance a pulse arrives | `arrives` |
 //! | the cost's curvature in an element's geometry | information | how well a scan pins the element down; `expected` its average over the cells' outcomes |
