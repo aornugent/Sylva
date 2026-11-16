@@ -70,14 +70,6 @@ params! {
         pub res_a: f64 = -2.563,
         pub res_b: f64 = 2.693,
         pub res_c: f64 = -0.122,
-        /// An unmodelled surface just behind an edge (3dtrees research 130 step 3c): the chance `behind_share` that a
-        /// cell whose layers leave some of the beam has a surface no element holds within the receiver's resolution
-        /// behind its last layer, at a uniform distance there; it takes the rest of the beam at reflectance
-        /// `behind_refl` (dB at full fill, face-on), and its return merges with the layers' or resolves by
-        /// [`Settings::p_resolve`]. 0 leaves it out. Measured on the candidates' edges from the outer neighbour's
-        /// first echo (`reflectance.py`).
-        pub behind_share: f64 = 0.561,
-        pub behind_refl: f64 = -17.248,
         /// Located edges (3dtrees research 130 step 2): an echo's reflectance (dB) is read beside its range. A return's
         /// predicted reflectance is `10 log10` of its members' energy shares (each fill × the beam left × cos^k ι ×
         /// the surface's reflectance, k `refl_incidence`, which sets the detection too; a merged return sums them), so
@@ -88,11 +80,10 @@ params! {
         /// its surface's reflectance with prior sd `refl_level_sd` (dB), marginalised with the alignment error. An echo
         /// nothing in the scene explains (the foliage field's, an outlier) reads `refl_background_mean` ±
         /// `refl_background_sd` (dB). All are measured on single echoes against the scene's own predictions
-        /// (`reflectance.py`); `refl_edge` on the edges with no surface within the resolution behind them (step 3c: the
-        /// merge with one is its own branch, `behind_share`).
+        /// (`reflectance.py`).
         pub refl_noise: f64 = 0.27,
         pub refl_dof: f64 = 2.7,
-        pub refl_edge: f64 = 10.2,
+        pub refl_edge: f64 = 9.06,
         pub refl_incidence: f64 = 0.25,
         pub refl_level_sd: f64 = 0.65,
         pub refl_background_mean: f64 = -21.18,

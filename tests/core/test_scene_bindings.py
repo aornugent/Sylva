@@ -92,7 +92,7 @@ def test_the_held_alignment_crosses_the_binding():
     assert list(pairs['i']) == [0] and list(pairs['j']) == [1] and pairs['cells'][0] and pairs['nodes'][0]
 
 
-def test_the_rest_of_the_pulse_crosses_the_binding():
+def test_expected_information_alone_and_free_space_cross_the_binding():
     """Research 130 step 3c: `information` without the observed stencil gives the same expected information and NaN
     for the observed part; the image gives each cell's free space (its first echo less the receiver's resolution, the
     longest range for a miss) under the settings."""

@@ -85,7 +85,7 @@ pub struct RangeImage {
     /// Each echo's reflectance (dB), beside `echo_range`; empty where the source has none.
     pub echo_refl: Vec<f32>,
     /// The most echoes any pulse recorded: the instrument's cap on targets per pulse, read from the data (AM's
-    /// VZ-2000i at 1.2 MHz records 4; the stand's simulator 3). A pulse at its cap says nothing past its last echo.
+    /// VZ-2000i at 1.2 MHz records 4; the stand's simulator 3). A pulse at its cap says nothing past its last echo ([`RangeImage::capped`]).
     pub max_targets: usize,
     /// Unit normal toward the scanner (world), `cos ι` and excess; NaN where no fit.
     pub normal: Vec<[f32; 3]>,
@@ -353,6 +353,13 @@ impl RangeImage {
             }
         }
         (25.0 / n.max(1) as f64).sqrt() as f32
+    }
+
+    /// Whether cell `k`'s pulse is capped: it returned as many echoes as the instrument records (`max_targets`), so it
+    /// says nothing past its last echo. A miss or no pulse is not.
+    pub fn capped(&self, k: usize) -> bool {
+        let n = self.echoes(k).len();
+        n > 0 && n >= self.max_targets
     }
 
     /// The reflectances (dB) of cell `k`'s echoes, beside [`RangeImage::echoes`]; empty where unknown.
