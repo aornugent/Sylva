@@ -85,8 +85,8 @@ pub const K: usize = 3;
 /// or more.
 pub const MIN_FILL: f64 = 0.01;
 
-/// The fill over which a cell is mostly the element's: its echo there reads the element's surface (its class, class
-/// evidence and shape mismatch).
+/// The fill over which a cell is mostly the element's: its echo there reads the element's surface (its surface class
+/// and shape mismatch).
 pub const MOSTLY: f64 = 0.5;
 
 /// An element's form: its geometry.
@@ -701,7 +701,8 @@ struct ElemData {
     across: f64,
     align: Vec<([i64; 3], f64)>,
     own_sd: [f64; 2],
-    /// Class evidence's cost in this scan, from its photometry over its echoes in cells it mostly fills.
+    /// Class evidence's cost in this scan: its group's log ratio from the photometry over the group's echoes (every
+    /// cell whose first echo is a member's), its share by its echoes.
     class_cost: f64,
 }
 
@@ -885,10 +886,12 @@ const MAX_NEWTON: usize = 40;
 
 /// One scan's data for the elements `score` (indices into `elems`, each with its layers in `rendered`), against the
 /// k-buffer of every element's layers, under the surface classes `cls`. A cell's evidence belongs to its front
-/// element.
+/// element. Elements of one `group` (per element in `elems`) and one class pool their class evidence (slice 5b): the
+/// group's photometry over every cell whose first echo is a member's gives one log ratio, so a group of thin elements
+/// clears the echo gate together, and each member carries its share by its echoes.
 #[allow(clippy::too_many_arguments)]
-fn elem_data(v: &RangeImage, rendered: &[Vec<(usize, Layer)>], elems: &[Element], cls: &[u8], score: &[usize], ref_epoch: u32, em: &Settings,
-             sc: &Background, ext: &Foliage) -> Vec<ElemData> {
+fn elem_data(v: &RangeImage, rendered: &[Vec<(usize, Layer)>], elems: &[Element], cls: &[u8], group: &[u32], score: &[usize], ref_epoch: u32,
+             em: &Settings, sc: &Background, ext: &Foliage) -> Vec<ElemData> {
     let buf = kbuffer(rendered);
     let other = v.epoch != ref_epoch;
     let level = if em.refl_noise > 0.0 && !v.echo_refl.is_empty() { em.refl_level_sd } else { 0.0 };
@@ -926,9 +929,10 @@ fn elem_data(v: &RangeImage, rendered: &[Vec<(usize, Layer)>], elems: &[Element]
             el.on_across = [el.on_across[0].min(z), el.on_across[1].max(z)];
         }
         let echoes = v.echoes(cell);
-        if let (true, true, Some(&db)) = (outcome == Outcome::On, front.f > MOSTLY, v.echo_refls(cell).first()) {
+        if let (Outcome::On, Some(&db)) = (outcome, v.echo_refls(cell).first()) {
+            // the reflectance read at full fill: an echo's energy is its fill's share of the beam
             let c = if v.cos_inc[cell].is_finite() { (v.cos_inc[cell] as f64).clamp(0.05, 1.0) } else { 0.5 };
-            let db = db as f64;
+            let db = db as f64 - 10.0 * front.f.max(0.01).log10();
             for (a, x) in photo[d].iter_mut().zip([1.0, db, db - 10.0 * c.log10(), (echoes.len() > 1) as u8 as f64, c]) {
                 *a += x;
             }
@@ -937,9 +941,16 @@ fn elem_data(v: &RangeImage, rendered: &[Vec<(usize, Layer)>], elems: &[Element]
         let base = cell_ll(echoes, refl, &[], cv.ground, 0.0, 0.0, em, &cv.bg.base());
         el.cells.push(CellData { bg: cv.bg, echoes: echoes.to_vec(), refl, layers, ground: cv.ground, wt: cv.wt, base, outcome });
     }
-    // class evidence argues for wood or leaf: its cost is the element's class's
+    // class evidence argues for wood or leaf: its group's, shared by echoes; its cost is the element's class's
+    let key = |el: &ElemData| (group[el.elem], elems[el.elem].class == Class::Leaf);
+    let mut pooled: HashMap<(u32, bool), [f64; 5]> = HashMap::new();
+    for (el, ph) in data.iter().zip(&photo) {
+        let g = pooled.entry(key(el)).or_insert([0.0; 5]);
+        g.iter_mut().zip(ph).for_each(|(a, x)| *a += x);
+    }
     for (el, ph) in data.iter_mut().zip(&photo) {
-        let llr = em.class_llr(ph);
+        let g = &pooled[&key(el)];
+        let llr = if ph[0] > 0.0 { em.class_llr(g) * (ph[0] / g[0]) } else { 0.0 };
         el.class_cost = match elems[el.elem].class { Class::Wood => -llr, Class::Leaf => llr };
     }
     data
@@ -1550,7 +1561,7 @@ impl Scene {
         let rendered: Vec<Vec<(usize, Layer)>> = ids.iter().enumerate()
             .map(|(k, &i)| self.rendered[s][i as usize].iter().map(|&(c, l)| (c, Layer { elem: k as u32, ..l })).collect()).collect();
         let cls = classes(v, &kbuffer(&rendered), &elems, &self.em, &self.sc, v.epoch != self.ref_epoch);
-        let data = elem_data(v, &rendered, &elems, &cls, &(0..ids.len()).collect::<Vec<_>>(), self.ref_epoch, &self.em, &self.sc, &self.ext);
+        let data = elem_data(v, &rendered, &elems, &cls, &ids, &(0..ids.len()).collect::<Vec<_>>(), self.ref_epoch, &self.em, &self.sc, &self.ext);
         let (mut held, terms) = solve_alignment(&data, &self.em);
         let n = self.elems.len();
         let (mut fit_terms, mut fit_cls) = (vec![None; n], vec![1u8; n]);
@@ -1635,7 +1646,9 @@ impl Scene {
         score.retain(|&i| present(i));
         let (ids, el, r) = local(&score);
         let cls: Vec<u8> = ids.iter().map(|&i| cls.get(&i).copied().unwrap_or_else(|| stored(i))).collect();
-        let data = elem_data(v, &r, &el, &cls, &(0..score.len()).collect::<Vec<_>>(), self.ref_epoch, em, &self.sc, &self.ext);
+        // the scene's elements each alone, the elements put in one group
+        let group: Vec<u32> = ids.iter().map(|&i| if added(i) { first } else { i }).collect();
+        let data = elem_data(v, &r, &el, &cls, &group, &(0..score.len()).collect::<Vec<_>>(), self.ref_epoch, em, &self.sc, &self.ext);
         let mut out: Vec<(u32, Option<Term>, u8)> = data.par_iter().map(|d| (ids[d.elem], Some(d.term(fit.held.shift(&d.align), em)), cls[d.elem])).collect();
         out.extend(without.iter().copied().chain((0..with.len() as u32).map(|k| first + k)).filter(|&i| !present(i)).map(|i| (i, None, 1)));
         out
@@ -1894,7 +1907,8 @@ impl Scene {
     }
 
     /// Each hypothesis's cost to add alone (one or more elements), per scan: (hypotheses × scans), in parallel, the
-    /// scene unchanged, its foliage field and alignment held. Equal to adding it then removing it.
+    /// scene unchanged, its foliage field and alignment held. Equal to adding it then removing it, except that a
+    /// hypothesis's elements are one group for class evidence ([`elem_data`]), as a scene's elements are not.
     pub fn costs_to_add(&self, hyps: &[Vec<Element>]) -> Vec<Vec<f64>> {
         self.costs_replacing(&hyps.iter().map(|h| (h.clone(), Vec::new())).collect::<Vec<_>>())
     }
@@ -2429,6 +2443,27 @@ mod tests {
         assert!(w.class != 0.0 && w.class == -l.class, "{} {}", w.class, l.class);
         let patch = Element { form: Form::Patch { centre: [0.0, 4.0, 0.0] }, class: Class::Leaf, r: 0.03, opacity: 1.0, mismatch: 0.002 };
         assert_eq!(rows(patch).front_shift_sd, 0.0);
+    }
+
+    /// Class evidence reaches thin wood (slice 5b): a stick a third of a footprint across, every cell of it under half
+    /// filled, gets class evidence; short pieces of it, each under the echo gate alone, clear it as one hypothesis.
+    #[test]
+    fn a_thin_stick_gets_class_evidence_and_a_group_pools() {
+        let v = thin_pole_view(0.0015, 6.0);
+        let (on, off, sc) = (Settings { class_temper: 1.0, ..Settings::default() }, Settings::default(), Background::default());
+        let row = cost(&v, &[stick(0.0, 6.0, 0.0015)], &on, &sc).1[0];
+        assert!(row.footprints_across < 0.4 && row.class != 0.0, "{row:?}");
+        let piece = |z: f64| Element { form: Form::Stick { a: [0.0, 6.0, z - 0.001], b: [0.0, 6.0, z + 0.001] }, ..stick(0.0, 6.0, 0.0015) };
+        let pieces: Vec<Element> = (0..12).map(|k| piece(-0.15 + 0.025 * k as f64)).collect();
+        // class evidence's part of each hypothesis's cost: with it on less with it off
+        let class = |hyps: &[Vec<Element>]| -> Vec<f64> {
+            let [a, b] = [on, off].map(|em| Scene::new(vec![v.clone()], &[], em, sc, None, 0).costs_to_add(hyps));
+            a.iter().zip(&b).map(|(x, y)| x[0] - y[0]).collect()
+        };
+        let alone = class(&pieces.iter().map(|p| vec![*p]).collect::<Vec<_>>());
+        assert!(alone.iter().all(|&c| c == 0.0), "{alone:?}");
+        let together = class(&[pieces.clone()])[0];
+        assert!(together != 0.0);
     }
 
     /// The reference epoch is declared, not the first scan's: a scene of the same scans in either order costs the

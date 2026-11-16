@@ -116,20 +116,22 @@ params! {
         /// instead (the review after slice 15).
         pub front_shift_base: f64 = 0.001,
         pub front_shift_slope: f64 = 0.1,
-        /// Class evidence (research 130 slice 15), per (element, scan): from the first echoes on the element (fill >
-        /// 0.5), their mean reflectance (dB), albedo (reflectance less 10 log10 cos ι), share of pulses with more
-        /// than one return and mean cos ι, a log likelihood ratio wood against leaf,
-        /// `class_b + Σ class_w · features`, fitted on the stand (`photometry.py`). `class_temper` scales it so an
-        /// element's sum over its scans is calibrated (the scans of one element are correlated); 0 leaves it out.
-        /// The stand's fit: per-element AUC 0.95. The temper that calibrates an element's sum is 0.386 (the
-        /// element-level scale 0.94 over the design effect `1 + (S − 1) ρ` at ρ 0.71 and a typical S of 3 views); it
-        /// defaults to 0 (off), since among sticks of one form it only adds noise to radius comparisons (the stand's
-        /// truth beats R × 0.7 falls from 0.967 to 0.95 with it on). A caller weighing forms turns it on.
-        pub class_b: f64 = 11.262,
-        pub class_w_refl: f64 = 1.0747,
-        pub class_w_albedo: f64 = -0.5962,
-        pub class_w_multi: f64 = -3.4553,
-        pub class_w_cos: f64 = -0.4111,
+        /// Class evidence (research 130 slices 15 and 5b), per (group, scan): from the first echoes on a group's
+        /// elements (every cell whose first echo is a member's; a hypothesis's elements are one group, a scene's
+        /// each alone), their mean reflectance read at full fill (dB, less 10 log10 of the element's predicted fill),
+        /// albedo (that less 10 log10 cos ι), share of pulses with more than one return and mean cos ι, a log
+        /// likelihood ratio wood against leaf, `class_b + Σ class_w · features`, fitted on the stand
+        /// (`photometry.py fill`, its `normalised` fit). `class_temper` scales it so an element's sum over its scans
+        /// is calibrated (the scans of one element are correlated); 0 leaves it out. The stand's fit: per-element AUC
+        /// 0.94 on 497 of 500 candidates (slice 15's cells over half filled: 0.96 on 469). The temper that
+        /// calibrates an element's sum is 0.43 (the element-level scale 0.96 over the design effect `1 + (S − 1) ρ`
+        /// at ρ 0.62 and a typical S of 3 views); it defaults to 0 (off), since among sticks of one class it only
+        /// adds noise to radius comparisons (slice 15). A caller weighing classes turns it on.
+        pub class_b: f64 = -5.1042,
+        pub class_w_refl: f64 = 0.1318,
+        pub class_w_albedo: f64 = -0.6467,
+        pub class_w_multi: f64 = -4.5721,
+        pub class_w_cos: f64 = 0.8327,
         pub class_temper: f64 = 0.0,
     }
 }
@@ -242,8 +244,8 @@ impl Settings {
         1.0 / (1.0 + (-(self.res_a + self.res_b * d + self.res_c * e)).exp())
     }
 
-    /// Class evidence from one scan's echoes on an element, `[n, Σ reflectance, Σ albedo, Σ multi-return, Σ cos]`:
-    /// the tempered log likelihood ratio, wood against leaf (0 under 5 echoes).
+    /// Class evidence from one scan's echoes on a group, `[n, Σ reflectance, Σ albedo, Σ multi-return, Σ cos]`
+    /// (reflectances at full fill): the tempered log likelihood ratio, wood against leaf (0 under 5 echoes).
     pub fn class_llr(&self, f: &[f64; 5]) -> f64 {
         if f[0] < 5.0 || self.class_temper == 0.0 {
             return 0.0;
