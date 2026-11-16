@@ -9,7 +9,8 @@
 //!   `settings_defaults()` returns the settings' defaults (AM's). An unknown key raises.
 //! - **Elements:** a dict of arrays, one row per element: `a`, `b` (n, 3) and `r` (n,) are required; `opacity` (n,)
 //!   defaults to 1, `mismatch` (n,) to the settings' prior `mismatch_base + mismatch_slope r`, `patch` (n,) bool
-//!   to false, and `leaf` (n,) bool, its class (wood or leaf), to `patch`. A patch is a ball about `a` of radius `r`
+//!   to false, `leaf` (n,) bool, its class (wood or leaf), to `patch`, and `group` (n,) int, its chain's key
+//!   (elements of one key are one term per scan: one set of nuisances, pooled class evidence), to -1, alone. A patch is a ball about `a` of radius `r`
 //!   (its extent); its `b` is ignored. An element that can't be scored (a radius that isn't positive, an opacity
 //!   outside (0, 1], a stick of no length) raises.
 //! - **Scenes:** `Scene(images, elements, settings, background, foliage, ref_epoch)` holds elements against range
@@ -31,7 +32,7 @@ use std::sync::Arc;
 use sylva_rs::scene::foliage::FoliageBox;
 use sylva_rs::scene::moments::{Candidate, Moments};
 use sylva_rs::scene::range_image::{Cell, RangeImage, RangeImageParams};
-use sylva_rs::scene::scene::{CellPrediction, Class, Element, ElementScan, Form, Information, Scene, SceneError};
+use sylva_rs::scene::scene::{CellPrediction, Class, Coupling, Element, ElementScan, Form, Information, Scene, SceneError};
 use sylva_rs::scene::settings::{Background, Settings};
 
 use crate::xyz_from_py;
@@ -79,7 +80,7 @@ fn elements_from_py(d: &Bound<'_, PyDict>, em: &Settings) -> PyResult<Vec<Elemen
     let req = |k: &str| get(k)?.ok_or_else(|| PyValueError::new_err(format!("elements need {k:?}")));
     for k in d.keys() {
         let k: String = k.extract()?;
-        if !["a", "b", "r", "opacity", "mismatch", "patch", "leaf"].contains(&k.as_str()) {
+        if !["a", "b", "r", "opacity", "mismatch", "patch", "leaf", "group"].contains(&k.as_str()) {
             return Err(bad(&k));
         }
     }
@@ -102,8 +103,12 @@ fn elements_from_py(d: &Bound<'_, PyDict>, em: &Settings) -> PyResult<Vec<Elemen
     };
     let patch = flag("patch", vec![false; r.len()])?;
     let leaf = flag("leaf", patch.clone())?;
+    let group: Vec<i64> = match get("group")? {
+        Some(v) => v.extract::<PyReadonlyArray1<i64>>()?.as_array().to_vec(),
+        None => vec![-1; r.len()],
+    };
     let n = r.len();
-    if [a.len(), b.len(), opacity.len(), mismatch.len(), patch.len(), leaf.len()].iter().any(|&m| m != n) {
+    if [a.len(), b.len(), opacity.len(), mismatch.len(), patch.len(), leaf.len(), group.len()].iter().any(|&m| m != n) {
         return Err(PyValueError::new_err("elements: every array needs one row per element"));
     }
     (0..n)
@@ -111,7 +116,7 @@ fn elements_from_py(d: &Bound<'_, PyDict>, em: &Settings) -> PyResult<Vec<Elemen
             let e = Element {
                 form: if patch[i] { Form::Patch { centre: a[i] } } else { Form::Stick { a: a[i], b: b[i] } },
                 class: if leaf[i] { Class::Leaf } else { Class::Wood },
-                r: r[i], opacity: opacity[i], mismatch: mismatch[i],
+                r: r[i], opacity: opacity[i], mismatch: mismatch[i], group: u32::try_from(group[i]).ok(),
             };
             match e.invalid() {
                 Some(why) => Err(PyValueError::new_err(format!("element {i}: {why}"))),
@@ -253,6 +258,7 @@ fn predictions_dict<'py>(py: Python<'py>, p: &[CellPrediction]) -> PyResult<Boun
 fn rows_dict<'py>(py: Python<'py>, rows: &[ElementScan]) -> PyResult<Bound<'py, PyDict>> {
     let d = PyDict::new(py);
     d.set_item("elem", rows.iter().map(|r| r.elem).collect::<Vec<_>>().into_pyarray(py))?;
+    d.set_item("group", rows.iter().map(|r| r.group.map_or(-1, i64::from)).collect::<Vec<_>>().into_pyarray(py))?;
     d.set_item("scan", rows.iter().map(|r| r.scan).collect::<Vec<_>>().into_pyarray(py))?;
     d.set_item("cells", rows.iter().map(|r| r.cells).collect::<Vec<_>>().into_pyarray(py))?;
     d.set_item("cells_on", rows.iter().map(|r| r.cells_on).collect::<Vec<_>>().into_pyarray(py))?;
@@ -304,7 +310,22 @@ pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyScene>()?;
     m.add_function(wrap_pyfunction!(candidates, m)?)?;
     m.add_function(wrap_pyfunction!(settings_defaults, m)?)?;
+    m.add_function(wrap_pyfunction!(coupling, m)?)?;
     Ok(())
+}
+
+/// The coupling along a chain of sticks joined end to end in order (scene::coupling): a declared term over their
+/// geometry alone, never in a cost. A dict: length, gap (m), radius, bend (nats).
+#[pyfunction]
+#[pyo3(signature = (sticks, drift=-0.15, form_sd=0.2, form_range=1.0, bend_sd=0.5))]
+fn coupling<'py>(py: Python<'py>, sticks: &Bound<'_, PyDict>, drift: f64, form_sd: f64, form_range: f64, bend_sd: f64) -> PyResult<Bound<'py, PyDict>> {
+    let es = elements_from_py(sticks, &Settings::default())?;
+    let row = sylva_rs::scene::scene::coupling(&es, &Coupling { drift, form_sd, form_range, bend_sd });
+    let d = PyDict::new(py);
+    for (k, v) in [("length", row.length), ("gap", row.gap), ("radius", row.radius), ("bend", row.bend)] {
+        d.set_item(k, v)?;
+    }
+    Ok(d)
 }
 
 /// A scene of elements held against range images (scene::Scene). Each element is rendered once per image; moves and
@@ -425,7 +446,7 @@ impl PyScene {
         py.detach(|| c.refit_alignment())
     }
 
-    /// Per (element, scan) (scene::ElementScan): elem, scan, cells, cells_on, arc (rad), footprints_across, surface; its cost
+    /// Per (term, scan) (scene::ElementScan): elem (a group's first member), group (-1 alone), scan, cells, cells_on, arc (rad), footprints_across, surface; its cost
     /// and the parts it sums (ray_on, ray_empty, ray_in_front, ray_behind, class, and alignment: its own nodes' prior and
     /// log-determinant; each scan's alignment part is `alignment_parts()`); the evidence discount (discount); the
     /// posterior along the beam at it, the alignment held: align_shift, align_sd, front_shift, front_shift_sd (m); and
@@ -493,7 +514,8 @@ impl PyScene {
     }
 
     /// Which hypotheses interact per scan (scene::Scene::interactions), each pair once: i, j (i < j), scan, cells
-    /// (they front a cell, or cells one scene element owns, in common) and nodes (they share an alignment node).
+    /// (they front a cell, or cells one scene term owns, in common, or join one group) and nodes (they share an
+    /// alignment node).
     fn interactions<'py>(&self, py: Python<'py>, hypotheses: Vec<Bound<'py, PyDict>>) -> PyResult<Bound<'py, PyDict>> {
         let hs: Vec<Vec<Element>> = hypotheses.iter().map(|d| elements_from_py(d, &self.em)).collect::<PyResult<_>>()?;
         let c = &self.inner;

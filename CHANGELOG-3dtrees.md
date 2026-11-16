@@ -57,6 +57,7 @@ branch `3dtrees/125-rebase`.
   integrated by a Laplace marginal. It returns its cost, the cost change of a move, rows splitting each (element,
   scan)'s cost into its parts, how well the scans pin elements' geometry down, one or several jointly
   (`information`), what one hypothesis is expected to cost against another (`divergence`), and elements' counts and
-  cell predictions. Bound as `_core.RangeImage`, `_core.Scene`, `_core.candidates` and
+  cell predictions. Elements of one group (a chain) are one term per scan; `coupling` is a declared term over a
+  chain's geometry. Bound as `_core.RangeImage`, `_core.Scene`, `_core.candidates`, `_core.coupling` and
   `_core.settings_defaults` in `scene_py.rs`, with `ShotsFile::read_echo_f64` for per-echo attributes. 3dtrees needs
   them to score geometry and class hypotheses from the rays. Additive.

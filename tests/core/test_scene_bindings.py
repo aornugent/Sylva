@@ -119,3 +119,15 @@ def test_expected_information_alone_and_free_space_cross_the_binding():
     reach = -d['res_a'] / d['res_b']
     assert np.allclose(A['free_to'][echo], np.maximum(A['range'][echo] - reach, 0), atol=1e-4)
     assert (A['free_to'][A['cell'] == 1] == 80.0).all()
+
+
+def test_a_chain_crosses_the_binding():
+    """Research 130 slice 6: a `group` column makes elements one term (one row, its group named), and `coupling` is
+    pure geometry beside the cost."""
+    v = pole_image()
+    halves = dict(a=np.array([[0.0, 4.0, -0.1], [0.0, 4.0, 0.0]]), b=np.array([[0.0, 4.0, 0.0], [0.0, 4.0, 0.1]]), r=np.array([0.03, 0.03]))
+    rows = _core.Scene([v], dict(halves, group=np.array([4, 4]))).rows()
+    assert list(rows['group']) == [4] and list(rows['elem']) == [0]
+    assert list(_core.Scene([v], halves).rows()['group']) == [-1, -1]
+    c = _core.coupling(halves)
+    assert np.isclose(c['length'], 0.2) and c['gap'] == 0.0 and np.isfinite(c['radius']) and np.isfinite(c['bend'])

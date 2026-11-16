@@ -25,6 +25,8 @@
 //! | the range up to which a pulse shows clear space | free space | `free_to`: the first echo less the receiver's resolution |
 //! | a proposed part of the scene | element | a form (a stick, an axis and radius; or a patch, a ball) and a class |
 //! | what an element is made of, wood or leaf | class | `Class`: its reflectance and the sign of its class evidence; a mark, not a shape |
+//! | sticks joined end to end, scored as one | chain; group | `Element::group`, a key: a group's members are one term per scan, one set of nuisances (alignment shift, stem front shift, reflectance level) and pooled class evidence |
+//! | a declared term over a chain's geometry alone | coupling | `coupling`, `Coupling`: taper, form departures, bends; beside the cost, never in it |
 //! | elements held against scans | scene | `Scene` |
 //! | `−log` likelihood ratio against the empty scene | cost | also of a move: `add`, `remove`, `change`, `costs_to_add`, `costs_to_remove` |
 //! | a cell's likelihood of its first echo | ray likelihood | the scene's data term |

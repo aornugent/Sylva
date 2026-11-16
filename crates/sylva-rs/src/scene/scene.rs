@@ -62,6 +62,9 @@
 //!   quasi-likelihood). It replaced slice 7's ρ_res, `1 + (n − 1) ρ` with n an element's own footprints, which
 //!   differed between hypotheses and, once every fronted cell counted, favoured the thinner (slice 7c).
 //!
+//! - **Chains** (3dtrees research 130 slice 6): elements of one group ([`Element`]'s `group`) are one term per scan
+//!   ([`Owner`]), so a chain of short sticks shares its nuisances and pools its class evidence; [`coupling`] is the
+//!   declared term over its geometry, reported beside the cost.
 //! - **The scene** ([`Scene`]) holds elements against range images, each rendered once. A move (add, remove,
 //!   change) returns its cost change with the alignment held, recomputing only the terms of the elements whose cells
 //!   it touches; `refit_alignment` re-solves the alignment. Its rows ([`ElementScan`]) split each (element, scan)'s cost into its parts, and
@@ -106,7 +109,9 @@ pub enum Class {
 }
 
 /// An element hypothesis: its form, its class, its section's radius (a stick's a₀; a patch's extent), its opacity
-/// (1 solid) and its shape mismatch sd (m). The caller supplies opacity and mismatch (each with a declared default).
+/// (1 solid), its shape mismatch sd (m) and its group. The caller supplies opacity and mismatch (each with a declared
+/// default). Elements of one `group` (a chain: research 130 slice 6) are one term per scan ([`Owner`]); none, the
+/// element is alone.
 #[derive(Debug, Clone, Copy)]
 pub struct Element {
     pub form: Form,
@@ -114,6 +119,42 @@ pub struct Element {
     pub r: f64,
     pub opacity: f64,
     pub mismatch: f64,
+    pub group: Option<u32>,
+}
+
+/// Whose term a cell's evidence enters, per scan: an element alone (by id), or a group (by its key). A group's members
+/// share one set of nuisances (one alignment shift, at their middles' mean; one stem front shift, its prior sd their
+/// mean; one reflectance level), one surface class (the median over their echoes) and their class evidence (its sign
+/// the first member's class: a group is one class), so a chain of short sticks is charged its nuisances once and pools
+/// its evidence over its length. Its members' cells are scored as one element's.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+enum Owner {
+    Alone(u32),
+    Group(u32),
+}
+
+/// Element `id`'s owner.
+fn owner(id: u32, e: &Element) -> Owner {
+    e.group.map_or(Owner::Alone(id), Owner::Group)
+}
+
+/// Each element's term among its owners: the place its owner first appears.
+fn slots(owners: &[Owner]) -> Vec<usize> {
+    let mut at: HashMap<Owner, usize> = HashMap::new();
+    owners.iter().map(|o| {
+        let n = at.len();
+        *at.entry(*o).or_insert(n)
+    }).collect()
+}
+
+/// The mean over some elements of a quantity (one element's is exactly its own).
+fn mean_of(es: &[&Element], f: impl Fn(&Element) -> f64) -> f64 {
+    es.iter().map(|e| f(e)).sum::<f64>() / es.len() as f64
+}
+
+/// A term's middle: its elements' middles' mean.
+fn middle(es: &[&Element]) -> Point {
+    [0, 1, 2].map(|k| mean_of(es, |e| e.mid()[k]))
 }
 
 impl Element {
@@ -228,7 +269,8 @@ impl Layer {
     }
 }
 
-/// What one scan says about one element, its cost split into parts that sum to `cost`.
+/// What one scan says about one element, or one group ([`Owner`]: `group`, and `elem` its first member), its cost
+/// split into parts that sum to `cost`. A group's row reads its members' cells together.
 /// - `cells`: cells where it is the nearest layer (at [`MIN_FILL`] or more); `cells_on`: those whose first echo is
 ///   its ([`Outcome::On`]); `across`: footprints across its diameter; `surface`: its surface class in this scan.
 /// - `arc`: the arc of a stick's outline its echoes span (rad, 0 to π; the support function's coverage, as the
@@ -247,6 +289,7 @@ impl Layer {
 #[derive(Debug, Clone, Copy)]
 pub struct ElementScan {
     pub elem: u32,
+    pub group: Option<u32>,
     pub scan: u32,
     pub cells: u32,
     pub cells_on: u32,
@@ -457,10 +500,11 @@ fn front_echo(layers: &[(Layer, u8)], ground: Option<(f64, f64)>, em: &Settings,
     f
 }
 
-/// Each element's surface class in one view: the median class of the view's echoes on it, in cells it mostly fills
-/// (mid where none). The class isn't known yet when these echoes are chosen, so they are read under the mid class.
-fn classes(v: &RangeImage, buf: &HashMap<usize, Vec<Layer>>, elems: &[Element], em: &Settings, sc: &Background, other: bool) -> Vec<u8> {
-    let mut ex: Vec<Vec<f64>> = vec![Vec::new(); elems.len()];
+/// Each element's surface class in one view: the median class of the view's echoes on its term (`slot`, per element:
+/// [`slots`]), in cells a member mostly fills (mid where none). The class isn't known yet when these echoes are chosen,
+/// so they are read under the mid class.
+fn classes(v: &RangeImage, buf: &HashMap<usize, Vec<Layer>>, elems: &[Element], slot: &[usize], em: &Settings, sc: &Background, other: bool) -> Vec<u8> {
+    let mut ex: Vec<Vec<f64>> = vec![Vec::new(); slot.iter().max().map_or(0, |m| m + 1)];
     for (&cell, ls) in buf {
         let ly = ls[0];
         if ly.f <= MOSTLY || v.cell[cell] != Cell::Echoes || !v.excess[cell].is_finite() {
@@ -470,10 +514,10 @@ fn classes(v: &RangeImage, buf: &HashMap<usize, Vec<Layer>>, elems: &[Element], 
         let layers: Vec<(Layer, u8)> = ls.iter().map(|l| (*l, 1)).collect();
         let fe = front_echo(&layers, ground, em, &vec![0.0; layers.len() + 1], elems[ly.elem as usize].front_shift_sd(em), other);
         if Outcome::of(obs, fe.mu, fe.sd) == Outcome::On {
-            ex[ly.elem as usize].push(v.excess[cell] as f64);
+            ex[slot[ly.elem as usize]].push(v.excess[cell] as f64);
         }
     }
-    ex.iter_mut()
+    let per: Vec<u8> = ex.iter_mut()
         .map(|e| {
             if e.is_empty() {
                 1
@@ -482,7 +526,8 @@ fn classes(v: &RangeImage, buf: &HashMap<usize, Vec<Layer>>, elems: &[Element], 
                 em.surface(e[e.len() / 2])
             }
         })
-        .collect()
+        .collect();
+    slot.iter().map(|&t| per[t]).collect()
 }
 
 /// What an element predicts in one cell it fronts ([`Scene::predict`]), on the path the likelihood scores: its fill,
@@ -687,12 +732,13 @@ struct CellData {
     outcome: Outcome,
 }
 
-/// One element's data in one scan: the cells it owns (its evidence: [`elem_data`]), and its latent nodes: its
-/// alignment nodes with their weights (its alignment shift is `Σ w z`, each hat's weight times its surface class's
-/// along-beam spread), and the prior sds of its own two nodes, the stem front shift (m; 0 when off) and the
-/// reflectance level (dB; 0 while reflectance isn't read).
+/// One term's data in one scan (an element's, or a group's: [`Owner`]): the cells its members own (its evidence:
+/// [`elem_data`]), and its latent nodes: its alignment nodes with their weights (its alignment shift is `Σ w z`, each
+/// hat's weight times its surface class's along-beam spread), and the prior sds of its own two nodes, the stem front
+/// shift (m; 0 when off) and the reflectance level (dB; 0 while reflectance isn't read).
 struct ElemData {
-    elem: usize,
+    /// Its members, as indices into the elements it was built from.
+    members: Vec<usize>,
     cells: Vec<CellData>,
     surface: u8,
     /// Cells whose first echo is its.
@@ -885,28 +931,34 @@ fn hats(x: &Point, l: f64) -> Vec<([i64; 3], f64)> {
 /// Newton steps at most per mode.
 const MAX_NEWTON: usize = 40;
 
-/// One scan's data for the elements `score` (indices into `elems`, each with its layers in `rendered`), against the
-/// k-buffer of every element's layers, under the surface classes `cls`. A cell's evidence belongs to its front
-/// element. Elements of one `group` (per element in `elems`) and one class pool their class evidence (slice 5b): the
-/// group's photometry over every cell whose first echo is a member's gives one log ratio, so a group of thin elements
-/// clears the echo gate together, and each member carries its share by its echoes.
+/// One scan's data for the elements `score` (indices into `elems`, each with its layers in `rendered`), one per term
+/// (`slot`, per element: [`slots`]), against the k-buffer of every element's layers, under the surface classes `cls`. A
+/// cell's evidence belongs to its front element's term. Class evidence reads the term's photometry over every cell
+/// whose first echo is a member's (slice 5b), so a group of thin elements clears the echo gate together.
 #[allow(clippy::too_many_arguments)]
-fn elem_data(v: &RangeImage, rendered: &[Vec<(usize, Layer)>], elems: &[Element], cls: &[u8], group: &[u32], score: &[usize], ref_epoch: u32,
+fn elem_data(v: &RangeImage, rendered: &[Vec<(usize, Layer)>], elems: &[Element], cls: &[u8], slot: &[usize], score: &[usize], ref_epoch: u32,
              em: &Settings, sc: &Background, ext: &Foliage) -> Vec<ElemData> {
     let buf = kbuffer(rendered);
     let other = v.epoch != ref_epoch;
     let level = if em.refl_noise > 0.0 && !v.echo_refl.is_empty() { em.refl_level_sd } else { 0.0 };
-    let mut data: Vec<ElemData> = Vec::with_capacity(score.len());
-    let mut by_elem: HashMap<u32, usize> = HashMap::new();
+    let (mut members, mut at, mut by_elem): (Vec<Vec<usize>>, HashMap<usize, usize>, HashMap<u32, usize>) = Default::default();
     for &i in score {
-        let (e, k) = (&elems[i], cls[i]);
-        let mid = e.mid();
-        let s_along = em.align_sd(k, other);
-        by_elem.insert(i as u32, data.len());
-        data.push(ElemData { elem: i, cells: Vec::new(), surface: k, cells_on: 0, on_across: [f64::INFINITY, f64::NEG_INFINITY], across: 2.0 * e.r / em.footprint(norm(&sub(&mid, &v.origin))),
-                             align: hats(&mid, ALIGN_SPACING).into_iter().map(|(key, w)| (key, w * s_along)).collect(),
-                             own_sd: [e.front_shift_sd(em), level], class_cost: 0.0 });
+        let d = *at.entry(slot[i]).or_insert_with(|| {
+            members.push(Vec::new());
+            members.len() - 1
+        });
+        members[d].push(i);
+        by_elem.insert(i as u32, d);
     }
+    let mut data: Vec<ElemData> = members.into_iter().map(|ms| {
+        let es: Vec<&Element> = ms.iter().map(|&i| &elems[i]).collect();
+        let (mid, k) = (middle(&es), cls[ms[0]]);
+        let s_along = em.align_sd(k, other);
+        ElemData { cells: Vec::new(), surface: k, cells_on: 0, on_across: [f64::INFINITY, f64::NEG_INFINITY],
+                   across: mean_of(&es, |e| 2.0 * e.r / em.footprint(norm(&sub(&e.mid(), &v.origin)))),
+                   align: hats(&mid, ALIGN_SPACING).into_iter().map(|(key, w)| (key, w * s_along)).collect(),
+                   own_sd: [mean_of(&es, |e| e.front_shift_sd(em)), level], class_cost: 0.0, members: ms }
+    }).collect();
     let mut photo = vec![[0.0; 5]; data.len()];
     // cells in index order, so an element's sums run in the same order in every run (the k-buffer is a hash map)
     let mut order: Vec<usize> = buf.keys().copied().collect();
@@ -942,26 +994,19 @@ fn elem_data(v: &RangeImage, rendered: &[Vec<(usize, Layer)>], elems: &[Element]
         let base = cell_ll(echoes, refl, &[], cv.ground, 0.0, 0.0, em, &cv.bg.base());
         el.cells.push(CellData { bg: cv.bg, echoes: echoes.to_vec(), refl, layers, ground: cv.ground, wt: cv.wt, base, outcome });
     }
-    // class evidence argues for wood or leaf: its group's, shared by echoes; its cost is the element's class's
-    let key = |el: &ElemData| (group[el.elem], elems[el.elem].class == Class::Leaf);
-    let mut pooled: HashMap<(u32, bool), [f64; 5]> = HashMap::new();
-    for (el, ph) in data.iter().zip(&photo) {
-        let g = pooled.entry(key(el)).or_insert([0.0; 5]);
-        g.iter_mut().zip(ph).for_each(|(a, x)| *a += x);
-    }
+    // class evidence argues for wood or leaf: the term's, its cost by its (first member's) class
     for (el, ph) in data.iter_mut().zip(&photo) {
-        let g = &pooled[&key(el)];
-        let llr = if ph[0] > 0.0 { em.class_llr(g) * (ph[0] / g[0]) } else { 0.0 };
-        el.class_cost = match elems[el.elem].class { Class::Wood => -llr, Class::Leaf => llr };
+        let llr = if ph[0] > 0.0 { em.class_llr(ph) } else { 0.0 };
+        el.class_cost = match elems[el.members[0]].class { Class::Wood => -llr, Class::Leaf => llr };
     }
     data
 }
 
 /// The scan alignment error held at its mode (research 130 offset-field-design.md §3, step 3a): the nodes' mode ẑ
 /// and covariance Σ₀ = Λ₀⁻¹ at the last refit, `m` = Σ₀ G₀ (the step Newton would still take, G₀ the cost's slope in
-/// the nodes there) and `gm` = G₀ᵀ Σ₀ G₀, and the terms the refit was taken with (`reference`, by element id).
+/// the nodes there) and `gm` = G₀ᵀ Σ₀ G₀, and the terms the refit was taken with (`reference`, by [`Owner`]).
 ///
-/// With its own nodes eliminated, each element meets the nodes through its alignment shift alone: slope γ and
+/// With its own nodes eliminated, each term (an element's or a group's) meets the nodes through its alignment shift alone: slope γ and
 /// curvature h along its weights r. For the elements now in the scan, `Λ = I + Σ h r rᵀ` and `G = ẑ + Σ γ r`, and the
 /// scan's alignment part is the Laplace marginal of that quadratic about ẑ, `½ ẑᵀẑ + ½ ln|Λ| − ½ Gᵀ Λ⁻¹ G`. Only the
 /// elements whose terms differ from the reference enter, as a rank-k correction to Λ₀ (Woodbury; a node new since the
@@ -974,7 +1019,7 @@ struct Held {
     m: Vec<f64>,
     gm: f64,
     logdet: f64,
-    reference: Vec<Option<Term>>,
+    reference: BTreeMap<Owner, Term>,
 }
 
 impl Held {
@@ -1078,31 +1123,34 @@ fn solve_alignment(data: &[ElemData], em: &Settings) -> (Held, Vec<Term>) {
     };
     let m: Vec<f64> = (&cov * &grad).iter().copied().collect();
     let gm = grad.iter().zip(&m).map(|(a, b)| a * b).sum();
-    (Held { index, z, cov, m, gm, logdet, reference: Vec::new() }, terms)
+    (Held { index, z, cov, m, gm, logdet, reference: BTreeMap::new() }, terms)
 }
 
-/// One scan's fit: per element id its surface class and term (none where the scan doesn't see it), the held
-/// alignment, and the scan's cost.
+/// One scan's fit: per element id its surface class, per [`Owner`] its term (none where the scan doesn't see it), the
+/// held alignment, and the scan's cost.
 struct Fit {
     cls: Vec<u8>,
-    terms: Vec<Option<Term>>,
+    terms: BTreeMap<Owner, Term>,
     held: Held,
     cost: f64,
 }
 
+/// A move's changes to a scan's fit: the terms by owner (none: it left the scan) and the elements' surface classes.
+type Changes = (Vec<(Owner, Option<Term>)>, Vec<(u32, u8)>);
+
 impl Fit {
-    /// The scan's cost with the terms `over` (by id; none: the element left) in place of its own: every term's cost
-    /// plus the held alignment's part ([`Held::part`]), its columns the terms that differ from the reference.
-    fn total(&self, over: &HashMap<u32, Option<Term>>) -> f64 {
-        let n = self.terms.len().max(self.held.reference.len()).max(over.keys().max().map_or(0, |&i| i as usize + 1));
+    /// The scan's cost with the terms `over` (none: the term left) in place of its own: every term's cost plus the
+    /// held alignment's part ([`Held::part`]), its columns the terms that differ from the reference, in owner order.
+    fn total(&self, over: &HashMap<Owner, Option<Term>>) -> f64 {
+        let owners: BTreeSet<Owner> = self.terms.keys().chain(self.held.reference.keys()).chain(over.keys()).copied().collect();
         let mut cost = 0.0;
         let mut cols: Vec<(&[([i64; 3], f64)], f64, f64)> = Vec::new();
-        for i in 0..n {
-            let now = match over.get(&(i as u32)) {
+        for o in owners {
+            let now = match over.get(&o) {
                 Some(t) => t.as_ref(),
-                None => self.terms.get(i).and_then(|t| t.as_ref()),
+                None => self.terms.get(&o),
             };
-            let was = self.held.reference.get(i).and_then(|t| t.as_ref());
+            let was = self.held.reference.get(&o);
             if let Some(t) = now {
                 cost += t.cost();
             }
@@ -1215,6 +1263,72 @@ fn segment(e: &Element) -> (Point, Point) {
     }
 }
 
+/// The coupling along a chain (research 130 slice 6; design-pass-3.md's product 6): a declared term over the chain's
+/// geometry alone, reported beside its cost, never in it, its values a consumer's to override. ln r follows a drift
+/// (`drift` per m along the chain: the taper, research 128's −0.15) and a stationary departure about it (an
+/// Ornstein–Uhlenbeck process, sd `form_sd` and range `form_range` m: 128's stem form departures, 0.2 over about 1 m)
+/// anchored on the first stick; the axis's direction walks with `bend_sd` rad per √m (the curvature; declared, not
+/// measured).
+#[derive(Debug, Clone, Copy)]
+pub struct Coupling {
+    pub drift: f64,
+    pub form_sd: f64,
+    pub form_range: f64,
+    pub bend_sd: f64,
+}
+
+impl Default for Coupling {
+    fn default() -> Self {
+        Coupling { drift: -0.15, form_sd: 0.2, form_range: 1.0, bend_sd: 0.5 }
+    }
+}
+
+/// A chain's coupling ([`Coupling`]): its `length` (m, its sticks' summed), the widest `gap` between one stick's end
+/// and the next's start (m), and the coupling's cost in its radii (`radius`) and directions (`bend`), nats: per joint,
+/// −log of the next stick's ln r given its predecessors' and of the turn between their axes, over `s` the distance
+/// between their middles.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct CouplingRow {
+    pub length: f64,
+    pub gap: f64,
+    pub radius: f64,
+    pub bend: f64,
+}
+
+/// The coupling of sticks joined end to end in order ([`Coupling`]): pure geometry, the same whatever the scans say.
+pub fn coupling(sticks: &[Element], c: &Coupling) -> CouplingRow {
+    let mut row = CouplingRow::default();
+    let (mut along, mut x0, mut x_prev) = (0.0, 0.0, 0.0);
+    for (k, e) in sticks.iter().enumerate() {
+        let (a, b) = segment(e);
+        let len = norm(&sub(&b, &a));
+        row.length += len;
+        let x = |s: f64| e.r.ln() - c.drift * s;
+        if k == 0 {
+            (along, x0, x_prev) = (0.5 * len, x(0.5 * len), x(0.5 * len));
+            continue;
+        }
+        let (pa, pb) = segment(&sticks[k - 1]);
+        let plen = norm(&sub(&pb, &pa));
+        row.gap = row.gap.max(norm(&sub(&a, &pb)));
+        let s = 0.5 * (plen + len);
+        along += s;
+        // ln r's departure from the drift, an OU step from the last one, its mean the first's
+        let rho = (-s / c.form_range).exp();
+        let var = c.form_sd * c.form_sd * (1.0 - rho * rho);
+        let xk = x(along);
+        let e_r = (xk - x0) - rho * (x_prev - x0);
+        row.radius += 0.5 * e_r * e_r / var + 0.5 * (2.0 * std::f64::consts::PI * var).ln();
+        x_prev = xk;
+        // the turn between the axes, a 2-D Gaussian of variance bend_sd² s per component
+        let (u, w) = (normalize(&sub(&pb, &pa)), normalize(&sub(&b, &a)));
+        let turn = dot(&u, &w).clamp(-1.0, 1.0).acos();
+        let vb = c.bend_sd * c.bend_sd * s;
+        row.bend += 0.5 * turn * turn / vb + (2.0 * std::f64::consts::PI * vb).ln();
+    }
+    row
+}
+
 /// An element's parameters in [`Scene::information`]: their steps (0.05 in ln r, 2 mm in place, and that over a
 /// stick's half-length in tilt).
 fn steps(e: &Element) -> Vec<f64> {
@@ -1260,16 +1374,23 @@ struct Shared {
 }
 
 impl Shared {
+    /// For `elems`, a group's members sharing one term's nodes ([`Owner`]: hats at their middles' mean, one front
+    /// shift and one reflectance level), as the cost has them when the group is these elements.
     fn new(n: usize, elems: &[Element]) -> Shared {
         let mut nodes: HashMap<[i64; 3], usize> = HashMap::new();
-        let hs: Vec<Vec<([i64; 3], f64)>> = elems.iter().map(|e| hats(&e.mid(), ALIGN_SPACING)).collect();
+        let slot = slots(&elems.iter().enumerate().map(|(k, e)| owner(k as u32, e)).collect::<Vec<_>>());
+        let terms = slot.iter().max().map_or(0, |m| m + 1);
+        let hs: Vec<Vec<([i64; 3], f64)>> = (0..terms).map(|t| {
+            let es: Vec<&Element> = elems.iter().zip(&slot).filter(|(_, &u)| u == t).map(|(e, _)| e).collect();
+            hats(&middle(&es), ALIGN_SPACING)
+        }).collect();
         for (k, _) in hs.iter().flatten() {
             let i = nodes.len();
             nodes.entry(*k).or_insert(i);
         }
         let first = nodes.len();
-        let elems: Vec<_> = hs.into_iter().enumerate().map(|(k, h)| (h, first + 2 * k)).collect();
-        let size = n + first + 2 * elems.len();
+        let elems: Vec<_> = slot.iter().map(|&t| (hs[t].clone(), first + 2 * t)).collect();
+        let size = n + first + 2 * terms;
         Shared { n, nodes, elems, m: nalgebra::DMatrix::zeros(size, size), j: nalgebra::DMatrix::zeros(size, size) }
     }
 
@@ -1458,19 +1579,30 @@ impl Scene {
 
     /// Each scan's alignment part ([`Held::part`]): its cost less its elements' terms.
     pub fn alignment_parts(&self) -> Vec<f64> {
-        self.fits.iter().map(|fit| fit.cost - fit.terms.iter().flatten().map(Term::cost).sum::<f64>()).collect()
+        self.fits.iter().map(|fit| fit.cost - fit.terms.values().map(Term::cost).sum::<f64>()).collect()
     }
 
-    /// A row per (element, scan), by element id: its term (the scan's alignment part is [`Scene::alignment_parts`]).
+    /// A row per (term, scan), by element id: an element's term, or a group's under its first member's id (the scan's
+    /// alignment part is [`Scene::alignment_parts`]).
     pub fn rows(&self) -> Vec<ElementScan> {
+        let mut first: HashMap<u32, u32> = HashMap::new();
+        for (i, e) in self.elems.iter().enumerate().rev() {
+            if let Some(g) = e.and_then(|e| e.group) {
+                first.insert(g, i as u32);
+            }
+        }
         let mut rows = Vec::new();
         for (s, fit) in self.fits.iter().enumerate() {
-            for (i, t) in fit.terms.iter().enumerate().filter_map(|(i, t)| t.as_ref().map(|t| (i, t))) {
+            for (o, t) in &fit.terms {
+                let (i, group) = match *o {
+                    Owner::Alone(i) => (i, None),
+                    Owner::Group(g) => (first[&g], Some(g)),
+                };
                 // the shift's posterior from the held alignment, and the own nodes' with it marginalised
                 let var = fit.held.between(&t.align, &t.align);
                 let own_sd = |j: usize| t.own_sd[j] * (t.own_cov[j][j] + t.own_link[j] * t.own_link[j] * var).max(0.0).sqrt();
                 rows.push(ElementScan {
-                    elem: i as u32, scan: s as u32, cells: t.cells, cells_on: t.cells_on, arc: t.arc, footprints_across: t.across, surface: t.surface,
+                    elem: i, group, scan: s as u32, cells: t.cells, cells_on: t.cells_on, arc: t.arc, footprints_across: t.across, surface: t.surface,
                     cost: t.cost(), ray_on: t.ray[0], ray_empty: t.ray[1], ray_in_front: t.ray[2], ray_behind: t.ray[3], class: t.class,
                     alignment: t.fit - t.ray.iter().sum::<f64>() + t.logdet, discount: self.em.discount,
                     align_shift: fit.held.shift(&t.align), align_sd: var.max(0.0).sqrt(), front_shift: t.own_sd[0] * t.own[0], front_shift_sd: own_sd(0),
@@ -1487,8 +1619,8 @@ impl Scene {
         let id = self.elems.len() as u32;
         let em = self.em;
         let layers: Vec<Vec<(usize, Layer)>> = self.views.par_iter().map(|v| render(v, &e, id, &em)).collect();
-        let changes: Vec<Vec<(u32, Option<Term>, u8)>> = (0..self.views.len()).into_par_iter()
-            .map(|s| if layers[s].is_empty() { Vec::new() } else { self.reterm(s, &[], &[(e, layers[s].clone())], id) }).collect();
+        let changes: Vec<Changes> = (0..self.views.len()).into_par_iter()
+            .map(|s| if layers[s].is_empty() { Changes::default() } else { self.reterm(s, &[], &[(e, layers[s].clone())], id) }).collect();
         self.elems.push(Some(e));
         self.claim(&e, true);
         let mut d = 0.0;
@@ -1503,8 +1635,8 @@ impl Scene {
     /// Remove a live element ([`Scene::check_id`]): the cost change.
     pub fn remove(&mut self, id: u32) -> f64 {
         let first = self.elems.len() as u32;
-        let changes: Vec<Vec<(u32, Option<Term>, u8)>> = (0..self.views.len()).into_par_iter()
-            .map(|s| if self.rendered[s][id as usize].is_empty() { Vec::new() } else { self.reterm(s, &[id], &[], first) }).collect();
+        let changes: Vec<Changes> = (0..self.views.len()).into_par_iter()
+            .map(|s| if self.rendered[s][id as usize].is_empty() { Changes::default() } else { self.reterm(s, &[id], &[], first) }).collect();
         if let Some(e) = self.elems[id as usize].take() {
             self.claim(&e, false);
         }
@@ -1521,8 +1653,8 @@ impl Scene {
     pub fn change(&mut self, id: u32, e: Element) -> f64 {
         let em = self.em;
         let layers: Vec<Vec<(usize, Layer)>> = self.views.par_iter().map(|v| render(v, &e, id, &em)).collect();
-        let changes: Vec<Vec<(u32, Option<Term>, u8)>> = (0..self.views.len()).into_par_iter().map(|s| {
-            if layers[s].is_empty() && self.rendered[s][id as usize].is_empty() { Vec::new() } else { self.reterm(s, &[id], &[(e, layers[s].clone())], id) }
+        let changes: Vec<Changes> = (0..self.views.len()).into_par_iter().map(|s| {
+            if layers[s].is_empty() && self.rendered[s][id as usize].is_empty() { Changes::default() } else { self.reterm(s, &[id], &[(e, layers[s].clone())], id) }
         }).collect();
         if let Some(old) = self.elems[id as usize].replace(e) {
             self.claim(&old, false);
@@ -1539,18 +1671,23 @@ impl Scene {
     }
 
     /// Put a move's new terms and classes into scan `s`'s fit: the cost change.
-    fn apply(&mut self, s: usize, changes: Vec<(u32, Option<Term>, u8)>) -> f64 {
-        if changes.is_empty() {
+    fn apply(&mut self, s: usize, (terms, cls): Changes) -> f64 {
+        if terms.is_empty() && cls.is_empty() {
             return 0.0;
         }
         let fit = &mut self.fits[s];
-        for (id, t, k) in changes {
+        for (id, k) in cls {
             let i = id as usize;
-            if fit.terms.len() <= i {
-                fit.terms.resize(i + 1, None);
+            if fit.cls.len() <= i {
                 fit.cls.resize(i + 1, 1);
             }
-            (fit.terms[i], fit.cls[i]) = (t, k);
+            fit.cls[i] = k;
+        }
+        for (o, t) in terms {
+            match t {
+                Some(t) => fit.terms.insert(o, t),
+                None => fit.terms.remove(&o),
+            };
         }
         let before = fit.cost;
         fit.cost = fit.total(&HashMap::new());
@@ -1564,14 +1701,13 @@ impl Scene {
         let elems: Vec<Element> = ids.iter().map(|&i| self.elems[i as usize].unwrap()).collect();
         let rendered: Vec<Vec<(usize, Layer)>> = ids.iter().enumerate()
             .map(|(k, &i)| self.rendered[s][i as usize].iter().map(|&(c, l)| (c, Layer { elem: k as u32, ..l })).collect()).collect();
-        let cls = classes(v, &kbuffer(&rendered), &elems, &self.em, &self.sc, v.epoch != self.ref_epoch);
-        let data = elem_data(v, &rendered, &elems, &cls, &ids, &(0..ids.len()).collect::<Vec<_>>(), self.ref_epoch, &self.em, &self.sc, &self.ext);
+        let owners: Vec<Owner> = ids.iter().zip(&elems).map(|(&i, e)| owner(i, e)).collect();
+        let slot = slots(&owners);
+        let cls = classes(v, &kbuffer(&rendered), &elems, &slot, &self.em, &self.sc, v.epoch != self.ref_epoch);
+        let data = elem_data(v, &rendered, &elems, &cls, &slot, &(0..ids.len()).collect::<Vec<_>>(), self.ref_epoch, &self.em, &self.sc, &self.ext);
         let (mut held, terms) = solve_alignment(&data, &self.em);
-        let n = self.elems.len();
-        let (mut fit_terms, mut fit_cls) = (vec![None; n], vec![1u8; n]);
-        for (el, t) in data.iter().zip(terms) {
-            fit_terms[ids[el.elem] as usize] = Some(t);
-        }
+        let mut fit_cls = vec![1u8; self.elems.len()];
+        let fit_terms: BTreeMap<Owner, Term> = data.iter().zip(terms).map(|(el, t)| (owners[el.members[0]], t)).collect();
         for (k, &i) in ids.iter().enumerate() {
             fit_cls[i as usize] = cls[k];
         }
@@ -1582,12 +1718,14 @@ impl Scene {
     }
 
     /// Scan `s` with the live elements `without` taken out and the elements `with` (each with its layers in
-    /// the scan) put in as ids `first`, `first + 1`, …: the new term and surface class of every element whose term
-    /// changes, by id (none: it left the scan), the alignment held. An element's term reads only the cells it is the
-    /// front of, each with its layers and their elements' classes, and a class reads the cells its element is the
+    /// the scan) put in as ids `first`, `first + 1`, …: the new term of every owner whose term changes (none: it left
+    /// the scan) and its elements' surface classes, the alignment held. An element's term reads only the cells it is
+    /// the front of, each with its layers and their elements' classes, and a class reads the cells its element is the
     /// front of. So the terms that change are those of the fronts of the cells the move touches (before it and after),
-    /// and of the fronts of the cells of an element whose class changed.
-    fn reterm(&self, s: usize, without: &[u32], with: &[(Element, Vec<(usize, Layer)>)], first: u32) -> Vec<(u32, Option<Term>, u8)> {
+    /// and of the fronts of the cells of an element whose class changed; and a group's term is its members' together,
+    /// so every present member of a group one of those (or an element taken out) belongs to is rescored with it, and
+    /// its pooled evidence never goes stale.
+    fn reterm(&self, s: usize, without: &[u32], with: &[(Element, Vec<(usize, Layer)>)], first: u32) -> Changes {
         let (v, em, fit, index) = (&*self.views[s], &self.em, &self.fits[s], &self.cells[s]);
         let added = |i: u32| i >= first && ((i - first) as usize) < with.len();
         let layers = |i: u32| -> &[(usize, Layer)] { if added(i) { &with[(i - first) as usize].1 } else { &self.rendered[s][i as usize] } };
@@ -1626,6 +1764,18 @@ impl Scene {
         };
         let stored = |i: u32| fit.cls.get(i as usize).copied().unwrap_or(1);
         let other = v.epoch != self.ref_epoch;
+        let owner_of = |i: u32| owner(i, &element(i));
+        // every present member of the groups of `ids` and of the elements taken out
+        let whole = |ids: &mut BTreeSet<u32>| {
+            let groups: BTreeSet<u32> = ids.iter().map(|&i| element(i)).chain(without.iter().map(|&i| self.elems[i as usize].unwrap())).filter_map(|e| e.group).collect();
+            if groups.is_empty() {
+                return;
+            }
+            let member = |e: &Element| e.group.is_some_and(|g| groups.contains(&g));
+            ids.extend((0..self.elems.len() as u32).filter(|&i| self.elems[i as usize].as_ref().is_some_and(member)));
+            ids.extend((0..with.len() as u32).filter(|&k| member(&with[k as usize].0)).map(|k| first + k));
+            ids.retain(|&i| present(i));
+        };
         // the fronts of the cells the move touches, and the elements it adds
         let touched: HashSet<usize> = without.iter().flat_map(|&w| self.rendered[s][w as usize].iter()).filter(|(_, l)| l.fronts()).map(|(c, _)| *c)
             .chain(fresh.keys().copied()).collect();
@@ -1635,8 +1785,9 @@ impl Scene {
             near.extend(after(c).first());
         }
         near.retain(|&i| present(i));
+        whole(&mut near);
         let (ids, el, r) = local(&near);
-        let cls_near = classes(v, &kbuffer(&r), &el, em, &self.sc, other);
+        let cls_near = classes(v, &kbuffer(&r), &el, &slots(&ids.iter().map(|&i| owner_of(i)).collect::<Vec<_>>()), em, &self.sc, other);
         let cls: HashMap<u32, u8> = ids.iter().zip(&cls_near).filter(|(i, _)| near.contains(i)).map(|(&i, &k)| (i, k)).collect();
         // and the fronts of the cells of an element whose class changed
         let mut score = near.clone();
@@ -1648,14 +1799,26 @@ impl Scene {
             }
         }
         score.retain(|&i| present(i));
+        whole(&mut score);
         let (ids, el, r) = local(&score);
         let cls: Vec<u8> = ids.iter().map(|&i| cls.get(&i).copied().unwrap_or_else(|| stored(i))).collect();
-        // the scene's elements each alone, the elements put in one group
-        let group: Vec<u32> = ids.iter().map(|&i| if added(i) { first } else { i }).collect();
-        let data = elem_data(v, &r, &el, &cls, &group, &(0..score.len()).collect::<Vec<_>>(), self.ref_epoch, em, &self.sc, &self.ext);
-        let mut out: Vec<(u32, Option<Term>, u8)> = data.par_iter().map(|d| (ids[d.elem], Some(d.term(fit.held.shift(&d.align), em)), cls[d.elem])).collect();
-        out.extend(without.iter().copied().chain((0..with.len() as u32).map(|k| first + k)).filter(|&i| !present(i)).map(|i| (i, None, 1)));
-        out
+        let owners: Vec<Owner> = ids.iter().map(|&i| owner_of(i)).collect();
+        let data = elem_data(v, &r, &el, &cls, &slots(&owners), &(0..score.len()).collect::<Vec<_>>(), self.ref_epoch, em, &self.sc, &self.ext);
+        let mut terms: Vec<(Owner, Option<Term>)> = data.par_iter().map(|d| (owners[d.members[0]], Some(d.term(fit.held.shift(&d.align), em)))).collect();
+        let mut out_cls: Vec<(u32, u8)> = (0..score.len()).map(|k| (ids[k], cls[k])).collect();
+        // the owners of the elements taken out or unseen now, unless a member is still scored
+        let kept: HashSet<Owner> = terms.iter().map(|t| t.0).collect();
+        let mut left: BTreeSet<Owner> = without.iter().map(|&i| owner(i, &self.elems[i as usize].unwrap())).collect();
+        for i in without.iter().copied().chain((0..with.len() as u32).map(|k| first + k)) {
+            if added(i) {
+                left.insert(owner_of(i));
+            }
+            if !present(i) {
+                out_cls.push((i, 1));
+            }
+        }
+        terms.extend(left.into_iter().filter(|o| !kept.contains(o)).map(|o| (o, None)));
+        (terms, out_cls)
     }
 
     /// What some elements predict in image `s` ([`Scene::check_scan`]) against the scene, per cell one of them fronts
@@ -1672,6 +1835,8 @@ impl Scene {
         let mut per: Vec<Vec<(usize, Layer)>> = es.iter().enumerate().map(|(k, e)| render(v, e, k as u32, em)).collect();
         let cells: HashSet<usize> = per.iter().flatten().map(|&(c, _)| c).collect();
         let mut els = es.to_vec();
+        let n = self.elems.len() as u32;
+        let mut owners: Vec<Owner> = es.iter().enumerate().map(|(k, e)| owner(n + k as u32, e)).collect();
         for (i, el) in self.elems.iter().enumerate() {
             let Some(el) = el.as_ref().filter(|_| !without.contains(&(i as u32))) else { continue };
             let k = per.len() as u32;
@@ -1679,11 +1844,12 @@ impl Scene {
             if !l.is_empty() {
                 els.push(*el);
                 per.push(l);
+                owners.push(owner(i as u32, el));
             }
         }
         let buf = kbuffer(&per);
         let other = v.epoch != self.ref_epoch;
-        let cls = classes(v, &buf, &els, em, &self.sc, other);
+        let cls = classes(v, &buf, &els, &slots(&owners), em, &self.sc, other);
         let mut out: Vec<CellPrediction> = buf.iter().filter(|(&cell, ls)| (ls[0].elem as usize) < es.len() && v.cell[cell] != Cell::NoPulse).map(|(&cell, ls)| {
             let ly = ls[0];
             let k = ly.elem as usize;
@@ -1757,7 +1923,8 @@ impl Scene {
     /// stem front shift and reflectance level, and the alignment's nodes, which neighbours share. So the alignment,
     /// which moves neighbours' depths together, cancels in their depth difference, where each element's own
     /// information charges it in full. Far apart (no node or cell in common) the information is the elements' own,
-    /// side by side.
+    /// side by side. Members of one group (a chain) share one term's nodes ([`Owner`]), as their cost does when `ids`
+    /// are the whole group; a chain's knots are a Jacobian away from its sticks' parameters (research 130 slice 6).
     ///
     /// **What it means under the evidence discount** (research 130 step 3b). Each cell's log-likelihood counts
     /// `w_c = 1 / (φ m)`, so the cost is a quasi-likelihood and E is its curvature: an sd read from E⁻¹ is honest only
@@ -1911,8 +2078,9 @@ impl Scene {
     }
 
     /// Each hypothesis's cost to add alone (one or more elements), per scan: (hypotheses × scans), in parallel, the
-    /// scene unchanged, its foliage field and alignment held. Equal to adding it then removing it, except that a
-    /// hypothesis's elements are one group for class evidence ([`elem_data`]), as a scene's elements are not.
+    /// scene unchanged, its foliage field and alignment held. Equal to adding it then removing it. A hypothesis's
+    /// elements of one group are one term ([`Owner`]: a chain), joined by the scene's members of that group, which are
+    /// rescored with it; its other elements are each alone.
     pub fn costs_to_add(&self, hyps: &[Vec<Element>]) -> Vec<Vec<f64>> {
         self.costs_replacing(&hyps.iter().map(|h| (h.clone(), Vec::new())).collect::<Vec<_>>())
     }
@@ -1932,31 +2100,40 @@ impl Scene {
             if with.iter().all(|w| w.1.is_empty()) && without.iter().all(|&w| self.rendered[s][w as usize].is_empty()) {
                 return 0.0;
             }
-            let over: HashMap<u32, Option<Term>> = self.reterm(s, without, &with, first).into_iter().map(|(i, t, _)| (i, t)).collect();
+            let over: HashMap<Owner, Option<Term>> = self.reterm(s, without, &with, first).0.into_iter().collect();
             self.fits[s].total(&over) - self.fits[s].cost
         }).collect()).collect()
     }
 
     /// Which hypotheses interact in each scan, so that their costs scored together differ from the sum of their costs
     /// alone: (i, j, scan, `cells`, `nodes`) for i < j, `cells` when they front a cell in common or cells whose front is
-    /// one scene element, `nodes` when they share an alignment node. With the alignment held, a
-    /// shared node only couples them through its rank-k correction (small); shared cells are evidence they share.
+    /// one scene term ([`Owner`]: an element, or any member of a group), or join one group, `nodes` when they share an
+    /// alignment node. With the alignment held, a shared node only couples them through its rank-k correction
+    /// (small); shared cells are evidence they share. A hypothesis is one move, so its own elements (a chain's joints)
+    /// never interact with each other.
     pub fn interactions(&self, hyps: &[Vec<Element>]) -> Vec<(u32, u32, u32, bool, bool)> {
         let mut out: BTreeMap<(u32, u32, u32), (bool, bool)> = BTreeMap::new();
         for (s, v) in self.views.iter().enumerate() {
-            // per key (a cell, an owning element or a node), the hypotheses that have it
+            // per key (a cell, or a term its hypotheses front or join), the hypotheses that have it
             let mut cells: HashMap<(bool, u64), BTreeSet<u32>> = HashMap::new();
             let mut nodes: HashMap<[i64; 3], BTreeSet<u32>> = HashMap::new();
+            let term = |o: Owner| match o {
+                Owner::Alone(i) => i as u64,
+                Owner::Group(g) => 1 << 32 | g as u64,
+            };
             let rendered: Vec<Vec<Vec<(usize, Layer)>>> = hyps.par_iter().map(|h| h.iter().map(|e| render(v, e, 0, &self.em)).collect()).collect();
             for (k, (h, ls)) in hyps.iter().zip(&rendered).enumerate() {
                 for (e, l) in h.iter().zip(ls).filter(|(_, l)| !l.is_empty()) {
                     for (key, _) in hats(&e.mid(), ALIGN_SPACING) {
                         nodes.entry(key).or_default().insert(k as u32);
                     }
+                    if let Some(g) = e.group {
+                        cells.entry((true, term(Owner::Group(g)))).or_default().insert(k as u32);
+                    }
                     for (c, _) in l.iter().filter(|(_, l)| l.fronts()) {
                         cells.entry((false, *c as u64)).or_default().insert(k as u32);
                         if let Some(&(o, _, _)) = self.cells[s].get(c).and_then(|e| e.iter().min_by(|a, b| a.1.total_cmp(&b.1))) {
-                            cells.entry((true, o as u64)).or_default().insert(k as u32);
+                            cells.entry((true, term(owner(o, &self.elems[o as usize].unwrap())))).or_default().insert(k as u32);
                         }
                     }
                 }
@@ -2072,7 +2249,7 @@ mod tests {
     }
 
     fn stick(x: f64, y: f64, r: f64) -> Element {
-        Element { form: Form::Stick { a: [x, y, -0.2], b: [x, y, 0.2] }, class: Class::Wood, r, opacity: 1.0, mismatch: 0.002 }
+        Element { form: Form::Stick { a: [x, y, -0.2], b: [x, y, 0.2] }, class: Class::Wood, r, opacity: 1.0, mismatch: 0.002, group: None }
     }
 
     /// The true pole has negative cost; a stick of the wrong radius, shifted, or porous has more; a stick where
@@ -2120,7 +2297,7 @@ mod tests {
     fn a_stick_just_before_a_wall_merges_its_edges() {
         let (em, sc) = (Settings::default(), Background::default());
         let v = Arc::new(pole_scan(0.02, 4.0, 0.5));
-        let wall = Element { form: Form::Patch { centre: [0.0, 6.5, 0.0] }, class: Class::Leaf, r: 2.0, opacity: 1.0, mismatch: 0.002 };
+        let wall = Element { form: Form::Patch { centre: [0.0, 6.5, 0.0] }, class: Class::Leaf, r: 2.0, opacity: 1.0, mismatch: 0.002, group: None };
         let e = |r: f64| cost(&v, &[wall, stick(0.0, 4.0, r)], &em, &sc).0;
         let truth = e(0.02);
         for r in [0.014, 0.028] {
@@ -2373,7 +2550,7 @@ mod tests {
         let (gh_x, gh_w) = ([-2.0201828704560856, -0.9585724646138185, 0.0, 0.9585724646138185, 2.0201828704560856],
                             [0.019953242059045913, 0.39361932315224116, 0.9453087204829419, 0.39361932315224116, 0.019953242059045913]);
         let buf = kbuffer(&rendered);
-        let cls = classes(&v, &buf, &[el], &em, &sc, false);
+        let cls = classes(&v, &buf, &[el], &[0], &em, &sc, false);
         let s_along = em.align_sd(cls[0], false).hypot(em.front_shift_sd(el.r));
         let ed = |shift: f64, level: f64| -> f64 {
             buf.iter().map(|(&cell, ls)| {
@@ -2402,7 +2579,7 @@ mod tests {
     fn patches_render_as_discs_and_predict_codes_cells() {
         let v = pole_view();
         let (em, sc) = (Settings::default(), Background::default());
-        let patch = |x: f64| Element { form: Form::Patch { centre: [x, 4.0, 0.0] }, class: Class::Leaf, r: 0.03, opacity: 1.0, mismatch: 0.0 };
+        let patch = |x: f64| Element { form: Form::Patch { centre: [x, 4.0, 0.0] }, class: Class::Leaf, r: 0.03, opacity: 1.0, mismatch: 0.0, group: None };
         let layers = render(&v, &patch(0.0), 0, &em);
         let f_max = layers.iter().map(|(_, l)| l.f).fold(0.0, f64::max);
         assert!(f_max > 0.99, "{f_max}");
@@ -2446,12 +2623,12 @@ mod tests {
             assert_eq!(a, b);
         }
         assert!(w.class != 0.0 && w.class == -l.class, "{} {}", w.class, l.class);
-        let patch = Element { form: Form::Patch { centre: [0.0, 4.0, 0.0] }, class: Class::Leaf, r: 0.03, opacity: 1.0, mismatch: 0.002 };
+        let patch = Element { form: Form::Patch { centre: [0.0, 4.0, 0.0] }, class: Class::Leaf, r: 0.03, opacity: 1.0, mismatch: 0.002, group: None };
         assert_eq!(rows(patch).front_shift_sd, 0.0);
     }
 
     /// Class evidence reaches thin wood (slice 5b): a stick a third of a footprint across, every cell of it under half
-    /// filled, gets class evidence; short pieces of it, each under the echo gate alone, clear it as one hypothesis.
+    /// filled, gets class evidence; short pieces of it, each under the echo gate alone, clear it as one group.
     #[test]
     fn a_thin_stick_gets_class_evidence_and_a_group_pools() {
         let v = thin_pole_view(0.0015, 6.0);
@@ -2467,8 +2644,9 @@ mod tests {
         };
         let alone = class(&pieces.iter().map(|p| vec![*p]).collect::<Vec<_>>());
         assert!(alone.iter().all(|&c| c == 0.0), "{alone:?}");
-        let together = class(&[pieces.clone()])[0];
-        assert!(together != 0.0);
+        assert_eq!(class(&[pieces.clone()])[0], 0.0);
+        let chain: Vec<Element> = pieces.iter().map(|p| Element { group: Some(7), ..*p }).collect();
+        assert!(class(&[chain])[0] != 0.0);
     }
 
     /// The reference epoch is declared, not the first scan's: a scene of the same scans in either order costs the
@@ -2609,5 +2787,100 @@ mod tests {
         }
         let row = truth.1[0];
         assert!((row.refl_level - 3.0).abs() < 3.0 * row.refl_level_sd.max(0.3), "{row:?}");
+    }
+
+    /// A piece of the test pole, from height `lo` to `hi`, in group `g`.
+    fn piece_of(lo: f64, hi: f64, g: Option<u32>) -> Element {
+        Element { form: Form::Stick { a: [0.0, 4.0, lo], b: [0.0, 4.0, hi] }, group: g, ..stick(0.0, 4.0, 0.03) }
+    }
+
+    /// A group is one term per scan (slice 6): a group of one costs what the element alone does; a pole cut in two
+    /// pieces and grouped reads their cells together under one set of nuisances (one row, one stem front shift and
+    /// reflectance level, its prior and log-determinant paid once), where the pieces alone pay theirs twice.
+    #[test]
+    fn a_groups_members_share_their_nuisances() {
+        let v = pole_view();
+        let (em, sc) = (Settings::default(), Background::default());
+        let one = piece_of(-0.2, 0.2, None);
+        assert_eq!(cost(&v, &[one], &em, &sc).0, cost(&v, &[Element { group: Some(3), ..one }], &em, &sc).0);
+        let (alone, grouped) = ([piece_of(-0.2, 0.0, None), piece_of(0.0, 0.2, None)], [piece_of(-0.2, 0.0, Some(3)), piece_of(0.0, 0.2, Some(3))]);
+        let (a, g) = (cost(&v, &alone, &em, &sc).1, cost(&v, &grouped, &em, &sc).1);
+        assert_eq!((a.len(), g.len()), (2, 1));
+        assert_eq!((g[0].elem, g[0].group, g[0].cells), (0, Some(3), a[0].cells + a[1].cells));
+        assert!(g[0].refl_level_sd < a[0].refl_level_sd.min(a[1].refl_level_sd), "{:?} {:?}", g[0], a);
+        // the own nodes' prior and log-determinant: once for the group, once a piece alone
+        assert!(g[0].alignment < a[0].alignment + a[1].alignment, "{} vs {}", g[0].alignment, a[0].alignment + a[1].alignment);
+    }
+
+    /// A move that touches one member rescores its whole group, so its pooled terms never go stale: pieces of the
+    /// pole 10 cm apart (no cell in common), added one by one, reach the same cost as the group built at once, with
+    /// class evidence pooled; removing a member restores the cost exactly, and `costs_to_add` of a member joining a
+    /// group equals adding it.
+    #[test]
+    fn a_touched_member_rescores_its_group() {
+        let v = thin_pole_view(0.0015, 6.0);
+        let (em, sc) = (Settings { class_temper: 1.0, ..Settings::default() }, Background::default());
+        let piece = |z: f64| Element { form: Form::Stick { a: [0.0, 6.0, z - 0.02], b: [0.0, 6.0, z + 0.02] }, group: Some(1), ..stick(0.0, 6.0, 0.0015) };
+        let pieces = [piece(-0.15), piece(-0.05), piece(0.05), piece(0.15)];
+        let at_once = Scene::new(vec![v.clone()], &pieces, em, sc, None, 0);
+        let mut by_one = Scene::new(vec![v.clone()], &pieces[..1], em, sc, None, 0);
+        for p in &pieces[1..] {
+            let t: f64 = by_one.costs_to_add(&[vec![*p]])[0].iter().sum();
+            let e0 = by_one.cost();
+            assert_eq!(t, by_one.add(*p).1);
+            let (id, _) = by_one.add(Element { group: Some(1), ..*p });
+            by_one.remove(id);
+            assert_eq!(by_one.cost(), e0 + t);
+        }
+        by_one.refit_alignment();
+        assert!((by_one.cost() - at_once.cost()).abs() < 1e-9 * at_once.cost().abs().max(1.0), "{} vs {}", by_one.cost(), at_once.cost());
+        assert_eq!(by_one.rows().len(), 1);
+        assert!(at_once.rows()[0].class != 0.0);
+    }
+
+    /// A chain is one hypothesis, so its own joints (two sticks meeting, sharing cells and a node) never read as
+    /// interacting; a hypothesis fronting cells of a scene group's member, or joining that group, interacts with
+    /// another that joins it.
+    #[test]
+    fn a_chains_joints_are_not_interacting_hypotheses() {
+        let v = pole_view();
+        let c = Scene::new(vec![v.clone()], &[piece_of(-0.2, 0.0, Some(5)), stick(0.4, 6.0, 0.02)], Settings::default(), Background::default(), None, 0);
+        let chain = vec![piece_of(-0.1, 0.05, Some(9)), piece_of(0.05, 0.2, Some(9))];
+        assert!(c.interactions(&[chain.clone()]).is_empty());
+        assert!(c.interactions(&[chain, vec![stick(-0.4, 7.5, 0.02)]]).iter().all(|p| !p.3), "far apart: cells in common only through a node");
+        // one fronts the scene group's member; the other, elsewhere in the view, interacts with it only by joining
+        let beside = stick(0.15, 4.0, 0.02);
+        let pairs = |g: Option<u32>| c.interactions(&[vec![piece_of(-0.15, -0.05, None)], vec![Element { group: g, ..beside }]]);
+        assert!(pairs(Some(5)).iter().any(|p| p.3), "{:?}", pairs(Some(5)));
+        assert!(pairs(None).iter().all(|p| !p.3), "{:?}", pairs(None));
+    }
+
+    /// The coupling is pure geometry: it takes no scan, ignores class, opacity and group, and moves with the radii
+    /// only through their changes along the chain. A straight chain whose ln r follows the drift pays only its
+    /// normalisers; scaling every radius leaves it; a bend and a jump in radius cost more; a gap is reported.
+    #[test]
+    fn the_coupling_is_pure_geometry() {
+        let c = Coupling::default();
+        let stick_at = |a: Point, b: Point, r: f64| Element { form: Form::Stick { a, b }, r, ..stick(0.0, 0.0, 0.01) };
+        let straight: Vec<Element> = (0..5).map(|k| {
+            let z = 0.1 * k as f64;
+            stick_at([0.0, 0.0, z], [0.0, 0.0, z + 0.1], 0.01 * (c.drift * (z + 0.05)).exp())
+        }).collect();
+        let base = coupling(&straight, &c);
+        assert!((base.length - 0.5).abs() < 1e-12 && base.gap < 1e-12);
+        let norm_r = 4.0 * 0.5 * (2.0 * std::f64::consts::PI * c.form_sd.powi(2) * (1.0 - (-0.2 / c.form_range).exp())).ln();
+        assert!((base.radius - norm_r).abs() < 1e-9, "{} vs {norm_r}", base.radius);
+        let marked: Vec<Element> = straight.iter().map(|e| Element { class: Class::Leaf, opacity: 0.4, group: Some(2), r: 2.0 * e.r, ..*e }).collect();
+        let same = coupling(&marked, &c);
+        assert!((same.radius - base.radius).abs() < 1e-9 && same.bend == base.bend);
+        let mut bent = straight.clone();
+        bent[4] = stick_at([0.0, 0.0, 0.4], [0.03, 0.0, 0.5], straight[4].r);
+        let mut jump = straight.clone();
+        jump[2].r *= 1.5;
+        let mut gap = straight.clone();
+        gap[3] = stick_at([0.0, 0.0, 0.32], [0.0, 0.0, 0.4], straight[3].r);
+        assert!(coupling(&bent, &c).bend > base.bend + 1.0);
+        assert!(coupling(&jump, &c).radius > base.radius + 1.0);
+        assert!((coupling(&gap, &c).gap - 0.02).abs() < 1e-12);
     }
 }
