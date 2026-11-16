@@ -6,11 +6,13 @@
 //! `−log` of its likelihood ratio against the empty scene, the cost change of a move, what an element predicts in an
 //! image, and how well the scans pin an element's geometry down.
 //!
-//! - **Elements** ([`Element`]): a stick (an axis, its section's mean radius a₀) or a leaf patch (a ball with its
-//!   extent, a disc in every view), each with an opacity and a shape mismatch. Opacity is the chance a pulse the
-//!   section fills meets solid there, its gaps wider than the footprint (synthesis §1's "extent, opacity"). The
-//!   mismatch is the sd of the section's and axis's departure from the form, which blurs the fill and spreads the
-//!   depth. A stick reflects as wood, a patch as leaf ([`Settings`]'s `refl_wood`, `refl_leaf`).
+//! - **Elements** ([`Element`]): a form, a stick (an axis, its section's mean radius a₀) or a patch (a ball with its
+//!   extent, a disc in every view), and a class, wood or leaf, each with an opacity and a shape mismatch. The form is
+//!   geometry only; the class sets the element's reflectance ([`Settings`]'s `refl_wood`, `refl_leaf`) and the side
+//!   its class evidence argues for, so the same stick marked wood and marked leaf shares its cells and nuisances
+//!   (3dtrees research 130 slice 5a). Opacity is the chance a pulse the section fills meets solid there, its gaps
+//!   wider than the footprint (synthesis §1's "extent, opacity"). The mismatch is the sd of the section's and axis's
+//!   departure from the form, which blurs the fill and spreads the depth.
 //! - **The k-buffer:** each element renders into each view's cells. A cell keeps up to [`K`] layers, nearest
 //!   first, each with a depth, a depth spread, a fill and a cosine. Fill is the beam (a uniform disc of the
 //!   footprint's diameter, as AM's raw edges measure it) convolved with the section, at three section radii over
@@ -87,7 +89,7 @@ pub const MIN_FILL: f64 = 0.01;
 /// evidence and shape mismatch).
 pub const MOSTLY: f64 = 0.5;
 
-/// An element's form.
+/// An element's form: its geometry.
 #[derive(Debug, Clone, Copy)]
 pub enum Form {
     /// An axis from `a` to `b` (world, m).
@@ -96,11 +98,19 @@ pub enum Form {
     Patch { centre: Point },
 }
 
-/// An element hypothesis: its form, its section's radius (a stick's a₀; a patch's extent), its opacity (1 solid)
-/// and its shape mismatch sd (m). The caller supplies opacity and mismatch (each with a declared default).
+/// What an element is made of: it sets the element's reflectance and the sign of its class evidence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Class {
+    Wood,
+    Leaf,
+}
+
+/// An element hypothesis: its form, its class, its section's radius (a stick's a₀; a patch's extent), its opacity
+/// (1 solid) and its shape mismatch sd (m). The caller supplies opacity and mismatch (each with a declared default).
 #[derive(Debug, Clone, Copy)]
 pub struct Element {
     pub form: Form,
+    pub class: Class,
     pub r: f64,
     pub opacity: f64,
     pub mismatch: f64,
@@ -111,6 +121,23 @@ impl Element {
         match self.form {
             Form::Stick { a, b } => [0, 1, 2].map(|k| 0.5 * (a[k] + b[k])),
             Form::Patch { centre } => centre,
+        }
+    }
+
+    /// Its surface's reflectance (dB at full fill, face-on), by its class.
+    fn refl(&self, em: &Settings) -> f64 {
+        match self.class {
+            Class::Wood => em.refl_wood,
+            Class::Leaf => em.refl_leaf,
+        }
+    }
+
+    /// Its stem front shift's prior sd (m): a stick's section departs from round as each view sees it; a patch's disc
+    /// has no front to shift.
+    fn front_shift_sd(&self, em: &Settings) -> f64 {
+        match self.form {
+            Form::Stick { .. } => em.front_shift_sd(self.r),
+            Form::Patch { .. } => 0.0,
         }
     }
 
@@ -177,7 +204,7 @@ struct Layer {
     f: f64,
     fq: [f64; 3],
     cos: f64,
-    /// The surface's reflectance (dB at full fill, face-on), by the element's form.
+    /// The surface's reflectance (dB at full fill, face-on), by the element's class.
     db: f64,
     elem: u32,
     op: f64,
@@ -259,13 +286,14 @@ fn render(v: &RangeImage, e: &Element, id: u32, em: &Settings) -> Vec<(usize, La
     if e.invalid().is_some() {
         return out;
     }
-    let (u, half, db) = match e.form {
+    let db = e.refl(em);
+    let (u, half) = match e.form {
         Form::Stick { a, b } => {
             let ax = sub(&b, &a);
             let len = norm(&ax);
-            (Some(ax.map(|x| x / len)), 0.5 * len, em.refl_wood)
+            (Some(ax.map(|x| x / len)), 0.5 * len)
         }
-        Form::Patch { .. } => (None, 0.0, em.refl_leaf),
+        Form::Patch { .. } => (None, 0.0),
     };
     let mid = e.mid();
     let c = sub(&mid, &v.origin);
@@ -418,13 +446,13 @@ fn cell_view(v: &RangeImage, cell: usize, ts: &[f64], em: &Settings, sc: &Backgr
 
 /// The front element's echo in a cell as the likelihood reads it: the first return of the most likely way the cell's
 /// layers (each with its surface class) and the ground come back ([`returns`]), with its sd widened by the alignment
-/// error's and the stem front shift's prior spreads (an element of radius `r`; `other` for a scan off the reference
-/// epoch). [`Outcome::of`] against it is the one rule for "the cell's first echo is the element's".
-fn front_echo(layers: &[(Layer, u8)], ground: Option<(f64, f64)>, em: &Settings, taus: &[f64], r: f64, other: bool) -> Return {
+/// error's and the stem front shift's prior spreads (the front element's, `front_sd`; `other` for a scan off the
+/// reference epoch). [`Outcome::of`] against it is the one rule for "the cell's first echo is the element's".
+fn front_echo(layers: &[(Layer, u8)], ground: Option<(f64, f64)>, em: &Settings, taus: &[f64], front_sd: f64, other: bool) -> Return {
     let pats = returns(layers, ground, 0.0, 0.0, em, taus).0;
     let first = pats.iter().max_by(|a, b| a.0.total_cmp(&b.0)).and_then(|p| p.1.first().copied());
     let mut f = first.unwrap_or(Return { t: f64::NAN, mu: f64::NAN, sd: f64::NAN, s: 0.0, s_q: [0.0; 3], db: [f64::NAN; 3], fill: [0.0; 3], arrives: 0.0 });
-    f.sd = f.sd.hypot(em.align_sd(layers[0].1, other)).hypot(em.front_shift_sd(r));
+    f.sd = f.sd.hypot(em.align_sd(layers[0].1, other)).hypot(front_sd);
     f
 }
 
@@ -439,7 +467,7 @@ fn classes(v: &RangeImage, buf: &HashMap<usize, Vec<Layer>>, elems: &[Element], 
         }
         let (obs, ground, _) = obs_ground(v, cell, sc);
         let layers: Vec<(Layer, u8)> = ls.iter().map(|l| (*l, 1)).collect();
-        let fe = front_echo(&layers, ground, em, &vec![0.0; layers.len() + 1], elems[ly.elem as usize].r, other);
+        let fe = front_echo(&layers, ground, em, &vec![0.0; layers.len() + 1], elems[ly.elem as usize].front_shift_sd(em), other);
         if Outcome::of(obs, fe.mu, fe.sd) == Outcome::On {
             ex[ly.elem as usize].push(v.excess[cell] as f64);
         }
@@ -665,7 +693,7 @@ struct CellData {
 struct ElemData {
     elem: usize,
     cells: Vec<CellData>,
-    class: u8,
+    surface: u8,
     /// Cells whose first echo is its.
     cells_on: u32,
     /// The least and greatest of those cells' rays' place across its axis, in radii (clamped to ±1; a stick's).
@@ -793,7 +821,7 @@ impl ElemData {
                 _ => 0.0,
             },
             across: self.across,
-            surface: self.class,
+            surface: self.surface,
         }
     }
 }
@@ -871,9 +899,9 @@ fn elem_data(v: &RangeImage, rendered: &[Vec<(usize, Layer)>], elems: &[Element]
         let mid = e.mid();
         let s_along = em.align_sd(k, other);
         by_elem.insert(i as u32, data.len());
-        data.push(ElemData { elem: i, cells: Vec::new(), class: k, cells_on: 0, on_across: [f64::INFINITY, f64::NEG_INFINITY], across: 2.0 * e.r / em.footprint(norm(&sub(&mid, &v.origin))),
+        data.push(ElemData { elem: i, cells: Vec::new(), surface: k, cells_on: 0, on_across: [f64::INFINITY, f64::NEG_INFINITY], across: 2.0 * e.r / em.footprint(norm(&sub(&mid, &v.origin))),
                              align: hats(&mid, ALIGN_SPACING).into_iter().map(|(key, w)| (key, w * s_along)).collect(),
-                             own_sd: [em.front_shift_sd(e.r), level], class_cost: 0.0 });
+                             own_sd: [e.front_shift_sd(em), level], class_cost: 0.0 });
     }
     let mut photo = vec![[0.0; 5]; data.len()];
     // cells in index order, so an element's sums run in the same order in every run (the k-buffer is a hash map)
@@ -889,7 +917,7 @@ fn elem_data(v: &RangeImage, rendered: &[Vec<(usize, Layer)>], elems: &[Element]
         let layers: Vec<(Layer, u8)> = ls.iter().map(|l| (*l, cls[l.elem as usize])).collect();
         let ts: Vec<f64> = layers.iter().map(|(l, _)| l.t).collect();
         let cv = cell_view(v, cell, &ts, em, sc, ext);
-        let fe = front_echo(&layers, cv.ground, em, &cv.bg.taus, elems[front.elem as usize].r, other);
+        let fe = front_echo(&layers, cv.ground, em, &cv.bg.taus, elems[front.elem as usize].front_shift_sd(em), other);
         let outcome = Outcome::of(cv.obs, fe.mu, fe.sd);
         let el = &mut data[d];
         el.cells_on += (outcome == Outcome::On) as u32;
@@ -909,10 +937,10 @@ fn elem_data(v: &RangeImage, rendered: &[Vec<(usize, Layer)>], elems: &[Element]
         let base = cell_ll(echoes, refl, &[], cv.ground, 0.0, 0.0, em, &cv.bg.base());
         el.cells.push(CellData { bg: cv.bg, echoes: echoes.to_vec(), refl, layers, ground: cv.ground, wt: cv.wt, base, outcome });
     }
-    // class evidence: the element's form is its class hypothesis (a stick wood, a patch leaf)
+    // class evidence argues for wood or leaf: its cost is the element's class's
     for (el, ph) in data.iter_mut().zip(&photo) {
         let llr = em.class_llr(ph);
-        el.class_cost = match elems[el.elem].form { Form::Stick { .. } => -llr, Form::Patch { .. } => llr };
+        el.class_cost = match elems[el.elem].class { Class::Wood => -llr, Class::Leaf => llr };
     }
     data
 }
@@ -1645,7 +1673,7 @@ impl Scene {
             let layers: Vec<(Layer, u8)> = ls.iter().map(|l| (*l, cls[l.elem as usize])).collect();
             let ts: Vec<f64> = layers.iter().map(|(l, _)| l.t).collect();
             let cv = cell_view(v, cell, &ts, em, &self.sc, &self.ext);
-            let fe = front_echo(&layers, cv.ground, em, &cv.bg.taus, es[k].r, other);
+            let fe = front_echo(&layers, cv.ground, em, &cv.bg.taus, es[k].front_shift_sd(em), other);
             CellPrediction {
                 cell, elem: ly.elem, fill: ly.f, recorded: fe.s, arrives: fe.arrives, surface: cls[k], depth: fe.mu, sd: fe.sd, refl: if fe.db[1] > -200.0 { fe.db[1] } else { f64::NAN }, cos: ly.cos, obs: cv.obs,
                 obs_refl: v.echo_refls(cell).first().map_or(f64::NAN, |&x| x as f64),
@@ -1793,7 +1821,7 @@ impl Scene {
                 shared.add(&slope(&echo, Some(0.0)), &[], 1.0 / (pc * (1.0 - pc)), p.weight);
                 // the depth's own sd, without the shifts' spread `predict` widens it by
                 let k = p.elem as usize;
-                let (align, front) = (em.align_sd(p.surface, other), em.front_shift_sd(es[k].r));
+                let (align, front) = (em.align_sd(p.surface, other), es[k].front_shift_sd(em));
                 let load = shared.depth(k, align, front);
                 shared.add(&slope(&|q| q.depth, None), &load, pc * k_depth / (p.sd * p.sd - align * align - front * front).max(1e-12), p.weight);
                 if refl && p.refl.is_finite() {
@@ -1853,7 +1881,7 @@ impl Scene {
                 bernoulli += w * (ea * (ea / eb).ln() + (1.0 - ea) * ((1.0 - ea) / (1.0 - eb)).ln());
                 let (Some(a), Some(b)) = (a, b) else { continue };
                 let k = a.elem as usize;
-                let (align, front) = (em.align_sd(a.surface, other), em.front_shift_sd(p[k].r));
+                let (align, front) = (em.align_sd(a.surface, other), p[k].front_shift_sd(em));
                 let load = shared.depth(k, align, front);
                 shared.add(&[b.depth - a.depth], &load, ea * k_depth / (a.sd * a.sd - align * align - front * front).max(1e-12), w);
                 if refl && (b.refl - a.refl).is_finite() {
@@ -2026,7 +2054,7 @@ mod tests {
     }
 
     fn stick(x: f64, y: f64, r: f64) -> Element {
-        Element { form: Form::Stick { a: [x, y, -0.2], b: [x, y, 0.2] }, r, opacity: 1.0, mismatch: 0.002 }
+        Element { form: Form::Stick { a: [x, y, -0.2], b: [x, y, 0.2] }, class: Class::Wood, r, opacity: 1.0, mismatch: 0.002 }
     }
 
     /// The true pole has negative cost; a stick of the wrong radius, shifted, or porous has more; a stick where
@@ -2073,7 +2101,7 @@ mod tests {
     fn a_stick_just_before_a_wall_merges_its_edges() {
         let (em, sc) = (Settings::default(), Background::default());
         let v = Arc::new(pole_scan(0.02, 4.0, 0.5));
-        let wall = Element { form: Form::Patch { centre: [0.0, 6.5, 0.0] }, r: 2.0, opacity: 1.0, mismatch: 0.002 };
+        let wall = Element { form: Form::Patch { centre: [0.0, 6.5, 0.0] }, class: Class::Leaf, r: 2.0, opacity: 1.0, mismatch: 0.002 };
         let e = |r: f64| cost(&v, &[wall, stick(0.0, 4.0, r)], &em, &sc).0;
         let truth = e(0.02);
         for r in [0.014, 0.028] {
@@ -2355,7 +2383,7 @@ mod tests {
     fn patches_render_as_discs_and_predict_codes_cells() {
         let v = pole_view();
         let (em, sc) = (Settings::default(), Background::default());
-        let patch = |x: f64| Element { form: Form::Patch { centre: [x, 4.0, 0.0] }, r: 0.03, opacity: 1.0, mismatch: 0.0 };
+        let patch = |x: f64| Element { form: Form::Patch { centre: [x, 4.0, 0.0] }, class: Class::Leaf, r: 0.03, opacity: 1.0, mismatch: 0.0 };
         let layers = render(&v, &patch(0.0), 0, &em);
         let f_max = layers.iter().map(|(_, l)| l.f).fold(0.0, f64::max);
         assert!(f_max > 0.99, "{f_max}");
@@ -2370,17 +2398,37 @@ mod tests {
         assert!(p.iter().all(|q| q.weight > 0.0 && q.weight <= 1.0 / em.discount));
     }
 
-    /// A patch renders with leaf's reflectance and a stick with wood's: the same disc's echo is recorded less often
-    /// as leaf (the review after slice 15: patches were rendered as wood).
+    /// The class sets the reflectance: the same stick marked leaf is recorded less often than marked wood when leaf
+    /// is dimmer (the review after slice 15: patches were rendered as wood).
     #[test]
-    fn a_patch_reflects_as_leaf_and_a_stick_as_wood() {
+    fn a_leaf_stick_reflects_as_leaf() {
         let v = pole_view();
         let em = Settings { refl_leaf: -40.0, ..Settings::default() };
         let c = Scene::new(vec![v.clone()], &[], em, Background::default(), None, 0);
-        let patch = Element { form: Form::Patch { centre: [0.0, 4.0, 0.0] }, r: 0.03, opacity: 1.0, mismatch: 0.0 };
+        let wood = Element { mismatch: 0.0, ..stick(0.0, 4.0, 0.03) };
         let mean = |p: Vec<CellPrediction>| p.iter().map(|q| q.recorded).sum::<f64>() / p.len() as f64;
-        let (leaf, wood) = (mean(c.predict(&[patch], 0)), mean(c.predict(&[Element { mismatch: 0.0, ..stick(0.0, 4.0, 0.03) }], 0)));
+        let (leaf, wood) = (mean(c.predict(&[Element { class: Class::Leaf, ..wood }], 0)), mean(c.predict(&[wood], 0)));
         assert!(leaf < wood - 0.1, "leaf {leaf} wood {wood}");
+    }
+
+    /// Class is a mark, not a shape (slice 5a): at equal reflectances the same stick marked wood and marked leaf
+    /// reads the same cells with the same nuisances (alignment, stem front shift, reflectance level), and only its
+    /// class evidence changes sign. A patch has no stem front shift.
+    #[test]
+    fn the_same_stick_marked_wood_and_leaf_shares_cells_and_nuisances() {
+        let v = thin_pole_view(0.03, 4.0);
+        let em = Settings { refl_leaf: Settings::default().refl_wood, class_temper: 1.0, ..Settings::default() };
+        let wood = stick(0.0, 4.0, 0.03);
+        let rows = |e: Element| cost(&v, &[e], &em, &Background::default()).1[0];
+        let (w, l) = (rows(wood), rows(Element { class: Class::Leaf, ..wood }));
+        assert_eq!((w.cells, w.cells_on), (l.cells, l.cells_on));
+        for (a, b) in [(w.ray_on, l.ray_on), (w.ray_empty, l.ray_empty), (w.ray_behind, l.ray_behind), (w.alignment, l.alignment),
+                       (w.align_shift, l.align_shift), (w.front_shift, l.front_shift), (w.refl_level, l.refl_level)] {
+            assert_eq!(a, b);
+        }
+        assert!(w.class != 0.0 && w.class == -l.class, "{} {}", w.class, l.class);
+        let patch = Element { form: Form::Patch { centre: [0.0, 4.0, 0.0] }, class: Class::Leaf, r: 0.03, opacity: 1.0, mismatch: 0.002 };
+        assert_eq!(rows(patch).front_shift_sd, 0.0);
     }
 
     /// The reference epoch is declared, not the first scan's: a scene of the same scans in either order costs the

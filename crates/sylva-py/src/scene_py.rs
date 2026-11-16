@@ -8,9 +8,10 @@
 //! - **Settings and background:** flat dicts of the records' fields (`Settings`, `Background`), each optional;
 //!   `settings_defaults()` returns the settings' defaults (AM's). An unknown key raises.
 //! - **Elements:** a dict of arrays, one row per element: `a`, `b` (n, 3) and `r` (n,) are required; `opacity` (n,)
-//!   defaults to 1, `mismatch` (n,) to the settings' prior `mismatch_base + mismatch_slope r`, and `patch` (n,) bool
-//!   to false. A patch is a ball about `a` of radius `r` (its extent); its `b` is ignored. An element that can't be
-//!   scored (a radius that isn't positive, an opacity outside (0, 1], a stick of no length) raises.
+//!   defaults to 1, `mismatch` (n,) to the settings' prior `mismatch_base + mismatch_slope r`, `patch` (n,) bool
+//!   to false, and `leaf` (n,) bool, its class (wood or leaf), to `patch`. A patch is a ball about `a` of radius `r`
+//!   (its extent); its `b` is ignored. An element that can't be scored (a radius that isn't positive, an opacity
+//!   outside (0, 1], a stick of no length) raises.
 //! - **Scenes:** `Scene(images, elements, settings, background, foliage, ref_epoch)` holds elements against range
 //!   images, the alignment error's spread stated for the scans of epoch `ref_epoch` (another epoch's add `align_epoch_*`): `cost()`, `rows()`, the cost change of each move (`add`,
 //!   `remove`, `change`, `costs_to_add`, `costs_to_remove`) with the alignment held, `refit_alignment()` and
@@ -30,7 +31,7 @@ use std::sync::Arc;
 use sylva_rs::scene::foliage::FoliageBox;
 use sylva_rs::scene::moments::{Candidate, Moments};
 use sylva_rs::scene::range_image::{Cell, RangeImage, RangeImageParams};
-use sylva_rs::scene::scene::{CellPrediction, Element, ElementScan, Form, Information, Scene, SceneError};
+use sylva_rs::scene::scene::{CellPrediction, Class, Element, ElementScan, Form, Information, Scene, SceneError};
 use sylva_rs::scene::settings::{Background, Settings};
 
 use crate::xyz_from_py;
@@ -78,7 +79,7 @@ fn elements_from_py(d: &Bound<'_, PyDict>, em: &Settings) -> PyResult<Vec<Elemen
     let req = |k: &str| get(k)?.ok_or_else(|| PyValueError::new_err(format!("elements need {k:?}")));
     for k in d.keys() {
         let k: String = k.extract()?;
-        if !["a", "b", "r", "opacity", "mismatch", "patch"].contains(&k.as_str()) {
+        if !["a", "b", "r", "opacity", "mismatch", "patch", "leaf"].contains(&k.as_str()) {
             return Err(bad(&k));
         }
     }
@@ -93,18 +94,23 @@ fn elements_from_py(d: &Bound<'_, PyDict>, em: &Settings) -> PyResult<Vec<Elemen
     };
     let opacity = col("opacity", &|_| 1.0)?;
     let mismatch = col("mismatch", &|i| em.mismatch_sd(r[i]))?;
-    let patch: Vec<bool> = match get("patch")? {
-        Some(v) => v.extract::<PyReadonlyArray1<bool>>()?.as_array().to_vec(),
-        None => vec![false; r.len()],
+    let flag = |k: &str, dflt: Vec<bool>| -> PyResult<Vec<bool>> {
+        Ok(match get(k)? {
+            Some(v) => v.extract::<PyReadonlyArray1<bool>>()?.as_array().to_vec(),
+            None => dflt,
+        })
     };
+    let patch = flag("patch", vec![false; r.len()])?;
+    let leaf = flag("leaf", patch.clone())?;
     let n = r.len();
-    if [a.len(), b.len(), opacity.len(), mismatch.len(), patch.len()].iter().any(|&m| m != n) {
+    if [a.len(), b.len(), opacity.len(), mismatch.len(), patch.len(), leaf.len()].iter().any(|&m| m != n) {
         return Err(PyValueError::new_err("elements: every array needs one row per element"));
     }
     (0..n)
         .map(|i| {
             let e = Element {
                 form: if patch[i] { Form::Patch { centre: a[i] } } else { Form::Stick { a: a[i], b: b[i] } },
+                class: if leaf[i] { Class::Leaf } else { Class::Wood },
                 r: r[i], opacity: opacity[i], mismatch: mismatch[i],
             };
             match e.invalid() {

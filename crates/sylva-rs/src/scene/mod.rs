@@ -23,7 +23,8 @@
 //! | a cell's nearest echo | first echo | the one the ray likelihood reads |
 //! | the most echoes the instrument records per pulse | the target cap | `max_targets`; a pulse at it is capped (`RangeImage::capped`), and says nothing past its last echo |
 //! | the range up to which a pulse shows clear space | free space | `free_to`: the first echo less the receiver's resolution |
-//! | a proposed part of the scene | element | a stick (an axis and radius; wood) or a patch (a ball; leaf) |
+//! | a proposed part of the scene | element | a form (a stick, an axis and radius; or a patch, a ball) and a class |
+//! | what an element is made of, wood or leaf | class | `Class`: its reflectance and the sign of its class evidence; a mark, not a shape |
 //! | elements held against scans | scene | `Scene` |
 //! | `−log` likelihood ratio against the empty scene | cost | also of a move: `add`, `remove`, `change`, `costs_to_add`, `costs_to_remove` |
 //! | a cell's likelihood of its first echo | ray likelihood | the scene's data term |
