@@ -55,7 +55,8 @@ branch `3dtrees/125-rebase`.
   against range images, each rendered once with a uniform-disc beam (returns within the resolution merge), with a
   per-scan alignment error and a per-(element, scan) stem front shift over which each scan's ray likelihood is
   integrated by a Laplace marginal. It returns its cost, the cost change of a move, rows splitting each (element,
-  scan)'s cost into its parts, how well the scans pin an element's geometry down (`information`), and each element's
-  counts and cell predictions. Bound as `_core.RangeImage`, `_core.Scene`, `_core.candidates` and
+  scan)'s cost into its parts, how well the scans pin elements' geometry down, one or several jointly
+  (`information`), what one hypothesis is expected to cost against another (`divergence`), and elements' counts and
+  cell predictions. Bound as `_core.RangeImage`, `_core.Scene`, `_core.candidates` and
   `_core.settings_defaults` in `scene_py.rs`, with `ShotsFile::read_echo_f64` for per-echo attributes. 3dtrees needs
   them to score geometry and class hypotheses from the rays. Additive.

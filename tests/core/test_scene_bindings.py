@@ -55,7 +55,7 @@ def test_bad_input_raises_instead_of_panicking():
         with pytest.raises(ValueError):
             sc.add(bad)
     for call in (lambda: sc.remove([7]), lambda: sc.change(7, pole()), lambda: sc.predict(pole(), 3),
-                 lambda: sc.information(7), lambda: sc.remove([0, 0])):
+                 lambda: sc.information([7]), lambda: sc.remove([0, 0])):
         with pytest.raises(ValueError):
             call()
 
@@ -67,7 +67,7 @@ def test_an_empty_scene_costs_nothing_and_a_pole_is_pinned_down():
     rows = sc.rows()
     parts = sum(rows[k] for k in ('ray_on', 'ray_empty', 'ray_in_front', 'ray_behind', 'class', 'alignment'))
     assert np.allclose(parts, rows['cost']) and rows['cost'][0] < 0
-    info = sc.information(0)
+    info = sc.information([0])
     assert info['hessian'].shape == (1, 5, 5) and np.isfinite(info['hessian']).all() and np.diag(info['hessian'][0]).max() > 0
     assert info['expected'].shape == (1, 5, 5) and np.linalg.eigvalsh(info['expected'][0]).min() > -1e-6 * np.abs(info['expected'][0]).max()
     j = info['gradient_variance'][0]
@@ -111,7 +111,7 @@ def test_expected_information_alone_and_free_space_cross_the_binding():
     longest range for a miss) under the settings."""
     v = pole_image()
     sc = _core.Scene([v], pole())
-    full, alone = sc.information(0), sc.information(0, observed=False)
+    full, alone = sc.information([0]), sc.information([0], observed=False)
     assert np.allclose(full['expected'], alone['expected']) and np.isnan(alone['hessian']).all() and np.isnan(alone['gradient']).all()
     d = _core.settings_defaults()
     A = v.arrays(d)

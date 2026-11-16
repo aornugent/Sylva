@@ -14,8 +14,9 @@
 //! - **Scenes:** `Scene(images, elements, settings, background, foliage, ref_epoch)` holds elements against range
 //!   images, the alignment error's spread stated for the scans of epoch `ref_epoch` (another epoch's add `align_epoch_*`): `cost()`, `rows()`, the cost change of each move (`add`,
 //!   `remove`, `change`, `costs_to_add`, `costs_to_remove`) with the alignment held, `refit_alignment()` and
-//!   `exact_cost()`, which hypotheses interact (`interactions`), an element's counts (`counts`), cell predictions (`predict`) and how well
-//!   the scans pin it down (`information`). A bad element id or scan index raises.
+//!   `exact_cost()`, which hypotheses interact (`interactions`), an element's counts (`counts`), cell predictions (`predict`), what one
+//!   hypothesis is expected to cost against another (`divergence`) and how well the scans pin elements down, one or
+//!   several jointly (`information`). A bad element id or scan index raises.
 //! - **The foliage field:** `foliage` is a dict `lo`, `hi` (the box, 3 each), `voxel`, `prior_path` and `margin`
 //!   (m); the field is then the elements' residual there (`FoliageBox`), held through moves. `refit_foliage()`,
 //!   `promote(element)` and `demote(id)` move mass between the field and the elements; `foliage_voxels()` gives it
@@ -232,6 +233,7 @@ impl PyRangeImage {
 fn predictions_dict<'py>(py: Python<'py>, p: &[CellPrediction]) -> PyResult<Bound<'py, PyDict>> {
     let d = PyDict::new(py);
     d.set_item("cell", p.iter().map(|x| x.cell as i64).collect::<Vec<_>>().into_pyarray(py))?;
+    d.set_item("elem", p.iter().map(|x| x.elem).collect::<Vec<_>>().into_pyarray(py))?;
     d.set_item("surface", p.iter().map(|x| x.surface).collect::<Vec<_>>().into_pyarray(py))?;
     d.set_item("outcome", p.iter().map(|x| x.outcome as u8).collect::<Vec<_>>().into_pyarray(py))?;
     type F = fn(&CellPrediction) -> f64;
@@ -494,18 +496,23 @@ impl PyScene {
         Ok(d)
     }
 
-    /// How well the scans pin element `id` down (scene::Scene::information): per scan, the cost's slope `gradient`
-    /// (scans, n) and curvature `hessian` (scans, n, n) in its parameters: a stick's ln r, its axis moved across itself
-    /// (two directions, m) and tilted (rad); a patch's ln r and its centre moved (x, y, z, m). Beside them the
-    /// expected information `expected` (scans, n, n): what its cells would tell on average, positive semi-definite;
-    /// and `gradient_variance` (scans, n, n): the slope's variance were the cells independent, for the sandwich
-    /// `E⁻¹ J E⁻¹`. With `observed` false the stencil is skipped (two thirds of the cost) and `gradient` and
-    /// `hessian` read NaN.
-    #[pyo3(signature = (id, observed=true))]
-    fn information<'py>(&self, py: Python<'py>, id: u32, observed: bool) -> PyResult<Bound<'py, PyDict>> {
-        self.inner.check_id(id).map_err(scene_err)?;
+    /// How well the scans pin elements `ids` down, one or several jointly (scene::Scene::information): per scan, the
+    /// cost's slope `gradient` (scans, n) and curvature `hessian` (scans, n, n) in their parameters, each element's in
+    /// turn: a stick's ln r, its axis moved across itself (two directions, m) and tilted (rad); a patch's ln r and its
+    /// centre moved (x, y, z, m). Beside them the expected information `expected` (scans, n, n): what their cells would
+    /// tell on average, positive semi-definite, the latents they share marginalised once; and `gradient_variance`
+    /// (scans, n, n): the slope's variance were the cells independent, for the sandwich `E⁻¹ J E⁻¹`. With `observed`
+    /// false the stencil is skipped (two thirds of the cost for one element) and `gradient` and `hessian` read NaN.
+    #[pyo3(signature = (ids, observed=true))]
+    fn information<'py>(&self, py: Python<'py>, ids: Vec<u32>, observed: bool) -> PyResult<Bound<'py, PyDict>> {
+        for (k, &id) in ids.iter().enumerate() {
+            self.inner.check_id(id).map_err(scene_err)?;
+            if ids[..k].contains(&id) {
+                return Err(PyValueError::new_err(format!("element {id} twice")));
+            }
+        }
         let c = &self.inner;
-        let out = py.detach(|| c.information(id, observed));
+        let out = py.detach(|| c.information(&ids, observed));
         let (s, n) = (out.len(), out.first().map_or(0, |m| m.gradient.len()));
         let d = PyDict::new(py);
         d.set_item("gradient", out.iter().flat_map(|x| x.gradient.clone()).collect::<Vec<f64>>().into_pyarray(py).reshape([s, n])?)?;
@@ -514,6 +521,14 @@ impl PyScene {
         d.set_item("expected", square(|x| &x.expected)?)?;
         d.set_item("gradient_variance", square(|x| &x.gradient_variance)?)?;
         Ok(d)
+    }
+
+    /// What hypothesis `q` is expected to cost against hypothesis `p` were `p` true, per scan (scene::Scene::divergence;
+    /// nats): `p` and `q` element dicts; returns (scans,).
+    fn divergence<'py>(&self, py: Python<'py>, p: &Bound<'py, PyDict>, q: &Bound<'py, PyDict>) -> PyResult<Bound<'py, PyArray1<f64>>> {
+        let (p, q) = (elements_from_py(p, &self.em)?, elements_from_py(q, &self.em)?);
+        let c = &self.inner;
+        Ok(py.detach(|| c.divergence(&p, &q)).into_pyarray(py))
     }
 
     /// One element's counts against the scene, per scan, in footprints (scene::ElementCounts): scan, mismatch_ss,
@@ -534,17 +549,17 @@ impl PyScene {
         Ok(d)
     }
 
-    /// What one element predicts in scan `scan` against the scene, per cell it fronts (scene::CellPrediction): cell
-    /// (flat index), surface, outcome (0 on, 1 empty, 2 in front, 3 behind), fill, recorded, arrives, depth, sd, refl
-    /// (the echo's predicted reflectance, dB), cos (the mean cos ι where the element meets the footprint), obs,
-    /// obs_refl (the first echo's reflectance, dB), weight (the cell weight), footprint (m), across and along (where
-    /// the ray passes the axis).
-    #[pyo3(signature = (element, scan=0))]
-    fn predict<'py>(&self, py: Python<'py>, element: &Bound<'_, PyDict>, scan: usize) -> PyResult<Bound<'py, PyDict>> {
+    /// What elements predict in scan `scan` against the scene, per cell one of them fronts (scene::CellPrediction): cell
+    /// (flat index), elem (which of them, its row), surface, outcome (0 on, 1 empty, 2 in front, 3 behind), fill,
+    /// recorded, arrives, depth, sd, refl (the echo's predicted reflectance, dB), cos (the mean cos ι where the element
+    /// meets the footprint), obs, obs_refl (the first echo's reflectance, dB), weight (the cell weight), footprint (m),
+    /// across and along (where the ray passes the axis).
+    #[pyo3(signature = (elements, scan=0))]
+    fn predict<'py>(&self, py: Python<'py>, elements: &Bound<'_, PyDict>, scan: usize) -> PyResult<Bound<'py, PyDict>> {
         self.inner.check_scan(scan).map_err(scene_err)?;
-        let e = self.one(element)?;
+        let es = elements_from_py(elements, &self.em)?;
         let c = &self.inner;
-        let p = py.detach(|| c.predict(e, scan));
+        let p = py.detach(|| c.predict(&es, scan));
         predictions_dict(py, &p)
     }
 }
