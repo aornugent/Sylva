@@ -16,7 +16,7 @@
 //!   footprint's diameter, as AM's raw edges measure it) convolved with the section, at three section radii over
 //!   the mismatch; an echo's chance is the detection's mean over them. Along a stick's axis it is cut square, so a
 //!   chain of sticks joins without seams.
-//! - **The ray likelihood, one cell:** its first echo, or none, against a diffuse echo hazard κ along the ray (the
+//! - **The ray likelihood, one cell:** its pulse's echoes, or none, against a diffuse echo hazard κ along the ray (the
 //!   background), the layers in depth order, then a ground plane.
 //!   - The beam reaches layer i with energy `e_i = f_i Π_{j<i} (1 − op_j f_j)`, and its echo is recorded with
 //!     `op_i det_i`, where `det_i` is the chance it clears the detection floor ([`Settings::p_detect`]):
@@ -25,9 +25,17 @@
 //!     [`Settings::p_resolve`] of their separation and energy ratio; else they merge into one, recorded if any
 //!     member is, at their energy-weighted depth (energy: op · e · cos · reflectance), its spread their spread about
 //!     it. A cell's likelihood is the mixture over these merge patterns.
-//!   - An echo at r has density `Σ_i P_i op_i det_i t_ν(r − t_i − bias_k − δ; σ_k ⊕ spread_i)` over the returns, plus
-//!     `κ e^{−κr} Π_{t_j<r} (1 − op_j det_j)`, where P_i is the chance that nothing nearer was kept, plus a uniform
-//!     outlier share. An empty cell has probability `e^{−κ t_end} Π (1 − op_j det_j)`.
+//!   - The first echo at r has density `Σ_i P_i op_i det_i t_ν(r − t_i − bias_k − δ; σ_k ⊕ spread_i)` over the
+//!     returns, plus `κ e^{−κr} Π_{t_j<r} (1 − op_j det_j)`, where P_i is the chance that nothing nearer was kept,
+//!     plus a uniform outlier share. An empty cell has probability `e^{−κ t_end} Π (1 − op_j det_j)`.
+//!   - **The rest of the pulse** (3dtrees research 130 step 3c, [`Pulse::lik`]): every later echo is read the same
+//!     way, as one of the returns behind the last one read, an echo of the background (in the beam the echoes so far
+//!     left, read from their reflectance; behind an edge of fill f, `10 log10 (1 − f)` dimmer) or an outlier; the
+//!     background's path restarts the receiver's resolution after each echo. After the last echo, the
+//!     returns left and the background's path record nothing, unless the pulse is at the instrument's cap (it says
+//!     nothing past its last echo). Where the layers leave some of the beam, a declared share of cells has an
+//!     unmodelled surface within the resolution behind them, which merges with their return or resolves
+//!     ([`Settings`]' `behind_share`).
 //!   - **Located edges** (3dtrees research 130 step 2): the echo's reflectance x (dB) is read beside its range. A
 //!     return predicts `10 log10 Σ e_i cos^k ι_i 10^(ρ_i / 10)` over its members (one layer, or a merge with a
 //!     surface behind), at the mismatch's three section radii, and x reads about it with the per-echo noise, wider at
@@ -400,7 +408,7 @@ struct CellView {
 fn cell_view(v: &RangeImage, cell: usize, ts: &[f64], em: &Settings, sc: &Background, ext: &Foliage) -> CellView {
     let (obs, ground, w) = obs_ground(v, cell, sc);
     let wt = em.cell_weight(if obs.is_finite() { obs } else { ts[0] }, v.step());
-    let bg = ext.ray_bg(&v.origin, &w, ts, ground.map(|g| g.0), ground.map_or(T_MAX, |g| g.0), obs);
+    let bg = ext.ray_bg(&v.origin, &w, ts, ground.map(|g| g.0), ground.map_or(T_MAX, |g| g.0), v.echoes(cell), em.resolution());
     CellView { obs, ground, wt, bg }
 }
 
@@ -409,9 +417,9 @@ fn cell_view(v: &RangeImage, cell: usize, ts: &[f64], em: &Settings, sc: &Backgr
 /// error's and the stem front shift's prior spreads (an element of radius `r`; `other` for a scan off the reference
 /// epoch). [`Outcome::of`] against it is the one rule for "the cell's first echo is the element's".
 fn front_echo(layers: &[(Layer, u8)], ground: Option<(f64, f64)>, em: &Settings, taus: &[f64], r: f64, other: bool) -> Return {
-    let pats = returns(layers, ground, 0.0, 0.0, em, taus).0;
+    let pats = returns(layers, ground, 0.0, 0.0, em, taus, None).0;
     let first = pats.iter().max_by(|a, b| a.0.total_cmp(&b.0)).and_then(|p| p.1.first().copied());
-    let mut f = first.unwrap_or(Return { t: f64::NAN, mu: f64::NAN, sd: f64::NAN, s: 0.0, s_q: [0.0; 3], db: [f64::NAN; 3], fill: [0.0; 3], arrives: 0.0 });
+    let mut f = first.unwrap_or(Return { t: f64::NAN, mu: f64::NAN, sd: f64::NAN, s: 0.0, s_q: [0.0; 3], db: [f64::NAN; 3], fill: [0.0; 3], tau: f64::INFINITY, beam: 1.0 });
     f.sd = f.sd.hypot(em.align_sd(layers[0].1, other)).hypot(em.front_shift_sd(r));
     f
 }
@@ -475,8 +483,9 @@ pub struct CellPrediction {
 /// One return a pulse can record: a run of layers (and the ground) within the receiver's resolution of its first,
 /// merged. `s` is the chance it is recorded, `mu` and `sd` its echo's depth and spread; `s_q` the chance it is
 /// recorded, `db` its echo's predicted reflectance (dB) and `fill` the share of the beam it meets, at the shape
-/// mismatch's three section radii (as [`Layer`]'s `fq`); `t` its first member's range and `arrives` the chance the
-/// pulse meets nothing of the foliage field before it.
+/// mismatch's three section radii (as [`Layer`]'s `fq`); `t` its first member's range, `tau` the foliage field's
+/// optical depth to it (the pulse meets nothing of the field before it with `e^{−τ}`) and `beam` the share of the
+/// beam the scene leaves behind its last member.
 #[derive(Clone, Copy)]
 struct Return {
     t: f64,
@@ -486,7 +495,8 @@ struct Return {
     s_q: [f64; 3],
     db: [f64; 3],
     fill: [f64; 3],
-    arrives: f64,
+    tau: f64,
+    beam: f64,
 }
 
 impl Return {
@@ -513,7 +523,8 @@ impl Return {
 /// One member of a cell's returns, a layer or the ground: its range, its echo's depth and sd, the chance it is
 /// recorded, its energy (the merge's weight: opacity × the beam it meets × cos ι × reflectance), its energy share
 /// when it is hit and the share of the beam it meets, at the shape mismatch's three section radii (the share without
-/// the opacity; its echo's reflectance is `10 log10` of it) and the foliage field's optical depth to it.
+/// the opacity; its echo's reflectance is `10 log10` of it), the foliage field's optical depth to it and the share of
+/// the beam left behind it.
 struct Member {
     t: f64,
     depth: f64,
@@ -524,6 +535,7 @@ struct Member {
     share: [f64; 3],
     fill: [f64; 3],
     tau: f64,
+    beam: f64,
 }
 
 /// The ways a cell's layers (each with its element's surface class) and the ground at `ground` = (range, cos) come
@@ -531,8 +543,11 @@ struct Member {
 /// returns, nearest first, and its chance; and the range the beam ends at. Adjacent members resolve into two echoes
 /// with [`Settings::p_resolve`] of their separation and energy ratio, else merge at their energy-weighted depth and
 /// summed energy share; patterns under 1e-4 are dropped. `taus` are the foliage field's optical depths to each layer
-/// and then to the ground ([`RayFoliage`]).
-fn returns(layers: &[(Layer, u8)], ground: Option<(f64, f64)>, shift: f64, level: f64, em: &Settings, taus: &[f64]) -> (Vec<(f64, Vec<Return>)>, f64) {
+/// and then to the ground ([`RayFoliage`]). With `behind` (its range and the field's optical depth to it), an
+/// unmodelled surface lies there, behind the layers, and takes the rest of the beam ([`Settings`]'s `behind_share`,
+/// `behind_refl`).
+#[allow(clippy::too_many_arguments)]
+fn returns(layers: &[(Layer, u8)], ground: Option<(f64, f64)>, shift: f64, level: f64, em: &Settings, taus: &[f64], behind: Option<(f64, f64)>) -> (Vec<(f64, Vec<Return>)>, f64) {
     let t_end = ground.map_or(T_MAX, |g| g.0);
     let mut beam = 1.0;
     let mut m: Vec<Member> = Vec::with_capacity(layers.len() + 1);
@@ -548,14 +563,23 @@ fn returns(layers: &[(Layer, u8)], ground: Option<(f64, f64)>, shift: f64, level
         let share = ly.fq.map(|f| f * unit);
         beam *= 1.0 - ly.f * ly.op;
         m.push(Member { t: ly.t, depth: ly.t + em.depth_bias(k, ly.t) + shift, sd: em.depth_sd(k, ly.spread), s, s_q, energy: ly.op * ly.f * unit, share,
-                        fill: ly.fq.map(|f| f * b0), tau: taus[li] });
+                        fill: ly.fq.map(|f| f * b0), tau: taus[li], beam });
+    }
+    if let Some((t, tau)) = behind {
+        // an unmodelled surface taking the rest of the beam (unless the ground is nearer)
+        if t < t_end {
+            let unit = beam * 10f64.powf(em.behind_refl / 10.0);
+            let s = em.p_detect(em.behind_refl, beam, t);
+            m.push(Member { t, depth: t + shift, sd: em.noise(2), s, s_q: [s; 3], energy: unit, share: [unit; 3], fill: [beam; 3], tau, beam: 0.0 });
+            beam = 0.0;
+        }
     }
     if let Some((tg, cg)) = ground {
         let cg = cg.powf(em.refl_incidence);
         let share = beam * cg * 10f64.powf(em.refl_ground / 10.0);
         let s = em.p_detect(em.refl_ground, beam * cg, tg);
         m.push(Member { t: tg, depth: tg, sd: em.noise(2), s, s_q: [s; 3], energy: share, share: [share; 3],
-                        fill: [beam; 3], tau: taus[layers.len()] });
+                        fill: [beam; 3], tau: taus[layers.len()], beam: 0.0 });
     }
     let n = m.len();
     // each adjacent pair's chance of resolving into two echoes
@@ -567,7 +591,7 @@ fn returns(layers: &[(Layer, u8)], ground: Option<(f64, f64)>, shift: f64, level
         let db = [0, 1, 2].map(|q| 10.0 * g.iter().map(|x| x.share[q]).sum::<f64>().max(1e-30).log10());
         let fill = [0, 1, 2].map(|q| g.iter().map(|x| x.fill[q]).sum::<f64>().min(1.0));
         if g.len() == 1 {
-            return Return { t: g[0].t, mu: g[0].depth, sd: g[0].sd, s: g[0].s, s_q: g[0].s_q, db, fill, arrives: (-g[0].tau).exp() };
+            return Return { t: g[0].t, mu: g[0].depth, sd: g[0].sd, s: g[0].s, s_q: g[0].s_q, db, fill, tau: g[0].tau, beam: g[0].beam };
         }
         // energy weights; members the beam no longer reaches weigh alike (the return is never recorded then)
         let total: f64 = g.iter().map(|x| x.energy).sum();
@@ -576,7 +600,7 @@ fn returns(layers: &[(Layer, u8)], ground: Option<(f64, f64)>, shift: f64, level
         let var = g.iter().map(|x| wt(x) * (x.sd * x.sd + (x.depth - mu).powi(2))).sum::<f64>();
         let none: f64 = g.iter().map(|x| 1.0 - x.s).product();
         let s_q = [0, 1, 2].map(|q| 1.0 - g.iter().map(|x| 1.0 - x.s_q[q]).product::<f64>());
-        Return { t: g[0].t, mu, sd: var.sqrt(), s: 1.0 - none, s_q, db, fill, arrives: (-g[0].tau).exp() }
+        Return { t: g[0].t, mu, sd: var.sqrt(), s: 1.0 - none, s_q, db, fill, tau: g[0].tau, beam: g[g.len() - 1].beam }
     };
     let mut out = Vec::new();
     for mask in 0u32..(1 << n.saturating_sub(1)) {
@@ -598,47 +622,113 @@ fn returns(layers: &[(Layer, u8)], ground: Option<(f64, f64)>, shift: f64, level
     (out, t_end)
 }
 
-/// One cell's log-likelihood: its first echo (or none), at its range and reflectance `refl` (dB; NaN unknown), against
-/// the foliage field along its ray (`bg`) and the returns its layers and the ground give ([`returns`]), the layers
-/// shifted by `shift` along the beam and `level` in reflectance.
+/// One cell's log-likelihood: its pulse's echoes (none for a miss), at their ranges and reflectances `refls` (dB; empty
+/// unknown), the pulse `capped` when it returned as many echoes as the instrument records, against the foliage field
+/// along its ray (`bg`) and the returns its layers and the ground give ([`returns`]), the layers shifted by `shift`
+/// along the beam and `level` in reflectance ([`Pulse::lik`]). With `anchor` (a range and the field's optical depth
+/// to it: [`behind_anchor`]), a mixture with an unmodelled surface within the receiver's resolution behind it, at
+/// three distances over it (research 130 step 3c). The surface is there or not whatever the elements are, so the
+/// empty scene's cell takes the same mixture at the same anchor: what the branch costs a cell that refutes it then
+/// cancels, and only what it explains counts.
 #[allow(clippy::too_many_arguments)]
-fn cell_ll(echoes: &[f32], refl: f64, layers: &[(Layer, u8)], ground: Option<(f64, f64)>, shift: f64, level: f64, em: &Settings, bg: &RayFoliage) -> f64 {
-    // the first echo only, for now
-    let obs = echoes.first().map_or(f64::NAN, |&r| r as f64);
-    let (patterns, t_end) = returns(layers, ground, shift, level, em, &bg.taus);
-    let other = em.refl_background(refl);
-    let lik = |rets: &[Return]| {
-        let (mut none_kept, mut none_before_obs, mut dens) = (1.0, 1.0, 0.0);
-        for r in rets {
-            if obs.is_finite() {
-                dens += r.arrives * none_kept * r.s * t_pdf((obs - r.mu) / r.sd, em.noise_dof) / r.sd * r.refl_density(refl, em);
-                if r.t < obs {
-                    none_before_obs *= 1.0 - r.s;
-                }
-            }
-            none_kept *= 1.0 - r.s;
-        }
-        if !obs.is_finite() {
-            return (-bg.tau_end).exp() * none_kept;
-        }
-        if obs < t_end {
-            dens += bg.sig_obs * (-bg.tau_obs).exp() * none_before_obs * other;
-        }
-        (1.0 - P_OUTLIER) * dens + P_OUTLIER / T_MAX * other
+fn cell_ll(echoes: &[f32], refls: &[f32], capped: bool, layers: &[(Layer, u8)], ground: Option<(f64, f64)>, shift: f64, level: f64, em: &Settings,
+           bg: &RayFoliage, anchor: Option<(f64, f64)>) -> f64 {
+    let lik = |behind: Option<(f64, f64)>| {
+        let (patterns, t_end) = returns(layers, ground, shift, level, em, &bg.taus, behind);
+        let pulse = Pulse { echoes, refls, capped, t_end, em, bg };
+        patterns.iter().map(|(p, rets)| p * pulse.lik(rets, 0, 0, 1.0, 1.0, 1.0, 0.0)).sum::<f64>()
     };
-    if patterns.len() == 1 {
-        return lik(&patterns[0].1).max(1e-300).ln();
+    let mut l = lik(None);
+    if let Some((t, tau)) = anchor {
+        let with = [1.0, 3.0, 5.0].iter().map(|&u| lik(Some((t + shift + u / 6.0 * em.resolution(), tau)))).sum::<f64>() / 3.0;
+        l = (1.0 - em.behind_share) * l + em.behind_share * with;
     }
-    patterns.iter().map(|(p, rets)| p * lik(rets)).sum::<f64>().max(1e-300).ln()
+    l.max(1e-300).ln()
 }
 
-/// One cell an element fronts, as its ray likelihood scores it: its ray through the foliage field, echoes, its first
-/// echo's reflectance (dB; NaN unknown), layers, ground and weight, its log-likelihood under the empty scene, and what
-/// its first echo says about the element.
+/// Where a cell's unmodelled surface would lie behind ([`cell_ll`]): its last layer's range and the field's optical
+/// depth to it, where `behind_share` is set and its layers leave some of the beam (an edge).
+fn behind_anchor(layers: &[(Layer, u8)], taus: &[f64], em: &Settings) -> Option<(f64, f64)> {
+    let left: f64 = layers.iter().map(|(ly, _)| 1.0 - ly.f * ly.op).product();
+    let last = layers.len().checked_sub(1)?;
+    (em.behind_share > 0.0 && left > 0.02).then(|| (layers[last].0.t, taus[last]))
+}
+
+/// One pulse's echoes against one way its returns come back ([`cell_ll`]).
+struct Pulse<'a> {
+    echoes: &'a [f32],
+    refls: &'a [f32],
+    capped: bool,
+    t_end: f64,
+    em: &'a Settings,
+    bg: &'a RayFoliage,
+}
+
+impl Pulse<'_> {
+    /// The chance of echoes `i..` given returns `rets[j..]` not yet accounted for (research 130 step 3c: every echo
+    /// is scored, not the first alone). Each echo is one of those returns (the ones before it not recorded), an echo
+    /// of the foliage field (the returns before it not recorded) or an outlier.
+    /// - **The field's echoes** are a Poisson process along the ray in the beam the echoes so far left, `seen`: each
+    ///   echo's reflectance against a full hit is the share it took, as the field reads them ([`super::foliage`]).
+    ///   That beam is read from the echoes alone, the same for every hypothesis, so how often a pulse echoes again
+    ///   doesn't lean on the declared background's density along the rest of the ray (on the stand's checks, the
+    ///   scene's beam there favoured a wider stick wherever a pulse returned nothing more: research 130 step 3c).
+    /// - **The rest of the beam:** the field's echo reads `10 log10` of the beam the scene leaves, `scene` (the share
+    ///   the returns matched so far leave: [`Return`]'s `beam`) × `taken` (what the field's own echoes left), dimmer:
+    ///   behind an edge of fill f, `1 − f`, as a located edge reads f.
+    /// - **Behind an occluder:** the returns behind a field's echo are met with the chance `taken` (as an element's
+    ///   opacity is a chance): one that read as a full hit leaves nothing for them to return, and its pulse is no
+    ///   evidence against them.
+    ///
+    /// The path after an echo restarts at its range plus the receiver's resolution (`tau0`, the optical depth there).
+    /// After the last echo, the returns left and the field's path to the beam's end record nothing, unless the pulse
+    /// is capped: a capped pulse says nothing past its last echo. The first echo reads as before step 3c (the whole
+    /// beam, from the origin).
+    #[allow(clippy::too_many_arguments)]
+    fn lik(&self, rets: &[Return], i: usize, j: usize, scene: f64, taken: f64, seen: f64, tau0: f64) -> f64 {
+        let em = self.em;
+        if i == self.echoes.len() {
+            if self.capped {
+                return 1.0;
+            }
+            return rets[j..].iter().map(|r| 1.0 - r.s * taken).product::<f64>() * (-seen * (self.bg.tau_end - tau0).max(0.0)).exp();
+        }
+        let (o, x) = (self.echoes[i] as f64, self.refls.get(i).map_or(f64::NAN, |&x| x as f64));
+        let [tau_o, sig_o, tau_after] = self.bg.echoes[i];
+        let left = if x.is_finite() { (1.0 - 10f64.powf((x - em.refl_full_hit()) / 10.0)).clamp(0.0, 1.0) } else { 1.0 };
+        let mut total = 0.0;
+        // one of the returns
+        let mut none = 1.0;
+        for (k, r) in rets.iter().enumerate().skip(j) {
+            let d = (-seen * (r.tau - tau0).max(0.0)).exp() * none * r.s * taken * t_pdf((o - r.mu) / r.sd, em.noise_dof) / r.sd * r.refl_density(x, em);
+            if d > 0.0 {
+                total += (1.0 - P_OUTLIER) * d * self.lik(rets, i + 1, k + 1, r.beam, taken, seen * left, tau_after);
+            }
+            none *= 1.0 - r.s * taken;
+        }
+        // the foliage field's
+        if o < self.t_end && seen > 0.0 {
+            let jn = (j..rets.len()).find(|&k| rets[k].t >= o).unwrap_or(rets.len());
+            let none: f64 = rets[j..jn].iter().map(|r| 1.0 - r.s * taken).product();
+            let d = seen * sig_o * (-seen * (tau_o - tau0).max(0.0)).exp() * none * em.refl_background(x - 10.0 * (scene * taken).max(1e-6).log10());
+            if d > 0.0 {
+                total += (1.0 - P_OUTLIER) * d * self.lik(rets, i + 1, jn, scene, taken * left, seen * left, tau_after);
+            }
+        }
+        // an outlier
+        total + P_OUTLIER / T_MAX * em.refl_background(x) * self.lik(rets, i + 1, j, scene, taken, seen, tau0)
+    }
+}
+
+/// One cell an element fronts, as its ray likelihood scores it: its ray through the foliage field, its pulse's echoes
+/// and their reflectances (dB; empty unknown), whether the pulse is at the instrument's cap, layers, ground and weight,
+/// its log-likelihood under the empty scene, and what its first echo says about the element.
 struct CellData {
     bg: RayFoliage,
     echoes: Vec<f32>,
-    refl: f64,
+    refls: Vec<f32>,
+    capped: bool,
+    anchor: Option<(f64, f64)>,
     layers: Vec<(Layer, u8)>,
     ground: Option<(f64, f64)>,
     wt: f64,
@@ -670,7 +760,7 @@ impl ElemData {
     fn ll_parts(&self, x: (f64, f64), em: &Settings) -> (f64, [f64; 4]) {
         let (mut total, mut parts) = (0.0, [0.0; 4]);
         for c in &self.cells {
-            let l = c.wt * (cell_ll(&c.echoes, c.refl, &c.layers, c.ground, x.0, x.1, em, &c.bg) - c.base);
+            let l = c.wt * (cell_ll(&c.echoes, &c.refls, c.capped, &c.layers, c.ground, x.0, x.1, em, &c.bg, c.anchor) - c.base);
             total += l;
             parts[c.outcome as usize] += l;
         }
@@ -893,9 +983,10 @@ fn elem_data(v: &RangeImage, rendered: &[Vec<(usize, Layer)>], elems: &[Element]
                 *a += x;
             }
         }
-        let refl = v.echo_refls(cell).first().map_or(f64::NAN, |&x| x as f64);
-        let base = cell_ll(echoes, refl, &[], cv.ground, 0.0, 0.0, em, &cv.bg.base());
-        el.cells.push(CellData { bg: cv.bg, echoes: echoes.to_vec(), refl, layers, ground: cv.ground, wt: cv.wt, base, outcome });
+        let (refls, capped) = (v.echo_refls(cell), !echoes.is_empty() && echoes.len() >= v.max_targets);
+        let anchor = behind_anchor(&layers, &cv.bg.taus, em);
+        let base = cell_ll(echoes, refls, capped, &[], cv.ground, 0.0, 0.0, em, &cv.bg.base(), anchor);
+        el.cells.push(CellData { bg: cv.bg, echoes: echoes.to_vec(), refls: refls.to_vec(), capped, anchor, layers, ground: cv.ground, wt: cv.wt, base, outcome });
     }
     // class evidence: the element's form is its class hypothesis (a stick wood, a patch leaf)
     for (el, ph) in data.iter_mut().zip(&photo) {
@@ -1509,7 +1600,7 @@ impl Scene {
             let cv = cell_view(v, cell, &ts, em, &self.sc, &self.ext);
             let fe = front_echo(&layers, cv.ground, em, &cv.bg.taus, e.r, other);
             CellPrediction {
-                cell, elem: 0, fill: ly.f, recorded: fe.s, arrives: fe.arrives, surface: cls[0], depth: fe.mu, sd: fe.sd, refl: if fe.db[1] > -200.0 { fe.db[1] } else { f64::NAN }, cos: ly.cos, obs: cv.obs,
+                cell, elem: 0, fill: ly.f, recorded: fe.s, arrives: (-fe.tau).exp(), surface: cls[0], depth: fe.mu, sd: fe.sd, refl: if fe.db[1] > -200.0 { fe.db[1] } else { f64::NAN }, cos: ly.cos, obs: cv.obs,
                 obs_refl: v.echo_refls(cell).first().map_or(f64::NAN, |&x| x as f64),
                 outcome: Outcome::of(cv.obs, fe.mu, fe.sd), weight: cv.wt, footprint: em.footprint(ly.t), across: ly.x, along: ly.s,
             }
@@ -1566,7 +1657,9 @@ impl Scene {
     /// latents every cell shares are marginalised out under their priors (the depth's shift, alignment and stem
     /// front, and the reflectance level: a Schur complement). It is positive semi-definite and reads a direction the
     /// cells don't see as 0, where the observed curvature reads the cost's roughness (half the far views' pairs read
-    /// a negative direction: step 2). It leaves out what other elements' cells say.
+    /// a negative direction: step 2). It leaves out what other elements' cells say, and the later echoes (research
+    /// 130 step 3c); a partial cell's reflectance counts `1 − behind_share` of itself, the share of edges with no
+    /// unmodelled surface merging with them.
     ///
     /// **What it means under the evidence discount** (research 130 step 3b). Each cell's log-likelihood counts
     /// `w_c = 1 / (φ m)`, so the cost is a quasi-likelihood and E is its curvature: an sd read from E⁻¹ is honest only
@@ -1583,7 +1676,10 @@ impl Scene {
     ///
     /// **ln r is the space radius is unbiased in:** the stand's fitted ln r sits −0.003 from the truth (median, R ≥
     /// 1 cm); r's own mean is `exp(ln r + ½ sd²)`, so an average of radii should be taken in ln r.
-    pub fn information(&self, id: u32) -> Vec<Information> {
+    ///
+    /// Without `observed`, the stencil is skipped (about two thirds of the cost: research 130 step 3b) and the slope
+    /// and observed curvature read NaN, for a consumer that reads the expected information alone.
+    pub fn information(&self, id: u32, observed: bool) -> Vec<Information> {
         let e = self.elems[id as usize].expect("a live element");
         let hs = 0.002;
         let (n, steps, perp, half) = match e.form {
@@ -1626,7 +1722,7 @@ impl Scene {
                 }
             }
         }
-        let items: Vec<(Vec<Element>, Option<u32>)> = pts.iter().map(|t| (vec![at(t)], Some(id))).collect();
+        let items: Vec<(Vec<Element>, Option<u32>)> = if observed { pts.iter().map(|t| (vec![at(t)], Some(id))).collect() } else { Vec::new() };
         let c = self.costs_replacing(&items);
         let em = &self.em;
         let (k_depth, k_refl) = ((em.noise_dof + 1.0) / (em.noise_dof + 3.0), (em.refl_dof + 1.0) / (em.refl_dof + 3.0));
@@ -1676,7 +1772,9 @@ impl Scene {
                 let mut obs = vec![(0, slope(&|q| q.depth, None), pc * k_depth / (p.sd * p.sd - shifts * shifts).max(1e-12))];
                 if refl && p.refl.is_finite() {
                     prior[1] = em.refl_level_sd;
-                    obs.push((1, slope(&|q| q.refl, None), pc * k_refl / em.refl_noise.hypot(em.refl_edge * (1.0 - p.fill.clamp(0.0, 1.0))).powi(2)));
+                    // a partial cell's reflectance reads its fill only when no unmodelled surface merges with it
+                    let clear = if p.fill < 0.98 { 1.0 - em.behind_share } else { 1.0 };
+                    obs.push((1, slope(&|q| q.refl, None), clear * pc * k_refl / em.refl_noise.hypot(em.refl_edge * (1.0 - p.fill.clamp(0.0, 1.0))).powi(2)));
                 }
                 for (k, g, w) in obs {
                     add(&g, w);
@@ -1703,6 +1801,10 @@ impl Scene {
             [m, j]
         }).collect();
         (0..self.views.len()).map(|s| {
+            let [expected, gradient_variance] = expected[s].clone();
+            if !observed {
+                return Information { gradient: vec![f64::NAN; n], hessian: vec![f64::NAN; n * n], expected, gradient_variance };
+            }
             let f = |k: usize| c[k][s];
             let g: Vec<f64> = (0..n).map(|i| (f(1 + 2 * i) - f(2 + 2 * i)) / (2.0 * steps[i])).collect();
             let mut m = vec![0.0; n * n];
@@ -1718,7 +1820,6 @@ impl Scene {
                     k += 4;
                 }
             }
-            let [expected, gradient_variance] = expected[s].clone();
             Information { gradient: g, hessian: m, expected, gradient_variance }
         }).collect()
     }
@@ -1823,9 +1924,17 @@ mod tests {
 
     /// [`pole_scan`] with the pole's wood reflecting `wood` dB.
     fn pole_scan_of(r_pole: f64, y_pole: f64, gap: f64, wood: f64) -> RangeImage {
+        pole_scan_echoes(r_pole, y_pole, gap, wood, false)
+    }
+
+    /// [`pole_scan_of`], and with `later` every echo: a pulse whose pole echo is recorded and resolved from the wall
+    /// also returns the wall's, with the rest of the beam, where it clears the detection floor; the instrument's cap
+    /// is 4 (none is reached).
+    fn pole_scan_echoes(r_pole: f64, y_pole: f64, gap: f64, wood: f64, later: bool) -> RangeImage {
         let (period, interval, zstep) = (6.6e-3, 0.825e-6, 0.03);
         let em = Settings::default();
         let (mut t, mut d, mut r, mut refl) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+        let (mut echo_start, mut echo_range, mut echo_refl) = (vec![0u32], Vec::new(), Vec::new());
         let u = |s: u64| ((s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407) >> 11) as f64 + 0.5) / (1u64 << 53) as f64;
         for l in 0..200usize {
             for k in 0..400usize {
@@ -1865,9 +1974,24 @@ mod tests {
                 t.push(l as f64 * period + k as f64 * interval);
                 d.push(w);
                 r.push(range as f32);
+                echo_range.push(range as f32);
+                echo_refl.push((db + n_refl) as f32);
+                let n_wall = 2.0 * (-2.0 * u(seed * 37).ln()).sqrt() * (2.0 * std::f64::consts::PI * u(seed * 7919 * 37)).cos();
+                if kept && wall - ez / ec >= RESOLUTION && 10.0 * ew.max(1e-12).log10() + n_wall > em.floor(wall) {
+                    echo_range.push(wall as f32);
+                    echo_refl.push((10.0 * ew.max(1e-12).log10() + em.refl_noise * n_wall / 2.0) as f32);
+                }
+                echo_start.push(echo_range.len() as u32);
             }
         }
         let id = [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]];
+        if later {
+            let zen = d.iter().map(|w: &Point| w[2].clamp(-1.0, 1.0).acos().to_degrees()).fold((f64::INFINITY, f64::NEG_INFINITY), |(a, b), z| (a.min(z), b.max(z)));
+            let mut v = RangeImage::new(&t, &d, echo_start, echo_range, zen, id, [0.0; 3], 0, &RangeImageParams::default());
+            v.echo_refl = echo_refl;
+            v.max_targets = 4;
+            return v;
+        }
         let mut v = RangeImage::from_first_echoes(&t, &d, &r, id, [0.0; 3], 0, &RangeImageParams::default());
         v.echo_refl = refl;
         v
@@ -2131,9 +2255,10 @@ mod tests {
                 let wt = em.cell_weight(echoes.first().map_or(ls[0].t, |&r| r as f64), v.step());
                 let w = v.direction((cell / v.n_cols) as f64, (cell % v.n_cols) as f64);
                 let ts: Vec<f64> = layers.iter().map(|(l, _)| l.t).collect();
-                let bg = Foliage::uniform(sc.kappa).ray_bg(&v.origin, &w, &ts, None, T_MAX, echoes.first().map_or(f64::NAN, |&r| r as f64));
-                let refl = v.echo_refls(cell).first().map_or(f64::NAN, |&x| x as f64);
-                wt * (cell_ll(echoes, refl, &layers, None, shift, level, &em, &bg) - cell_ll(echoes, refl, &[], None, 0.0, 0.0, &em, &bg.base()))
+                let bg = Foliage::uniform(sc.kappa).ray_bg(&v.origin, &w, &ts, None, T_MAX, echoes, em.resolution());
+                let (refls, capped) = (v.echo_refls(cell), !echoes.is_empty() && echoes.len() >= v.max_targets);
+                let anchor = behind_anchor(&layers, &bg.taus, &em);
+                wt * (cell_ll(echoes, refls, capped, &layers, None, shift, level, &em, &bg, anchor) - cell_ll(echoes, refls, capped, &[], None, 0.0, 0.0, &em, &bg.base(), anchor))
             }).sum()
         };
         let sq = std::f64::consts::SQRT_2;
@@ -2201,9 +2326,11 @@ mod tests {
     #[test]
     fn the_pole_is_pinned_down_and_rows_split_their_cost() {
         let v = pole_view();
-        let (em, sc) = (Settings::default(), Background::default());
+        // nothing lies within the resolution behind the pole, so no unmodelled surface is declared (the expected
+        // information averages over the declared share, which the observed curvature here doesn't see)
+        let (em, sc) = (Settings { behind_share: 0.0, ..Settings::default() }, Background::default());
         let c = Scene::new(vec![v.clone()], &[stick(0.0, 4.0, 0.03)], em, sc, None, 0);
-        let info = &c.information(0)[0];
+        let info = &c.information(0, true)[0];
         let (m, x) = (&info.hessian, &info.expected);
         for i in 0..3 {
             assert!(m[i * 5 + i] > 0.0, "{i}: {m:?}");
@@ -2227,7 +2354,7 @@ mod tests {
         let sc = Background::default();
         let at = |phi: f64| {
             let c = Scene::new(vec![v.clone()], &[stick(0.0, 4.0, 0.03)], Settings { discount: phi, ..Settings::default() }, sc, None, 0);
-            let i = c.information(0).remove(0);
+            let i = c.information(0, true).remove(0);
             (i.expected[12], i.gradient_variance[12], c.rows()[0].arc)
         };
         let ((e1, j1, arc), (e2, j2, _)) = (at(10.0), at(20.0));
@@ -2244,10 +2371,12 @@ mod tests {
     #[test]
     fn located_edges_pin_a_thin_sticks_radius() {
         let sc = Background::default();
+        // the pole stands alone (nothing within the resolution behind it), so no unmodelled surface is declared
+        let em = Settings { behind_share: 0.0, ..Settings::default() };
         for (r, y) in [(0.01, 6.0), (0.006, 6.0)] {
             let v = thin_pole_view(r, y);
-            let info = |em: Settings| Scene::new(vec![v.clone()], &[stick(0.0, y, r)], em, sc, None, 0).information(0)[0].hessian[0];
-            let (with, without) = (info(Settings::default()), info(Settings { refl_noise: 0.0, ..Settings::default() }));
+            let info = |em: Settings| Scene::new(vec![v.clone()], &[stick(0.0, y, r)], em, sc, None, 0).information(0, true)[0].hessian[0];
+            let (with, without) = (info(em), info(Settings { refl_noise: 0.0, ..em }));
             assert!(with > 1.5 * without, "r {r}: with reflectance {with}, without {without}");
         }
     }
@@ -2265,5 +2394,75 @@ mod tests {
         }
         let row = truth.1[0];
         assert!((row.refl_level - 3.0).abs() < 3.0 * row.refl_level_sd.max(0.3), "{row:?}");
+    }
+
+    /// One edge cell, by hand (research 130 step 3c): a stick's layer at 4 m filling `f` of the beam, a wall at 8 m
+    /// taking the rest, and the pulse's echoes.
+    fn edge_cell(f: f64, echoes: &[f32], refls: &[f32], capped: bool, em: &Settings) -> f64 {
+        let layer = |t: f64, f: f64, db: f64, elem: u32| Layer { t, spread: 0.0, f, fq: [f; 3], cos: 1.0, db, elem, op: 1.0, x: 0.0, s: 0.0 };
+        let layers = [(layer(4.0, f, em.refl_wood, 0), 0u8), (layer(8.0, 1.0, em.refl_ground, 1), 0u8)];
+        let bg = Foliage::uniform(0.05).ray_bg(&[0.0; 3], &[0.0, 1.0, 0.0], &[4.0, 8.0], None, T_MAX, echoes, em.resolution());
+        cell_ll(echoes, refls, capped, &layers, None, 0.0, 0.0, em, &bg, behind_anchor(&layers, &bg.taus, em))
+    }
+
+    /// Later echoes behind an edge (research 130 step 3c): the wall's echo behind a stick's edge reads the rest of the
+    /// beam, so with the edge's own reflectance unknown it alone tells a stick filling 0.3 of the beam from one
+    /// filling 0.9 (the wall echo is 10 log10 0.7 dimmer than a full hit); without it (the pulse capped at its first
+    /// echo) they differ by little. At the stand's edge spread (2 dB per unit of beam missed; AM's 10 dB reads it
+    /// too, but weakly).
+    #[test]
+    fn a_later_echo_reads_the_rest_of_the_beam() {
+        let em = Settings { refl_edge: 2.0, ..Settings::default() };
+        let wall = (em.refl_ground + 10.0 * 0.7f64.log10()) as f32;
+        let two = |f: f64| edge_cell(f, &[4.0, 8.0], &[f32::NAN, wall], false, &em);
+        let one = |f: f64| edge_cell(f, &[4.0], &[f32::NAN], true, &em);
+        assert!(two(0.3) > two(0.9) + 3.0, "with the wall's echo: {} vs {}", two(0.3), two(0.9));
+        assert!((one(0.3) - one(0.9)).abs() < 0.5, "first echo alone: {} vs {}", one(0.3), one(0.9));
+    }
+
+    /// The instrument's cap (research 130 step 3c): a pulse that returned as many echoes as the instrument records
+    /// says nothing past its last echo, so a wall behind that would have echoed costs nothing there; uncapped, its
+    /// missing echo is evidence against it. Free space reaches the first echo less the receiver's resolution.
+    #[test]
+    fn a_capped_pulse_says_nothing_past_its_last_echo() {
+        let em = Settings::default();
+        let (capped, open) = (edge_cell(0.3, &[4.0], &[f32::NAN], true, &em), edge_cell(0.3, &[4.0], &[f32::NAN], false, &em));
+        assert!(capped > open + 3.0, "capped {capped}, uncapped {open}");
+        assert!((em.free_to(4.0) - (4.0 - em.resolution())).abs() < 1e-12 && em.free_to(f64::NAN) == T_MAX);
+    }
+
+    /// A merge with an unmodelled surface (research 130 step 3c): a pole 0.5 m before a wall the scene doesn't hold,
+    /// closer than the receiver's resolution, so its edges' echoes merge with the wall's, bright and pulled back. With
+    /// the edge model's spread small (2 dB per unit of beam missed), the branch for an unmodelled surface behind
+    /// explains them: the true pole costs less with it, and beats a thinner and a thicker one.
+    #[test]
+    fn an_unmodelled_surface_just_behind_merges_with_the_edge() {
+        let sc = Background::default();
+        let v = Arc::new(pole_scan(0.02, 4.0, 0.5));
+        let em = Settings { refl_edge: 2.0, behind_refl: -20.0, ..Settings::default() };
+        let e = |em: &Settings, r: f64| cost(&v, &[stick(0.0, 4.0, r)], em, &sc).0;
+        let (off, on) = (Settings { behind_share: 0.0, ..em }, Settings { behind_share: 0.5, ..em });
+        assert!(e(&on, 0.02) < e(&off, 0.02) - 3.0, "with the branch {}, without {}", e(&on, 0.02), e(&off, 0.02));
+        for r in [0.014, 0.028] {
+            assert!(e(&on, r) > e(&on, 0.02) + 0.5, "r {r}: {} vs {}", e(&on, r), e(&on, 0.02));
+        }
+    }
+
+    /// Later echoes in a scene (research 130 step 3c): a thin pole 3 m before a wall the scene doesn't hold, every
+    /// echo kept, so the wall's echoes behind its edges read as the background's in the beam the pole leaves. The true
+    /// radius beats a thinner and a thicker one, and those echoes add to the evidence against the thicker (which
+    /// leaves them too little beam).
+    #[test]
+    fn later_echoes_behind_a_thin_poles_edges_count() {
+        let (em, sc) = (Settings::default(), Background::default());
+        let (first, every) = (Arc::new(pole_scan_echoes(0.006, 6.0, 3.0, em.refl_wood, false)), Arc::new(pole_scan_echoes(0.006, 6.0, 3.0, em.refl_wood, true)));
+        let e = |v: &Arc<RangeImage>, r: f64| cost(v, &[stick(0.0, 6.0, r)], &em, &sc).0;
+        for v in [&first, &every] {
+            for r in [0.0042, 0.0084] {
+                assert!(e(v, r) > e(v, 0.006) + 0.5, "r {r}: {} vs {}", e(v, r), e(v, 0.006));
+            }
+        }
+        let against = |v: &Arc<RangeImage>| e(v, 0.0084) - e(v, 0.006);
+        assert!(against(&every) > against(&first), "every echo {}, first alone {}", against(&every), against(&first));
     }
 }

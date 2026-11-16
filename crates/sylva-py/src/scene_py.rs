@@ -28,7 +28,7 @@ use pyo3::types::PyDict;
 use std::sync::Arc;
 use sylva_rs::scene::foliage::FoliageBox;
 use sylva_rs::scene::moments::{Candidate, Moments};
-use sylva_rs::scene::range_image::{RangeImage, RangeImageParams};
+use sylva_rs::scene::range_image::{Cell, RangeImage, RangeImageParams};
 use sylva_rs::scene::scene::{CellPrediction, Element, ElementScan, Form, Information, Scene, SceneError};
 use sylva_rs::scene::settings::{Background, Settings};
 
@@ -165,8 +165,9 @@ impl PyRangeImage {
     }
 
     /// The cell arrays, each (n_lines, n_cols[, k]): cell (0 echoes, 1 miss, 2 no pulse), echoes (their count),
-    /// range and refl (the first echo's; refl in dB, NaN unknown), pulse (-1 none), normal, cos_inc, excess; and
-    /// surface (its class under the `settings`' class edges).
+    /// range and refl (the first echo's; refl in dB, NaN unknown), pulse (-1 none), normal, cos_inc, excess; and,
+    /// under the `settings`, surface (its class by the class edges) and free_to (the range up to which its pulse shows
+    /// clear space: scene::settings::Settings::free_to; NaN where no pulse).
     #[pyo3(signature = (settings=None))]
     fn arrays<'py>(&self, py: Python<'py>, settings: Option<&Bound<'_, PyDict>>) -> PyResult<Bound<'py, PyDict>> {
         let em = self::settings(settings)?;
@@ -182,6 +183,8 @@ impl PyRangeImage {
         d.set_item("cos_inc", v.cos_inc.clone().into_pyarray(py).reshape(sh)?)?;
         d.set_item("excess", v.excess.clone().into_pyarray(py).reshape(sh)?)?;
         d.set_item("surface", v.excess.iter().map(|&e| em.surface(e as f64)).collect::<Vec<u8>>().into_pyarray(py).reshape(sh)?)?;
+        let free = |k: usize| if v.cell[k] == Cell::NoPulse { f64::NAN } else { em.free_to(v.range[k] as f64) };
+        d.set_item("free_to", (0..v.cell.len()).map(free).collect::<Vec<f64>>().into_pyarray(py).reshape(sh)?)?;
         Ok(d)
     }
 
@@ -476,11 +479,13 @@ impl PyScene {
     /// (two directions, m) and tilted (rad); a patch's ln r and its centre moved (x, y, z, m). Beside them the
     /// expected information `expected` (scans, n, n): what its cells would tell on average, positive semi-definite;
     /// and `gradient_variance` (scans, n, n): the slope's variance were the cells independent, for the sandwich
-    /// `E⁻¹ J E⁻¹`.
-    fn information<'py>(&self, py: Python<'py>, id: u32) -> PyResult<Bound<'py, PyDict>> {
+    /// `E⁻¹ J E⁻¹`. With `observed` false the stencil is skipped (two thirds of the cost) and `gradient` and
+    /// `hessian` read NaN.
+    #[pyo3(signature = (id, observed=true))]
+    fn information<'py>(&self, py: Python<'py>, id: u32, observed: bool) -> PyResult<Bound<'py, PyDict>> {
         self.inner.check_id(id).map_err(scene_err)?;
         let c = &self.inner;
-        let out = py.detach(|| c.information(id));
+        let out = py.detach(|| c.information(id, observed));
         let (s, n) = (out.len(), out.first().map_or(0, |m| m.gradient.len()));
         let d = PyDict::new(py);
         d.set_item("gradient", out.iter().flat_map(|x| x.gradient.clone()).collect::<Vec<f64>>().into_pyarray(py).reshape([s, n])?)?;

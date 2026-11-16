@@ -20,7 +20,7 @@
 //!   first and from the previous echo plus the receiver's resolution after that (a surface closer behind an echo would
 //!   have merged with it: [`Settings::resolution`]). The report is the first K returns in time (research 130 slice
 //!   12b), so after the last echo the path on is transmission only if the pulse returned fewer echoes than the
-//!   instrument records ([`RangeImage::max_targets`]): a pulse at its cap says nothing about what lies beyond.
+//!   instrument records ([`RangeImage`]'s `max_targets`): a pulse at its cap says nothing about what lies beyond.
 //! - **Energy after an echo.** A pulse's echo energies are bounded by its emitted energy (synthesis §4): an echo's
 //!   reflectance against a full-footprint hit on the dimmest canopy surface ([`Settings::refl_full_hit`]) is the
 //!   share of the beam it took, so a full hit on leaf or wood reads as the whole beam, and only the rest goes on. So
@@ -64,19 +64,19 @@ pub struct Foliage {
 }
 
 /// What a cell's ray meets of the foliage field: the optical depth to each of its layers and then the ground (`taus`), to the
-/// beam's end, and to its first echo, with σ at that echo.
+/// beam's end, and per echo of its pulse (`echoes`): the optical depth to it, σ at it, and the optical depth to it
+/// plus the receiver's resolution (where the path after it restarts: a surface closer behind would have merged).
 #[derive(Debug, Clone)]
 pub struct RayFoliage {
     pub taus: Vec<f64>,
     pub tau_end: f64,
-    pub tau_obs: f64,
-    pub sig_obs: f64,
+    pub echoes: Vec<[f64; 3]>,
 }
 
 impl RayFoliage {
     /// The same ray with its layers left out (the ground's optical depth kept).
     pub fn base(&self) -> RayFoliage {
-        RayFoliage { taus: vec![*self.taus.last().unwrap_or(&0.0)], ..*self }
+        RayFoliage { taus: vec![*self.taus.last().unwrap_or(&0.0)], tau_end: self.tau_end, echoes: self.echoes.clone() }
     }
 }
 
@@ -125,16 +125,15 @@ impl Foliage {
     }
 
     /// What a cell's ray from `o` along `w` meets: optical depths to its layers' ranges, its ground's, the beam's end
-    /// and its first echo `obs` (NaN for none).
-    pub fn ray_bg(&self, o: &Point, w: &Point, layer_ts: &[f64], ground_t: Option<f64>, t_end: f64, obs: f64) -> RayFoliage {
+    /// and each of its pulse's `echoes` (and that echo plus `reach`, the receiver's resolution), with σ at each echo.
+    pub fn ray_bg(&self, o: &Point, w: &Point, layer_ts: &[f64], ground_t: Option<f64>, t_end: f64, echoes: &[f32], reach: f64) -> RayFoliage {
         let mut taus: Vec<f64> = layer_ts.iter().map(|&t| self.tau(o, w, t)).collect();
         taus.push(ground_t.map_or(0.0, |t| self.tau(o, w, t)));
-        let (tau_obs, sig_obs) = if obs.is_finite() {
-            self.tau_hazard(o, w, obs)
-        } else {
-            (f64::NAN, f64::NAN)
-        };
-        RayFoliage { taus, tau_end: self.tau(o, w, t_end), tau_obs, sig_obs }
+        let echoes = echoes.iter().map(|&r| {
+            let (tau, sig) = self.tau_hazard(o, w, r as f64);
+            [tau, sig, self.tau(o, w, r as f64 + reach)]
+        }).collect();
+        RayFoliage { taus, tau_end: self.tau(o, w, t_end), echoes }
     }
 }
 
@@ -235,7 +234,7 @@ fn ray(v: &RangeImage, sp: &FoliageBox, em: &Settings, cap: usize, k: usize, mut
 
 /// The weighted counts of image `v`'s cells in `cells` (every cell when `None`).
 pub fn counts(v: &RangeImage, sp: &FoliageBox, em: &Settings, cells: Option<&HashSet<usize>>) -> Counts {
-    let cap = v.max_targets();
+    let cap = v.max_targets;
     let one = |k: usize, acc: &mut Counts| ray(v, sp, em, cap, k, |key, h, l| {
         let e = acc.entry(key).or_insert((0.0, 0.0));
         e.0 += h;

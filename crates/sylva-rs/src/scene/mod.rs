@@ -20,7 +20,11 @@
 //! |---|---|---|
 //! | one scanner position's pulses | scan | its range image is the scan on its lattice |
 //! | a lattice position | cell | holds a pulse's echoes, a miss (a pulse with no echo) or no pulse |
-//! | a cell's nearest echo | first echo | the one the ray likelihood reads |
+//! | a cell's nearest echo | first echo | the one an outcome reads |
+//! | a pulse's echoes after its first | later echoes | the ray likelihood reads them too: behind an edge, the rest of the beam |
+//! | the most echoes the instrument records per pulse | the target cap | `max_targets`; a pulse at it is capped, and says nothing past its last echo |
+//! | a surface no element holds within the receiver's resolution behind a cell's layers | unmodelled surface behind | `behind_share`, `behind_refl`: a branch of the cell's likelihood, merging with the layers' return |
+//! | the range up to which a pulse shows clear space | free space | `free_to`: the first echo less the receiver's resolution |
 //! | a proposed part of the scene | element | a stick (an axis and radius; wood) or a patch (a ball; leaf) |
 //! | elements held against scans | scene | `Scene` |
 //! | `−log` likelihood ratio against the empty scene | cost | also of a move: `add`, `remove`, `change`, `costs_to_add`, `costs_to_remove` |

@@ -84,6 +84,9 @@ pub struct RangeImage {
     pub echo_range: Vec<f32>,
     /// Each echo's reflectance (dB), beside `echo_range`; empty where the source has none.
     pub echo_refl: Vec<f32>,
+    /// The most echoes any pulse recorded: the instrument's cap on targets per pulse, read from the data (AM's
+    /// VZ-2000i at 1.2 MHz records 4; the stand's simulator 3). A pulse at its cap says nothing past its last echo.
+    pub max_targets: usize,
     /// Unit normal toward the scanner (world), `cos ι` and excess; NaN where no fit.
     pub normal: Vec<[f32; 3]>,
     pub cos_inc: Vec<f32>,
@@ -223,8 +226,9 @@ impl RangeImage {
                 cell[k] = Cell::Miss;
             }
         }
+        let max_targets = echo_start.windows(2).map(|w| (w[1] - w[0]) as usize).max().unwrap_or(0);
         let mut v = RangeImage {
-            lat, c0, n_lines: nl, n_cols: nc, rot, origin, epoch, cell, range: rng, pulse, echo_start, echo_range, echo_refl: Vec::new(),
+            lat, c0, n_lines: nl, n_cols: nc, rot, origin, epoch, cell, range: rng, pulse, echo_start, echo_range, echo_refl: Vec::new(), max_targets,
             normal: Vec::new(), cos_inc: Vec::new(), excess: Vec::new(),
         };
         let fits: Vec<([f32; 3], f32)> = (0..n).into_par_iter().map(|k| v.fit(k, direction, p)).collect();
@@ -363,12 +367,6 @@ impl RangeImage {
     /// The lattice step (rad), the zenith step between a line's slots, as this scan's timing measures it.
     pub fn step(&self) -> f64 {
         self.lat.zenith_step.abs().to_radians()
-    }
-
-    /// The most echoes any pulse recorded: the instrument's cap on targets per pulse, read from the data (AM's VZ-2000i
-    /// at 1.2 MHz records 4; the stand's simulator 3).
-    pub fn max_targets(&self) -> usize {
-        self.echo_start.windows(2).map(|w| (w[1] - w[0]) as usize).max().unwrap_or(0)
     }
 
     /// The surfels of this scan's echo cells with a normal whose echo lies inside the box `lo`-`hi` (world positions
