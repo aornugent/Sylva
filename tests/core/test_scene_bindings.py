@@ -65,7 +65,7 @@ def test_an_empty_scene_costs_nothing_and_a_pole_is_pinned_down():
     assert _core.Scene([v], dict(a=np.zeros((0, 3)), b=np.zeros((0, 3)), r=np.zeros(0))).cost() == 0.0
     sc = _core.Scene([v], pole())
     rows = sc.rows()
-    parts = sum(rows[k] for k in ('ray_on', 'ray_empty', 'ray_in_front', 'ray_behind', 'class', 'alignment'))
+    parts = sum(rows[k] for k in ('ray_on', 'ray_empty', 'ray_in_front', 'ray_behind', 'alignment'))
     assert np.allclose(parts, rows['cost']) and rows['cost'][0] < 0
     info = sc.information([0])
     assert info['hessian'].shape == (1, 5, 5) and np.isfinite(info['hessian']).all() and np.diag(info['hessian'][0]).max() > 0

@@ -8,10 +8,11 @@
 //!
 //! - **Elements** ([`Element`]): a form, a stick (an axis, its section's mean radius a₀) or a patch (a ball with its
 //!   extent, a disc in every view), and a class, wood or leaf, each with an opacity and a shape mismatch. The form is
-//!   geometry only; the class sets the element's reflectance ([`Settings`]'s `refl_wood`, `refl_leaf`) and the side
-//!   its class evidence argues for, so the same stick marked wood and marked leaf shares its cells and nuisances
-//!   (3dtrees research 130 slice 5a). Opacity is the chance a pulse the section fills meets solid there, its gaps
-//!   wider than the footprint (synthesis §1's "extent, opacity"). The mismatch is the sd of the section's and axis's
+//!   geometry only; the class sets the element's reflectance ([`Settings`]'s `refl_wood`, `refl_leaf`), so the same
+//!   stick marked wood and marked leaf shares its cells and nuisances (3dtrees research 130 slice 5a). Class evidence
+//!   from photometry is the consumer's, read off [`Scene::predict`]'s cells beside the cost, never in it (slice 9).
+//!   Opacity is the chance a pulse the section fills meets solid there, its gaps wider than the footprint (synthesis
+//!   §1's "extent, opacity"). The mismatch is the sd of the section's and axis's
 //!   departure from the form, which blurs the fill and spreads the depth.
 //! - **The k-buffer:** each element renders into each view's cells. A cell keeps up to [`K`] layers, nearest
 //!   first, each with a depth, a depth spread, a fill and a cosine. Fill is the beam (a uniform disc of the
@@ -51,7 +52,7 @@
 //!     let a wider stick move echoes from the edges into the gate, where each is worth far more).
 //! - **The element's echo** ([`front_echo`]): the first return of the most likely way a cell comes back, its sd
 //!   widened by the alignment error and the stem front shift. [`Outcome::of`] against it is the one rule for "the
-//!   cell's first echo is the element's", used by the surface class, the cells_on, class evidence, `predict` and
+//!   cell's first echo is the element's", used by the surface class, the cells_on, `predict` and
 //!   `counts` (and, for any echo of the pulse, `predict`'s `read`); a cell mostly filled ([`MOSTLY`]) is where an echo
 //!   reads the element's surface.
 //! - **Depth over a footprint:** a layer's depth is the mean of the section's depth over the part of the footprint
@@ -73,7 +74,7 @@
 //!   differed between hypotheses and, once every fronted cell counted, favoured the thinner (slice 7c).
 //!
 //! - **Chains** (3dtrees research 130 slice 6): elements of one group ([`Element`]'s `group`) are one term per scan
-//!   ([`Owner`]), so a chain of short sticks shares its nuisances and pools its class evidence. A declared term over
+//!   ([`Owner`]), so a chain of short sticks shares its nuisances. A declared term over
 //!   its geometry alone (its coupling: taper, bends) is the consumer's, beside the cost, never in it.
 //! - **The scene** ([`Scene`]) holds elements against range images, each rendered once. A move (add, remove,
 //!   change) returns its cost change with the alignment held, recomputing only the terms of the elements whose cells
@@ -111,7 +112,7 @@ pub enum Form {
     Patch { centre: Point },
 }
 
-/// What an element is made of: it sets the element's reflectance and the sign of its class evidence.
+/// What an element is made of: it sets the element's reflectance.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Class {
     Wood,
@@ -134,9 +135,8 @@ pub struct Element {
 
 /// Whose term a cell's evidence enters, per scan: an element alone (by id), or a group (by its key). A group's members
 /// share one set of nuisances (one alignment shift, at their middles' mean; one stem front shift, its prior sd their
-/// mean; one reflectance level), one surface class (the median over their echoes) and their class evidence (its sign
-/// the first member's class: a group is one class), so a chain of short sticks is charged its nuisances once and pools
-/// its evidence over its length. Its members' cells are scored as one element's.
+/// mean; one reflectance level) and one surface class (the median over their echoes), so a chain of short sticks is
+/// charged its nuisances once. Its members' cells are scored as one element's.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 enum Owner {
     Alone(u32),
@@ -298,8 +298,7 @@ impl Layer {
 /// - The ray likelihood's cost at the alignment's mode, by what each cell's first echo says about the element:
 ///   `ray_on` (its echoes), `ray_empty` (pulses with no echo), `ray_in_front` (hidden by something nearer) and
 ///   `ray_behind` (pulses that passed through it: evidence against).
-/// - `class`: class evidence's cost (0 while it is off); `alignment`: its own nodes' (stem front shift, reflectance
-///   level) prior and log-determinant terms. The scan's alignment part is the scan's, not shared out among its
+/// - `alignment`: its own nodes' (stem front shift, reflectance level) prior and log-determinant terms. The scan's alignment part is the scan's, not shared out among its
 ///   elements ([`Scene::alignment_parts`]), so the rows and those parts sum to the scene's cost.
 /// - `discount`: the evidence discount φ every cell's evidence was divided by.
 /// - The posterior at the element in this scan, along the beam (m): the scan alignment error's shift and sd, and the
@@ -320,7 +319,6 @@ pub struct ElementScan {
     pub ray_empty: f64,
     pub ray_in_front: f64,
     pub ray_behind: f64,
-    pub class: f64,
     pub alignment: f64,
     pub discount: f64,
     pub align_shift: f64,
@@ -900,9 +898,6 @@ struct ElemData {
     across: f64,
     align: Vec<([i64; 3], f64)>,
     own_sd: [f64; 2],
-    /// Class evidence's cost in this scan: its group's log ratio from the photometry over the group's echoes (every
-    /// cell whose first echo is a member's), its share by its echoes.
-    class_cost: f64,
 }
 
 impl ElemData {
@@ -1006,7 +1001,6 @@ impl ElemData {
             align: self.align.clone(),
             fit: -ll + 0.5 * (y[0] * y[0] + y[1] * y[1]),
             logdet: 0.5 * det.ln(),
-            class: self.class_cost,
             slope: g[0] - pl[0] * gy[0] - pl[1] * gy[1],
             curv: q[0][0] - link[0] * pl[0] - link[1] * pl[1],
             own: y,
@@ -1026,9 +1020,9 @@ impl ElemData {
     }
 }
 
-/// One (element, scan)'s part of its scan's cost at an alignment shift, `fit + logdet + class`: `fit` its ray
-/// likelihood's cost plus its own nodes' prior at their mode ŷ, `logdet` half their Laplace log-determinant ln|P|,
-/// `class` class evidence's cost. With them, the cost's `slope` and `curv`ature in its alignment shift (its own nodes
+/// One (element, scan)'s part of its scan's cost at an alignment shift, `fit + logdet`: `fit` its ray likelihood's
+/// cost plus its own nodes' prior at their mode ŷ, `logdet` half their Laplace log-determinant ln|P|. With them, the
+/// cost's `slope` and `curv`ature in its alignment shift (its own nodes
 /// eliminated), and what its row reports: ŷ, its own nodes' covariance given the shift P⁻¹ and how they follow it
 /// (`own_link`: ŷ moves by −`own_link` per unit of shift), the ray likelihood's cost by outcome, and its cells.
 #[derive(Debug, Clone)]
@@ -1036,7 +1030,6 @@ struct Term {
     align: Vec<([i64; 3], f64)>,
     fit: f64,
     logdet: f64,
-    class: f64,
     slope: f64,
     curv: f64,
     own: [f64; 2],
@@ -1053,7 +1046,7 @@ struct Term {
 
 impl Term {
     fn cost(&self) -> f64 {
-        self.fit + self.logdet + self.class
+        self.fit + self.logdet
     }
 
     /// Whether it enters the scan alignment error as `other` does (the same nodes, slope and curvature).
@@ -1085,8 +1078,7 @@ const MAX_NEWTON: usize = 40;
 
 /// One scan's data for the elements `score` (indices into `elems`, each with its layers in `rendered`), one per term
 /// (`slot`, per element: [`slots`]), against the k-buffer of every element's layers, under the surface classes `cls`. A
-/// cell's evidence belongs to its front element's term. Class evidence reads the term's photometry over every cell
-/// whose first echo is a member's (slice 5b), so a group of thin elements clears the echo gate together.
+/// cell's evidence belongs to its front element's term.
 #[allow(clippy::too_many_arguments)]
 fn elem_data(v: &RangeImage, rendered: &[Vec<(usize, Layer)>], elems: &[Element], cls: &[u8], slot: &[usize], score: &[usize], ref_epoch: u32,
              em: &Settings, sc: &Background, ext: &Foliage) -> Vec<ElemData> {
@@ -1108,9 +1100,8 @@ fn elem_data(v: &RangeImage, rendered: &[Vec<(usize, Layer)>], elems: &[Element]
         let s_along = em.align_sd(k, other);
         ElemData { cells: Vec::new(), surface: k, cells_on: 0, on_across: [f64::INFINITY, f64::NEG_INFINITY],
                    across: mean_of(&es, |e| 2.0 * e.r / em.footprint(norm(&sub(&e.mid(), &v.origin)))),
-                   align: hs.into_iter().map(|(key, w)| (key, w * s_along)).collect(), own_sd: [front, level], class_cost: 0.0, members: ms }
+                   align: hs.into_iter().map(|(key, w)| (key, w * s_along)).collect(), own_sd: [front, level], members: ms }
     }).collect();
-    let mut photo = vec![[0.0; 5]; data.len()];
     // cells in index order, so an element's sums run in the same order in every run (the k-buffer is a hash map)
     let mut order: Vec<usize> = buf.keys().copied().collect();
     order.sort_unstable();
@@ -1132,24 +1123,10 @@ fn elem_data(v: &RangeImage, rendered: &[Vec<(usize, Layer)>], elems: &[Element]
             let z = (front.x / elems[front.elem as usize].r).clamp(-1.0, 1.0);
             el.on_across = [el.on_across[0].min(z), el.on_across[1].max(z)];
         }
-        let echoes = v.echoes(cell);
-        if let (Outcome::On, Some(&db)) = (outcome, v.echo_refls(cell).first()) {
-            // the reflectance read at full fill: an echo's energy is its fill's share of the beam
-            let c = if v.cos_inc[cell].is_finite() { (v.cos_inc[cell] as f64).clamp(0.05, 1.0) } else { 0.5 };
-            let db = db as f64 - 10.0 * front.f.max(0.01).log10();
-            for (a, x) in photo[d].iter_mut().zip([1.0, db, db - 10.0 * c.log10(), (echoes.len() > 1) as u8 as f64, c]) {
-                *a += x;
-            }
-        }
         let base = cell_ll(cv.echoes, cv.refls, cv.capped, &[], cv.ground, 0.0, 0.0, em, &cv.bg.base(), &[]);
         let merges = merges(&layers, cv.ground, &v.origin, &cv.w, em, ext);
         el.cells.push(CellData { echoes: cv.echoes.to_vec(), refls: cv.refls.to_vec(), capped: cv.capped, layers, merges, ground: cv.ground, wt: cv.wt, base,
                                  outcome, bg: cv.bg });
-    }
-    // class evidence argues for wood or leaf: the term's, its cost by its (first member's) class
-    for (el, ph) in data.iter_mut().zip(&photo) {
-        let llr = if ph[0] > 0.0 { em.class_llr(ph) } else { 0.0 };
-        el.class_cost = match elems[el.members[0]].class { Class::Wood => -llr, Class::Leaf => llr };
     }
     data
 }
@@ -1687,7 +1664,7 @@ impl Scene {
                 let own_sd = |j: usize| t.own_sd[j] * (t.own_cov[j][j] + t.own_link[j] * t.own_link[j] * var).max(0.0).sqrt();
                 rows.push(ElementScan {
                     elem: i, group, scan: s as u32, cells: t.cells, cells_on: t.cells_on, arc: t.arc, footprints_across: t.across, surface: t.surface,
-                    cost: t.cost(), ray_on: t.ray[0], ray_empty: t.ray[1], ray_in_front: t.ray[2], ray_behind: t.ray[3], class: t.class,
+                    cost: t.cost(), ray_on: t.ray[0], ray_empty: t.ray[1], ray_in_front: t.ray[2], ray_behind: t.ray[3],
                     alignment: t.fit - t.ray.iter().sum::<f64>() + t.logdet, discount: self.em.discount,
                     align_shift: fit.held.shift(&t.align), align_sd: var.max(0.0).sqrt(), front_shift: t.own_sd[0] * t.own[0], front_shift_sd: own_sd(0),
                     refl_level: t.own_sd[1] * t.own[1], refl_level_sd: own_sd(1),
@@ -2694,12 +2671,12 @@ mod tests {
     }
 
     /// Class is a mark, not a shape (slice 5a): at equal reflectances the same stick marked wood and marked leaf
-    /// reads the same cells with the same nuisances (alignment, stem front shift, reflectance level), and only its
-    /// class evidence changes sign. A patch has no stem front shift.
+    /// reads the same cells with the same nuisances (alignment, stem front shift, reflectance level) and costs the
+    /// same (class evidence is the consumer's: slice 9). A patch has no stem front shift.
     #[test]
     fn the_same_stick_marked_wood_and_leaf_shares_cells_and_nuisances() {
         let v = thin_pole_view(0.03, 4.0);
-        let em = Settings { refl_leaf: Settings::default().refl_wood, class_temper: 1.0, ..Settings::default() };
+        let em = Settings { refl_leaf: Settings::default().refl_wood, ..Settings::default() };
         let wood = stick(0.0, 4.0, 0.03);
         let rows = |e: Element| cost(&v, &[e], &em, &Background::default()).1[0];
         let (w, l) = (rows(wood), rows(Element { class: Class::Leaf, ..wood }));
@@ -2708,31 +2685,9 @@ mod tests {
                        (w.align_shift, l.align_shift), (w.front_shift, l.front_shift), (w.refl_level, l.refl_level)] {
             assert_eq!(a, b);
         }
-        assert!(w.class != 0.0 && w.class == -l.class, "{} {}", w.class, l.class);
+        assert_eq!(w.cost, l.cost);
         let patch = Element { form: Form::Patch { centre: [0.0, 4.0, 0.0] }, class: Class::Leaf, r: 0.03, opacity: 1.0, mismatch: 0.002, group: None };
         assert_eq!(rows(patch).front_shift_sd, 0.0);
-    }
-
-    /// Class evidence reaches thin wood (slice 5b): a stick a third of a footprint across, every cell of it under half
-    /// filled, gets class evidence; short pieces of it, each under the echo gate alone, clear it as one group.
-    #[test]
-    fn a_thin_stick_gets_class_evidence_and_a_group_pools() {
-        let v = thin_pole_view(0.0015, 6.0);
-        let (on, off, sc) = (Settings { class_temper: 1.0, ..Settings::default() }, Settings::default(), Background::default());
-        let row = cost(&v, &[stick(0.0, 6.0, 0.0015)], &on, &sc).1[0];
-        assert!(row.footprints_across < 0.4 && row.class != 0.0, "{row:?}");
-        let piece = |z: f64| Element { form: Form::Stick { a: [0.0, 6.0, z - 0.001], b: [0.0, 6.0, z + 0.001] }, ..stick(0.0, 6.0, 0.0015) };
-        let pieces: Vec<Element> = (0..12).map(|k| piece(-0.15 + 0.025 * k as f64)).collect();
-        // class evidence's part of each hypothesis's cost: with it on less with it off
-        let class = |hyps: &[Vec<Element>]| -> Vec<f64> {
-            let [a, b] = [on, off].map(|em| Scene::new(vec![v.clone()], &[], em, sc, None, 0).costs_to_add(hyps));
-            a.iter().zip(&b).map(|(x, y)| x[0] - y[0]).collect()
-        };
-        let alone = class(&pieces.iter().map(|p| vec![*p]).collect::<Vec<_>>());
-        assert!(alone.iter().all(|&c| c == 0.0), "{alone:?}");
-        assert_eq!(class(&[pieces.clone()])[0], 0.0);
-        let chain: Vec<Element> = pieces.iter().map(|p| Element { group: Some(7), ..*p }).collect();
-        assert!(class(&[chain])[0] != 0.0);
     }
 
     /// The reference epoch is declared, not the first scan's: a scene of the same scans in either order costs the
@@ -2768,7 +2723,7 @@ mod tests {
             assert!(x[i * 5 + i] > 0.25 * m[i * 5 + i] && x[i * 5 + i] < 4.0 * m[i * 5 + i], "{i}: expected {x:?} observed {m:?}");
         }
         let r = c.rows()[0];
-        let parts = r.ray_on + r.ray_empty + r.ray_in_front + r.ray_behind + r.class + r.alignment;
+        let parts = r.ray_on + r.ray_empty + r.ray_in_front + r.ray_behind + r.alignment;
         assert!((parts - r.cost).abs() < 1e-9, "{parts} vs {}", r.cost);
         assert!((r.cost + c.alignment_parts()[0] - c.cost()).abs() < 1e-9);
         assert_eq!(r.discount, em.discount);
@@ -2899,13 +2854,12 @@ mod tests {
     }
 
     /// A move that touches one member rescores its whole group, so its pooled terms never go stale: pieces of the
-    /// pole 10 cm apart (no cell in common), added one by one, reach the same cost as the group built at once, with
-    /// class evidence pooled; removing a member restores the cost exactly, and `costs_to_add` of a member joining a
-    /// group equals adding it.
+    /// pole 10 cm apart (no cell in common), added one by one, reach the same cost as the group built at once;
+    /// removing a member restores the cost exactly, and `costs_to_add` of a member joining a group equals adding it.
     #[test]
     fn a_touched_member_rescores_its_group() {
         let v = thin_pole_view(0.0015, 6.0);
-        let (em, sc) = (Settings { class_temper: 1.0, ..Settings::default() }, Background::default());
+        let (em, sc) = (Settings::default(), Background::default());
         let piece = |z: f64| Element { form: Form::Stick { a: [0.0, 6.0, z - 0.02], b: [0.0, 6.0, z + 0.02] }, group: Some(1), ..stick(0.0, 6.0, 0.0015) };
         let pieces = [piece(-0.15), piece(-0.05), piece(0.05), piece(0.15)];
         let at_once = Scene::new(vec![v.clone()], &pieces, em, sc, None, 0);
@@ -2921,7 +2875,6 @@ mod tests {
         by_one.refit_alignment();
         assert!((by_one.cost() - at_once.cost()).abs() < 1e-9 * at_once.cost().abs().max(1.0), "{} vs {}", by_one.cost(), at_once.cost());
         assert_eq!(by_one.rows().len(), 1);
-        assert!(at_once.rows()[0].class != 0.0);
     }
 
     /// A chain is one hypothesis, so its own joints (two sticks meeting, sharing cells and a node) never read as

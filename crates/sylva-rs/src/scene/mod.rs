@@ -28,8 +28,8 @@
 //! | the most echoes the instrument records per pulse | the target cap | `max_targets`; a pulse at it is capped (`RangeImage::capped`), and says nothing past its last echo |
 //! | the range up to which a pulse shows clear space | free space | `free_to`: the first echo less the receiver's resolution |
 //! | a proposed part of the scene | element | a form (a stick, an axis and radius; or a patch, a ball) and a class |
-//! | what an element is made of, wood or leaf | class | `Class`: its reflectance and the sign of its class evidence; a mark, not a shape |
-//! | sticks joined end to end, scored as one | chain; group | `Element::group`, a key: a group's members are one term per scan, one set of nuisances (alignment shift, stem front shift, reflectance level) and pooled class evidence |
+//! | what an element is made of, wood or leaf | class | `Class`: its reflectance; a mark, not a shape |
+//! | sticks joined end to end, scored as one | chain; group | `Element::group`, a key: a group's members are one term per scan, one set of nuisances (alignment shift, stem front shift, reflectance level) |
 //! | a declared term over a chain's geometry alone | coupling | the consumer's (taper, form departures, bends), beside the cost, never in it; not the scene's |
 //! | elements held against scans | scene | `Scene` |
 //! | `−log` likelihood ratio against the empty scene | cost | also of a move: `add`, `remove`, `change`, `costs_to_add`, `costs_to_remove` |
@@ -50,7 +50,7 @@
 //! | an echo's reflectance against its return's energy share, placing a silhouette's edge within a cell | located edges | `refl_noise`, `refl`, `obs_refl` |
 //! | an element's reflectance offset from its surface's, per (element, scan) | reflectance level | `refl_level`, `refl_level_sd` |
 //! | a cell's surface continuity | excess; surface class | solid, mid, fragmented |
-//! | wood-or-leaf evidence from photometry | class evidence | `class_*`, the row's `class` |
+//! | wood-or-leaf evidence from photometry | class evidence | the consumer's, from `predict`'s cells (3dtrees research 130 slice 9), beside the cost, never in it; not the scene's |
 //! | what elements don't explain: extinction σ per voxel | foliage field | `Foliage`, `foliage()`, `refit_foliage`; held through moves, as the alignment is (`FieldCounts`) |
 //! | what of a ray the foliage field is fitted from | the field's cut | a ray no element fronts counts whole; one an element fronts counts up to its front element's front surface (`cut`: its clear path and its echoes in front), never its echoes at or behind it; voxels within `margin` of an element's surface are left out (`foliage`'s module docs) |
 //! | κ outside the field, and a ground plane | background | `Background` |

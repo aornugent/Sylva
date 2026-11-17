@@ -10,7 +10,7 @@
 //! - **Elements:** a dict of arrays, one row per element: `a`, `b` (n, 3) and `r` (n,) are required; `opacity` (n,)
 //!   defaults to 1, `mismatch` (n,) to the settings' prior `mismatch_base + mismatch_slope r`, `patch` (n,) bool
 //!   to false, `leaf` (n,) bool, its class (wood or leaf), to `patch`, and `group` (n,) int, its chain's key
-//!   (elements of one key are one term per scan: one set of nuisances, pooled class evidence), to -1, alone. A patch is a ball about `a` of radius `r`
+//!   (elements of one key are one term per scan: one set of nuisances), to -1, alone. A patch is a ball about `a` of radius `r`
 //!   (its extent); its `b` is ignored. An element that can't be scored (a radius that isn't positive, an opacity
 //!   outside (0, 1], a stick of no length) raises.
 //! - **Scenes:** `Scene(images, elements, settings, background, foliage, ref_epoch)` holds elements against range
@@ -266,7 +266,7 @@ fn rows_dict<'py>(py: Python<'py>, rows: &[ElementScan]) -> PyResult<Bound<'py, 
     d.set_item("surface", rows.iter().map(|r| r.surface).collect::<Vec<_>>().into_pyarray(py))?;
     type F = fn(&ElementScan) -> f64;
     for (k, f) in [("arc", (|r| r.arc) as F), ("footprints_across", |r| r.footprints_across), ("cost", |r| r.cost), ("ray_on", |r| r.ray_on), ("ray_empty", |r| r.ray_empty),
-                   ("ray_in_front", |r| r.ray_in_front), ("ray_behind", |r| r.ray_behind), ("class", |r| r.class), ("alignment", |r| r.alignment),
+                   ("ray_in_front", |r| r.ray_in_front), ("ray_behind", |r| r.ray_behind), ("alignment", |r| r.alignment),
                    ("discount", |r| r.discount), ("align_shift", |r| r.align_shift), ("align_sd", |r| r.align_sd), ("front_shift", |r| r.front_shift),
                    ("front_shift_sd", |r| r.front_shift_sd), ("refl_level", |r| r.refl_level), ("refl_level_sd", |r| r.refl_level_sd)] {
         d.set_item(k, rows.iter().map(f).collect::<Vec<_>>().into_pyarray(py))?;
@@ -433,7 +433,7 @@ impl PyScene {
     }
 
     /// Per (term, scan) (scene::ElementScan): elem (a group's first member), group (-1 alone), scan, cells, cells_on, arc (rad), footprints_across, surface; its cost
-    /// and the parts it sums (ray_on, ray_empty, ray_in_front, ray_behind, class, and alignment: its own nodes' prior and
+    /// and the parts it sums (ray_on, ray_empty, ray_in_front, ray_behind, and alignment: its own nodes' prior and
     /// log-determinant; each scan's alignment part is `alignment_parts()`); the evidence discount (discount); the
     /// posterior along the beam at it, the alignment held: align_shift, align_sd, front_shift, front_shift_sd (m); and
     /// its reflectance level's: refl_level, refl_level_sd (dB).

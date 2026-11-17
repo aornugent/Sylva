@@ -3,8 +3,8 @@
 // Free software under the GNU General Public License v3.0 or later;
 // see the LICENSE file. There is no warranty, to the extent permitted by law.
 //! What the scene's likelihood assumes about the instrument, the site and what lies behind the elements: two
-//! settings records a caller sets, [`Settings`] (the instrument and site calibration, the declared priors and class
-//! evidence) and [`Background`] (a diffuse echo hazard and a ground plane). Their defaults are AM's: a RIEGL VZ-2000i
+//! settings records a caller sets, [`Settings`] (the instrument and site calibration and the declared priors) and
+//! [`Background`] (a diffuse echo hazard and a ground plane). Their defaults are AM's: a RIEGL VZ-2000i
 //! on Alice Mulga's raw scans (the corrected MTA import, 3dtrees research 130 slice 13b). Each calibrated value names
 //! the 3dtrees research 130 driver that measures it, and a site's values live in its settings file (research 130
 //! `settings/<site>.json`, written by those drivers), so another scanner or plot is a file, not code. What stays
@@ -142,23 +142,6 @@ params! {
         /// instead (the review after slice 15).
         pub front_shift_base: f64 = 0.001,
         pub front_shift_slope: f64 = 0.1,
-        /// Class evidence (research 130 slices 15 and 5b), per (group, scan): from the first echoes on a group's
-        /// elements (every cell whose first echo is a member's; a hypothesis's elements are one group, a scene's
-        /// each alone), their mean reflectance read at full fill (dB, less 10 log10 of the element's predicted fill),
-        /// albedo (that less 10 log10 cos ι), share of pulses with more than one return and mean cos ι, a log
-        /// likelihood ratio wood against leaf, `class_b + Σ class_w · features`, fitted on the stand
-        /// (`photometry.py fill`, its `normalised` fit). `class_temper` scales it so an element's sum over its scans
-        /// is calibrated (the scans of one element are correlated); 0 leaves it out. The stand's fit: per-element AUC
-        /// 0.94 on 497 of 500 candidates (slice 15's cells over half filled: 0.96 on 469). The temper that
-        /// calibrates an element's sum is 0.43 (the element-level scale 0.96 over the design effect `1 + (S − 1) ρ`
-        /// at ρ 0.62 and a typical S of 3 views); it defaults to 0 (off), since among sticks of one class it only
-        /// adds noise to radius comparisons (slice 15). A caller weighing classes turns it on.
-        pub class_b: f64 = -5.1042,
-        pub class_w_refl: f64 = 0.1318,
-        pub class_w_albedo: f64 = -0.6467,
-        pub class_w_multi: f64 = -4.5721,
-        pub class_w_cos: f64 = 0.8327,
-        pub class_temper: f64 = 0.0,
     }
 }
 
@@ -298,19 +281,9 @@ impl Settings {
         1.0 / (1.0 + (-(self.res_a + self.res_b * d + self.res_c * e)).exp())
     }
 
-    /// Class evidence from one scan's echoes on a group, `[n, Σ reflectance, Σ albedo, Σ multi-return, Σ cos]`
-    /// (reflectances at full fill): the tempered log likelihood ratio, wood against leaf (0 under 5 echoes).
-    pub fn class_llr(&self, f: &[f64; 5]) -> f64 {
-        if f[0] < 5.0 || self.class_temper == 0.0 {
-            return 0.0;
-        }
-        let m = [f[1] / f[0], f[2] / f[0], f[3] / f[0], f[4] / f[0]];
-        self.class_temper * (self.class_b + self.class_w_refl * m[0] + self.class_w_albedo * m[1] + self.class_w_multi * m[2] + self.class_w_cos * m[3])
-    }
-
     /// The reflectance (dB) the foliage field reads a full hit at, an echo's energy share being its reflectance
     /// against this: the dimmer canopy surface, wood or leaf, so a full hit on either reads as the whole beam (on AM
-    /// the declared leaf, −15.6 dB, is dimmer than the measured wood, −15.0: research 130 step 3a, slice 5b).
+    /// the declared leaf, −15.6 dB, is dimmer than the measured wood, −15.1: research 130 step 3a, slices 5b, 9).
     pub fn refl_full_hit(&self) -> f64 {
         self.refl_wood.min(self.refl_leaf)
     }
