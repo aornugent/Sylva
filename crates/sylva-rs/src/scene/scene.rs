@@ -2978,10 +2978,11 @@ mod tests {
 
     /// Slice 2c: a dense medium just behind a partial edge merges with its return (the merge share is high, and none
     /// behind an opaque full hit); the merged echo is brighter by the medium's energy and pulled back by the measured
-    /// pull, and an echo so read is likelier with the merge than without it.
+    /// pull, and an echo so read is likelier with the merge than without it. At slice 2c's map and pull (the box's,
+    /// which lean on the field): the second box's (slices 2d, 9) lean on range and pull too little to read here.
     #[test]
     fn a_merge_with_the_medium_reads_the_measured_pull() {
-        let em = Settings::default();
+        let em = Settings { pull_a: 1.2, pull_b: 0.075, merge_a: -1.7258, merge_field: 14.9334, merge_range: -0.0844, merge_fill: 1.9841, ..Settings::default() };
         let spec = FoliageBox { lo: [-0.5, 4.0, -0.5], hi: [0.5, 5.0, 0.5], voxel: 1.0, prior_path: 1.0, margin: 0.0 };
         let dense = Foliage { kappa: 0.05, spec: Some(spec), post: HashMap::from([([0, 0, 0], (5.0, 1.0))]) };
         let (o, w) = ([0.0; 3], [0.0, 1.0, 0.0]);

@@ -59,11 +59,11 @@ params! {
         /// The surfaces' reflectance (dB at full fill, face-on): wood and leaf (an element renders with its class's)
         /// and the ground. The dimmer of wood and leaf is the reference the foliage field reads an echo's energy share
         /// against ([`Settings::refl_full_hit`]), so a full hit on either reads as the whole beam. AM's wood is
-        /// measured on its candidates' interior echoes (`reflectance.py am`). AM's leaf is declared: `leaf.py` am's
-        /// single-echo peak in rank-3 voxels plus the stand's partial-fill offset (1.9 dB); not measured
-        /// (leaf-reflectance.md). AM's ground is measured on its ground echoes (`ground.py am`, 3dtrees research 130
-        /// slice 2d).
-        pub refl_wood: f64 = -15.0,
+        /// measured on its candidates' interior echoes (`reflectance.py site`, 3dtrees research 130 slice 9). AM's leaf
+        /// is declared: `leaf.py` am's single-echo peak in rank-3 voxels plus the stand's partial-fill offset (1.9 dB);
+        /// not measured (leaf-reflectance.md). AM's ground is measured on its ground echoes (`ground.py am`, slice 2d).
+        /// AM's measured values come from day-1 scans about a second box that no held-out check holds out.
+        pub refl_wood: f64 = -15.1,
         pub refl_leaf: f64 = -15.6,
         pub refl_ground: f64 = -16.9,
         /// The ground plane ([`Background`]'s `ground_z`), as AM's ground echoes measure it (3dtrees research 130 slice
@@ -83,9 +83,9 @@ params! {
         /// `d / (1 + 10^(pull_a + pull_b e))` (m), e the nearer's energy over the farther's (dB), with an sd as large:
         /// a fitted peak follows the nearer unless the farther outweighs it, far less than their energy-weighted range
         /// says (3dtrees research 130 slice 2c: AM's edges with one echo and a surface within the resolution behind,
-        /// the median pull over the separation by energy ratio, `reflectance.py`'s `merge_summary`).
-        pub pull_a: f64 = 1.2,
-        pub pull_b: f64 = 0.075,
+        /// fitted by least absolute deviations, `reflectance.py site`'s `merge_summary`; slice 9).
+        pub pull_a: f64 = 2.529,
+        pub pull_b: f64 = 0.062,
         /// The merge share behind a layer, calibrated per site (3dtrees research 130 slice 2c): the foliage field's
         /// share M (`1 − exp(−b ∫ σ (1 − p))`, [`super::scene`]'s merges) predicts AM's merges beside wood poorly in
         /// one box (0.10 against 0.48) and well in another (0.40 against 0.39), so the share is
@@ -106,14 +106,14 @@ params! {
         /// its surface's reflectance with prior sd `refl_level_sd` (dB), marginalised with the alignment error. An echo
         /// nothing in the scene explains (the foliage field's, an outlier) reads `refl_background_mean` ±
         /// `refl_background_sd` (dB). All are measured on single echoes against the scene's own predictions
-        /// (`reflectance.py`).
-        pub refl_noise: f64 = 0.27,
-        pub refl_dof: f64 = 2.7,
-        pub refl_edge: f64 = 9.06,
-        pub refl_incidence: f64 = 0.25,
-        pub refl_level_sd: f64 = 0.65,
-        pub refl_background_mean: f64 = -21.18,
-        pub refl_background_sd: f64 = 6.24,
+        /// (`reflectance.py site`, slice 9).
+        pub refl_noise: f64 = 0.38,
+        pub refl_dof: f64 = 3.6,
+        pub refl_edge: f64 = 9.91,
+        pub refl_incidence: f64 = 0.3,
+        pub refl_level_sd: f64 = 0.76,
+        pub refl_background_mean: f64 = -21.29,
+        pub refl_background_sd: f64 = 6.28,
         /// The scan alignment error (research 130 offset-field-design.md): an along-beam shift per (scan, place),
         /// its spread per class within the reference epoch (σ_u ≈ 0.57 σ_L,same, from alignment-rca's pair spreads
         /// and their +0.32 same-near-scan correlation), and the other-epoch part added in quadrature
