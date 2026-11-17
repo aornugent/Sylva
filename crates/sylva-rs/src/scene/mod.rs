@@ -20,7 +20,11 @@
 //! |---|---|---|
 //! | one scanner position's pulses | scan | its range image is the scan on its lattice |
 //! | a lattice position | cell | holds a pulse's echoes, a miss (a pulse with no echo) or no pulse |
-//! | a cell's nearest echo | first echo | the one the ray likelihood reads |
+//! | a cell's nearest echo | first echo | the one the outcome reads |
+//! | a pulse's echoes after its first | later echoes | the ray likelihood reads the pulse whole, each echo behind the last (3dtrees research 130 slice 2c), to its first echo alone beyond `later_to` |
+//! | what a pulse meets that isn't a surface it resolves | occluders; the medium | the elements' layers and the ground; the foliage field, κ outside its box |
+//! | the share of a return that merges with the medium behind its far side | merge share | `merge_share`, the site's calibrated map of the field's `1 − exp(−b ∫ σ (1 − p_resolve))`; a mixture inside the return |
+//! | how far a merge moves an echo back from the nearer return's range | pull | `pull`, by separation and energy ratio, measured |
 //! | the most echoes the instrument records per pulse | the target cap | `max_targets`; a pulse at it is capped (`RangeImage::capped`), and says nothing past its last echo |
 //! | the range up to which a pulse shows clear space | free space | `free_to`: the first echo less the receiver's resolution |
 //! | a proposed part of the scene | element | a form (a stick, an axis and radius; or a patch, a ball) and a class |
@@ -29,7 +33,7 @@
 //! | a declared term over a chain's geometry alone | coupling | `coupling`, `Coupling`: taper, form departures, bends; beside the cost, never in it |
 //! | elements held against scans | scene | `Scene` |
 //! | `−log` likelihood ratio against the empty scene | cost | also of a move: `add`, `remove`, `change`, `costs_to_add`, `costs_to_remove` |
-//! | a cell's likelihood of its first echo | ray likelihood | the scene's data term |
+//! | a cell's likelihood of its pulse | ray likelihood | the scene's data term |
 //! | an element's coverage of a cell's beam | fill | the beam (a uniform disc) convolved with the section |
 //! | what a cell's first echo says about an element | outcome | on it, empty (none), in front, behind (passed through) |
 //! | the element's predicted echo in a cell | the element's echo | `front_echo`; [`scene::Outcome::of`] against it |
@@ -50,7 +54,7 @@
 //! | what elements don't explain: extinction σ per voxel | foliage field | `Foliage`, `foliage()`, `refit_foliage`; held through moves, as the alignment is (`FieldCounts`) |
 //! | what of a ray the foliage field is fitted from | the field's cut | a ray no element fronts counts whole; one an element fronts counts up to its front element's front surface (`cut`: its clear path and its echoes in front), never its echoes at or behind it; voxels within `margin` of an element's surface are left out (`foliage`'s module docs) |
 //! | κ outside the field, and a ground plane | background | `Background` |
-//! | the chance the pulse meets no foliage before a return | chance a pulse arrives | `arrives` |
+//! | the chance the pulse meets no foliage before a return | chance a pulse arrives | `arrives`; `predict`'s `read`: an echo of the pulse on the element |
 //! | the cost's curvature in an element's geometry | information | how well a scan pins the element down; `expected` its average over the cells' outcomes; over several elements jointly (a pair's), the latents they share counted once |
 //! | what one hypothesis is expected to cost against another were the other true | divergence | `divergence(p, q)`: `E_p[cost(q) − cost(p)]` from their predictions |
 //! | the variance of the cost's slope were the cells independent | gradient's variance | `gradient_variance`; with E, the sandwich `E⁻¹ J E⁻¹` |

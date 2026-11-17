@@ -13,9 +13,10 @@
 //! - **Its estimate.** Each voxel's weighted counts, echoes in it (h) and ray length through it (L), give σ a Gamma
 //!   posterior, shape `α = h + κ b` and rate `β = L + b`, under a Gamma prior worth `b` metres of ray at mean κ; its
 //!   mean is `α / β`.
-//! - **What a ray meets of it** is the Gamma–Poisson predictive, σ integrated out per voxel: a stretch ℓ through a
-//!   voxel survives with chance `(β / (β + ℓ))^α` (optical depth `α ln(1 + ℓ / β)`), and an echo after ℓ in it has
-//!   hazard `α / (β + ℓ)`. Only the cells the scene's elements front are scored against it.
+//! - **What a ray meets of it** is σ's posterior mean `α / β` per voxel, for the optical depth, the hazard and the
+//!   merge share alike (3dtrees research 130 slice 2c: one medium, read the same at every point of a pulse; the
+//!   Gamma–Poisson predictive it replaces read each cell as a draw of its own). Only the cells the scene's elements
+//!   front are scored against it.
 //! - **A pulse's echo sequence:** every echo is a hit, and the path up to it is transmission, from the origin for the
 //!   first and from the previous echo plus the receiver's resolution after that (a surface closer behind an echo would
 //!   have merged with it: [`Settings::resolution`]). The report is the first K returns in time (research 130 slice
@@ -75,19 +76,19 @@ pub struct Foliage {
 }
 
 /// What a cell's ray meets of the foliage field: the optical depth to each of its layers and then the ground (`taus`), to the
-/// beam's end, and to its first echo, with σ at that echo.
+/// beam's end, and per echo of its pulse (`echoes`) the optical depth to it, σ at it, and the optical depth to it plus
+/// the receiver's resolution (where the field's path restarts after it: the module docs).
 #[derive(Debug, Clone)]
 pub struct RayFoliage {
     pub taus: Vec<f64>,
     pub tau_end: f64,
-    pub tau_obs: f64,
-    pub sig_obs: f64,
+    pub echoes: Vec<[f64; 3]>,
 }
 
 impl RayFoliage {
     /// The same ray with its layers left out (the ground's optical depth kept).
     pub fn base(&self) -> RayFoliage {
-        RayFoliage { taus: vec![*self.taus.last().unwrap_or(&0.0)], ..*self }
+        RayFoliage { taus: vec![*self.taus.last().unwrap_or(&0.0)], tau_end: self.tau_end, echoes: self.echoes.clone() }
     }
 }
 
@@ -109,18 +110,14 @@ impl Foliage {
         self.post.get(k).map_or(self.kappa, |&(a, b)| a / b)
     }
 
-    /// The predictive optical depth along the ray from `o` in direction `w` to range `t`, and the hazard of an echo
-    /// at `t`.
+    /// The optical depth along the ray from `o` in direction `w` to range `t`, and the hazard of an echo at `t`.
     pub fn tau_hazard(&self, o: &Point, w: &Point, t: f64) -> (f64, f64) {
         let (mut tau, mut hazard) = (self.kappa * t, self.kappa);
         if let Some(sp) = self.spec {
             traverse(&sp, o, w, 0.0, t, |k, a, b| {
-                if let Some(&(al, be)) = self.post.get(&k) {
-                    tau += al * (1.0 + (b - a) / be).ln() - self.kappa * (b - a);
-                    hazard = if b >= t { al / (be + b - a) } else { self.kappa };
-                } else {
-                    hazard = self.kappa;
-                }
+                let sig = self.sigma(&k);
+                tau += (sig - self.kappa) * (b - a);
+                hazard = if b >= t { sig } else { self.kappa };
             });
             let x = [0, 1, 2].map(|j| o[j] + w[j] * t);
             if !inside(&sp, &x) {
@@ -130,22 +127,38 @@ impl Foliage {
         (tau, hazard)
     }
 
-    /// The predictive optical depth along the ray from `o` in direction `w` to range `t`.
+    /// The optical depth along the ray from `o` in direction `w` to range `t`.
     pub fn tau(&self, o: &Point, w: &Point, t: f64) -> f64 {
         self.tau_hazard(o, w, t).0
     }
 
+    /// The ray's merge integral behind a return at range `at` whose resolving logit is `z0 + slope (u − at)` at range u
+    /// ([`Settings::p_resolve`]): `∫ σ(u) (1 − p(u)) du` from `from` to `to`, exact over σ's voxels (each constant).
+    pub fn merge_integral(&self, o: &Point, w: &Point, at: f64, from: f64, to: f64, z0: f64, slope: f64) -> f64 {
+        if to <= from {
+            return 0.0;
+        }
+        // ∫ (1 − p) du = u − softplus(z0 + slope (u − at)) / slope
+        let softplus = |z: f64| if z > 30.0 { z } else { z.exp().ln_1p() };
+        let part = |a: f64, b: f64| (b - a) - (softplus(z0 + slope * (b - at)) - softplus(z0 + slope * (a - at))) / slope;
+        let mut total = self.kappa * part(from, to);
+        if let Some(sp) = self.spec {
+            traverse(&sp, o, w, from, to, |k, a, b| total += (self.sigma(&k) - self.kappa) * part(a, b));
+        }
+        total
+    }
+
     /// What a cell's ray from `o` along `w` meets: optical depths to its layers' ranges, its ground's, the beam's end
-    /// and its first echo `obs` (NaN for none).
-    pub fn ray_bg(&self, o: &Point, w: &Point, layer_ts: &[f64], ground_t: Option<f64>, t_end: f64, obs: f64) -> RayFoliage {
+    /// and, per echo of its pulse at `echoes`, the optical depth to it, σ at it and the optical depth to it plus the
+    /// receiver's `resolution`.
+    pub fn ray_bg(&self, o: &Point, w: &Point, layer_ts: &[f64], ground_t: Option<f64>, t_end: f64, echoes: &[f32], resolution: f64) -> RayFoliage {
         let mut taus: Vec<f64> = layer_ts.iter().map(|&t| self.tau(o, w, t)).collect();
         taus.push(ground_t.map_or(0.0, |t| self.tau(o, w, t)));
-        let (tau_obs, sig_obs) = if obs.is_finite() {
-            self.tau_hazard(o, w, obs)
-        } else {
-            (f64::NAN, f64::NAN)
-        };
-        RayFoliage { taus, tau_end: self.tau(o, w, t_end), tau_obs, sig_obs }
+        let echoes = echoes.iter().map(|&r| {
+            let (tau, sig) = self.tau_hazard(o, w, r as f64);
+            [tau, sig, self.tau(o, w, r as f64 + resolution)]
+        }).collect();
+        RayFoliage { taus, tau_end: self.tau(o, w, t_end), echoes }
     }
 }
 
@@ -361,10 +374,17 @@ mod tests {
         f.post.insert([0, 1, 0], (1.05 * 1000.0, 1000.0));
         let through = f.tau(&o, &w, 100.0) - f.tau(&o, &w, 0.0);
         assert!(through > 0.05 * 100.0, "{through}");
-        // with much data the predictive is the plug-in; with little, a stretch survives more than σ's mean says
+        // σ's posterior mean, however much data it rests on (slice 2c)
         let seg = |f: &Foliage| f.tau(&o, &w, 100.0) - 0.05 * 100.0;
         let plug = seg(&f);
         f.post.insert([0, 1, 0], (1.05, 1.0));
-        assert!(seg(&f) < plug, "{} vs {plug}", seg(&f));
+        assert!((seg(&f) - plug).abs() < 1e-9, "{} vs {plug}", seg(&f));
+        // the merge integral: κ's exact over a ray that misses the box, and nothing past a resolved return
+        let (z0, slope) = (-2.563, 2.693);
+        let flat = Foliage::uniform(0.05);
+        let m = flat.merge_integral(&o, &w, 10.0, 10.0, 100.0, z0, slope);
+        let numeric: f64 = (0..20000).map(|i| 0.05 * 0.005 / (1.0 + (z0 + slope * (i as f64 + 0.5) * 0.005).exp())).sum();
+        assert!((m - numeric).abs() < 1e-6, "{m} vs {numeric}");
+        assert!(flat.merge_integral(&o, &w, 10.0, 20.0, 30.0, z0, slope) < 1e-10);
     }
 }

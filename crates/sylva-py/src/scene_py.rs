@@ -247,9 +247,10 @@ fn predictions_dict<'py>(py: Python<'py>, p: &[CellPrediction]) -> PyResult<Boun
     d.set_item("elem", p.iter().map(|x| x.elem).collect::<Vec<_>>().into_pyarray(py))?;
     d.set_item("surface", p.iter().map(|x| x.surface).collect::<Vec<_>>().into_pyarray(py))?;
     d.set_item("outcome", p.iter().map(|x| x.outcome as u8).collect::<Vec<_>>().into_pyarray(py))?;
+    d.set_item("read", p.iter().map(|x| x.read).collect::<Vec<_>>().into_pyarray(py))?;
     type F = fn(&CellPrediction) -> f64;
     for (k, f) in [("fill", (|x| x.fill) as F), ("recorded", |x| x.recorded), ("arrives", |x| x.arrives), ("depth", |x| x.depth), ("sd", |x| x.sd),
-                   ("refl", |x| x.refl), ("cos", |x| x.cos), ("obs", |x| x.obs), ("obs_refl", |x| x.obs_refl), ("weight", |x| x.weight), ("footprint", |x| x.footprint), ("across", |x| x.across), ("along", |x| x.along)] {
+                   ("refl", |x| x.refl), ("cos", |x| x.cos), ("merge", |x| x.merge), ("obs", |x| x.obs), ("obs_refl", |x| x.obs_refl), ("weight", |x| x.weight), ("footprint", |x| x.footprint), ("across", |x| x.across), ("along", |x| x.along)] {
         d.set_item(k, p.iter().map(f).collect::<Vec<_>>().into_pyarray(py))?;
     }
     Ok(d)
@@ -585,8 +586,9 @@ impl PyScene {
     /// What elements predict in scan `scan` against the scene, per cell one of them fronts (scene::CellPrediction): cell
     /// (flat index), elem (which of them, its row), surface, outcome (0 on, 1 empty, 2 in front, 3 behind), fill,
     /// recorded, arrives, depth, sd, refl (the echo's predicted reflectance, dB), cos (the mean cos ι where the element
-    /// meets the footprint), obs, obs_refl (the first echo's reflectance, dB), weight (the cell weight), footprint (m),
-    /// across and along (where the ray passes the axis).
+    /// meets the footprint), obs, obs_refl (the first echo's reflectance, dB), read (any echo the likelihood reads is
+    /// on it), merge (its merge share with the medium behind), weight (the cell weight), footprint (m), across and
+    /// along (where the ray passes the axis).
     #[pyo3(signature = (elements, scan=0))]
     fn predict<'py>(&self, py: Python<'py>, elements: &Bound<'_, PyDict>, scan: usize) -> PyResult<Bound<'py, PyDict>> {
         self.inner.check_scan(scan).map_err(scene_err)?;

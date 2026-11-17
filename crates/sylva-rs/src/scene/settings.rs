@@ -71,6 +71,29 @@ params! {
         pub res_a: f64 = -2.563,
         pub res_b: f64 = 2.693,
         pub res_c: f64 = -0.122,
+        /// Where two returns d m apart merge, the merged echo is pulled back from the nearer's range by
+        /// `d / (1 + 10^(pull_a + pull_b e))` (m), e the nearer's energy over the farther's (dB), with an sd as large:
+        /// a fitted peak follows the nearer unless the farther outweighs it, far less than their energy-weighted range
+        /// says (3dtrees research 130 slice 2c: AM's edges with one echo and a surface within the resolution behind,
+        /// the median pull over the separation by energy ratio, `reflectance.py`'s `merge_summary`).
+        pub pull_a: f64 = 1.2,
+        pub pull_b: f64 = 0.075,
+        /// The merge share behind a layer, calibrated per site (3dtrees research 130 slice 2c): the foliage field's
+        /// share M (`1 − exp(−b ∫ σ (1 − p))`, [`super::scene`]'s merges) under-predicts AM's merges beside wood five-
+        /// to tenfold (0.10 against 0.48) but ranks them (AUC 0.76), so the share is
+        /// `logistic(merge_a + merge_field M + merge_range t + merge_fill f)` at the layer's range t (m) and fill f,
+        /// fitted on edges whose pulse merged with a surface within the resolution behind (`reflectance.py`'s
+        /// `merge_summary`, the field held in).
+        pub merge_a: f64 = -1.7258,
+        pub merge_field: f64 = 14.9334,
+        pub merge_range: f64 = -0.0844,
+        pub merge_fill: f64 = 1.9841,
+        /// A pulse is read whole (3dtrees research 130 slice 2c) where its first echo lies within `later_to` (m); beyond, to
+        /// its first echo only, as a capped pulse is past its last: the medium the later echoes are read against holds
+        /// too little there (AM's foliage field lets twice too much through beyond 10 m, research 130 slice 2b, and
+        /// the flat background less still). AM's is declared at 15 m, slice 2c's fallback; the stand's reads every pulse
+        /// whole.
+        pub later_to: f64 = 15.0,
         /// Located edges (3dtrees research 130 step 2): an echo's reflectance (dB) is read beside its range. A return's
         /// predicted reflectance is `10 log10` of its members' energy shares (each fill × the beam left × cos^k ι ×
         /// the surface's reflectance, k `refl_incidence`, which sets the detection too; a merged return sums them), so
@@ -149,6 +172,23 @@ params! {
     }
 }
 
+/// The log normaliser of a Student t of `nu` degrees of freedom. The likelihood asks for two values of `nu` (the depth's
+/// and the reflectance's) many millions of times, so each thread keeps the last two.
+pub fn t_log_norm(nu: f64) -> f64 {
+    use std::cell::Cell;
+    thread_local!(static KEPT: Cell<[(u64, f64); 2]> = const { Cell::new([(u64::MAX, 0.0); 2]) });
+    KEPT.with(|k| {
+        let mut kept = k.get();
+        if let Some(&(_, c)) = kept.iter().find(|e| e.0 == nu.to_bits()) {
+            return c;
+        }
+        let c = libm::lgamma(0.5 * (nu + 1.0)) - libm::lgamma(0.5 * nu) - 0.5 * (nu * std::f64::consts::PI).ln();
+        kept = [(nu.to_bits(), c), kept[0]];
+        k.set(kept);
+        c
+    })
+}
+
 impl Settings {
     /// The beam's diameter (m) at a range.
     pub fn footprint(&self, range: f64) -> f64 {
@@ -212,8 +252,7 @@ impl Settings {
         let fl = self.floor(range);
         let phi = |z: f64| 0.5 * libm::erfc(-z / std::f64::consts::SQRT_2);
         let nu = self.refl_dof;
-        let t = (libm::lgamma(0.5 * (nu + 1.0)) - libm::lgamma(0.5 * nu) - 0.5 * (nu * std::f64::consts::PI).ln()
-                 - 0.5 * (nu + 1.0) * (1.0 + ((x - pred) / s).powi(2) / nu).ln()).exp() / s;
+        let t = (t_log_norm(nu) - 0.5 * (nu + 1.0) * (1.0 + ((x - pred) / s).powi(2) / nu).ln()).exp() / s;
         t * phi((x - fl) / self.detect_sd) / phi((pred - fl) / (s * s + self.detect_sd * self.detect_sd).sqrt()).max(1e-12)
     }
 
@@ -238,6 +277,18 @@ impl Settings {
     /// for a miss. 3dtrees research 130 step 3c: what carving free space reads.
     pub fn free_to(&self, first_echo: f64) -> f64 {
         if first_echo.is_finite() { (first_echo - self.resolution()).max(0.0) } else { T_MAX }
+    }
+
+    /// How far a merge of two returns `d` m apart, energies `e` dB apart (nearer over farther), pulls the echo back
+    /// from the nearer's range (m); its sd is as large.
+    pub fn pull(&self, d: f64, e: f64) -> f64 {
+        d.max(0.0) / (1.0 + 10f64.powf(self.pull_a + self.pull_b * e.clamp(-60.0, 60.0)))
+    }
+
+    /// The merge share behind a layer at range `t` (m) and fill `f` whose foliage field's share is `m` (the calibrated
+    /// map above).
+    pub fn merge_share(&self, m: f64, t: f64, f: f64) -> f64 {
+        1.0 / (1.0 + (-(self.merge_a + self.merge_field * m + self.merge_range * t + self.merge_fill * f)).exp())
     }
 
     /// The chance two returns `d` m apart, energies `e` dB apart (nearer over farther), come back as two echoes.
