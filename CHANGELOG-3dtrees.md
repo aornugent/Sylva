@@ -51,13 +51,13 @@ branch `3dtrees/125-rebase`.
   site settings (`Settings`: the beam, the per-echo noise, the detection floor rising with range, the receiver's
   resolution, 0.95 m at equal energies on AM's VZ-2000i, the class edges, the reflectances and the declared priors)
   and `Background`, both `params!` records whose defaults are AM's. `scene.foliage` is the foliage field, a residual
-  extinction per voxel in a box that every cell's ray likelihood reads. `scene.scene`'s `Scene` holds elements
+  extinction per voxel in a box that every cell's ray likelihood reads, and each scan's free space per voxel (the rays
+  crossing, reaching and clearing it: bounds on hidden wood). `scene.scene`'s `Scene` holds elements
   against range images, each rendered once with a uniform-disc beam (returns within the resolution merge), with a
   per-scan alignment error and a per-(element, scan) stem front shift over which each scan's ray likelihood is
   integrated by a Laplace marginal. It returns its cost, the cost change of a move, rows splitting each (element,
   scan)'s cost into its parts, how well the scans pin elements' geometry down, one or several jointly
   (`information`), what one hypothesis is expected to cost against another (`divergence`), and elements' counts and
-  cell predictions. Elements of one group (a chain) are one term per scan; `coupling` is a declared term over a
-  chain's geometry. Bound as `_core.RangeImage`, `_core.Scene`, `_core.candidates`, `_core.coupling` and
-  `_core.settings_defaults` in `scene_py.rs`, with `ShotsFile::read_echo_f64` for per-echo attributes. 3dtrees needs
-  them to score geometry and class hypotheses from the rays. Additive.
+  cell predictions. Elements of one group (a chain) are one term per scan. Bound as `_core.RangeImage`, `_core.Scene`,
+  `_core.candidates` and `_core.settings_defaults` in `scene_py.rs`, with `ShotsFile::read_echo_f64` for per-echo
+  attributes. 3dtrees needs them to score geometry and class hypotheses from the rays. Additive.

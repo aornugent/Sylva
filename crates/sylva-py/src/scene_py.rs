@@ -218,6 +218,25 @@ impl PyRangeImage {
         Ok(d)
     }
 
+    /// Free space per voxel of the box `lo`-`hi` (m, `voxel` m cubes) under the `settings` (scene::foliage::free_space):
+    /// crossed, reached and clear, each (nx, ny, nz) counts of pulses whose ray crosses the voxel, enters it before its
+    /// first echo, and leaves it before its clear range (`free_to`) ends.
+    #[pyo3(signature = (lo, hi, voxel, settings=None))]
+    fn free_space<'py>(&self, py: Python<'py>, lo: [f64; 3], hi: [f64; 3], voxel: f64, settings: Option<&Bound<'_, PyDict>>) -> PyResult<Bound<'py, PyDict>> {
+        if !(voxel > 0.0) || (0..3).any(|a| !(hi[a] > lo[a])) {
+            return Err(PyValueError::new_err("free_space needs voxel > 0 and hi > lo"));
+        }
+        let em = self::settings(settings)?;
+        let n = [0, 1, 2].map(|a| ((hi[a] - lo[a]) / voxel).ceil() as usize);
+        let v = &self.inner;
+        let counts = py.detach(|| sylva_rs::scene::foliage::free_space(v, lo, hi, voxel, &em));
+        let d = PyDict::new(py);
+        for (name, c) in ["crossed", "reached", "clear"].into_iter().zip(counts) {
+            d.set_item(name, c.into_pyarray(py).reshape(n)?)?;
+        }
+        Ok(d)
+    }
+
     /// The fractional (line, col) and range of each world point (NaN outside the lattice), flat (n × 3).
     fn cells<'py>(&self, py: Python<'py>, points: PyReadonlyArray2<f64>) -> PyResult<Bound<'py, PyArray1<f64>>> {
         let p = xyz_from_py(points)?;

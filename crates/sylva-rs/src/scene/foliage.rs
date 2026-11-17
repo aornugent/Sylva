@@ -261,6 +261,32 @@ fn ray(v: &RangeImage, sp: &FoliageBox, em: &Settings, k: usize, cut: f64, mut a
     traverse(sp, &v.origin, &w, start, cut.min(known), |key, a, b| add(key, 0.0, wt * b0 * (b - a)));
 }
 
+/// Free space in one scan, per voxel of a box (3dtrees research 130 slice 7: the wood map's bounds on hidden wood).
+/// Each cell with a pulse traces its ray through the voxels its line crosses, and counts in each: `crossed`, the ray
+/// crosses it; `reached`, it enters it before its first echo; `clear`, it leaves it before its clear range ends,
+/// [`Settings::free_to`] of the first echo (a miss reaches and clears every voxel), so a surface that could have merged
+/// into that echo is never carved. So `crossed − reached` are the voxel's rays in shadow, and `reached − clear` the
+/// ones that end in it or within the receiver's resolution behind it. Counts in voxel order, x slowest:
+/// `(i · ny + j) · nz + l`.
+pub fn free_space(v: &RangeImage, lo: Point, hi: Point, voxel: f64, em: &Settings) -> [Vec<u32>; 3] {
+    use std::sync::atomic::{AtomicU32, Ordering::Relaxed};
+    let sp = FoliageBox { lo, hi, voxel, prior_path: 0.0, margin: 0.0 };
+    let n = [0, 1, 2].map(|a| ((hi[a] - lo[a]) / voxel).ceil() as usize);
+    let counts: [Vec<AtomicU32>; 3] = std::array::from_fn(|_| (0..n[0] * n[1] * n[2]).map(|_| AtomicU32::new(0)).collect());
+    (0..v.cell.len()).into_par_iter().filter(|&k| v.cell[k] != Cell::NoPulse).for_each(|k| {
+        let w = v.direction((k / v.n_cols) as f64, (k % v.n_cols) as f64);
+        let first = if v.cell[k] == Cell::Echoes { v.range[k] as f64 } else { f64::INFINITY };
+        let free = em.free_to(first);
+        traverse(&sp, &v.origin, &w, 0.0, f64::INFINITY, |key, a, b| {
+            let i = (key[0] as usize * n[1] + key[1] as usize) * n[2] + key[2] as usize;
+            counts[0][i].fetch_add(1, Relaxed);
+            counts[1][i].fetch_add((a < first) as u32, Relaxed);
+            counts[2][i].fetch_add((b <= free) as u32, Relaxed);
+        });
+    });
+    counts.map(|c| c.into_iter().map(AtomicU32::into_inner).collect())
+}
+
 /// Add (h, l) to a voxel's counts; a voxel whose counts fall to nothing (within rounding) has no data.
 fn accumulate(acc: &mut Counts, key: [i32; 3], h: f64, l: f64) {
     let e = acc.entry(key).or_insert((0.0, 0.0));

@@ -121,6 +121,20 @@ def test_expected_information_alone_and_free_space_cross_the_binding():
     assert (A['free_to'][A['cell'] == 1] == 80.0).all()
 
 
+def test_free_space_per_voxel_crosses_the_binding():
+    """Research 130 slice 7: per voxel, the rays crossing it, reaching it and clearing it; in front of the pole every
+    ray clears, behind it some are in shadow; bad boxes raise."""
+    v = pole_image()
+    fs = v.free_space([-0.1, 1.0, -0.1], [0.1, 8.6, 0.1], 0.2)
+    assert all(fs[k].shape == (1, 38, 1) for k in ('crossed', 'reached', 'clear'))
+    c, r, f = (fs[k][0, :, 0] for k in ('crossed', 'reached', 'clear'))
+    assert (f <= r).all() and (r <= c).all()
+    assert c[5] > 0 and f[5] == c[5]
+    assert r[20] < c[20]
+    with pytest.raises(ValueError):
+        v.free_space([0.0, 0.0, 0.0], [0.0, 1.0, 1.0], 0.2)
+
+
 def test_a_chain_crosses_the_binding():
     """Research 130 slice 6: a `group` column makes elements one term (one row, its group named)."""
     v = pole_image()

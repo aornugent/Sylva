@@ -26,7 +26,7 @@
 //! | the share of a return that merges with the medium behind its far side | merge share | `merge_share`, the site's calibrated map of the field's `1 − exp(−b ∫ σ (1 − p_resolve))`; a mixture inside the return |
 //! | how far a merge moves an echo back from the nearer return's range | pull | `pull`, by separation and energy ratio, measured |
 //! | the most echoes the instrument records per pulse | the target cap | `max_targets`; a pulse at it is capped (`RangeImage::capped`), and says nothing past its last echo |
-//! | the range up to which a pulse shows clear space | free space | `free_to`: the first echo less the receiver's resolution |
+//! | the range up to which a pulse shows clear space | free space | `free_to`: the first echo less the receiver's resolution; per voxel, [`foliage::free_space`]'s rays crossing, reaching and clearing it (3dtrees research 130 slice 7) |
 //! | a proposed part of the scene | element | a form (a stick, an axis and radius; or a patch, a ball) and a class |
 //! | what an element is made of, wood or leaf | class | `Class`: its reflectance; a mark, not a shape |
 //! | sticks joined end to end, scored as one | chain; group | `Element::group`, a key: a group's members are one term per scan, one set of nuisances (alignment shift, stem front shift, reflectance level) |
