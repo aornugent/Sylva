@@ -61,10 +61,18 @@ params! {
         /// against ([`Settings::refl_full_hit`]), so a full hit on either reads as the whole beam. AM's wood is
         /// measured on its candidates' interior echoes (`reflectance.py am`). AM's leaf is declared: `leaf.py` am's
         /// single-echo peak in rank-3 voxels plus the stand's partial-fill offset (1.9 dB); not measured
-        /// (leaf-reflectance.md). The ground is the stand's material (sim-mulga's sim-clumps).
+        /// (leaf-reflectance.md). AM's ground is measured on its ground echoes (`ground.py am`, 3dtrees research 130
+        /// slice 2d).
         pub refl_wood: f64 = -15.0,
         pub refl_leaf: f64 = -15.6,
-        pub refl_ground: f64 = -20.0,
+        pub refl_ground: f64 = -16.9,
+        /// The ground plane ([`Background`]'s `ground_z`), as AM's ground echoes measure it (3dtrees research 130 slice
+        /// 2d, `ground.py am`, from scans the checks never hold out): a pulse that reaches the terrain records an echo
+        /// near it with chance `ground_echo` (times the detection's), since a quarter of AM's grazing pulses return
+        /// none there however bright its ground; and that echo lies about the plane with height sd `ground_sd` (m): the
+        /// terrain's misfit to the plane and the echo's height over the terrain, so `ground_sd / cos ι` along the ray.
+        pub ground_echo: f64 = 0.73,
+        pub ground_sd: f64 = 0.241,
         /// The receiver resolving two returns `d` m apart whose energies differ by `e` dB (the nearer's over the
         /// farther's): `logit p = res_a + res_b d + res_c e`. AM's VZ-2000i, fitted on its raw edges with a
         /// single-echo surface behind (research 130 slice 12b, `pulses.py resolution`): 0.95 m at equal energies.
@@ -79,21 +87,15 @@ params! {
         pub pull_a: f64 = 1.2,
         pub pull_b: f64 = 0.075,
         /// The merge share behind a layer, calibrated per site (3dtrees research 130 slice 2c): the foliage field's
-        /// share M (`1 − exp(−b ∫ σ (1 − p))`, [`super::scene`]'s merges) under-predicts AM's merges beside wood five-
-        /// to tenfold (0.10 against 0.48) but ranks them (AUC 0.76), so the share is
+        /// share M (`1 − exp(−b ∫ σ (1 − p))`, [`super::scene`]'s merges) predicts AM's merges beside wood poorly in
+        /// one box (0.10 against 0.48) and well in another (0.40 against 0.39), so the share is
         /// `logistic(merge_a + merge_field M + merge_range t + merge_fill f)` at the layer's range t (m) and fill f,
-        /// fitted on edges whose pulse merged with a surface within the resolution behind (`reflectance.py`'s
-        /// `merge_summary`, the field held in).
-        pub merge_a: f64 = -1.7258,
-        pub merge_field: f64 = 14.9334,
-        pub merge_range: f64 = -0.0844,
-        pub merge_fill: f64 = 1.9841,
-        /// A pulse is read whole (3dtrees research 130 slice 2c) where its first echo lies within `later_to` (m); beyond, to
-        /// its first echo only, as a capped pulse is past its last: the medium the later echoes are read against holds
-        /// too little there (AM's foliage field lets twice too much through beyond 10 m, research 130 slice 2b, and
-        /// the flat background less still). AM's is declared at 15 m, slice 2c's fallback; the stand's reads every pulse
-        /// whole.
-        pub later_to: f64 = 15.0,
+        /// fitted on edges whose pulse merged with a surface within the resolution behind (`reflectance.py site`'s
+        /// `merge_summary`, the field held in; slice 2d: AM's from day-1 scans the held-out checks never hold out).
+        pub merge_a: f64 = -0.1104,
+        pub merge_field: f64 = 1.2609,
+        pub merge_range: f64 = -0.1127,
+        pub merge_fill: f64 = 0.1912,
         /// Located edges (3dtrees research 130 step 2): an echo's reflectance (dB) is read beside its range. A return's
         /// predicted reflectance is `10 log10` of its members' energy shares (each fill × the beam left × cos^k ι ×
         /// the surface's reflectance, k `refl_incidence`, which sets the detection too; a merged return sums them), so

@@ -21,7 +21,7 @@
 //! | one scanner position's pulses | scan | its range image is the scan on its lattice |
 //! | a lattice position | cell | holds a pulse's echoes, a miss (a pulse with no echo) or no pulse |
 //! | a cell's nearest echo | first echo | the one the outcome reads |
-//! | a pulse's echoes after its first | later echoes | the ray likelihood reads the pulse whole, each echo behind the last (3dtrees research 130 slice 2c), to its first echo alone beyond `later_to` |
+//! | a pulse's echoes after its first | later echoes | the ray likelihood reads the pulse whole, each echo behind the last (3dtrees research 130 slice 2c) |
 //! | what a pulse meets that isn't a surface it resolves | occluders; the medium | the elements' layers and the ground; the foliage field, κ outside its box |
 //! | the share of a return that merges with the medium behind its far side | merge share | `merge_share`, the site's calibrated map of the field's `1 − exp(−b ∫ σ (1 − p_resolve))`; a mixture inside the return |
 //! | how far a merge moves an echo back from the nearer return's range | pull | `pull`, by separation and energy ratio, measured |
@@ -30,7 +30,7 @@
 //! | a proposed part of the scene | element | a form (a stick, an axis and radius; or a patch, a ball) and a class |
 //! | what an element is made of, wood or leaf | class | `Class`: its reflectance and the sign of its class evidence; a mark, not a shape |
 //! | sticks joined end to end, scored as one | chain; group | `Element::group`, a key: a group's members are one term per scan, one set of nuisances (alignment shift, stem front shift, reflectance level) and pooled class evidence |
-//! | a declared term over a chain's geometry alone | coupling | `coupling`, `Coupling`: taper, form departures, bends; beside the cost, never in it |
+//! | a declared term over a chain's geometry alone | coupling | the consumer's (taper, form departures, bends), beside the cost, never in it; not the scene's |
 //! | elements held against scans | scene | `Scene` |
 //! | `−log` likelihood ratio against the empty scene | cost | also of a move: `add`, `remove`, `change`, `costs_to_add`, `costs_to_remove` |
 //! | a cell's likelihood of its pulse | ray likelihood | the scene's data term |

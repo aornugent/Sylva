@@ -20,8 +20,8 @@
 //!   chain of sticks joins without seams.
 //! - **The ray likelihood, one cell:** its pulse whole (3dtrees research 130 slice 2c), against occluders (the
 //!   layers in depth order, then a ground plane) and a medium (the foliage field; κ, the background, outside its
-//!   box): after any return, the next surface is the medium's ([`Pulse::lik`]). Where its first echo lies beyond
-//!   `later_to` it is read to that echo alone; a pulse at the target cap says nothing past its last.
+//!   box): after any return, the next surface is the medium's ([`Pulse::lik`]). A pulse at the target cap says
+//!   nothing past its last echo.
 //!   - The beam reaches layer i with energy `e_i = f_i Π_{j<i} (1 − op_j f_j)`, and its echo is recorded with
 //!     `op_i det_i`, where `det_i` is the chance it clears the detection floor ([`Settings::p_detect`]):
 //!     `Φ((ρ_dB + 10 log10(e_i cos ι_i) − floor(t_i)) / σ)`.
@@ -73,8 +73,8 @@
 //!   differed between hypotheses and, once every fronted cell counted, favoured the thinner (slice 7c).
 //!
 //! - **Chains** (3dtrees research 130 slice 6): elements of one group ([`Element`]'s `group`) are one term per scan
-//!   ([`Owner`]), so a chain of short sticks shares its nuisances and pools its class evidence; [`coupling`] is the
-//!   declared term over its geometry, reported beside the cost.
+//!   ([`Owner`]), so a chain of short sticks shares its nuisances and pools its class evidence. A declared term over
+//!   its geometry alone (its coupling: taper, bends) is the consumer's, beside the cost, never in it.
 //! - **The scene** ([`Scene`]) holds elements against range images, each rendered once. A move (add, remove,
 //!   change) returns its cost change with the alignment held, recomputing only the terms of the elements whose cells
 //!   it touches; `refit_alignment` re-solves the alignment. Its rows ([`ElementScan`]) split each (element, scan)'s cost into its parts, and
@@ -165,6 +165,13 @@ fn mean_of(es: &[&Element], f: impl Fn(&Element) -> f64) -> f64 {
 /// A term's middle: its elements' middles' mean.
 fn middle(es: &[&Element]) -> Point {
     [0, 1, 2].map(|k| mean_of(es, |e| e.mid()[k]))
+}
+
+/// A term's latent nodes ([`Owner`]: an element's, or a group's members' together): its alignment hats at its middle
+/// ([`hats`]) and its stem front shift's prior sd (its members' mean). The cost ([`elem_data`]) and the information
+/// ([`Shared`]) read them here, so a group's front shift has one prior in both.
+fn term_nodes(es: &[&Element], em: &Settings) -> (Vec<([i64; 3], f64)>, f64) {
+    (hats(&middle(es), ALIGN_SPACING), mean_of(es, |e| e.front_shift_sd(em)))
 }
 
 impl Element {
@@ -485,7 +492,8 @@ fn obs_ground(v: &RangeImage, cell: usize, sc: &Background) -> (f64, Option<(f64
     (obs, ground, w)
 }
 
-/// A cell as the likelihood reads it: its first echo (NaN for none), its pulse ([`pulse_of`]), the ground along its
+/// A cell as the likelihood reads it: its first echo (NaN for none), its pulse (its echoes, their reflectances, and
+/// whether it is capped: [`RangeImage::capped`]), the ground along its
 /// ray and the ray's direction, its weight ([`Settings::cell_weight`], at its first echo's range or else its front
 /// layer's) and what its ray meets of the foliage field to each layer (ranges `ts`, nearest first), the ground, the
 /// beam's end and each echo it reads.
@@ -502,7 +510,7 @@ struct CellView<'a> {
 
 fn cell_view<'a>(v: &'a RangeImage, cell: usize, ts: &[f64], em: &Settings, sc: &Background, ext: &Foliage) -> CellView<'a> {
     let (obs, ground, w) = obs_ground(v, cell, sc);
-    let (echoes, refls, capped) = pulse_of(v, cell, em);
+    let (echoes, refls, capped) = (v.echoes(cell), v.echo_refls(cell), v.capped(cell));
     let wt = em.cell_weight(if obs.is_finite() { obs } else { ts[0] }, v.step());
     let bg = ext.ray_bg(&v.origin, &w, ts, ground.map(|g| g.0), ground.map_or(T_MAX, |g| g.0), echoes, em.resolution());
     CellView { obs, echoes, refls, capped, ground, w, wt, bg }
@@ -699,11 +707,11 @@ fn returns(layers: &[(Layer, u8)], ground: Option<(f64, f64)>, shift: f64, level
         m.push(Member { t: ly.t, depth: ly.t + em.depth_bias(k, ly.t) + shift, sd: em.depth_sd(k, ly.spread), s, s_q, energy: ly.op * ly.f * unit, share,
                         fill: ly.fq.map(|f| f * b0), tau: taus[li], beam, merge: merges.get(li).copied().unwrap_or_default() });
     }
-    if let Some((tg, cg)) = ground {
-        let cg = cg.powf(em.refl_incidence);
+    if let Some((tg, cos)) = ground {
+        let cg = cos.powf(em.refl_incidence);
         let share = beam * cg * 10f64.powf(em.refl_ground / 10.0);
-        let s = em.p_detect(em.refl_ground, beam * cg, tg);
-        m.push(Member { t: tg, depth: tg, sd: em.noise(2), s, s_q: [s; 3], energy: share, share: [share; 3],
+        let s = em.ground_echo * em.p_detect(em.refl_ground, beam * cg, tg);
+        m.push(Member { t: tg, depth: tg, sd: em.noise(2).hypot(em.ground_sd / cos), s, s_q: [s; 3], energy: em.ground_echo * share, share: [share; 3],
                         fill: [beam; 3], tau: taus[layers.len()], beam: 0.0, merge: Merge::default() });
     }
     let n = m.len();
@@ -822,8 +830,7 @@ impl Pulse<'_> {
     ///   evidence against them.
     ///
     /// After the last echo, the returns left and the medium's path to the beam's end record nothing, unless the pulse
-    /// is capped: a capped pulse says nothing past its last echo. A pulse read to its first echo alone is this with
-    /// `capped` set after it.
+    /// is capped: a capped pulse says nothing past its last echo.
     #[allow(clippy::too_many_arguments)]
     fn lik(&self, rets: &[Return], i: usize, j: usize, scene: f64, taken: f64, seen: f64, tau0: f64) -> f64 {
         let em = self.em;
@@ -860,19 +867,8 @@ impl Pulse<'_> {
     }
 }
 
-/// A cell's pulse as the likelihood reads it: its echoes and their reflectances (dB; empty unknown), and whether it
-/// says nothing past its last echo: at the target cap ([`RangeImage::capped`]), or read to its first echo alone where
-/// that lies beyond [`Settings`]' `later_to`.
-fn pulse_of<'a>(v: &'a RangeImage, cell: usize, em: &Settings) -> (&'a [f32], &'a [f32], bool) {
-    let (e, r) = (v.echoes(cell), v.echo_refls(cell));
-    match e.first() {
-        Some(&first) if first as f64 > em.later_to => (&e[..1], &r[..r.len().min(1)], true),
-        _ => (e, r, v.capped(cell)),
-    }
-}
-
-/// One cell an element fronts, as its ray likelihood scores it: its ray through the foliage field, its pulse
-/// ([`pulse_of`]), layers, each layer's merge with the medium behind it, ground and weight, its log-likelihood under
+/// One cell an element fronts, as its ray likelihood scores it: its ray through the foliage field, its pulse (its
+/// echoes and their reflectances, and whether it is capped), layers, each layer's merge with the medium behind it, ground and weight, its log-likelihood under
 /// the empty scene (the medium and the ground alone: the same for every hypothesis), and what its first echo says
 /// about the element.
 struct CellData {
@@ -1108,12 +1104,11 @@ fn elem_data(v: &RangeImage, rendered: &[Vec<(usize, Layer)>], elems: &[Element]
     }
     let mut data: Vec<ElemData> = members.into_iter().map(|ms| {
         let es: Vec<&Element> = ms.iter().map(|&i| &elems[i]).collect();
-        let (mid, k) = (middle(&es), cls[ms[0]]);
+        let (k, (hs, front)) = (cls[ms[0]], term_nodes(&es, em));
         let s_along = em.align_sd(k, other);
         ElemData { cells: Vec::new(), surface: k, cells_on: 0, on_across: [f64::INFINITY, f64::NEG_INFINITY],
                    across: mean_of(&es, |e| 2.0 * e.r / em.footprint(norm(&sub(&e.mid(), &v.origin)))),
-                   align: hats(&mid, ALIGN_SPACING).into_iter().map(|(key, w)| (key, w * s_along)).collect(),
-                   own_sd: [mean_of(&es, |e| e.front_shift_sd(em)), level], class_cost: 0.0, members: ms }
+                   align: hs.into_iter().map(|(key, w)| (key, w * s_along)).collect(), own_sd: [front, level], class_cost: 0.0, members: ms }
     }).collect();
     let mut photo = vec![[0.0; 5]; data.len()];
     // cells in index order, so an element's sums run in the same order in every run (the k-buffer is a hash map)
@@ -1420,72 +1415,6 @@ fn segment(e: &Element) -> (Point, Point) {
     }
 }
 
-/// The coupling along a chain (research 130 slice 6; design-pass-3.md's product 6): a declared term over the chain's
-/// geometry alone, reported beside its cost, never in it, its values a consumer's to override. ln r follows a drift
-/// (`drift` per m along the chain: the taper, research 128's −0.15) and a stationary departure about it (an
-/// Ornstein–Uhlenbeck process, sd `form_sd` and range `form_range` m: 128's stem form departures, 0.2 over about 1 m)
-/// anchored on the first stick; the axis's direction walks with `bend_sd` rad per √m (the curvature; declared, not
-/// measured).
-#[derive(Debug, Clone, Copy)]
-pub struct Coupling {
-    pub drift: f64,
-    pub form_sd: f64,
-    pub form_range: f64,
-    pub bend_sd: f64,
-}
-
-impl Default for Coupling {
-    fn default() -> Self {
-        Coupling { drift: -0.15, form_sd: 0.2, form_range: 1.0, bend_sd: 0.5 }
-    }
-}
-
-/// A chain's coupling ([`Coupling`]): its `length` (m, its sticks' summed), the widest `gap` between one stick's end
-/// and the next's start (m), and the coupling's cost in its radii (`radius`) and directions (`bend`), nats: per joint,
-/// −log of the next stick's ln r given its predecessors' and of the turn between their axes, over `s` the distance
-/// between their middles.
-#[derive(Debug, Clone, Copy, Default)]
-pub struct CouplingRow {
-    pub length: f64,
-    pub gap: f64,
-    pub radius: f64,
-    pub bend: f64,
-}
-
-/// The coupling of sticks joined end to end in order ([`Coupling`]): pure geometry, the same whatever the scans say.
-pub fn coupling(sticks: &[Element], c: &Coupling) -> CouplingRow {
-    let mut row = CouplingRow::default();
-    let (mut along, mut x0, mut x_prev) = (0.0, 0.0, 0.0);
-    for (k, e) in sticks.iter().enumerate() {
-        let (a, b) = segment(e);
-        let len = norm(&sub(&b, &a));
-        row.length += len;
-        let x = |s: f64| e.r.ln() - c.drift * s;
-        if k == 0 {
-            (along, x0, x_prev) = (0.5 * len, x(0.5 * len), x(0.5 * len));
-            continue;
-        }
-        let (pa, pb) = segment(&sticks[k - 1]);
-        let plen = norm(&sub(&pb, &pa));
-        row.gap = row.gap.max(norm(&sub(&a, &pb)));
-        let s = 0.5 * (plen + len);
-        along += s;
-        // ln r's departure from the drift, an OU step from the last one, its mean the first's
-        let rho = (-s / c.form_range).exp();
-        let var = c.form_sd * c.form_sd * (1.0 - rho * rho);
-        let xk = x(along);
-        let e_r = (xk - x0) - rho * (x_prev - x0);
-        row.radius += 0.5 * e_r * e_r / var + 0.5 * (2.0 * std::f64::consts::PI * var).ln();
-        x_prev = xk;
-        // the turn between the axes, a 2-D Gaussian of variance bend_sd² s per component
-        let (u, w) = (normalize(&sub(&pb, &pa)), normalize(&sub(&b, &a)));
-        let turn = dot(&u, &w).clamp(-1.0, 1.0).acos();
-        let vb = c.bend_sd * c.bend_sd * s;
-        row.bend += 0.5 * turn * turn / vb + (2.0 * std::f64::consts::PI * vb).ln();
-    }
-    row
-}
-
 /// An element's parameters in [`Scene::information`]: their steps (0.05 in ln r, 2 mm in place, and that over a
 /// stick's half-length in tilt).
 fn steps(e: &Element) -> Vec<f64> {
@@ -1516,16 +1445,17 @@ fn moved(e: &Element, th: &[f64]) -> Element {
 }
 
 /// One scan's evidence on n quantities from the cells of some elements, with the latents the cells share
-/// marginalised out once (research 130 step 3a, slice 4): the scan alignment error's nodes about each element (shared
-/// by neighbours), and each element's stem front shift and reflectance level, each a unit node scaled as the cost
-/// scales it ([`elem_data`]). Each observable adds its slope in the quantities and its loading on the nodes, at its
+/// marginalised out once (research 130 step 3a, slice 4): the scan alignment error's nodes about each term (shared
+/// by neighbours), and each term's stem front shift and reflectance level, each a unit node scaled as the cost scales
+/// it ([`term_nodes`]). Each observable adds its slope in the quantities and its loading on the nodes, at its
 /// information weight and the cell's weight w; the information over (quantities, nodes) is kept at w and at w² (the
 /// gradient's variance were the cells independent).
 struct Shared {
     n: usize,
     nodes: HashMap<[i64; 3], usize>,
-    /// Per element: its hats ([`hats`]) and the index of its front shift node (its reflectance level's is next).
-    elems: Vec<(Vec<([i64; 3], f64)>, usize)>,
+    /// Per element: its term's hats, the index of its front shift node (its reflectance level's is next) and that
+    /// node's prior sd ([`term_nodes`]).
+    elems: Vec<(Vec<([i64; 3], f64)>, usize, f64)>,
     m: nalgebra::DMatrix<f64>,
     j: nalgebra::DMatrix<f64>,
 }
@@ -1533,29 +1463,26 @@ struct Shared {
 impl Shared {
     /// For `elems`, a group's members sharing one term's nodes ([`Owner`]: hats at their middles' mean, one front
     /// shift and one reflectance level), as the cost has them when the group is these elements.
-    fn new(n: usize, elems: &[Element]) -> Shared {
+    fn new(n: usize, elems: &[Element], em: &Settings) -> Shared {
         let mut nodes: HashMap<[i64; 3], usize> = HashMap::new();
         let slot = slots(&elems.iter().enumerate().map(|(k, e)| owner(k as u32, e)).collect::<Vec<_>>());
         let terms = slot.iter().max().map_or(0, |m| m + 1);
-        let hs: Vec<Vec<([i64; 3], f64)>> = (0..terms).map(|t| {
-            let es: Vec<&Element> = elems.iter().zip(&slot).filter(|(_, &u)| u == t).map(|(e, _)| e).collect();
-            hats(&middle(&es), ALIGN_SPACING)
-        }).collect();
-        for (k, _) in hs.iter().flatten() {
+        let tn: Vec<_> = (0..terms).map(|t| term_nodes(&elems.iter().zip(&slot).filter(|(_, &u)| u == t).map(|(e, _)| e).collect::<Vec<_>>(), em)).collect();
+        for (k, _) in tn.iter().flat_map(|t| &t.0) {
             let i = nodes.len();
             nodes.entry(*k).or_insert(i);
         }
         let first = nodes.len();
-        let elems: Vec<_> = slot.iter().map(|&t| (hs[t].clone(), first + 2 * t)).collect();
+        let elems: Vec<_> = slot.iter().map(|&t| (tn[t].0.clone(), first + 2 * t, tn[t].1)).collect();
         let size = n + first + 2 * terms;
         Shared { n, nodes, elems, m: nalgebra::DMatrix::zeros(size, size), j: nalgebra::DMatrix::zeros(size, size) }
     }
 
-    /// A depth's loading on the nodes, in element `k`'s cell of surface class `surface`: its alignment shift (its
-    /// class's along-beam spread over its hats) and its stem front shift.
-    fn depth(&self, k: usize, align_sd: f64, front_sd: f64) -> Vec<(usize, f64)> {
-        let (h, own) = &self.elems[k];
-        h.iter().map(|(key, w)| (self.nodes[key], w * align_sd)).chain([(*own, front_sd)]).collect()
+    /// A depth's loading on the nodes, in element `k`'s cell: its alignment shift (the cell's class's along-beam
+    /// spread `align_sd` over its hats) and its term's stem front shift.
+    fn depth(&self, k: usize, align_sd: f64) -> Vec<(usize, f64)> {
+        let (h, own, front) = &self.elems[k];
+        h.iter().map(|(key, w)| (self.nodes[key], w * align_sd)).chain([(*own, *front)]).collect()
     }
 
     /// A reflectance's loading on the nodes, in element `k`'s cell: its reflectance level.
@@ -2143,7 +2070,7 @@ impl Scene {
             let sides: Vec<[HashMap<usize, CellPrediction>; 2]> = (0..n).map(|i| [pred(&pts[1 + 2 * i]), pred(&pts[2 + 2 * i])]).collect();
             let refl = em.refl_noise > 0.0 && !self.views[s].echo_refl.is_empty();
             let other = self.views[s].epoch != self.ref_epoch;
-            let mut shared = Shared::new(n, &es);
+            let mut shared = Shared::new(n, &es, em);
             // cells in index order, so the sums run in the same order in every run
             let mut centre: Vec<CellPrediction> = pred(&pts[0]).into_values().collect();
             centre.sort_unstable_by_key(|p| p.cell);
@@ -2165,7 +2092,7 @@ impl Scene {
                 // the depth's own sd, without the shifts' spread `predict` widens it by
                 let k = p.elem as usize;
                 let (align, front) = (em.align_sd(p.surface, other), es[k].front_shift_sd(em));
-                let load = shared.depth(k, align, front);
+                let load = shared.depth(k, align);
                 shared.add(&slope(&|q| q.depth, None), &load, pc * k_depth / (p.sd * p.sd - align * align - front * front).max(1e-12), p.weight);
                 if refl && p.refl.is_finite() {
                     let load = shared.refl(k, em.refl_level_sd);
@@ -2213,7 +2140,7 @@ impl Scene {
             let (pp, qq) = (at(p), at(q));
             let refl = em.refl_noise > 0.0 && !self.views[s].echo_refl.is_empty();
             let other = self.views[s].epoch != self.ref_epoch;
-            let mut shared = Shared::new(1, p);
+            let mut shared = Shared::new(1, p, em);
             let mut bernoulli = 0.0;
             let echo = |c: Option<&CellPrediction>| c.map_or(0.0, |c| c.arrives * c.recorded).clamp(1e-3, 1.0 - 1e-3);
             let cells: BTreeSet<usize> = pp.keys().chain(qq.keys()).copied().collect();
@@ -2225,7 +2152,7 @@ impl Scene {
                 let (Some(a), Some(b)) = (a, b) else { continue };
                 let k = a.elem as usize;
                 let (align, front) = (em.align_sd(a.surface, other), p[k].front_shift_sd(em));
-                let load = shared.depth(k, align, front);
+                let load = shared.depth(k, align);
                 shared.add(&[b.depth - a.depth], &load, ea * k_depth / (a.sd * a.sd - align * align - front * front).max(1e-12), w);
                 if refl && (b.refl - a.refl).is_finite() {
                     let load = shared.refl(k, em.refl_level_sd);
@@ -2714,11 +2641,10 @@ mod tests {
         let ed = |shift: f64, level: f64| -> f64 {
             buf.iter().map(|(&cell, ls)| {
                 let layers: Vec<(Layer, u8)> = ls.iter().map(|l| (*l, cls[0])).collect();
-                let echoes = v.echoes(cell);
+                let (echoes, refls, capped) = (v.echoes(cell), v.echo_refls(cell), v.capped(cell));
                 let wt = em.cell_weight(echoes.first().map_or(ls[0].t, |&r| r as f64), v.step());
                 let w = v.direction((cell / v.n_cols) as f64, (cell % v.n_cols) as f64);
                 let ts: Vec<f64> = layers.iter().map(|(l, _)| l.t).collect();
-                let (echoes, refls, capped) = pulse_of(&v, cell, &em);
                 let bg = Foliage::uniform(sc.kappa).ray_bg(&v.origin, &w, &ts, None, T_MAX, echoes, em.resolution());
                 let ms = merges(&layers, None, &v.origin, &w, &em, &Foliage::uniform(sc.kappa));
                 wt * (cell_ll(echoes, refls, capped, &layers, None, shift, level, &em, &bg, &ms) - cell_ll(echoes, refls, capped, &[], None, 0.0, 0.0, &em, &bg.base(), &[]))
@@ -3015,35 +2941,6 @@ mod tests {
         assert!(pairs(None).iter().all(|p| !p.3), "{:?}", pairs(None));
     }
 
-    /// The coupling is pure geometry: it takes no scan, ignores class, opacity and group, and moves with the radii
-    /// only through their changes along the chain. A straight chain whose ln r follows the drift pays only its
-    /// normalisers; scaling every radius leaves it; a bend and a jump in radius cost more; a gap is reported.
-    #[test]
-    fn the_coupling_is_pure_geometry() {
-        let c = Coupling::default();
-        let stick_at = |a: Point, b: Point, r: f64| Element { form: Form::Stick { a, b }, r, ..stick(0.0, 0.0, 0.01) };
-        let straight: Vec<Element> = (0..5).map(|k| {
-            let z = 0.1 * k as f64;
-            stick_at([0.0, 0.0, z], [0.0, 0.0, z + 0.1], 0.01 * (c.drift * (z + 0.05)).exp())
-        }).collect();
-        let base = coupling(&straight, &c);
-        assert!((base.length - 0.5).abs() < 1e-12 && base.gap < 1e-12);
-        let norm_r = 4.0 * 0.5 * (2.0 * std::f64::consts::PI * c.form_sd.powi(2) * (1.0 - (-0.2 / c.form_range).exp())).ln();
-        assert!((base.radius - norm_r).abs() < 1e-9, "{} vs {norm_r}", base.radius);
-        let marked: Vec<Element> = straight.iter().map(|e| Element { class: Class::Leaf, opacity: 0.4, group: Some(2), r: 2.0 * e.r, ..*e }).collect();
-        let same = coupling(&marked, &c);
-        assert!((same.radius - base.radius).abs() < 1e-9 && same.bend == base.bend);
-        let mut bent = straight.clone();
-        bent[4] = stick_at([0.0, 0.0, 0.4], [0.03, 0.0, 0.5], straight[4].r);
-        let mut jump = straight.clone();
-        jump[2].r *= 1.5;
-        let mut gap = straight.clone();
-        gap[3] = stick_at([0.0, 0.0, 0.32], [0.0, 0.0, 0.4], straight[3].r);
-        assert!(coupling(&bent, &c).bend > base.bend + 1.0);
-        assert!(coupling(&jump, &c).radius > base.radius + 1.0);
-        assert!((coupling(&gap, &c).gap - 0.02).abs() < 1e-12);
-    }
-
     /// A bare layer for the pulse's tests: at range `t`, fill `f` (at every section radius), opacity `op`, face-on.
     fn layer(t: f64, f: f64, op: f64) -> (Layer, u8) {
         (Layer { t, far: t + 0.01, spread: 0.0, f, fq: [f; 3], cos: 1.0, db: Settings::default().refl_wood, elem: 0, op, x: 0.0, s: 0.0 }, 1)
@@ -3123,5 +3020,45 @@ mod tests {
         let common: Vec<&usize> = a.keys().filter(|k| b.contains_key(k)).collect();
         assert!(common.len() > 20);
         assert!(common.iter().all(|k| a[k] == b[k]));
+    }
+
+    /// Slice 2d: the ground plane's echo is read at `ground_sd / cos ι` along the ray and recorded with chance
+    /// `ground_echo`. On a grazing ray (cos 0.2) the ground term reads an echo 1.5 m before the plane (terrain 0.3 m
+    /// over it), which the per-echo noise alone can't; and a pulse that returns nothing pays about `1 − ground_echo`,
+    /// not a near-certain echo's absence.
+    #[test]
+    fn the_ground_reads_its_misfit_along_the_ray() {
+        let em = Settings::default();
+        let flat = Foliage::uniform(0.05);
+        let (o, w) = ([0.0; 3], [0.0, 0.96f64.sqrt(), -0.2]);
+        let ll = |echoes: &[f32], refls: &[f32], em: &Settings| {
+            let bg = flat.ray_bg(&o, &w, &[], Some(10.0), 10.0, echoes, em.resolution());
+            cell_ll(echoes, refls, false, &[], Some((10.0, 0.2)), 0.0, 0.0, em, &bg, &[])
+        };
+        let x = (em.refl_ground + 10.0 * 0.2f64.powf(em.refl_incidence).log10()) as f32;
+        let tight = Settings { ground_sd: 0.0, ..em };
+        let (spread, plane) = (ll(&[8.5], &[x], &em), ll(&[8.5], &[x], &tight));
+        assert!(spread > plane + 3.0, "{spread} vs {plane}");
+        let medium = -0.05 * 10.0;
+        let (none, certain) = (ll(&[], &[], &em), ll(&[], &[], &Settings { ground_echo: 1.0, ..em }));
+        assert!((none - medium - (1.0 - em.ground_echo).ln()).abs() < 1e-3, "{none}");
+        assert!(certain < none - 20.0, "{certain}");
+    }
+
+    /// Slice 2d: a group's information loads one stem front shift with the prior its cost gives it (its members' mean
+    /// sd: [`term_nodes`]), not each member's own.
+    #[test]
+    fn a_groups_information_and_cost_share_its_front_shift_prior() {
+        let v = pole_view();
+        let (em, sc) = (Settings::default(), Background::default());
+        let es = [Element { r: 0.03, ..piece_of(-0.2, 0.0, Some(3)) }, Element { r: 0.015, ..piece_of(0.0, 0.2, Some(3)) }];
+        let rendered = render_all(&v, &es, &em);
+        let d = elem_data(&v, &rendered, &es, &[1, 1], &[0, 0], &[0, 1], 0, &em, &sc, &Foliage::uniform(sc.kappa));
+        assert_eq!(d.len(), 1);
+        let shared = Shared::new(1, &es, &em);
+        for (k, e) in es.iter().enumerate() {
+            assert!((e.front_shift_sd(&em) - d[0].own_sd[0]).abs() > 1e-4);
+            assert_eq!(shared.depth(k, 0.0).last().unwrap().1, d[0].own_sd[0]);
+        }
     }
 }

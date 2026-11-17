@@ -32,7 +32,7 @@ use std::sync::Arc;
 use sylva_rs::scene::foliage::FoliageBox;
 use sylva_rs::scene::moments::{Candidate, Moments};
 use sylva_rs::scene::range_image::{Cell, RangeImage, RangeImageParams};
-use sylva_rs::scene::scene::{CellPrediction, Class, Coupling, Element, ElementScan, Form, Information, Scene, SceneError};
+use sylva_rs::scene::scene::{CellPrediction, Class, Element, ElementScan, Form, Information, Scene, SceneError};
 use sylva_rs::scene::settings::{Background, Settings};
 
 use crate::xyz_from_py;
@@ -311,22 +311,7 @@ pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyScene>()?;
     m.add_function(wrap_pyfunction!(candidates, m)?)?;
     m.add_function(wrap_pyfunction!(settings_defaults, m)?)?;
-    m.add_function(wrap_pyfunction!(coupling, m)?)?;
     Ok(())
-}
-
-/// The coupling along a chain of sticks joined end to end in order (scene::coupling): a declared term over their
-/// geometry alone, never in a cost. A dict: length, gap (m), radius, bend (nats).
-#[pyfunction]
-#[pyo3(signature = (sticks, drift=-0.15, form_sd=0.2, form_range=1.0, bend_sd=0.5))]
-fn coupling<'py>(py: Python<'py>, sticks: &Bound<'_, PyDict>, drift: f64, form_sd: f64, form_range: f64, bend_sd: f64) -> PyResult<Bound<'py, PyDict>> {
-    let es = elements_from_py(sticks, &Settings::default())?;
-    let row = sylva_rs::scene::scene::coupling(&es, &Coupling { drift, form_sd, form_range, bend_sd });
-    let d = PyDict::new(py);
-    for (k, v) in [("length", row.length), ("gap", row.gap), ("radius", row.radius), ("bend", row.bend)] {
-        d.set_item(k, v)?;
-    }
-    Ok(d)
 }
 
 /// A scene of elements held against range images (scene::Scene). Each element is rendered once per image; moves and
