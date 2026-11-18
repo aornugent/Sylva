@@ -61,9 +61,9 @@
 //!     let a wider stick move echoes from the edges into the gate, where each is worth far more).
 //! - **The element's echo** ([`front_echo`]): the first return of the most likely way a cell comes back, its sd
 //!   widened by the alignment error and the stem front shift. [`Outcome::of`] against it is the one rule for "the
-//!   cell's first echo is the element's", used by the surface class, the cells_on, `predict` and
-//!   `counts` (and, for any echo of the pulse, `predict`'s `read`); a cell mostly filled ([`MOSTLY`]) is where an echo
-//!   reads the element's surface.
+//!   cell's first echo is the element's", for reporting only: the cells_on, arcs and rows' parts, `predict` and
+//!   `counts` (and, for any echo of the pulse, `predict`'s `read`); the cost never reads it. A cell mostly filled
+//!   ([`MOSTLY`]) is where an echo reads the element's surface.
 //! - **Depth over a footprint:** a layer's depth is the mean of the section's depth over the part of the footprint
 //!   it meets, weighted by each part's energy (the cosine of incidence), as a scanner's mixed echo is
 //!   ([`footprint_depth`]). The mismatch spreads the depth but doesn't move it (slice 7b).
@@ -71,8 +71,10 @@
 //!   shift on nodes ℓ apart (trilinear hats, normalised) with a unit Gaussian prior, scaled at each element by its
 //!   surface class's spread (and the other-epoch part for a scan off the reference epoch, which the caller
 //!   declares). A cell's depths move by the shift at its front element. Neighbours sharing nodes share one shift,
-//!   and one scan's joint evidence on a place is capped by the prior. The surface class k (which sets the along
-//!   spread, the bias and the noise) is the median class of the view's echoes on the element. With it, the **stem
+//!   and one scan's joint evidence on a place is capped by the prior. **Surface classes** (3dtrees research 130
+//!   slice-structure): every echo reads the depth bias and noise of its own cell's class ([`cell_class`]: the excess
+//!   there, data); a term's class, which sets its along spread, is the median over the cells it mostly fills
+//!   ([`term_classes`]). So no term's evidence depends on another's class. With it, the **stem
 //!   front shift** (slice 14): a node of the element's own per scan, its section's departure from round as that view
 //!   sees it. A scan's cost is the Laplace marginal of its data over both and the reflectance levels
 //!   ([`solve_alignment`]); between refits the alignment is held ([`Held`], research 130 step 3a).
@@ -109,8 +111,8 @@ pub const K: usize = 3;
 /// or more.
 pub const MIN_FILL: f64 = 0.01;
 
-/// The fill over which a cell is mostly the element's: its echo there reads the element's surface (its surface class
-/// and shape mismatch).
+/// The fill over which a cell is mostly the element's: its echo there reads the element's surface (its term's surface
+/// class and its shape mismatch).
 pub const MOSTLY: f64 = 0.5;
 
 /// An element's form: its geometry.
@@ -145,7 +147,7 @@ pub struct Element {
 
 /// Whose term a cell's evidence enters, per scan: an element alone (by id), or a group (by its key). A group's members
 /// share one set of nuisances (one alignment shift, at their middles' mean; one stem front shift, its prior sd their
-/// mean; one reflectance level) and one surface class (the median over their echoes), so a chain of short sticks is
+/// mean; one reflectance level) and one surface class (the median over their cells: [`term_classes`]), so a chain of short sticks is
 /// charged its nuisances once. Its members' cells are scored as one element's.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 enum Owner {
@@ -301,7 +303,8 @@ impl Layer {
 /// What one scan says about one element, or one group ([`Owner`]: `group`, and `elem` its first member), its cost
 /// split into parts that sum to `cost`. A group's row reads its members' cells together.
 /// - `cells`: cells where it is the nearest layer (at [`MIN_FILL`] or more); `cells_on`: those whose first echo is
-///   its ([`Outcome::On`]); `across`: footprints across its diameter; `surface`: its surface class in this scan.
+///   its ([`Outcome::On`]); `across`: footprints across its diameter; `surface`: its term's surface class in this
+///   scan ([`term_classes`]).
 /// - `arc`: the arc of a stick's outline its echoes span (rad, 0 to π; the support function's coverage, as the
 ///   candidates' arcs): `asin(x_max / r) − asin(x_min / r)` over its `cells_on` rays' places across its axis, so π
 ///   where the scan sees its whole near side, less where it is hidden or seen past the edge only.
@@ -512,17 +515,25 @@ struct CellView {
     pulse: Pulse,
 }
 
-/// Cell `cell` of image `v` with `layers` in front of it (nearest first, each with its element's surface class),
-/// against the foliage field `ext` and the background's ground.
-fn cell_view(v: &RangeImage, cell: usize, layers: Vec<(Layer, u8)>, em: &Settings, sc: &Background, ext: &Foliage) -> CellView {
+/// Cell `cell` of image `v` with `layers` in front of it (nearest first), read at the cell's surface class
+/// ([`cell_class`]), against the foliage field `ext` and the background's ground.
+fn cell_view(v: &RangeImage, cell: usize, layers: Vec<Layer>, em: &Settings, sc: &Background, ext: &Foliage) -> CellView {
     let (obs, ground, w) = obs_ground(v, cell, sc);
-    let wt = em.cell_weight(if obs.is_finite() { obs } else { layers[0].0.t }, v.step());
-    CellView { obs, wt, pulse: Pulse::new(occluders(layers, ground), &v.origin, &w, v.echoes(cell), v.echo_refls(cell), v.max_targets, em, ext) }
+    let wt = em.cell_weight(if obs.is_finite() { obs } else { layers[0].t }, v.step());
+    let pulse = Pulse::new(occluders(layers, ground), cell_class(v, cell, em), &v.origin, &w, v.echoes(cell), v.echo_refls(cell), v.max_targets, em, ext);
+    CellView { obs, wt, pulse }
+}
+
+/// Cell `cell`'s surface class: its echo's surface continuity (the excess, data), mid where it has no surface fit.
+/// Every return of the cell's pulse reads that class's depth bias and noise (3dtrees research 130 optimisation.md).
+fn cell_class(v: &RangeImage, cell: usize, em: &Settings) -> u8 {
+    let x = v.excess[cell];
+    if v.cell[cell] == Cell::Echoes && x.is_finite() { em.surface(x as f64) } else { 1 }
 }
 
 /// The front element's echo in a cell as the likelihood reads it: the first return of the most likely way the cell's
 /// occluders come back ([`Receiver::front`]; none without an occluder), its sd widened by the alignment error's spread
-/// at the front layer's surface class `k` and the stem front shift's prior spread (the front element's, `front_sd`;
+/// at the front element's term's surface class `k` ([`term_classes`]) and the stem front shift's prior spread (the front element's, `front_sd`;
 /// `other` for a scan off the reference epoch). [`Outcome::of`] against it is the one rule for "the cell's first echo
 /// is the element's".
 fn front_echo(rx: &Receiver<f64>, k: u8, front_sd: f64, other: bool, em: &Settings) -> Option<Return> {
@@ -534,33 +545,20 @@ fn depth_sd(fe: Option<&Return>) -> (f64, f64) {
     fe.map_or((f64::NAN, f64::NAN), |f| (f.mu, f.sd))
 }
 
-/// Each element's surface class in one view: the median class of the view's echoes on its term (`slot`, per element:
-/// [`slots`]), in cells a member mostly fills (mid where none). The class isn't known yet when these echoes are chosen,
-/// so they are read under the mid class.
-fn classes(v: &RangeImage, buf: &HashMap<usize, Vec<Layer>>, elems: &[Element], slot: &[usize], em: &Settings, sc: &Background, other: bool) -> Vec<u8> {
-    let mut ex: Vec<Vec<f64>> = vec![Vec::new(); slot.iter().max().map_or(0, |m| m + 1)];
+/// Each element's term's surface class in one view (`slot`, per element: [`slots`]), which sets the term's alignment
+/// spread: the median class of the cells its members mostly fill ([`MOSTLY`]) that hold an echo with a surface fit (mid
+/// where none). The echoes themselves read their own cells' class ([`cell_class`]).
+fn term_classes(v: &RangeImage, buf: &HashMap<usize, Vec<Layer>>, slot: &[usize], em: &Settings) -> Vec<u8> {
+    let mut ks: Vec<Vec<u8>> = vec![Vec::new(); slot.iter().max().map_or(0, |m| m + 1)];
     for (&cell, ls) in buf {
-        let ly = ls[0];
-        if ly.f <= MOSTLY || v.cell[cell] != Cell::Echoes || !v.excess[cell].is_finite() {
-            continue;
-        }
-        let (obs, ground, _) = obs_ground(v, cell, sc);
-        let rx = receiver(&occluders(ls.iter().map(|l| (*l, 1)).collect(), ground), 0.0, 0.0, em);
-        let (mu, sd) = depth_sd(front_echo(&rx, 1, elems[ly.elem as usize].front_shift_sd(em), other, em).as_ref());
-        if Outcome::of(obs, mu, sd) == Outcome::On {
-            ex[slot[ly.elem as usize]].push(v.excess[cell] as f64);
+        if ls[0].f > MOSTLY && v.cell[cell] == Cell::Echoes && v.excess[cell].is_finite() {
+            ks[slot[ls[0].elem as usize]].push(em.surface(v.excess[cell] as f64));
         }
     }
-    let per: Vec<u8> = ex.iter_mut()
-        .map(|e| {
-            if e.is_empty() {
-                1
-            } else {
-                e.sort_by(f64::total_cmp);
-                em.surface(e[e.len() / 2])
-            }
-        })
-        .collect();
+    let per: Vec<u8> = ks.iter_mut().map(|k| {
+        k.sort_unstable();
+        k.get(k.len() / 2).copied().unwrap_or(1)
+    }).collect();
     slot.iter().map(|&t| per[t]).collect()
 }
 
@@ -568,7 +566,7 @@ fn classes(v: &RangeImage, buf: &HashMap<usize, Vec<Layer>>, elems: &[Element], 
 /// the chance its echo is recorded, the chance the pulse arrives (meets nothing of the foliage field before the
 /// element's return), the echo's predicted depth and sd ([`front_echo`]) and reflectance (dB, at the element's
 /// declared reflectance and its own section radius, without the shape mismatch's blur; NaN where that section
-/// misses the beam), the mean cos ι over the part of the footprint the element meets, the element's surface class,
+/// misses the beam), the mean cos ι over the part of the footprint the element meets, its term's surface class,
 /// the observed first echo (NaN for none) and its reflectance (NaN unknown), the [`Outcome`], whether any echo the
 /// likelihood reads of the cell's pulse is on the element (`read`: [`Outcome::of`] for each), its merge share with the
 /// medium behind it (`merge`: [`merges`]), the cell's weight ([`Settings::cell_weight`]), the footprint (m) and where
@@ -614,11 +612,10 @@ struct Merge {
     pull: f64,
 }
 
-/// What a pulse meets as a surface: an element's layer, read at its element's surface class, or the ground plane, at
-/// the cosine of incidence along the ray.
+/// What a pulse meets as a surface: an element's layer, or the ground plane, at the cosine of incidence along the ray.
 #[derive(Debug, Clone, Copy)]
 enum Surface {
-    Layer(Layer, u8),
+    Layer(Layer),
     Ground(f64),
 }
 
@@ -633,12 +630,12 @@ struct Occluder {
     merge: Merge,
 }
 
-/// A cell's occluders: its `layers` (nearest first, each with its element's surface class) in front of the ground at
-/// `ground` = (range, cos), then the ground; no optical depths or merges yet ([`Pulse::new`] reads them).
-fn occluders(layers: Vec<(Layer, u8)>, ground: Option<(f64, f64)>) -> Vec<Occluder> {
+/// A cell's occluders: its `layers` (nearest first) in front of the ground at `ground` = (range, cos), then the
+/// ground; no optical depths or merges yet ([`Pulse::new`] reads them).
+fn occluders(layers: Vec<Layer>, ground: Option<(f64, f64)>) -> Vec<Occluder> {
     let t_end = ground.map_or(T_MAX, |g| g.0);
     let bare = |surface, t| Occluder { surface, t, tau: 0.0, merge: Merge::default() };
-    layers.into_iter().take_while(|l| l.0.t < t_end).map(|(l, k)| bare(Surface::Layer(l, k), l.t))
+    layers.into_iter().take_while(|l| l.t < t_end).map(|l| bare(Surface::Layer(l), l.t))
         .chain(ground.map(|(t, cos)| bare(Surface::Ground(cos), t))).collect()
 }
 
@@ -754,15 +751,15 @@ impl<T: Real> Receiver<T> {
     }
 }
 
-/// The ways a cell's occluders `occ` come back ([`Receiver`]), with every layer shifted by `shift` along the beam and
-/// its reflectance by `level` (dB). Adjacent members resolve into two echoes with [`Settings::p_resolve`] of their
+/// The ways a cell's occluders `occ` come back ([`Receiver`]), its layers read at the cell's surface class `k`, with
+/// every layer shifted by `shift` along the beam and its reflectance by `level` (dB). Adjacent members resolve into two echoes with [`Settings::p_resolve`] of their
 /// separation and energy ratio, else merge, summing their energy shares, into one echo pulled back from the nearest
 /// member's by the measured pull ([`Settings::pull`], at the others' energy and energy-weighted separation; 3dtrees
 /// research 130 slice 2c, before which it sat at their energy-weighted depth); patterns under 1e-4 are dropped.
-fn receiver<T: Real>(occ: &[Occluder], shift: T, level: T, em: &Settings) -> Receiver<T> {
+fn receiver<T: Real>(occ: &[Occluder], k: u8, shift: T, level: T, em: &Settings) -> Receiver<T> {
     let mut beam = 1.0;
     let m: Vec<Member<T>> = occ.iter().map(|o| match o.surface {
-        Surface::Layer(ly, k) => {
+        Surface::Layer(ly) => {
             let db = level + ly.db;
             let cos = ly.cos.powf(em.refl_incidence);
             let s_q = ly.fq.map(|f| em.p_detect(db, f * beam * cos, ly.t) * ly.op);
@@ -835,7 +832,7 @@ fn receiver<T: Real>(occ: &[Occluder], shift: T, level: T, em: &Settings) -> Rec
 fn merges(occ: &mut [Occluder], m: &Medium, em: &Settings) {
     let mut beam = 1.0;
     for i in 0..occ.len() {
-        let Surface::Layer(ly, _) = occ[i].surface else { continue };
+        let Surface::Layer(ly) = occ[i].surface else { continue };
         let echo = ly.db + 10.0 * (ly.f * beam * ly.cos.powf(em.refl_incidence)).max(1e-12).log10();
         beam *= 1.0 - ly.f * ly.op;
         if beam < 1e-6 {
@@ -859,7 +856,8 @@ fn merges(occ: &mut [Occluder], m: &Medium, em: &Settings) {
 
 /// One cell's pulse and its owners, as the likelihood reads it (3dtrees research 130 formulation.md: one pass per
 /// pulse): its echoes and their reflectances, the most echoes its scan records (`cap`, the target cap; a pulse at it is
-/// capped, [`RangeImage::capped`], and says nothing past its last echo), its occluders ([`Occluder`]) and what its ray
+/// capped, [`RangeImage::capped`], and says nothing past its last echo), its occluders ([`Occluder`]), the surface class
+/// they are read at (its cell's: [`cell_class`]) and what its ray
 /// meets of the foliage field besides: the optical depth to the beam's end (`tau_end`) and, per echo (`medium`), the
 /// optical depth to it, σ at it and the optical depth to it plus the receiver's resolution, where the medium's path
 /// restarts after it. [`Pulse::read`] is the one pass over it.
@@ -869,6 +867,7 @@ struct Pulse {
     refls: Vec<f32>,
     cap: usize,
     occluders: Vec<Occluder>,
+    class: u8,
     tau_end: f64,
     medium: Vec<[f64; 3]>,
 }
@@ -894,17 +893,18 @@ impl<T> Reading<T> {
 
 impl Pulse {
     /// The pulse of a ray from `o` along `w` with its `echoes` (their reflectances `refls`; the scan's target cap
-    /// `cap`) against occluders `occ` ([`occluders`]) and the foliage field `ext`, its ray walked once through the
-    /// field's voxels ([`Medium`]): each occluder's optical depth and merge, and the medium along the ray.
+    /// `cap`) against occluders `occ` ([`occluders`]) read at surface class `class` and the foliage field `ext`, its ray
+    /// walked once through the field's voxels ([`Medium`]): each occluder's optical depth and merge, and the medium
+    /// along the ray.
     #[allow(clippy::too_many_arguments)]
-    fn new(mut occ: Vec<Occluder>, o: &Point, w: &Point, echoes: &[f32], refls: &[f32], cap: usize, em: &Settings, ext: &Foliage) -> Pulse {
+    fn new(mut occ: Vec<Occluder>, class: u8, o: &Point, w: &Point, echoes: &[f32], refls: &[f32], cap: usize, em: &Settings, ext: &Foliage) -> Pulse {
         let m = ext.medium(o, w);
         for x in occ.iter_mut() {
             x.tau = m.tau(x.t);
         }
         merges(&mut occ, &m, em);
         let medium = echoes.iter().map(|&r| [m.tau(r as f64), m.hazard(r as f64), m.tau(r as f64 + em.resolution())]).collect();
-        Pulse { echoes: echoes.to_vec(), refls: refls.to_vec(), cap, tau_end: m.tau(Pulse::end(&occ)), occluders: occ, medium }
+        Pulse { echoes: echoes.to_vec(), refls: refls.to_vec(), cap, tau_end: m.tau(Pulse::end(&occ)), occluders: occ, class, medium }
     }
 
     /// The range the beam of a pulse with occluders `occ` ends at: the ground's, else [`T_MAX`].
@@ -919,7 +919,7 @@ impl Pulse {
     /// The receiver's reading of its occluders, the layers shifted by `shift` along the beam and `level` in
     /// reflectance ([`receiver`]).
     fn receiver<T: Real>(&self, shift: T, level: T, em: &Settings) -> Receiver<T> {
-        receiver(&self.occluders, shift, level, em)
+        receiver(&self.occluders, self.class, shift, level, em)
     }
 
     /// The one pass (3dtrees research 130 slice 2c, formulation.md): the pulse whole against the returns its occluders
@@ -1246,12 +1246,14 @@ fn hats(x: &Point, l: f64) -> Vec<([i64; 3], f64)> {
 const MAX_NEWTON: usize = 40;
 
 /// One scan's data for the elements `score` (indices into `elems`, each with its layers in `rendered`), one per term
-/// (`slot`, per element: [`slots`]), against the k-buffer of every element's layers, under the surface classes `cls`. A
-/// cell's evidence belongs to its front element's term.
+/// (`slot`, per element: [`slots`]), against the k-buffer of every element's layers. A cell's evidence belongs to its
+/// front element's term; its echoes read the cell's own surface class ([`cell_class`]) and its shift the term's
+/// alignment spread ([`term_classes`]), so a term depends on no other term's class.
 #[allow(clippy::too_many_arguments)]
-fn elem_data(v: &RangeImage, rendered: &[Vec<(usize, Layer)>], elems: &[Element], cls: &[u8], slot: &[usize], score: &[usize], ref_epoch: u32,
+fn elem_data(v: &RangeImage, rendered: &[Vec<(usize, Layer)>], elems: &[Element], slot: &[usize], score: &[usize], ref_epoch: u32,
              em: &Settings, sc: &Background, ext: &Foliage) -> Vec<ElemData> {
     let buf = kbuffer(rendered);
+    let cls = term_classes(v, &buf, slot, em);
     let other = v.epoch != ref_epoch;
     let level = if em.refl_noise > 0.0 && !v.echo_refl.is_empty() { em.refl_level_sd } else { 0.0 };
     let (mut members, mut at, mut by_elem): (Vec<Vec<usize>>, HashMap<usize, usize>, HashMap<u32, usize>) = Default::default();
@@ -1281,8 +1283,7 @@ fn elem_data(v: &RangeImage, rendered: &[Vec<(usize, Layer)>], elems: &[Element]
         if v.cell[cell] == Cell::NoPulse {
             continue; // no pulse was placed here: nothing observed, neither echo nor miss
         }
-        let layers: Vec<(Layer, u8)> = ls.iter().map(|l| (*l, cls[l.elem as usize])).collect();
-        let cv = cell_view(v, cell, layers, em, sc, ext);
+        let cv = cell_view(v, cell, ls.clone(), em, sc, ext);
         let (mu, sd) = depth_sd(front_echo(&cv.pulse.receiver(0.0, 0.0, em), cls[front.elem as usize], elems[front.elem as usize].front_shift_sd(em), other, em).as_ref());
         let outcome = Outcome::of(cv.obs, mu, sd);
         let el = &mut data[d];
@@ -1458,17 +1459,15 @@ fn solve_alignment(data: &[ElemData], em: &Settings) -> (Held, Vec<Term>) {
     (held(index, z, grad, hess), terms)
 }
 
-/// One scan's fit: per element id its surface class, per [`Owner`] its term (none where the scan doesn't see it), the
-/// held alignment, and the scan's cost.
+/// One scan's fit: per [`Owner`] its term (none where the scan doesn't see it), the held alignment, and the scan's cost.
 struct Fit {
-    cls: Vec<u8>,
     terms: BTreeMap<Owner, Term>,
     held: Held,
     cost: f64,
 }
 
-/// A move's changes to a scan's fit: the terms by owner (none: it left the scan) and the elements' surface classes.
-type Changes = (Vec<(Owner, Option<Term>)>, Vec<(u32, u8)>);
+/// A move's changes to a scan's fit: the terms by owner (none: it left the scan).
+type Changes = Vec<(Owner, Option<Term>)>;
 
 impl Fit {
     /// The scan's cost with the terms `over` (none: the term left) in place of its own: every term's cost plus the
@@ -1545,9 +1544,8 @@ impl std::error::Error for SceneError {}
 /// - A scan's cost is a term per element it sees, plus the scan alignment error's part. Moves (`add`, `remove`,
 ///   `change`) and queries (`costs_to_add`, `costs_to_remove`, `information`) hold the alignment ([`Held`]): its mode
 ///   and precision stay as the last refit left them, and a move's change to them is a rank-k correction on the nodes
-///   it touches. So a move recomputes only the terms of the elements whose cells it touches (and of those whose cells
-///   a changed surface class touches), not the scan, and removing an element restores the cost exactly (synthesis
-///   §18 invariant 7). [`Scene::refit_alignment`] re-solves the alignment (a move like `refit_foliage`), after which
+///   it touches. So a move recomputes only the terms of the elements whose cells it touches, not the scan, and
+///   removing an element restores the cost exactly (synthesis §18 invariant 7). [`Scene::refit_alignment`] re-solves the alignment (a move like `refit_foliage`), after which
 ///   the cost is the exact Laplace marginal ([`Scene::exact_cost`], the referee); the scene is built refitted.
 /// - Element ids are stable and never reused.
 /// - The reference epoch (the scanning day the alignment error's spread is stated for) is declared: a scan of another epoch adds the other-epoch part
@@ -1992,19 +1990,12 @@ impl Scene {
         d + self.recount(delta)
     }
 
-    /// Put a move's new terms and classes into scan `s`'s fit: the cost change.
-    fn apply(&mut self, s: usize, (terms, cls): Changes) -> f64 {
-        if terms.is_empty() && cls.is_empty() {
+    /// Put a move's new terms into scan `s`'s fit: the cost change.
+    fn apply(&mut self, s: usize, terms: Changes) -> f64 {
+        if terms.is_empty() {
             return 0.0;
         }
         let fit = &mut self.fits[s];
-        for (id, k) in cls {
-            let i = id as usize;
-            if fit.cls.len() <= i {
-                fit.cls.resize(i + 1, 1);
-            }
-            fit.cls[i] = k;
-        }
         for (o, t) in terms {
             match t {
                 Some(t) => fit.terms.insert(o, t),
@@ -2016,37 +2007,35 @@ impl Scene {
         fit.cost - before
     }
 
-    /// Scan `s` solved afresh for the elements as they are ([`solve_alignment`]), its alignment held there.
-    fn solve(&self, s: usize) -> Fit {
-        let v = &*self.views[s];
+    /// Scan `s`'s data for every live element it sees ([`elem_data`]), each term with its owner.
+    fn data(&self, s: usize) -> Vec<(Owner, ElemData)> {
         let ids: Vec<u32> = (0..self.elems.len() as u32).filter(|&i| self.elems[i as usize].is_some() && !self.rendered[s][i as usize].is_empty()).collect();
         let elems: Vec<Element> = ids.iter().map(|&i| self.elems[i as usize].unwrap()).collect();
         let rendered: Vec<Vec<(usize, Layer)>> = ids.iter().enumerate()
             .map(|(k, &i)| self.rendered[s][i as usize].iter().map(|&(c, l)| (c, Layer { elem: k as u32, ..l })).collect()).collect();
         let owners: Vec<Owner> = ids.iter().zip(&elems).map(|(&i, e)| owner(i, e)).collect();
-        let slot = slots(&owners);
-        let cls = classes(v, &kbuffer(&rendered), &elems, &slot, &self.em, &self.sc, v.epoch != self.ref_epoch);
-        let data = elem_data(v, &rendered, &elems, &cls, &slot, &(0..ids.len()).collect::<Vec<_>>(), self.ref_epoch, &self.em, &self.sc, &self.ext);
+        let data = elem_data(&self.views[s], &rendered, &elems, &slots(&owners), &(0..ids.len()).collect::<Vec<_>>(), self.ref_epoch, &self.em, &self.sc, &self.ext);
+        data.into_iter().map(|d| (owners[d.members[0]], d)).collect()
+    }
+
+    /// Scan `s` solved afresh for the elements as they are ([`solve_alignment`]), its alignment held there.
+    fn solve(&self, s: usize) -> Fit {
+        let (owners, data): (Vec<Owner>, Vec<ElemData>) = self.data(s).into_iter().unzip();
         let (mut held, terms) = solve_alignment(&data, &self.em);
-        let mut fit_cls = vec![1u8; self.elems.len()];
-        let fit_terms: BTreeMap<Owner, Term> = data.iter().zip(terms).map(|(el, t)| (owners[el.members[0]], t)).collect();
-        for (k, &i) in ids.iter().enumerate() {
-            fit_cls[i as usize] = cls[k];
-        }
+        let fit_terms: BTreeMap<Owner, Term> = owners.into_iter().zip(terms).collect();
         held.reference = fit_terms.clone();
-        let mut fit = Fit { cls: fit_cls, terms: fit_terms, held, cost: 0.0 };
+        let mut fit = Fit { terms: fit_terms, held, cost: 0.0 };
         fit.cost = fit.total(&HashMap::new());
         fit
     }
 
     /// Scan `s` with the live elements `without` taken out and the elements `with` (each with its layers in
     /// the scan) put in as ids `first`, `first + 1`, …: the new term of every owner whose term changes (none: it left
-    /// the scan) and its elements' surface classes, the alignment held. An element's term reads only the cells it is
-    /// the front of, each with its layers and their elements' classes, and a class reads the cells its element is the
-    /// front of. So the terms that change are those of the fronts of the cells the move touches (before it and after),
-    /// and of the fronts of the cells of an element whose class changed; and a group's term is its members' together,
-    /// so every present member of a group one of those (or an element taken out) belongs to is rescored with it, and
-    /// its pooled evidence never goes stale.
+    /// the scan), the alignment held. A term reads only the cells its members are the front of, each with its layers at
+    /// the cell's own surface class, and its class reads the same cells ([`term_classes`]). So the terms that change are
+    /// those of the fronts of the cells the move touches (before it and after); and a group's term is its members'
+    /// together, so every present member of a group one of those (or an element taken out) belongs to is rescored with
+    /// it, and its pooled evidence never goes stale.
     fn reterm(&self, s: usize, without: &[u32], with: &[(Element, Vec<(usize, Layer)>)], first: u32) -> Changes {
         let (v, em, fit, index) = (&*self.views[s], &self.em, &self.fits[s], &self.cells[s]);
         let added = |i: u32| i >= first && ((i - first) as usize) < with.len();
@@ -2069,23 +2058,6 @@ impl Scene {
         let before = |c: usize| nearest(index.get(&c).cloned().unwrap_or_default());
         let after = |c: usize| nearest(index.get(&c).into_iter().flatten().filter(|x| !without.contains(&x.0) && !added(x.0))
             .chain(fresh.get(&c).into_iter().flatten()).copied().collect());
-        // the elements `ids` and every layer in the cells they front, numbered from 0 (the context after them)
-        let local = |ids: &BTreeSet<u32>| -> (Vec<u32>, Vec<Element>, Vec<Vec<(usize, Layer)>>) {
-            let mut cells: Vec<usize> = ids.iter().flat_map(|&i| fronting(i)).collect();
-            cells.sort_unstable();
-            cells.dedup();
-            let mut all: Vec<u32> = ids.iter().copied().collect();
-            let mut seen: HashSet<u32> = ids.iter().copied().collect();
-            for &c in &cells {
-                all.extend(after(c).into_iter().filter(|&i| seen.insert(i)));
-            }
-            let cells: HashSet<usize> = cells.into_iter().collect();
-            let rendered = all.iter().enumerate()
-                .map(|(k, &i)| layers(i).iter().filter(|(c, _)| cells.contains(c)).map(|&(c, l)| (c, Layer { elem: k as u32, ..l })).collect()).collect();
-            (all.clone(), all.iter().map(|&i| element(i)).collect(), rendered)
-        };
-        let stored = |i: u32| fit.cls.get(i as usize).copied().unwrap_or(1);
-        let other = v.epoch != self.ref_epoch;
         let owner_of = |i: u32| owner(i, &element(i));
         // every present member of the groups of `ids` and of the elements taken out
         let whole = |ids: &mut BTreeSet<u32>| {
@@ -2108,43 +2080,31 @@ impl Scene {
         }
         near.retain(|&i| present(i));
         whole(&mut near);
-        let (ids, el, r) = local(&near);
-        let cls_near = classes(v, &kbuffer(&r), &el, &slots(&ids.iter().map(|&i| owner_of(i)).collect::<Vec<_>>()), em, &self.sc, other);
-        let cls: HashMap<u32, u8> = ids.iter().zip(&cls_near).filter(|(i, _)| near.contains(i)).map(|(&i, &k)| (i, k)).collect();
-        // and the fronts of the cells of an element whose class changed
-        let mut score = near.clone();
-        for &i in &near {
-            if added(i) || cls[&i] != stored(i) {
-                for c in fronting(i) {
-                    score.extend(after(c).first());
-                }
-            }
+        // those terms' elements and every layer in the cells they front, numbered from 0 (the context after them)
+        let mut cells: Vec<usize> = near.iter().flat_map(|&i| fronting(i)).collect();
+        cells.sort_unstable();
+        cells.dedup();
+        let mut ids: Vec<u32> = near.iter().copied().collect();
+        let mut seen: HashSet<u32> = near.iter().copied().collect();
+        for &c in &cells {
+            ids.extend(after(c).into_iter().filter(|&i| seen.insert(i)));
         }
-        score.retain(|&i| present(i));
-        whole(&mut score);
-        let (ids, el, r) = local(&score);
-        let cls: Vec<u8> = ids.iter().map(|&i| cls.get(&i).copied().unwrap_or_else(|| stored(i))).collect();
+        let cells: HashSet<usize> = cells.into_iter().collect();
+        let r: Vec<Vec<(usize, Layer)>> = ids.iter().enumerate()
+            .map(|(k, &i)| layers(i).iter().filter(|(c, _)| cells.contains(c)).map(|&(c, l)| (c, Layer { elem: k as u32, ..l })).collect()).collect();
+        let el: Vec<Element> = ids.iter().map(|&i| element(i)).collect();
         let owners: Vec<Owner> = ids.iter().map(|&i| owner_of(i)).collect();
-        let data = elem_data(v, &r, &el, &cls, &slots(&owners), &(0..score.len()).collect::<Vec<_>>(), self.ref_epoch, em, &self.sc, &self.ext);
+        let data = elem_data(v, &r, &el, &slots(&owners), &(0..near.len()).collect::<Vec<_>>(), self.ref_epoch, em, &self.sc, &self.ext);
         // a held term's own nodes start where its reference's did, so an unchanged term is recomputed exactly
         let mut terms: Vec<(Owner, Option<Term>)> = data.par_iter().map(|d| {
             let o = owners[d.members[0]];
             (o, Some(d.term(fit.held.shift(&d.align), fit.held.reference.get(&o).map_or([0.0; 2], |t| t.start), em)))
         }).collect();
-        let mut out_cls: Vec<(u32, u8)> = (0..score.len()).map(|k| (ids[k], cls[k])).collect();
         // the owners of the elements taken out or unseen now, unless a member is still scored
         let kept: HashSet<Owner> = terms.iter().map(|t| t.0).collect();
-        let mut left: BTreeSet<Owner> = without.iter().map(|&i| owner(i, &self.elems[i as usize].unwrap())).collect();
-        for i in without.iter().copied().chain((0..with.len() as u32).map(|k| first + k)) {
-            if added(i) {
-                left.insert(owner_of(i));
-            }
-            if !present(i) {
-                out_cls.push((i, 1));
-            }
-        }
-        terms.extend(left.into_iter().filter(|o| !kept.contains(o)).map(|o| (o, None)));
-        (terms, out_cls)
+        let left = without.iter().map(|&i| owner(i, &self.elems[i as usize].unwrap())).chain((0..with.len() as u32).map(|k| owner_of(first + k)));
+        terms.extend(left.collect::<BTreeSet<Owner>>().into_iter().filter(|o| !kept.contains(o)).map(|o| (o, None)));
+        terms
     }
 
     /// What some elements predict in image `s` ([`Scene::check_scan`]) against the scene, per cell one of them fronts
@@ -2175,17 +2135,16 @@ impl Scene {
         }
         let buf = kbuffer(&per);
         let other = v.epoch != self.ref_epoch;
-        let cls = classes(v, &buf, &els, &slots(&owners), em, &self.sc, other);
+        let cls = term_classes(v, &buf, &slots(&owners), em);
         let mut out: Vec<CellPrediction> = buf.iter().filter(|(&cell, ls)| (ls[0].elem as usize) < es.len() && v.cell[cell] != Cell::NoPulse).map(|(&cell, ls)| {
             let ly = ls[0];
             let k = ly.elem as usize;
-            let layers: Vec<(Layer, u8)> = ls.iter().map(|l| (*l, cls[l.elem as usize])).collect();
-            let cv = cell_view(v, cell, layers, em, &self.sc, &self.ext);
+            let cv = cell_view(v, cell, ls.clone(), em, &self.sc, &self.ext);
             let (pulse, r) = (&cv.pulse, cv.pulse.read(0.0, 0.0, em));
             let fe = front_echo(&r.rx, cls[k], es[k].front_shift_sd(em), other, em);
             let (depth, sd) = depth_sd(fe.as_ref());
             // the element's occluder: none where it lies past the beam's end
-            let at = pulse.occluders.iter().position(|o| matches!(o.surface, Surface::Layer(l, _) if l.elem == ly.elem));
+            let at = pulse.occluders.iter().position(|o| matches!(o.surface, Surface::Layer(l) if l.elem == ly.elem));
             CellPrediction {
                 cell, elem: ly.elem, fill: ly.f, recorded: fe.map_or(0.0, |f| f.s), arrives: fe.map_or(0.0, |f| (-pulse.occluders[f.first].tau).exp()), surface: cls[k], depth, sd,
                 refl: fe.map_or(f64::NAN, |f| if f.db[1] > -200.0 { f.db[1] } else { f64::NAN }), cos: ly.cos, obs: cv.obs,
@@ -2435,7 +2394,7 @@ impl Scene {
                     return 0.0;
                 }
                 let with: Vec<(Element, Vec<(usize, Layer)>)> = h.iter().copied().zip(ls.iter().cloned()).collect();
-                let over: HashMap<Owner, Option<Term>> = self.reterm(s, without, &with, first).0.into_iter().collect();
+                let over: HashMap<Owner, Option<Term>> = self.reterm(s, without, &with, first).into_iter().collect();
                 self.fits[s].total(&over) - self.fits[s].cost
             }).collect();
             if let Some(f) = &self.field {
@@ -2556,8 +2515,7 @@ mod tests {
                 let ids: Vec<u32> = (0..els.len() as u32).collect();
                 let rendered: Vec<Vec<(usize, Layer)>> = ids.iter().map(|&i| c.rendered[s][i as usize].clone()).collect();
                 let slot = slots(&ids.iter().map(|&i| owner(i, &els[i as usize])).collect::<Vec<_>>());
-                let cls = classes(vv, &kbuffer(&rendered), &els, &slot, &em, &sc, false);
-                let data = elem_data(vv, &rendered, &els, &cls, &slot, &(0..els.len()).collect::<Vec<_>>(), 0, &em, &sc, &c.ext);
+                let data = elem_data(vv, &rendered, &els, &slot, &(0..els.len()).collect::<Vec<_>>(), 0, &em, &sc, &c.ext);
                 let ((hj, tj), (hn, tn)) = (solve_alignment(&data, &em), solve_alignment_nested(&data, &em));
                 let total = |h: &Held, t: &[Term]| t.iter().map(Term::cost).sum::<f64>() + 0.5 * h.z.iter().map(|x| x * x).sum::<f64>() + 0.5 * h.logdet - 0.5 * h.gm;
                 assert!((total(&hj, &tj) - total(&hn, &tn)).abs() < 1e-4, "{} vs {}", total(&hj, &tj), total(&hn, &tn));
@@ -2897,12 +2855,12 @@ mod tests {
         let (em, sc) = (Settings::default(), Background::default());
         for e in [stick(0.0, 4.0, 0.03), stick(0.004, 4.0, 0.025)] {
             let rendered = render_all(&v, &[e], &em);
-            let d = &elem_data(&v, &rendered, &[e], &[1], &[0], &[0], 0, &em, &sc, &Foliage::uniform(sc.kappa))[0];
+            let d = &elem_data(&v, &rendered, &[e], &[0], &[0], 0, &em, &sc, &Foliage::uniform(sc.kappa))[0];
             assert!(d.own_sd[0] > 0.0 && d.own_sd[1] > 0.0);
             for x in [(0.0, 0.0), (0.002, -0.4)] {
                 let q = d.quad(x, &em);
                 let f = |dx: f64, db: f64| -d.quad((x.0 + dx, x.1 + db), &em).ll;
-                let (h, hb) = (2e-5, 2e-3);
+                let (h, hb) = (1e-5, 2e-3);
                 let g = [(f(h, 0.0) - f(-h, 0.0)) / (2.0 * h), (f(0.0, hb) - f(0.0, -hb)) / (2.0 * hb)];
                 let hess = [(f(h, 0.0) - 2.0 * f(0.0, 0.0) + f(-h, 0.0)) / (h * h), (f(h, hb) - f(h, -hb) - f(-h, hb) + f(-h, -hb)) / (4.0 * h * hb),
                             (f(0.0, hb) - 2.0 * f(0.0, 0.0) + f(0.0, -hb)) / (hb * hb)];
@@ -2957,6 +2915,39 @@ mod tests {
         assert!(near(d_remove, full(&[wide]) - full(&[wide, side])), "remove {d_remove} exact {}", full(&[wide]) - full(&[wide, side]));
         c.refit_alignment();
         assert!((c.cost() - full(&[wide])).abs() < 1e-9 * c.cost().abs().max(1.0), "{} vs {}", c.cost(), full(&[wide]));
+    }
+
+    /// A move's change is a full recompute's (3dtrees research 130 slice-structure): each cell read at its own surface
+    /// class, a term depends on no other term's class, so after adds, changes and removes among neighbours that share
+    /// cells (a group among them), every scan's terms equal its terms recomputed from scratch at the held alignment
+    /// (each from its reference's start), bit for bit; and the moves undone restore the cost exactly.
+    #[test]
+    fn a_moves_terms_are_a_full_recompute() {
+        let v = pole_view();
+        let (em, sc) = (Settings::default(), Background::default());
+        let front = stick(0.02, 3.9, 0.02);
+        let mut c = Scene::new(vec![v.clone(), v.clone()], &[stick(0.0, 4.0, 0.03), front, piece_of(-0.2, 0.0, Some(5))], em, sc, Some(field_box(0.1)), 0);
+        let check = |c: &Scene| {
+            for s in 0..c.n_scans() {
+                let fit = &c.fits[s];
+                let fresh: BTreeMap<Owner, f64> = c.data(s).into_iter()
+                    .map(|(o, d)| (o, d.term(fit.held.shift(&d.align), fit.held.reference.get(&o).map_or([0.0; 2], |t| t.start), &em).cost())).collect();
+                assert_eq!(fresh, fit.terms.iter().map(|(o, t)| (*o, t.cost())).collect::<BTreeMap<Owner, f64>>());
+            }
+        };
+        let e0 = c.cost();
+        let (a, _) = c.add(stick(0.01, 3.95, 0.025));
+        check(&c);
+        c.change(1, stick(0.05, 3.85, 0.03));
+        check(&c);
+        let (b, _) = c.add(piece_of(0.0, 0.2, Some(5)));
+        check(&c);
+        c.remove(a);
+        check(&c);
+        c.remove(b);
+        c.change(1, front);
+        check(&c);
+        assert_eq!(c.cost(), e0);
     }
 
     /// Which hypotheses interact: two sticks on the pole's cells share cells and a node; one beside them in the view
@@ -3055,15 +3046,13 @@ mod tests {
         let (gh_x, gh_w) = ([-2.0201828704560856, -0.9585724646138185, 0.0, 0.9585724646138185, 2.0201828704560856],
                             [0.019953242059045913, 0.39361932315224116, 0.9453087204829419, 0.39361932315224116, 0.019953242059045913]);
         let buf = kbuffer(&rendered);
-        let cls = classes(&v, &buf, &[el], &[0], &em, &sc, false);
-        let s_along = em.align_sd(cls[0], false).hypot(em.front_shift_sd(el.r));
+        let s_along = em.align_sd(term_classes(&v, &buf, &[0], &em)[0], false).hypot(em.front_shift_sd(el.r));
         let ed = |shift: f64, level: f64| -> f64 {
             buf.iter().map(|(&cell, ls)| {
-                let layers: Vec<(Layer, u8)> = ls.iter().map(|l| (*l, cls[0])).collect();
                 let echoes = v.echoes(cell);
                 let wt = em.cell_weight(echoes.first().map_or(ls[0].t, |&r| r as f64), v.step());
                 let w = v.direction((cell / v.n_cols) as f64, (cell % v.n_cols) as f64);
-                let p = Pulse::new(occluders(layers, None), &v.origin, &w, echoes, v.echo_refls(cell), v.max_targets, &em, &Foliage::uniform(sc.kappa));
+                let p = Pulse::new(occluders(ls.clone(), None), cell_class(&v, cell, &em), &v.origin, &w, echoes, v.echo_refls(cell), v.max_targets, &em, &Foliage::uniform(sc.kappa));
                 wt * (p.read(shift, level, &em).ll - p.empty().read(0.0, 0.0, &em).ll)
             }).sum()
         };
@@ -3335,24 +3324,24 @@ mod tests {
     }
 
     /// A bare layer for the pulse's tests: at range `t`, fill `f` (at every section radius), opacity `op`, face-on.
-    fn layer(t: f64, f: f64, op: f64) -> (Layer, u8) {
-        (Layer { t, far: t + 0.01, spread: 0.0, f, fq: [f; 3], cos: 1.0, db: Settings::default().refl_wood, elem: 0, op, x: 0.0, s: 0.0 }, 1)
+    fn layer(t: f64, f: f64, op: f64) -> Layer {
+        Layer { t, far: t + 0.01, spread: 0.0, f, fq: [f; 3], cos: 1.0, db: Settings::default().refl_wood, elem: 0, op, x: 0.0, s: 0.0 }
     }
 
     /// One cell's pulse on a ray along y, `ground` (range, cos) behind it, against a medium `ext`; `capped` when it
     /// returned all the echoes it could.
-    fn pulse_of(echoes: &[f32], refls: &[f32], capped: bool, layers: &[(Layer, u8)], ground: Option<(f64, f64)>, ext: &Foliage) -> Pulse {
+    fn pulse_of(echoes: &[f32], refls: &[f32], capped: bool, layers: &[Layer], ground: Option<(f64, f64)>, ext: &Foliage) -> Pulse {
         pulse_in(&Settings::default(), echoes, refls, capped, layers, ground, ext)
     }
 
     /// [`pulse_of`] under settings `em`.
-    fn pulse_in(em: &Settings, echoes: &[f32], refls: &[f32], capped: bool, layers: &[(Layer, u8)], ground: Option<(f64, f64)>, ext: &Foliage) -> Pulse {
+    fn pulse_in(em: &Settings, echoes: &[f32], refls: &[f32], capped: bool, layers: &[Layer], ground: Option<(f64, f64)>, ext: &Foliage) -> Pulse {
         let cap = if capped { echoes.len() } else { usize::MAX };
-        Pulse::new(occluders(layers.to_vec(), ground), &[0.0; 3], &[0.0, 1.0, 0.0], echoes, refls, cap, em, ext)
+        Pulse::new(occluders(layers.to_vec(), ground), 1, &[0.0; 3], &[0.0, 1.0, 0.0], echoes, refls, cap, em, ext)
     }
 
     /// One cell's log-likelihood on a ray along y against a medium `ext`.
-    fn ll_of(echoes: &[f32], refls: &[f32], capped: bool, layers: &[(Layer, u8)], ext: &Foliage) -> f64 {
+    fn ll_of(echoes: &[f32], refls: &[f32], capped: bool, layers: &[Layer], ext: &Foliage) -> f64 {
         pulse_of(echoes, refls, capped, layers, None, ext).read(0.0, 0.0, &Settings::default()).ll
     }
 
@@ -3400,7 +3389,7 @@ mod tests {
         let (merged, alone) = (r.density(at, x, &em, &p.occluders), r.density(at, x, &em, &plain));
         assert!(merged > 1.5 * alone, "{merged} vs {alone}");
         // two layers within the resolution merge into one echo the measured pull behind the nearer
-        let pair = receiver(&occluders(vec![layer(4.0, 0.5, 1.0), layer(4.3, 1.0, 1.0)], None), 0.0, 0.0, &em).patterns;
+        let pair = receiver(&occluders(vec![layer(4.0, 0.5, 1.0), layer(4.3, 1.0, 1.0)], None), 1, 0.0, 0.0, &em).patterns;
         let merged = pair.iter().find(|p| p.1.len() == 1).unwrap().1[0];
         let e = 10.0 * (0.5f64 / 0.5).log10();
         assert!((merged.mu - (4.0 + em.depth_bias(1, 4.0) + em.pull(0.3 + em.depth_bias(1, 4.3) - em.depth_bias(1, 4.0), e))).abs() < 1e-9, "{}", merged.mu);
@@ -3416,7 +3405,7 @@ mod tests {
         let ext = Foliage::uniform(sc.kappa);
         let bases = |e: Element| -> HashMap<usize, f64> {
             let rendered = render_all(&v, &[e], &em);
-            let d = elem_data(&v, &rendered, &[e], &[1], &[0], &[0], 0, &em, &sc, &ext);
+            let d = elem_data(&v, &rendered, &[e], &[0], &[0], 0, &em, &sc, &ext);
             let cells: Vec<usize> = { let mut c: Vec<usize> = kbuffer(&rendered).keys().copied().collect(); c.sort_unstable(); c.retain(|&k| v.cell[k] != Cell::NoPulse); c };
             cells.into_iter().zip(d[0].cells.iter().map(|c| c.base)).collect()
         };
@@ -3436,7 +3425,7 @@ mod tests {
         let flat = Foliage::uniform(0.05);
         let (o, w) = ([0.0; 3], [0.0, 0.96f64.sqrt(), -0.2]);
         let ll = |echoes: &[f32], refls: &[f32], em: &Settings| {
-            Pulse::new(occluders(Vec::new(), Some((10.0, 0.2))), &o, &w, echoes, refls, usize::MAX, em, &flat).read(0.0, 0.0, em).ll
+            Pulse::new(occluders(Vec::new(), Some((10.0, 0.2))), 1, &o, &w, echoes, refls, usize::MAX, em, &flat).read(0.0, 0.0, em).ll
         };
         let x = (em.refl_ground + 10.0 * 0.2f64.powf(em.refl_incidence).log10()) as f32;
         let tight = Settings { ground_sd: 0.0, ..em };
@@ -3456,7 +3445,7 @@ mod tests {
         let (em, sc) = (Settings::default(), Background::default());
         let es = [Element { r: 0.03, ..piece_of(-0.2, 0.0, Some(3)) }, Element { r: 0.015, ..piece_of(0.0, 0.2, Some(3)) }];
         let rendered = render_all(&v, &es, &em);
-        let d = elem_data(&v, &rendered, &es, &[1, 1], &[0, 0], &[0, 1], 0, &em, &sc, &Foliage::uniform(sc.kappa));
+        let d = elem_data(&v, &rendered, &es, &[0, 0], &[0, 1], 0, &em, &sc, &Foliage::uniform(sc.kappa));
         assert_eq!(d.len(), 1);
         let shared = Shared::new(1, &es, &em);
         for (k, e) in es.iter().enumerate() {
@@ -3493,7 +3482,7 @@ mod tests {
         let (em, sc) = (Settings::default(), Background::default());
         let es = [stick(0.0, 4.0, 0.03), Element { opacity: 0.4, ..stick(0.03, 3.9, 0.045) }];
         let rendered = render_all(&v, &es, &em);
-        let data = elem_data(&v, &rendered, &es, &[1, 1], &[0, 1], &[0, 1], 0, &em, &sc, &Foliage::uniform(sc.kappa));
+        let data = elem_data(&v, &rendered, &es, &[0, 1], &[0, 1], 0, &em, &sc, &Foliage::uniform(sc.kappa));
         let mut out: Vec<Pulse> = data.into_iter().flat_map(|d| d.cells.into_iter().map(|c| c.pulse)).collect();
         let spec = FoliageBox { lo: [-0.5, 4.0, -0.5], hi: [0.5, 5.0, 0.5], voxel: 1.0, margin: 0.0 };
         let dense = Foliage { kappa: 0.05, spec: Some(spec), post: HashMap::from([([0, 0, 0], (5.0, 1.0))]) };
@@ -3561,7 +3550,7 @@ mod tests {
         };
         for (layers, ground, cap) in cases {
             let occ = occluders(layers, ground);
-            let rx = receiver(&occ, 0.0, 0.0, &em);
+            let rx = receiver(&occ, 1, 0.0, 0.0, &em);
             let m = &rx.members;
             let n = 200_000;
             let mut count = 0;

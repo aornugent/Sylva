@@ -54,7 +54,7 @@
 //! | the chance a pulse its section fills meets solid | opacity | `opacity` |
 //! | an echo's reflectance against its return's energy share, placing a silhouette's edge within a cell | located edges | `refl_noise`, `refl`, `obs_refl` |
 //! | an element's reflectance offset from its surface's, per (element, scan) | reflectance level | `refl_level`, `refl_level_sd` |
-//! | a cell's surface continuity | excess; surface class | solid, mid, fragmented |
+//! | a cell's surface continuity | excess; surface class | solid, mid, fragmented; per cell, the depth bias and noise of every echo in it; a term's, the median over the cells it mostly fills, its alignment spread |
 //! | wood-or-leaf evidence from photometry | class evidence | the consumer's, from `predict`'s cells (3dtrees research 130 slice 9), beside the cost, never in it; not the scene's |
 //! | what elements don't explain: extinction σ per voxel | foliage field | `Foliage`, `foliage()`, `refit_foliage`; its counts are kept live through moves (`FieldCounts`) |
 //! | what of a ray the foliage field counts | the field's cut | a ray no element fronts counts whole; one an element fronts counts up to its front element's front surface (`cut`: its clear path and its echoes in front), never its echoes at or behind it, which are the element's (`foliage`'s module docs) |
