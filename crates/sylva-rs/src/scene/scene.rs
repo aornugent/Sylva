@@ -1072,10 +1072,43 @@ impl ElemData {
         Eliminated { pi, det, link, pl, gy, slope: g[0] - pl[0] * gy[0] - pl[1] * gy[1], curv: q[0][0] - link[0] * pl[0] - link[1] * pl[1] }
     }
 
+    /// Its ray likelihood's value at `x` = (δ, reflectance level).
+    fn ll(&self, x: (f64, f64), em: &Settings) -> f64 {
+        self.cells.iter().map(|c| (c.pulse.read(x.0, x.1, em).ll - c.base) * c.wt).sum()
+    }
+
+    /// Its term at alignment shift `a` (m) ([`ElemData::newton`]), from `start`, or with none known (a term new to
+    /// the scan) from the best of its cold starts ([`ElemData::cold_starts`]): the lowest cost, `start` the one it came from.
+    fn term(&self, a: f64, start: Option<[f64; 2]>, em: &Settings) -> Term {
+        match start {
+            Some(y) => self.newton(a, y, em),
+            None => self.cold_starts(a, em).into_iter().map(|y| self.newton(a, y, em)).min_by(|p, q| p.cost().total_cmp(&q.cost())).expect("a start"),
+        }
+    }
+
+    /// Where its own nodes start at alignment shift `a` with nothing warmer known (3dtrees research 130 slice-pulse.md):
+    /// the reflectance level's likelihood can have two modes (a narrow one, where some cells' reflectances fit
+    /// exactly, beside a broad one), and Newton keeps to the basin it starts in. So the level is scanned on a coarse grid,
+    /// ±4 prior sds by 2 with the stem front shift at 0, and Newton starts from the grid's two lowest local minima
+    /// (its one where it has one). Without a level node, 0.
+    fn cold_starts(&self, a: f64, em: &Settings) -> Vec<[f64; 2]> {
+        if self.own_sd[1] == 0.0 {
+            return vec![[0.0; 2]];
+        }
+        let grid: Vec<(f64, f64)> = (-2..=2).map(|k| {
+            let y = [0.0, 2.0 * k as f64];
+            (y[1], -self.ll(self.at(a, y), em) + 0.5 * y[1] * y[1])
+        }).collect();
+        let low = |i: usize| (i == 0 || grid[i].1 <= grid[i - 1].1) && (i + 1 == grid.len() || grid[i].1 <= grid[i + 1].1);
+        let mut minima: Vec<(f64, f64)> = (0..grid.len()).filter(|&i| low(i)).map(|i| grid[i]).collect();
+        minima.sort_by(|p, q| p.1.total_cmp(&q.1));
+        minima.iter().take(2).map(|m| [0.0, m.0]).collect()
+    }
+
     /// Its term at alignment shift `a` (m): its own nodes y at their mode given `a` (Newton from `start`, a step at
     /// most 3 prior sds, halved until the cost falls, stopping under a micronat), the Laplace step over them, and its
     /// cost's slope and curvature in `a` with them eliminated (the Schur complement of its curvature over (a, y)).
-    fn term(&self, a: f64, start: [f64; 2], em: &Settings) -> Term {
+    fn newton(&self, a: f64, start: [f64; 2], em: &Settings) -> Term {
         let s = self.own_sd;
         let prior = |y: [f64; 2]| 0.5 * (y[0] * y[0] + y[1] * y[1]);
         let mut y = if s == [0.0; 2] { [0.0; 2] } else { start };
@@ -1374,8 +1407,9 @@ fn held(index: HashMap<[i64; 3], usize>, z: Vec<f64>, grad: nalgebra::DVector<f6
 /// joint curvature is an arrowhead: each term's own block is eliminated by its Schur complement
 /// ([`ElemData::eliminate`]), the nodes step on the system that leaves, and each term's own nodes follow, `−P⁻¹(g_y +
 /// link Δa)`; both steps at most 3 prior sds, halved together until the total cost falls (each term read once a
-/// trial), stopping under a millinat. Then each term's own Newton finishes from the joint mode ([`ElemData::term`]),
-/// so its [`Term`] is what the nested solver (the test's referee) defines; the precision is the final terms'. Its value
+/// trial), stopping under a millinat; each term's own nodes start at its best cold start ([`ElemData::cold_starts`],
+/// the alignment at 0). Then each term's own Newton finishes from the joint mode ([`ElemData::term`]), so its
+/// [`Term`] is what the nested solver (the test's referee) defines; the precision is the final terms'. Its value
 /// is the held alignment's at its own reference ([`Held::part`] with no columns).
 fn solve_alignment(data: &[ElemData], em: &Settings) -> (Held, Vec<Term>) {
     let index = alignment_nodes(data);
@@ -1385,7 +1419,7 @@ fn solve_alignment(data: &[ElemData], em: &Settings) -> (Held, Vec<Term>) {
     let objective = |z: &[f64], ys: &[[f64; 2]], ls: &[Local]| {
         0.5 * z.iter().map(|x| x * x).sum::<f64>() + ls.iter().zip(ys).map(|(l, y)| -l.ll + 0.5 * (y[0] * y[0] + y[1] * y[1])).sum::<f64>()
     };
-    let (mut z, mut ys) = (vec![0.0; n], vec![[0.0; 2]; data.len()]);
+    let (mut z, mut ys): (Vec<f64>, Vec<[f64; 2]>) = (vec![0.0; n], data.par_iter().map(|el| el.cold_starts(0.0, em)[0]).collect());
     let mut ls = read(&z, &ys);
     for _ in 0..MAX_NEWTON {
         let es: Vec<Eliminated> = data.iter().zip(&ls).zip(&ys).map(|((el, l), y)| el.eliminate(l, *y)).collect();
@@ -1423,7 +1457,7 @@ fn solve_alignment(data: &[ElemData], em: &Settings) -> (Held, Vec<Term>) {
             break;
         }
     }
-    let terms: Vec<Term> = data.par_iter().zip(&ys).map(|(el, y)| el.term(shift(el, &z), *y, em)).collect();
+    let terms: Vec<Term> = data.par_iter().zip(&ys).map(|(el, y)| el.term(shift(el, &z), Some(*y), em)).collect();
     let (grad, hess) = alignment_system(&index, &z, terms.iter().map(|t| (&t.align[..], t.slope, t.curv)));
     (held(index, z, grad, hess), terms)
 }
@@ -2096,7 +2130,7 @@ impl Scene {
         // a held term's own nodes start where its reference's did, so an unchanged term is recomputed exactly
         let mut terms: Vec<(Owner, Option<Term>)> = data.par_iter().map(|d| {
             let o = owners[d.members[0]];
-            (o, Some(d.term(fit.held.shift(&d.align), fit.held.reference.get(&o).map_or([0.0; 2], |t| t.start), em)))
+            (o, Some(d.term(fit.held.shift(&d.align), fit.held.reference.get(&o).map(|t| t.start), em)))
         }).collect();
         let mut out_cls: Vec<(u32, u8)> = (0..score.len()).map(|k| (ids[k], cls[k])).collect();
         // the owners of the elements taken out or unseen now, unless a member is still scored
@@ -2474,7 +2508,7 @@ mod tests {
         let index = alignment_nodes(data);
         let n = index.len();
         let terms_at = |z: &[f64], from: &[Term]| -> Vec<Term> {
-            data.par_iter().enumerate().map(|(i, el)| el.term(el.align.iter().map(|(k, w)| w * z[index[k]]).sum(), from.get(i).map_or([0.0; 2], |t| t.own), em)).collect()
+            data.par_iter().enumerate().map(|(i, el)| el.term(el.align.iter().map(|(k, w)| w * z[index[k]]).sum(), from.get(i).map(|t| t.own), em)).collect()
         };
         let objective = |z: &[f64], t: &[Term]| 0.5 * z.iter().map(|x| x * x).sum::<f64>() + t.iter().map(|t| t.fit).sum::<f64>();
         let system = |z: &[f64], t: &[Term]| alignment_system(&index, z, t.iter().map(|t| (&t.align[..], t.slope, t.curv)));
@@ -2880,9 +2914,12 @@ mod tests {
                     assert!((raw[i] - hess[i]).abs() < 1e-3 * (hess[0].abs() * hess[2].abs()).sqrt().max(1.0), "{x:?} curvature {raw:?} vs {hess:?}");
                 }
             }
-            let (cold, warm) = (d.term(0.0, [0.0; 2], &em), d.term(0.0, [0.5, -0.5], &em));
+            let (cold, warm) = (d.term(0.0, Some([0.0; 2]), &em), d.term(0.0, Some([0.5, -0.5]), &em));
             assert!((cold.own[0] - warm.own[0]).abs() < 1e-3 && (cold.own[1] - warm.own[1]).abs() < 1e-3, "{:?} vs {:?}", cold.own, warm.own);
             assert!((cold.cost() - warm.cost()).abs() < 1e-5, "{} vs {}", cold.cost(), warm.cost());
+            // with no start known, the level scan's best start: no worse than Newton from 0, and where it began
+            let scanned = d.term(0.0, None, &em);
+            assert!(scanned.cost() <= cold.cost() + 1e-6 && d.cold_starts(0.0, &em).contains(&scanned.start), "{} vs {}", scanned.cost(), cold.cost());
             let at = d.quad(d.at(0.0, cold.own), &em);
             for i in 0..2 {
                 assert!((d.own_sd[i] * at.g[i] + cold.own[i]).abs() < 0.01, "slope in y {:?} at {:?}", at.g, cold.own);
