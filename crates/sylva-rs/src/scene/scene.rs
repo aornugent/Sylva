@@ -83,6 +83,7 @@
 //!
 //! Cells no element touches cancel. Context (neighbours, competitors) enters as more elements in the set.
 
+use super::dual::{Dual, Real};
 use super::settings::{Background, Settings, ALIGN_SPACING, P_OUTLIER, T_MAX};
 use super::foliage::{self, FieldCounts, FixedCounts, Foliage, FoliageBox, RayFoliage};
 use super::range_image::{Cell, RangeImage};
@@ -340,9 +341,9 @@ fn disc_cdf(z: f64) -> f64 {
     0.5 + (z * (1.0 - z * z).sqrt() + z.asin()) / std::f64::consts::PI
 }
 
-fn t_pdf(x: f64, nu: f64) -> f64 {
+fn t_pdf<T: Real>(x: T, nu: f64) -> T {
     let c = super::settings::t_log_norm(nu);
-    (c - 0.5 * (nu + 1.0) * (1.0 + x * x / nu).ln()).exp()
+    (-((x * x / nu + 1.0).ln() * (0.5 * (nu + 1.0))) + c).exp()
 }
 
 /// One element's layers in one view, out to the beam's edge and two cells past its section.
@@ -612,54 +613,55 @@ struct Merge {
 /// optical depth to it, `beam` the share of the beam the scene leaves behind it, and `merge` its last member's merge
 /// with the medium behind.
 #[derive(Clone, Copy)]
-struct Return {
+struct Return<T = f64> {
     t: f64,
-    mu: f64,
-    sd: f64,
-    s: f64,
-    s_q: [f64; 3],
-    db: [f64; 3],
+    mu: T,
+    sd: T,
+    s: T,
+    s_q: [T; 3],
+    db: [T; 3],
     fill: [f64; 3],
     tau: f64,
     beam: f64,
     merge: Merge,
 }
 
-impl Return {
+impl<T: Real> Return<T> {
     /// The density of its echo's reflectance `x` (dB) as recorded ([`Settings::refl_density`]), with `add` more
     /// energy share merged into it (a medium surface's, read at the medium's spread for its part): a mixture over the
     /// shape mismatch's three section radii, each weighted by its rule weight and its chance of being recorded (a
     /// radius whose section misses the beam records nothing, so it says nothing of the reflectance), each widened by
     /// the reflectance's spread between adjacent radii. Three sharp points would leave gaps between them that a
     /// reflectance noise of tenths of a dB reads as misfits.
-    fn refl_density(&self, x: f64, em: &Settings, add: f64) -> f64 {
+    fn refl_density(&self, x: f64, em: &Settings, add: f64) -> T {
         if !x.is_finite() || em.refl_noise <= 0.0 {
-            return 1.0;
+            return T::c(1.0);
         }
-        let w: [f64; 3] = [0, 1, 2].map(|q| [1.0, 4.0, 1.0][q] * self.s_q[q]);
-        let total: f64 = w.iter().sum();
-        if total <= 0.0 {
-            return 1.0;
+        let w: [T; 3] = [0, 1, 2].map(|q| self.s_q[q] * [1.0, 4.0, 1.0][q]);
+        let total: T = w.iter().copied().sum();
+        if total.v() <= 0.0 {
+            return T::c(1.0);
         }
-        let db = self.db.map(|d| if add > 0.0 { 10.0 * (10f64.powf(d / 10.0) + add).log10() } else { d });
-        let gap = |a: f64, b: f64| if a > -200.0 && b > -200.0 { (a - b).abs() / 2.0 } else { 0.0 };
-        let spread = gap(db[1], db[0]).max(gap(db[2], db[1]));
-        let medium = |q: usize| if add > 0.0 { em.refl_background_sd * add / 10f64.powf(db[q] / 10.0) } else { 0.0 };
-        (0..3).filter(|&q| w[q] > 0.0).map(|q| w[q] * em.refl_density(x, db[q], spread.hypot(medium(q)), self.fill[q], self.t)).sum::<f64>() / total
+        let db = self.db.map(|d| if add > 0.0 { ((d / 10.0).exp10() + add).log10() * 10.0 } else { d });
+        let gap = |a: T, b: T| if a.v() > -200.0 && b.v() > -200.0 { (if a.v() < b.v() { b - a } else { a - b }) / 2.0 } else { T::c(0.0) };
+        let (g1, g2) = (gap(db[1], db[0]), gap(db[2], db[1]));
+        let spread = if g2.v() > g1.v() { g2 } else { g1 };
+        let medium = |q: usize| if add > 0.0 { T::c(em.refl_background_sd * add) / (db[q] / 10.0).exp10() } else { T::c(0.0) };
+        (0..3).filter(|&q| w[q].v() > 0.0).map(|q| w[q] * em.refl_density(x, db[q], spread.hypot(medium(q)), self.fill[q], self.t)).sum::<T>() / total
     }
 
     /// The density of its echo at range `o` with reflectance `x` (dB; NaN unknown): its own echo, or, in its merge
     /// share, merged with the medium surface behind it, pulled back by the measured pull ([`Settings::pull`], its sd as
     /// large) and brighter by that surface's energy (3dtrees research 130 slice 2c: a mixture inside the return, never
     /// another return).
-    fn density(&self, o: f64, x: f64, em: &Settings) -> f64 {
-        let alone = t_pdf((o - self.mu) / self.sd, em.noise_dof) / self.sd * self.refl_density(x, em, 0.0);
+    fn density(&self, o: f64, x: f64, em: &Settings) -> T {
+        let alone = t_pdf((T::c(o) - self.mu) / self.sd, em.noise_dof) / self.sd * self.refl_density(x, em, 0.0);
         let m = self.merge.share;
         if m <= 0.0 {
             return alone;
         }
-        let sd = self.sd.hypot(self.merge.pull);
-        (1.0 - m) * alone + m * t_pdf((o - self.mu - self.merge.pull) / sd, em.noise_dof) / sd * self.refl_density(x, em, self.merge.energy)
+        let sd = self.sd.hypot(T::c(self.merge.pull));
+        alone * (1.0 - m) + t_pdf((T::c(o) - self.mu - self.merge.pull) / sd, em.noise_dof) * m / sd * self.refl_density(x, em, self.merge.energy)
     }
 }
 
@@ -668,14 +670,14 @@ impl Return {
 /// share of the beam it meets, at the shape mismatch's three section radii (the share without the opacity; its echo's
 /// reflectance is `10 log10` of it), the foliage field's optical depth to it, the beam left behind it, and its merge
 /// with the medium behind.
-struct Member {
+struct Member<T> {
     t: f64,
-    depth: f64,
+    depth: T,
     sd: f64,
-    s: f64,
-    s_q: [f64; 3],
-    energy: f64,
-    share: [f64; 3],
+    s: T,
+    s_q: [T; 3],
+    energy: T,
+    share: [T; 3],
     fill: [f64; 3],
     tau: f64,
     beam: f64,
@@ -691,57 +693,59 @@ struct Member {
 /// under 1e-4 are dropped. `taus` are the foliage field's optical depths to each layer and then to the ground
 /// ([`RayFoliage`]); `merges` each layer's merge with the medium behind it ([`merges`]; none where empty).
 #[allow(clippy::too_many_arguments)]
-fn returns(layers: &[(Layer, u8)], ground: Option<(f64, f64)>, shift: f64, level: f64, em: &Settings, taus: &[f64], merges: &[Merge]) -> (Vec<(f64, Vec<Return>)>, f64) {
+fn returns<T: Real>(layers: &[(Layer, u8)], ground: Option<(f64, f64)>, shift: T, level: T, em: &Settings, taus: &[f64], merges: &[Merge])
+    -> (Vec<(T, Vec<Return<T>>)>, f64) {
     let t_end = ground.map_or(T_MAX, |g| g.0);
     let mut beam = 1.0;
-    let mut m: Vec<Member> = Vec::with_capacity(layers.len() + 1);
+    let mut m: Vec<Member<T>> = Vec::with_capacity(layers.len() + 1);
     for (li, &(ly, k)) in layers.iter().enumerate() {
         if ly.t >= t_end {
             break;
         }
-        let db = ly.db + level;
+        let db = level + ly.db;
         let cos = ly.cos.powf(em.refl_incidence);
-        let s_q = ly.fq.map(|f| ly.op * em.p_detect(db, f * beam * cos, ly.t));
-        let s = (s_q[0] + 4.0 * s_q[1] + s_q[2]) / 6.0;
-        let (b0, unit) = (beam, beam * cos * 10f64.powf(db / 10.0));
-        let share = ly.fq.map(|f| f * unit);
+        let s_q = ly.fq.map(|f| em.p_detect(db, f * beam * cos, ly.t) * ly.op);
+        let s = (s_q[0] + s_q[1] * 4.0 + s_q[2]) / 6.0;
+        let (b0, unit) = (beam, (db / 10.0).exp10() * (beam * cos));
+        let share = ly.fq.map(|f| unit * f);
         beam *= 1.0 - ly.f * ly.op;
-        m.push(Member { t: ly.t, depth: ly.t + em.depth_bias(k, ly.t) + shift, sd: em.depth_sd(k, ly.spread), s, s_q, energy: ly.op * ly.f * unit, share,
+        m.push(Member { t: ly.t, depth: shift + (ly.t + em.depth_bias(k, ly.t)), sd: em.depth_sd(k, ly.spread), s, s_q, energy: unit * (ly.op * ly.f), share,
                         fill: ly.fq.map(|f| f * b0), tau: taus[li], beam, merge: merges.get(li).copied().unwrap_or_default() });
     }
     if let Some((tg, cos)) = ground {
         let cg = cos.powf(em.refl_incidence);
         let share = beam * cg * 10f64.powf(em.refl_ground / 10.0);
         let s = em.ground_echo * em.p_detect(em.refl_ground, beam * cg, tg);
-        m.push(Member { t: tg, depth: tg, sd: em.noise(2).hypot(em.ground_sd / cos), s, s_q: [s; 3], energy: em.ground_echo * share, share: [share; 3],
+        m.push(Member { t: tg, depth: T::c(tg), sd: em.noise(2).hypot(em.ground_sd / cos), s: T::c(s), s_q: [T::c(s); 3], energy: T::c(em.ground_echo * share),
+                        share: [T::c(share); 3],
                         fill: [beam; 3], tau: taus[layers.len()], beam: 0.0, merge: Merge::default() });
     }
     let n = m.len();
     // each adjacent pair's chance of resolving into two echoes
-    let pr: Vec<f64> = (1..n).map(|j| {
-        let e = 10.0 * (m[j - 1].energy.max(1e-300) / m[j].energy.max(1e-300)).log10();
+    let pr: Vec<T> = (1..n).map(|j| {
+        let e = (m[j - 1].energy.max(1e-300) / m[j].energy.max(1e-300)).log10() * 10.0;
         em.p_resolve(m[j].t - m[j - 1].t, e.clamp(-60.0, 60.0))
     }).collect();
-    let group = |g: &[Member]| {
-        let db = [0, 1, 2].map(|q| 10.0 * g.iter().map(|x| x.share[q]).sum::<f64>().max(1e-30).log10());
+    let group = |g: &[Member<T>]| {
+        let db = [0, 1, 2].map(|q| g.iter().map(|x| x.share[q]).sum::<T>().max(1e-30).log10() * 10.0);
         let fill = [0, 1, 2].map(|q| g.iter().map(|x| x.fill[q]).sum::<f64>().min(1.0));
         let last = &g[g.len() - 1];
         if g.len() == 1 {
-            return Return { t: g[0].t, mu: g[0].depth, sd: g[0].sd, s: g[0].s, s_q: g[0].s_q, db, fill, tau: g[0].tau, beam: last.beam, merge: last.merge };
+            return Return { t: g[0].t, mu: g[0].depth, sd: T::c(g[0].sd), s: g[0].s, s_q: g[0].s_q, db, fill, tau: g[0].tau, beam: last.beam, merge: last.merge };
         }
         // the merged echo follows the nearest member, pulled back by the rest
-        let rest: f64 = g[1..].iter().map(|x| x.energy).sum();
-        let d = if rest > 0.0 { g[1..].iter().map(|x| x.energy * (x.depth - g[0].depth)).sum::<f64>() / rest } else { g[g.len() - 1].depth - g[0].depth };
-        let pull = em.pull(d, 10.0 * (g[0].energy.max(1e-300) / rest.max(1e-300)).log10());
-        let none: f64 = g.iter().map(|x| 1.0 - x.s).product();
-        let s_q = [0, 1, 2].map(|q| 1.0 - g.iter().map(|x| 1.0 - x.s_q[q]).product::<f64>());
-        Return { t: g[0].t, mu: g[0].depth + pull, sd: g[0].sd.hypot(pull), s: 1.0 - none, s_q, db, fill, tau: g[0].tau, beam: last.beam, merge: last.merge }
+        let rest: T = g[1..].iter().map(|x| x.energy).sum();
+        let d = if rest.v() > 0.0 { g[1..].iter().map(|x| x.energy * (x.depth - g[0].depth)).sum::<T>() / rest } else { g[g.len() - 1].depth - g[0].depth };
+        let pull = em.pull(d, (g[0].energy.max(1e-300) / rest.max(1e-300)).log10() * 10.0);
+        let none: T = g.iter().map(|x| T::c(1.0) - x.s).product();
+        let s_q = [0, 1, 2].map(|q| T::c(1.0) - g.iter().map(|x| T::c(1.0) - x.s_q[q]).product::<T>());
+        Return { t: g[0].t, mu: g[0].depth + pull, sd: T::c(g[0].sd).hypot(pull), s: T::c(1.0) - none, s_q, db, fill, tau: g[0].tau, beam: last.beam, merge: last.merge }
     };
     let mut out = Vec::new();
     for mask in 0u32..(1 << n.saturating_sub(1)) {
         // bit j set: members j and j + 1 resolve
-        let prob: f64 = (0..n.saturating_sub(1)).map(|j| if mask >> j & 1 == 1 { pr[j] } else { 1.0 - pr[j] }).product();
-        if prob < 1e-4 {
+        let prob: T = (0..n.saturating_sub(1)).map(|j| if mask >> j & 1 == 1 { pr[j] } else { T::c(1.0) - pr[j] }).product();
+        if prob.v() < 1e-4 {
             continue;
         }
         let mut rets = Vec::with_capacity(n);
@@ -795,11 +799,11 @@ fn merges(layers: &[(Layer, u8)], ground: Option<(f64, f64)>, o: &Point, w: &Poi
 /// give ([`returns`], each with its merge with the medium behind it, `merges`), the layers shifted by `shift` along the
 /// beam and `level` in reflectance.
 #[allow(clippy::too_many_arguments)]
-fn cell_ll(echoes: &[f32], refls: &[f32], capped: bool, layers: &[(Layer, u8)], ground: Option<(f64, f64)>, shift: f64, level: f64, em: &Settings,
-           bg: &RayFoliage, merges: &[Merge]) -> f64 {
+fn cell_ll<T: Real>(echoes: &[f32], refls: &[f32], capped: bool, layers: &[(Layer, u8)], ground: Option<(f64, f64)>, shift: T, level: T, em: &Settings,
+                    bg: &RayFoliage, merges: &[Merge]) -> T {
     let (patterns, t_end) = returns(layers, ground, shift, level, em, &bg.taus, merges);
     let pulse = Pulse { echoes, refls, capped, t_end, em, bg };
-    patterns.iter().map(|(p, rets)| p * pulse.lik(rets, 0, 0, 1.0, 1.0, 1.0, 0.0)).sum::<f64>().max(1e-300).ln()
+    patterns.iter().map(|(p, rets)| *p * pulse.lik(rets, 0, 0, 1.0, 1.0, 1.0, 0.0)).sum::<T>().max(1e-300).ln()
 }
 
 /// One pulse's echoes against one way its returns come back ([`cell_ll`]).
@@ -834,38 +838,38 @@ impl Pulse<'_> {
     /// After the last echo, the returns left and the medium's path to the beam's end record nothing, unless the pulse
     /// is capped: a capped pulse says nothing past its last echo.
     #[allow(clippy::too_many_arguments)]
-    fn lik(&self, rets: &[Return], i: usize, j: usize, scene: f64, taken: f64, seen: f64, tau0: f64) -> f64 {
+    fn lik<T: Real>(&self, rets: &[Return<T>], i: usize, j: usize, scene: f64, taken: f64, seen: f64, tau0: f64) -> T {
         let em = self.em;
         if i == self.echoes.len() {
             if self.capped {
-                return 1.0;
+                return T::c(1.0);
             }
-            return rets[j..].iter().map(|r| 1.0 - r.s * taken).product::<f64>() * (-seen * (self.bg.tau_end - tau0).max(0.0)).exp();
+            return rets[j..].iter().map(|r| T::c(1.0) - r.s * taken).product::<T>() * (-seen * (self.bg.tau_end - tau0).max(0.0)).exp();
         }
         let (o, x) = (self.echoes[i] as f64, self.refls.get(i).map_or(f64::NAN, |&x| x as f64));
         let [tau_o, sig_o, tau_after] = self.bg.echoes[i];
         let left = if x.is_finite() { (1.0 - 10f64.powf((x - em.refl_full_hit()) / 10.0)).clamp(0.0, 1.0) } else { 1.0 };
-        let mut total = 0.0;
+        let mut total = T::c(0.0);
         // one of the returns
-        let mut none = 1.0;
+        let mut none = T::c(1.0);
         for (k, r) in rets.iter().enumerate().skip(j) {
-            let d = (-seen * (r.tau - tau0).max(0.0)).exp() * none * r.s * taken * r.density(o, x, em);
-            if d > 0.0 {
-                total += (1.0 - P_OUTLIER) * d * self.lik(rets, i + 1, k + 1, r.beam, taken, seen * left, tau_after);
+            let d = none * (-seen * (r.tau - tau0).max(0.0)).exp() * r.s * taken * r.density(o, x, em);
+            if d.v() > 0.0 {
+                total += d * (1.0 - P_OUTLIER) * self.lik(rets, i + 1, k + 1, r.beam, taken, seen * left, tau_after);
             }
-            none *= 1.0 - r.s * taken;
+            none *= T::c(1.0) - r.s * taken;
         }
         // the medium's
         if o < self.t_end && seen > 0.0 {
             let jn = (j..rets.len()).find(|&k| rets[k].t >= o).unwrap_or(rets.len());
-            let none: f64 = rets[j..jn].iter().map(|r| 1.0 - r.s * taken).product();
-            let d = seen * sig_o * (-seen * (tau_o - tau0).max(0.0)).exp() * none * em.refl_background(x - 10.0 * (scene * taken).max(1e-6).log10());
-            if d > 0.0 {
-                total += (1.0 - P_OUTLIER) * d * self.lik(rets, i + 1, jn, scene, taken * left, seen * left, tau_after);
+            let none: T = rets[j..jn].iter().map(|r| T::c(1.0) - r.s * taken).product();
+            let d = none * (seen * sig_o * (-seen * (tau_o - tau0).max(0.0)).exp()) * em.refl_background(x - 10.0 * (scene * taken).max(1e-6).log10());
+            if d.v() > 0.0 {
+                total += d * (1.0 - P_OUTLIER) * self.lik(rets, i + 1, jn, scene, taken * left, seen * left, tau_after);
             }
         }
         // an outlier
-        total + P_OUTLIER / T_MAX * em.refl_background(x) * self.lik(rets, i + 1, j, scene, taken, seen, tau0)
+        total + self.lik(rets, i + 1, j, scene, taken, seen, tau0) * (P_OUTLIER / T_MAX * em.refl_background(x))
     }
 }
 
@@ -905,40 +909,24 @@ struct ElemData {
 }
 
 impl ElemData {
-    /// Its ray likelihood at `x` = (δ, reflectance level), in total and by [`Outcome`] (in its order).
-    fn ll_parts(&self, x: (f64, f64), em: &Settings) -> (f64, [f64; 4]) {
-        let (mut total, mut parts) = (0.0, [0.0; 4]);
-        for c in &self.cells {
-            let l = c.wt * (cell_ll(&c.echoes, &c.refls, c.capped, &c.layers, c.ground, x.0, x.1, em, &c.bg, &c.merges) - c.base);
-            total += l;
-            parts[c.outcome as usize] += l;
-        }
-        (total, parts)
-    }
-
-    fn ll(&self, x: (f64, f64), em: &Settings) -> f64 {
-        self.ll_parts(x, em).0
-    }
-
     /// (δ, reflectance level) at alignment shift `a` and own nodes `y`.
     fn at(&self, a: f64, y: [f64; 2]) -> (f64, f64) {
         (a + self.own_sd[0] * y[0], self.own_sd[1] * y[1])
     }
 
-    /// −ll's slope and curvature in (δ, level) at `x`, by central differences (3e-4 m, 0.05 dB; the cross term
-    /// forward), the curvature's negative directions dropped. Without a level node only δ's are filled.
-    fn quad(&self, x: (f64, f64), em: &Settings) -> ([f64; 2], [[f64; 2]; 2]) {
-        let (h, hb) = (3e-4, 0.05);
-        let f = |d: f64, b: f64| -self.ll((x.0 + d, x.1 + b), em);
-        let (f0, fp, fm) = (f(0.0, 0.0), f(h, 0.0), f(-h, 0.0));
-        let mut g = [(fp - fm) / (2.0 * h), 0.0];
-        let (a, mut b, mut c) = ((fp - 2.0 * f0 + fm) / (h * h), 0.0, 0.0);
-        if self.own_sd[1] > 0.0 {
-            let (bp, bm, pp) = (f(0.0, hb), f(0.0, -hb), f(h, hb));
-            g[1] = (bp - bm) / (2.0 * hb);
-            c = (bp - 2.0 * f0 + bm) / (hb * hb);
-            b = (pp - fp - bp + f0) / (h * hb);
+    /// Its ray likelihood at `x` = (δ, reflectance level), in total and by [`Outcome`] (in its order), and −ll's slope
+    /// and curvature in (δ, level) there, in closed form, one pass over its cells ([`Dual`]; the value is the `f64`
+    /// one), the curvature's negative directions dropped. Without a level node only δ's are filled.
+    fn quad(&self, x: (f64, f64), em: &Settings) -> Local {
+        let level = if self.own_sd[1] > 0.0 { Dual::var(x.1, 1) } else { Dual::c(x.1) };
+        let (mut total, mut parts) = (Dual::c(0.0), [0.0; 4]);
+        for c in &self.cells {
+            let l = (cell_ll(&c.echoes, &c.refls, c.capped, &c.layers, c.ground, Dual::var(x.0, 0), level, em, &c.bg, &c.merges) - c.base) * c.wt;
+            total += l;
+            parts[c.outcome as usize] += l.v;
         }
+        let g = [-total.g[0], -total.g[1]];
+        let (a, b, c) = (-total.h[0], -total.h[1], -total.h[2]);
         // the 2 × 2 curvature's eigen-decomposition, negative eigenvalues set to 0
         let (m, d) = (0.5 * (a + c), (0.25 * (a - c).powi(2) + b * b).sqrt());
         let (l1, l2) = (m + d, m - d);
@@ -952,15 +940,15 @@ impl ElemData {
             let n2 = v[0] * v[0] + v[1] * v[1];
             [[l1 * v[0] * v[0] / n2, l1 * v[0] * v[1] / n2], [l1 * v[0] * v[1] / n2, l1 * v[1] * v[1] / n2]]
         };
-        (g, hess)
+        Local { ll: total.v, parts, g, hess }
     }
 
-    /// Its term at alignment shift `a` (m): its own nodes y at their mode given `a` (Newton from 0, a step at most 3
-    /// prior sds, halved until the cost falls, stopping under a micronat), the Laplace step over them, and its cost's
-    /// slope and curvature in `a` with them eliminated (the Schur complement of its curvature over (a, y)).
-    fn term(&self, a: f64, em: &Settings) -> Term {
+    /// Its term at alignment shift `a` (m): its own nodes y at their mode given `a` (Newton from `start`, a step at
+    /// most 3 prior sds, halved until the cost falls, stopping under a micronat), the Laplace step over them, and its
+    /// cost's slope and curvature in `a` with them eliminated (the Schur complement of its curvature over (a, y)).
+    fn term(&self, a: f64, start: [f64; 2], em: &Settings) -> Term {
         let s = self.own_sd;
-        let cost = |y: [f64; 2]| -self.ll(self.at(a, y), em) + 0.5 * (y[0] * y[0] + y[1] * y[1]);
+        let prior = |y: [f64; 2]| 0.5 * (y[0] * y[0] + y[1] * y[1]);
         // the curvature over y, P = diag(s) Q diag(s) + I, its inverse and determinant; the slope over y
         let own = |q: [[f64; 2]; 2]| {
             let p = [[s[0] * s[0] * q[0][0] + 1.0, s[0] * s[1] * q[0][1]], [s[0] * s[1] * q[0][1], s[1] * s[1] * q[1][1] + 1.0]];
@@ -969,38 +957,36 @@ impl ElemData {
         };
         let slope_y = |g: [f64; 2], y: [f64; 2]| [s[0] * g[0] + y[0], s[1] * g[1] + y[1]];
         let mul = |m: [[f64; 2]; 2], x: [f64; 2]| [m[0][0] * x[0] + m[0][1] * x[1], m[1][0] * x[0] + m[1][1] * x[1]];
-        let mut y = [0.0; 2];
-        let (mut g, mut q) = self.quad(self.at(a, y), em);
+        let mut y = if s == [0.0; 2] { [0.0; 2] } else { start };
+        let mut at = self.quad(self.at(a, y), em);
         if s != [0.0; 2] {
-            let mut f_now = cost(y);
+            let mut f_now = -at.ll + prior(y);
             for _ in 0..MAX_NEWTON {
-                let mut step = mul(own(q).0, slope_y(g, y));
+                let mut step = mul(own(at.hess).0, slope_y(at.g, y));
                 step = step.map(|x| x / (step[0].abs().max(step[1].abs()).max(3.0) / 3.0));
                 let (mut t, mut fall) = (1.0, None);
                 while t >= 1e-3 {
                     let yn = [y[0] - t * step[0], y[1] - t * step[1]];
-                    let f_new = cost(yn);
+                    let next = self.quad(self.at(a, yn), em);
+                    let f_new = -next.ll + prior(yn);
                     if f_new <= f_now {
                         fall = Some(f_now - f_new);
-                        (y, f_now) = (yn, f_new);
+                        (y, f_now, at) = (yn, f_new, next);
                         break;
                     }
                     t *= 0.5;
                 }
-                let Some(fall) = fall else { break };
-                // the slope and curvature are always the final mode's
-                (g, q) = self.quad(self.at(a, y), em);
-                if fall < 1e-6 {
+                if fall.is_none_or(|f| f < 1e-6) {
                     break;
                 }
             }
         }
+        let (g, q, ll, parts) = (at.g, at.hess, at.ll, at.parts);
         // over (a, y): M = Jᵀ Q J + diag(0, I), J = [[1, s0, 0], [0, 0, s1]]; its a–y block is `link`
         let (pi, det) = own(q);
         let link = [q[0][0] * s[0], q[0][1] * s[1]];
         let pl = mul(pi, link);
         let gy = slope_y(g, y);
-        let (ll, parts) = self.ll_parts(self.at(a, y), em);
         Term {
             align: self.align.clone(),
             fit: -ll + 0.5 * (y[0] * y[0] + y[1] * y[1]),
@@ -1008,6 +994,7 @@ impl ElemData {
             slope: g[0] - pl[0] * gy[0] - pl[1] * gy[1],
             curv: q[0][0] - link[0] * pl[0] - link[1] * pl[1],
             own: y,
+            start,
             own_sd: s,
             own_cov: pi,
             own_link: pl,
@@ -1024,10 +1011,20 @@ impl ElemData {
     }
 }
 
+/// One term's ray likelihood at a point (δ, reflectance level), by outcome, and −ll's slope and curvature there
+/// ([`ElemData::quad`]).
+struct Local {
+    ll: f64,
+    parts: [f64; 4],
+    g: [f64; 2],
+    hess: [[f64; 2]; 2],
+}
+
 /// One (element, scan)'s part of its scan's cost at an alignment shift, `fit + logdet`: `fit` its ray likelihood's
 /// cost plus its own nodes' prior at their mode ŷ, `logdet` half their Laplace log-determinant ln|P|. With them, the
 /// cost's `slope` and `curv`ature in its alignment shift (its own nodes
-/// eliminated), and what its row reports: ŷ, its own nodes' covariance given the shift P⁻¹ and how they follow it
+/// eliminated), where its own nodes' Newton began (`start`: a move recomputes a held term from its reference's, so an
+/// unchanged term comes out the same), and what its row reports: ŷ, its own nodes' covariance given the shift P⁻¹ and how they follow it
 /// (`own_link`: ŷ moves by −`own_link` per unit of shift), the ray likelihood's cost by outcome, and its cells.
 #[derive(Debug, Clone)]
 struct Term {
@@ -1037,6 +1034,7 @@ struct Term {
     slope: f64,
     curv: f64,
     own: [f64; 2],
+    start: [f64; 2],
     own_sd: [f64; 2],
     own_cov: [[f64; 2]; 2],
     own_link: [f64; 2],
@@ -1207,7 +1205,10 @@ fn solve_alignment(data: &[ElemData], em: &Settings) -> (Held, Vec<Term>) {
         }
     }
     let n = index.len();
-    let terms_at = |z: &[f64]| -> Vec<Term> { data.par_iter().map(|el| el.term(el.align.iter().map(|(k, w)| w * z[index[k]]).sum(), em)).collect() };
+    // each term's own nodes start from their mode at the last step (warm), from 0 at the first
+    let terms_at = |z: &[f64], from: &[Term]| -> Vec<Term> {
+        data.par_iter().enumerate().map(|(i, el)| el.term(el.align.iter().map(|(k, w)| w * z[index[k]]).sum(), from.get(i).map_or([0.0; 2], |t| t.own), em)).collect()
+    };
     let objective = |z: &[f64], t: &[Term]| 0.5 * z.iter().map(|x| x * x).sum::<f64>() + t.iter().map(|t| t.fit).sum::<f64>();
     let assemble = |z: &[f64], t: &[Term]| {
         let mut grad = nalgebra::DVector::from_column_slice(z);
@@ -1224,7 +1225,7 @@ fn solve_alignment(data: &[ElemData], em: &Settings) -> (Held, Vec<Term>) {
         (grad, hess)
     };
     let mut z = vec![0.0; n];
-    let mut terms = terms_at(&z);
+    let mut terms = terms_at(&z, &[]);
     let (mut grad, mut hess) = assemble(&z, &terms);
     for _ in 0..MAX_NEWTON {
         let Some(ch) = (n > 0).then(|| hess.clone().cholesky()).flatten() else { break };
@@ -1234,7 +1235,7 @@ fn solve_alignment(data: &[ElemData], em: &Settings) -> (Held, Vec<Term>) {
         let (mut t, mut fall) = (1.0, None);
         while t >= 1e-3 {
             let zn: Vec<f64> = z.iter().zip(step.iter()).map(|(a, b)| a - t * b).collect();
-            let tn = terms_at(&zn);
+            let tn = terms_at(&zn, &terms);
             let f_new = objective(&zn, &tn);
             if f_new <= f_now {
                 fall = Some(f_now - f_new);
@@ -1924,7 +1925,11 @@ impl Scene {
         let cls: Vec<u8> = ids.iter().map(|&i| cls.get(&i).copied().unwrap_or_else(|| stored(i))).collect();
         let owners: Vec<Owner> = ids.iter().map(|&i| owner_of(i)).collect();
         let data = elem_data(v, &r, &el, &cls, &slots(&owners), &(0..score.len()).collect::<Vec<_>>(), self.ref_epoch, em, &self.sc, &self.ext);
-        let mut terms: Vec<(Owner, Option<Term>)> = data.par_iter().map(|d| (owners[d.members[0]], Some(d.term(fit.held.shift(&d.align), em)))).collect();
+        // a held term's own nodes start where its reference's did, so an unchanged term is recomputed exactly
+        let mut terms: Vec<(Owner, Option<Term>)> = data.par_iter().map(|d| {
+            let o = owners[d.members[0]];
+            (o, Some(d.term(fit.held.shift(&d.align), fit.held.reference.get(&o).map_or([0.0; 2], |t| t.start), em)))
+        }).collect();
         let mut out_cls: Vec<(u32, u8)> = (0..score.len()).map(|k| (ids[k], cls[k])).collect();
         // the owners of the elements taken out or unseen now, unless a member is still scored
         let kept: HashSet<Owner> = terms.iter().map(|t| t.0).collect();
@@ -2610,6 +2615,43 @@ mod tests {
         let (collapsed, today) = ((out[0] + out[1]) - (inn[0] + inn[1]), out[0] - inn[0]);
         assert!(collapsed.abs() < 0.1 * today.abs(), "collapsed {collapsed} vs today {today}");
         c.remove(0);
+    }
+
+    /// The own nodes' slope and curvature in closed form ([`ElemData::quad`], research 130 slice-collapsed) match
+    /// central differences of the ray likelihood, at the pole's truth and off it; and a term's mode is the same from
+    /// a cold start and a warm one, where the cost's slope in its own nodes vanishes.
+    #[test]
+    fn closed_form_derivatives_match_finite_differences() {
+        let v = pole_view();
+        let (em, sc) = (Settings::default(), Background::default());
+        for e in [stick(0.0, 4.0, 0.03), stick(0.004, 4.0, 0.025)] {
+            let rendered = render_all(&v, &[e], &em);
+            let d = &elem_data(&v, &rendered, &[e], &[1], &[0], &[0], 0, &em, &sc, &Foliage::uniform(sc.kappa))[0];
+            assert!(d.own_sd[0] > 0.0 && d.own_sd[1] > 0.0);
+            for x in [(0.0, 0.0), (0.002, -0.4)] {
+                let q = d.quad(x, &em);
+                let f = |dx: f64, db: f64| -d.quad((x.0 + dx, x.1 + db), &em).ll;
+                let (h, hb) = (2e-5, 2e-3);
+                let g = [(f(h, 0.0) - f(-h, 0.0)) / (2.0 * h), (f(0.0, hb) - f(0.0, -hb)) / (2.0 * hb)];
+                let hess = [(f(h, 0.0) - 2.0 * f(0.0, 0.0) + f(-h, 0.0)) / (h * h), (f(h, hb) - f(h, -hb) - f(-h, hb) + f(-h, -hb)) / (4.0 * h * hb),
+                            (f(0.0, hb) - 2.0 * f(0.0, 0.0) + f(0.0, -hb)) / (hb * hb)];
+                assert_eq!(q.ll, -f(0.0, 0.0));
+                for i in 0..2 {
+                    assert!((q.g[i] - g[i]).abs() < 1e-4 * (g[i].abs() + 1.0), "{x:?} slope {:?} vs {g:?}", q.g);
+                }
+                let raw = [q.hess[0][0], q.hess[0][1], q.hess[1][1]];
+                for i in 0..3 {
+                    assert!((raw[i] - hess[i]).abs() < 1e-3 * (hess[0].abs() * hess[2].abs()).sqrt().max(1.0), "{x:?} curvature {raw:?} vs {hess:?}");
+                }
+            }
+            let (cold, warm) = (d.term(0.0, [0.0; 2], &em), d.term(0.0, [0.5, -0.5], &em));
+            assert!((cold.own[0] - warm.own[0]).abs() < 1e-3 && (cold.own[1] - warm.own[1]).abs() < 1e-3, "{:?} vs {:?}", cold.own, warm.own);
+            assert!((cold.cost() - warm.cost()).abs() < 1e-5, "{} vs {}", cold.cost(), warm.cost());
+            let at = d.quad(d.at(0.0, cold.own), &em);
+            for i in 0..2 {
+                assert!((d.own_sd[i] * at.g[i] + cold.own[i]).abs() < 0.01, "slope in y {:?} at {:?}", at.g, cold.own);
+            }
+        }
     }
 
     /// A scene's moves hold the alignment (step 3a): each move's cost change stays near the exact marginal's

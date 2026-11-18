@@ -10,6 +10,7 @@
 //! - [`moments`]: surfel moments per (voxel, scan), and the candidate elements read off them.
 //! - [`settings`]: the instrument and site settings and the background.
 //! - [`foliage`]: the foliage field, a residual extinction on voxels.
+//! - [`dual`]: second-order forward derivatives, for the own nodes' Newton in closed form.
 //! - [`scene`]: elements, their rendering, the scan alignment error and the [`scene::Scene`] that holds them.
 //!
 //! # Glossary
@@ -69,6 +70,7 @@
 //! | hypotheses whose cost together isn't the sum of their costs alone | interacting hypotheses | `interactions`: a shared cell or front element, or a shared alignment node |
 //! | a measurement against the stand's truth or AM's held-out scans | check | |
 
+pub mod dual;
 pub mod foliage;
 pub mod lattice;
 pub mod settings;
