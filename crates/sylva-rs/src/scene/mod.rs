@@ -23,10 +23,10 @@
 //! | a lattice position | cell | holds a pulse's echoes, a miss (a pulse with no echo) or no pulse |
 //! | a cell's nearest echo | first echo | the one the outcome reads |
 //! | a pulse's echoes after its first | later echoes | the ray likelihood reads the pulse whole, each echo behind the last (3dtrees research 130 slice 2c) |
-//! | what a pulse meets that isn't a surface it resolves | occluders; the medium | the elements' layers and the ground; the foliage field, κ outside its box |
+//! | what a pulse meets that isn't a surface it resolves | occluders; the medium | `Occluder`: an element's layer or the ground, one list per pulse, nearest first; the foliage field, κ outside its box |
 //! | the share of a return that merges with the medium behind its far side | merge share | `merge_share`, the site's calibrated map of the field's `1 − exp(−b ∫ σ (1 − p_resolve))`; a mixture inside the return |
 //! | how far a merge moves an echo back from the nearer return's range | pull | `pull`, by separation and energy ratio, measured |
-//! | a cell's pulse and what made its echoes | pulse; owners | `Pulse`: its echoes against its owners, the layers, the ground and the medium (and outliers) |
+//! | a cell's pulse and what made its echoes | pulse; owners | `Pulse`: its echoes against its owners, its occluders and the medium (and outliers) |
 //! | the receiver's reading of a pulse's occluders | receiver | `Receiver`: which returns merge, which are recorded, the cap; the expected number of returns it records (`predict`'s `returns`) |
 //! | one reading of a pulse that gives every quantity the scene takes from it | the pass | `Pulse::read`: the likelihood with its derivatives, the receiver, the beam each owner leaves (`predict`'s `beam`), each echo's responsibilities (3dtrees research 130 slice-pulse) |
 //! | the posterior over which owner made an echo | responsibility | per echo, over the members, the medium and an outlier, summing to one; reported (`predict`'s `owned`), not yet in the cost |

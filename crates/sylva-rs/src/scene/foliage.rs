@@ -123,23 +123,6 @@ pub struct Foliage {
     pub post: HashMap<[i32; 3], (f64, f64)>,
 }
 
-/// What a cell's ray meets of the foliage field: the optical depth to each of its layers and then the ground (`taus`), to the
-/// beam's end, and per echo of its pulse (`echoes`) the optical depth to it, σ at it, and the optical depth to it plus
-/// the receiver's resolution (where the field's path restarts after it: the module docs).
-#[derive(Debug, Clone)]
-pub struct RayFoliage {
-    pub taus: Vec<f64>,
-    pub tau_end: f64,
-    pub echoes: Vec<[f64; 3]>,
-}
-
-impl RayFoliage {
-    /// The same ray with its layers left out (the ground's optical depth kept).
-    pub fn base(&self) -> RayFoliage {
-        RayFoliage { taus: vec![*self.taus.last().unwrap_or(&0.0)], tau_end: self.tau_end, echoes: self.echoes.clone() }
-    }
-}
-
 impl Foliage {
     /// The background alone: κ everywhere.
     pub fn uniform(kappa: f64) -> Self {
@@ -193,19 +176,6 @@ impl Foliage {
             traverse(&sp, o, w, from, to, |k, a, b| total += (self.sigma(&k) - self.kappa) * part(a, b));
         }
         total
-    }
-
-    /// What a cell's ray from `o` along `w` meets: optical depths to its layers' ranges, its ground's, the beam's end
-    /// and, per echo of its pulse at `echoes`, the optical depth to it, σ at it and the optical depth to it plus the
-    /// receiver's `resolution`.
-    pub fn ray_bg(&self, o: &Point, w: &Point, layer_ts: &[f64], ground_t: Option<f64>, t_end: f64, echoes: &[f32], resolution: f64) -> RayFoliage {
-        let mut taus: Vec<f64> = layer_ts.iter().map(|&t| self.tau(o, w, t)).collect();
-        taus.push(ground_t.map_or(0.0, |t| self.tau(o, w, t)));
-        let echoes = echoes.iter().map(|&r| {
-            let (tau, sig) = self.tau_hazard(o, w, r as f64);
-            [tau, sig, self.tau(o, w, r as f64 + resolution)]
-        }).collect();
-        RayFoliage { taus, tau_end: self.tau(o, w, t_end), echoes }
     }
 }
 
