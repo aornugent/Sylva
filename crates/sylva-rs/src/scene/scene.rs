@@ -41,7 +41,9 @@
 //!     returns, plus `σ(r) e^{−τ(r)} Π_{t_j<r} (1 − op_j det_j)`, where P_i is the chance that nothing nearer was kept,
 //!     plus a uniform outlier share. Each later echo is read the same way behind the last, the medium's path
 //!     restarting at it plus the resolution, in the beam the echoes so far left. A pulse with no echo has probability
-//!     `e^{−τ_end} Π (1 − op_j det_j)`.
+//!     `e^{−τ_end} Π (1 − op_j det_j)`. Each `1 − op_j det_j` is computed as `op_j miss_j + 1 − op_j`, `miss_j` the
+//!     detection's own tail ([`Settings::p_miss`]): `1 − det_j` cancels to 0 for a bright near-full hit, and a cliff
+//!     of hundreds of nats follows (3dtrees research 130 rca-level-modes.md).
 //!   - **The merge with the medium** ([`merges`]): a layer's return merges with a medium surface within the resolution
 //!     behind its far side with the site's calibrated merge share, at unshifted ranges, built once per cell; inside
 //!     the return's density it is a mixture, its merged echo pulled back and brighter ([`Return::density`]).
@@ -615,8 +617,9 @@ struct Merge {
 }
 
 /// One return a pulse can record: a run of layers (and the ground) within the receiver's resolution of its first,
-/// merged. `s` is the chance it is recorded, `mu` and `sd` its echo's depth and spread; `s_q` the chance it is
-/// recorded, `db` its echo's predicted reflectance (dB) and `fill` the share of the beam it meets, at the shape
+/// merged. `s` is the chance it is recorded and `q` the chance it isn't (its members' `q` multiplied, never `1 − s`,
+/// which cancels for a bright near-full hit: [`Settings::p_miss`]), `mu` and `sd` its echo's depth and spread; `s_q`
+/// the chance it is recorded, `db` its echo's predicted reflectance (dB) and `fill` the share of the beam it meets, at the shape
 /// mismatch's three section radii (as [`Layer`]'s `fq`); `t` its first member's range, `tau` the foliage field's
 /// optical depth to it, `beam` the share of the beam the scene leaves behind it, and `merge` its last member's merge
 /// with the medium behind; `first` its first member ([`Receiver`]'s), the one that makes its echo.
@@ -627,6 +630,7 @@ struct Return<T = f64> {
     mu: T,
     sd: T,
     s: T,
+    q: T,
     s_q: [T; 3],
     db: [T; 3],
     fill: [f64; 3],
@@ -675,7 +679,7 @@ impl<T: Real> Return<T> {
 }
 
 /// One member of a cell's returns, a layer or the ground: its range, its echo's depth and sd, the chance it is
-/// recorded, its energy (opacity × the beam it meets × cos ι × reflectance), its energy share when it is hit and the
+/// recorded and (`q`, without cancellation) not, its energy (opacity × the beam it meets × cos ι × reflectance), its energy share when it is hit and the
 /// share of the beam it meets, at the shape mismatch's three section radii (the share without the opacity; its echo's
 /// reflectance is `10 log10` of it), the foliage field's optical depth to it, the beam left behind it, and its merge
 /// with the medium behind.
@@ -684,6 +688,7 @@ struct Member<T> {
     depth: T,
     sd: f64,
     s: T,
+    q: T,
     s_q: [T; 3],
     energy: T,
     share: [T; 3],
@@ -707,7 +712,7 @@ impl<T: Real> Receiver<T> {
     /// The first return of the most likely pattern (none recorded where there is none).
     fn front(&self) -> Return<T> {
         let first = self.patterns.iter().max_by(|a, b| a.0.v().total_cmp(&b.0.v())).and_then(|p| p.1.first().copied());
-        first.unwrap_or(Return { first: 0, t: f64::NAN, mu: T::c(f64::NAN), sd: T::c(f64::NAN), s: T::c(0.0), s_q: [T::c(0.0); 3], db: [T::c(f64::NAN); 3],
+        first.unwrap_or(Return { first: 0, t: f64::NAN, mu: T::c(f64::NAN), sd: T::c(f64::NAN), s: T::c(0.0), q: T::c(1.0), s_q: [T::c(0.0); 3], db: [T::c(f64::NAN); 3],
                                  fill: [0.0; 3], tau: f64::INFINITY, beam: 1.0, merge: Merge::default() })
     }
 
@@ -755,10 +760,12 @@ fn returns<T: Real>(layers: &[(Layer, u8)], ground: Option<(f64, f64)>, shift: T
         let cos = ly.cos.powf(em.refl_incidence);
         let s_q = ly.fq.map(|f| em.p_detect(db, f * beam * cos, ly.t) * ly.op);
         let s = (s_q[0] + s_q[1] * 4.0 + s_q[2]) / 6.0;
+        let q_q = ly.fq.map(|f| em.p_miss(db, f * beam * cos, ly.t) * ly.op + (1.0 - ly.op));
+        let q = (q_q[0] + q_q[1] * 4.0 + q_q[2]) / 6.0;
         let (b0, unit) = (beam, (db / 10.0).exp10() * (beam * cos));
         let share = ly.fq.map(|f| unit * f);
         beam *= 1.0 - ly.f * ly.op;
-        m.push(Member { t: ly.t, depth: shift + (ly.t + em.depth_bias(k, ly.t)), sd: em.depth_sd(k, ly.spread), s, s_q, energy: unit * (ly.op * ly.f), share,
+        m.push(Member { t: ly.t, depth: shift + (ly.t + em.depth_bias(k, ly.t)), sd: em.depth_sd(k, ly.spread), s, q, s_q, energy: unit * (ly.op * ly.f), share,
                         fill: ly.fq.map(|f| f * b0), tau: taus[li], beam, merge: merges.get(li).copied().unwrap_or_default() });
     }
     let n_layers = m.len();
@@ -767,7 +774,8 @@ fn returns<T: Real>(layers: &[(Layer, u8)], ground: Option<(f64, f64)>, shift: T
         let cg = cos.powf(em.refl_incidence);
         let share = beam * cg * 10f64.powf(em.refl_ground / 10.0);
         let s = em.ground_echo * em.p_detect(em.refl_ground, beam * cg, tg);
-        m.push(Member { t: tg, depth: T::c(tg), sd: em.noise(2).hypot(em.ground_sd / cos), s: T::c(s), s_q: [T::c(s); 3], energy: T::c(em.ground_echo * share),
+        let q = em.ground_echo * em.p_miss(em.refl_ground, beam * cg, tg) + (1.0 - em.ground_echo);
+        m.push(Member { t: tg, depth: T::c(tg), sd: em.noise(2).hypot(em.ground_sd / cos), s: T::c(s), q: T::c(q), s_q: [T::c(s); 3], energy: T::c(em.ground_echo * share),
                         share: [T::c(share); 3],
                         fill: [beam; 3], tau: taus[layers.len()], beam: 0.0, merge: Merge::default() });
     }
@@ -782,16 +790,16 @@ fn returns<T: Real>(layers: &[(Layer, u8)], ground: Option<(f64, f64)>, shift: T
         let fill = [0, 1, 2].map(|q| g.iter().map(|x| x.fill[q]).sum::<f64>().min(1.0));
         let last_m = &g[g.len() - 1];
         if g.len() == 1 {
-            return Return { first, t: g[0].t, mu: g[0].depth, sd: T::c(g[0].sd), s: g[0].s, s_q: g[0].s_q, db, fill, tau: g[0].tau, beam: last_m.beam,
+            return Return { first, t: g[0].t, mu: g[0].depth, sd: T::c(g[0].sd), s: g[0].s, q: g[0].q, s_q: g[0].s_q, db, fill, tau: g[0].tau, beam: last_m.beam,
                             merge: last_m.merge };
         }
         // the merged echo follows the nearest member, pulled back by the rest
         let rest: T = g[1..].iter().map(|x| x.energy).sum();
         let d = if rest.v() > 0.0 { g[1..].iter().map(|x| x.energy * (x.depth - g[0].depth)).sum::<T>() / rest } else { g[g.len() - 1].depth - g[0].depth };
         let pull = em.pull(d, (g[0].energy.max(1e-300) / rest.max(1e-300)).log10() * 10.0);
-        let none: T = g.iter().map(|x| T::c(1.0) - x.s).product();
+        let none: T = g.iter().map(|x| x.q).product();
         let s_q = [0, 1, 2].map(|q| T::c(1.0) - g.iter().map(|x| T::c(1.0) - x.s_q[q]).product::<T>());
-        Return { first, t: g[0].t, mu: g[0].depth + pull, sd: T::c(g[0].sd).hypot(pull), s: T::c(1.0) - none, s_q, db, fill, tau: g[0].tau, beam: last_m.beam,
+        Return { first, t: g[0].t, mu: g[0].depth + pull, sd: T::c(g[0].sd).hypot(pull), s: T::c(1.0) - none, q: none, s_q, db, fill, tau: g[0].tau, beam: last_m.beam,
                  merge: last_m.merge }
     };
     let mut out = Vec::new();
@@ -958,7 +966,7 @@ impl Pass<'_> {
             if self.capped {
                 return T::c(1.0);
             }
-            return rets[j..].iter().map(|r| T::c(1.0) - r.s * taken).product::<T>() * (-seen * (p.bg.tau_end - tau0).max(0.0)).exp();
+            return rets[j..].iter().map(|r| r.q * taken + (1.0 - taken)).product::<T>() * (-seen * (p.bg.tau_end - tau0).max(0.0)).exp();
         }
         let (o, x) = (p.echoes[i] as f64, p.refls.get(i).map_or(f64::NAN, |&x| x as f64));
         let [tau_o, sig_o, tau_after] = p.bg.echoes[i];
@@ -974,12 +982,12 @@ impl Pass<'_> {
                 resp[row + r.first] += prefix * f.v() * rest.v();
                 total += f * rest;
             }
-            none *= T::c(1.0) - r.s * taken;
+            none *= r.q * taken + (1.0 - taken);
         }
         // the medium's
         if o < self.t_end && seen > 0.0 {
             let jn = (j..rets.len()).find(|&k| rets[k].t >= o).unwrap_or(rets.len());
-            let none: T = rets[j..jn].iter().map(|r| T::c(1.0) - r.s * taken).product();
+            let none: T = rets[j..jn].iter().map(|r| r.q * taken + (1.0 - taken)).product();
             let d = none * (seen * sig_o * (-seen * (tau_o - tau0).max(0.0)).exp()) * em.refl_background(x - 10.0 * (scene * taken).max(1e-6).log10());
             if d.v() > 0.0 {
                 let f = d * (1.0 - P_OUTLIER);
@@ -3452,37 +3460,6 @@ mod tests {
         assert!((0..38).all(|i| clear[i] <= reached[i] && reached[i] <= crossed[i]));
     }
 
-    /// The recursion before the one pass (e1603b1's `Pulse::lik`), kept as its referee for the value.
-    #[allow(clippy::too_many_arguments)]
-    fn lik_before(p: &Pulse, em: &Settings, t_end: f64, rets: &[Return], i: usize, j: usize, scene: f64, taken: f64, seen: f64, tau0: f64) -> f64 {
-        if i == p.echoes.len() {
-            if p.capped() {
-                return 1.0;
-            }
-            return rets[j..].iter().map(|r| 1.0 - r.s * taken).product::<f64>() * (-seen * (p.bg.tau_end - tau0).max(0.0)).exp();
-        }
-        let (o, x) = (p.echoes[i] as f64, p.refls.get(i).map_or(f64::NAN, |&x| x as f64));
-        let [tau_o, sig_o, tau_after] = p.bg.echoes[i];
-        let left = if x.is_finite() { (1.0 - 10f64.powf((x - em.refl_full_hit()) / 10.0)).clamp(0.0, 1.0) } else { 1.0 };
-        let (mut total, mut none) = (0.0, 1.0);
-        for (k, r) in rets.iter().enumerate().skip(j) {
-            let d = none * (-seen * (r.tau - tau0).max(0.0)).exp() * r.s * taken * r.density(o, x, em);
-            if d > 0.0 {
-                total += d * (1.0 - P_OUTLIER) * lik_before(p, em, t_end, rets, i + 1, k + 1, r.beam, taken, seen * left, tau_after);
-            }
-            none *= 1.0 - r.s * taken;
-        }
-        if o < t_end && seen > 0.0 {
-            let jn = (j..rets.len()).find(|&k| rets[k].t >= o).unwrap_or(rets.len());
-            let none: f64 = rets[j..jn].iter().map(|r| 1.0 - r.s * taken).product();
-            let d = none * (seen * sig_o * (-seen * (tau_o - tau0).max(0.0)).exp()) * em.refl_background(x - 10.0 * (scene * taken).max(1e-6).log10());
-            if d > 0.0 {
-                total += d * (1.0 - P_OUTLIER) * lik_before(p, em, t_end, rets, i + 1, jn, scene, taken * left, seen * left, tau_after);
-            }
-        }
-        total + lik_before(p, em, t_end, rets, i + 1, j, scene, taken, seen, tau0) * (P_OUTLIER / T_MAX * em.refl_background(x))
-    }
-
     /// Pulses for the pass's tests: every cell two sticks front in the pole's scan, and bare ones with a merge, a
     /// dense medium behind a partial edge, the cap, the ground and a miss.
     fn test_pulses() -> Vec<Pulse> {
@@ -3502,18 +3479,18 @@ mod tests {
         out
     }
 
-    /// The one pass's likelihood is the recursion's before it, bit for bit, at the nuisances' zero and off it.
+    /// A pulse that returned nothing through an opaque full hit of wood at 4 m, far above the detection floor
+    /// (z ≈ 12.7): its likelihood is the chance the hit went unrecorded, Φ(−z), smooth in the reflectance level, never
+    /// the 1e-300 floor that `1 − p_detect` cancels to (3dtrees research 130 rca-level-modes.md).
     #[test]
-    fn the_pass_is_the_old_likelihood() {
+    fn a_miss_through_a_bright_full_hit_reads_the_detection_tail() {
         let em = Settings::default();
-        let ps = test_pulses();
-        assert!(ps.len() > 20 && ps.iter().any(|p| p.layers.len() > 1), "{}", ps.len());
-        for p in ps.iter().flat_map(|p| [p.clone(), p.empty()]) {
-            for (shift, level) in [(0.0, 0.0), (0.004, -0.3)] {
-                let rx = p.receiver(shift, level, &em);
-                let old = rx.patterns.iter().map(|(q, rets)| q * lik_before(&p, &em, rx.t_end, rets, 0, 0, 1.0, 1.0, 1.0, 0.0)).sum::<f64>().max(1e-300).ln();
-                assert_eq!(p.read(shift, level, &em).ll, old);
-            }
+        let p = pulse_of(&[], &[], false, &[layer(4.0, 1.0, 1.0)], None, &Foliage::uniform(0.0));
+        let z = |level: f64| (em.refl_wood + level - em.floor(4.0)) / em.detect_sd;
+        for level in [-1.0, -0.5, 0.0, 0.5] {
+            let ll = p.read(0.0, level, &em).ll;
+            let tail = (0.5 * libm::erfc(z(level) / std::f64::consts::SQRT_2)).ln();
+            assert!((ll - tail).abs() < 1e-6 * tail.abs(), "level {level}: ll {ll}, ln Φ(−z) {tail}");
         }
     }
 

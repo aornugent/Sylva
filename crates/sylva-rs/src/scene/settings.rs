@@ -234,6 +234,12 @@ impl Settings {
         (-((db + 10.0 * e.max(1e-12).log10() - self.floor(range)) / self.detect_sd) / std::f64::consts::SQRT_2).erfc() * 0.5
     }
 
+    /// The chance it is not recorded: `1 − p_detect`, computed as its own tail. `1 − p_detect` cancels to 0 once
+    /// p_detect rounds to 1 (z > 8.3, a bright near-full hit; 3dtrees research 130 rca-level-modes.md).
+    pub fn p_miss<T: Real>(&self, db: T, e: f64, range: f64) -> T {
+        (((db + 10.0 * e.max(1e-12).log10() - self.floor(range)) / self.detect_sd) / std::f64::consts::SQRT_2).erfc() * 0.5
+    }
+
     /// The density of an echo's reflectance `x` (dB) given its return's predicted reflectance `pred`, give or take
     /// `spread` (dB, the element's own uncertainty), and fill `fill` at range `range`, as recorded: the per-echo noise,
     /// truncated by the detection floor (its chance of clearing the floor is the return's own, so this is the
