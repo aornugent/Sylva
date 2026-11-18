@@ -51,8 +51,11 @@
 //! | an element's reflectance offset from its surface's, per (element, scan) | reflectance level | `refl_level`, `refl_level_sd` |
 //! | a cell's surface continuity | excess; surface class | solid, mid, fragmented |
 //! | wood-or-leaf evidence from photometry | class evidence | the consumer's, from `predict`'s cells (3dtrees research 130 slice 9), beside the cost, never in it; not the scene's |
-//! | what elements don't explain: extinction σ per voxel | foliage field | `Foliage`, `foliage()`, `refit_foliage`; held through moves, as the alignment is (`FieldCounts`) |
-//! | what of a ray the foliage field is fitted from | the field's cut | a ray no element fronts counts whole; one an element fronts counts up to its front element's front surface (`cut`: its clear path and its echoes in front), never its echoes at or behind it; voxels within `margin` of an element's surface are left out (`foliage`'s module docs) |
+//! | what elements don't explain: extinction σ per voxel | foliage field | `Foliage`, `foliage()`, `refit_foliage`; its counts are kept live through moves (`FieldCounts`) |
+//! | what of a ray the foliage field counts | the field's cut | a ray no element fronts counts whole; one an element fronts counts up to its front element's front surface (`cut`: its clear path and its echoes in front), never its echoes at or behind it, which are the element's (`foliage`'s module docs) |
+//! | the foliage field's prior per voxel | the field's prior | a Gamma, `field_prior_mean` worth `field_prior_path` m of weighted ray; measured per site (the empty scene's type-II maximum) |
+//! | the field's counts scored with σ integrated out | the field's term | `Σ ln NB` over the voxels (a Gamma-mixed Poisson marginal), live and exact through moves; its change against the empty scene's, less the plug-in the cells' ratios already read, is the cost's `field_part`, the last column of `costs_to_add` and `costs_to_remove` in a scene with a field, and each row's `field` (3dtrees research 130 formulation.md) |
+//! | what a pulse meets of the field behind an element's front | the held field | σ's posterior mean, read by the ray likelihood (τ, the medium's echoes, the merge), held between refits as the alignment is; within `margin` of an element's surface it reads κ |
 //! | κ outside the field, and a ground plane | background | `Background` |
 //! | the chance the pulse meets no foliage before a return | chance a pulse arrives | `arrives`; `predict`'s `read`: an echo of the pulse on the element |
 //! | the cost's curvature in an element's geometry | information | how well a scan pins the element down; `expected` its average over the cells' outcomes; over several elements jointly (a pair's), the latents they share counted once |

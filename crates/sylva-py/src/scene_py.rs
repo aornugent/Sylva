@@ -14,13 +14,14 @@
 //!   (its extent); its `b` is ignored. An element that can't be scored (a radius that isn't positive, an opacity
 //!   outside (0, 1], a stick of no length) raises.
 //! - **Scenes:** `Scene(images, elements, settings, background, foliage, ref_epoch)` holds elements against range
-//!   images, the alignment error's spread stated for the scans of epoch `ref_epoch` (another epoch's add `align_epoch_*`): `cost()`, `rows()` and each scan's `alignment_parts()`, the cost change of each move (`add`,
+//!   images, the alignment error's spread stated for the scans of epoch `ref_epoch` (another epoch's add `align_epoch_*`): `cost()`, `rows()`, each scan's `alignment_parts()` and the foliage field's `field_part()`, the cost change of each move (`add`,
 //!   `remove`, `change`, `costs_to_add`, `costs_to_remove`) with the alignment held, `refit_alignment()` and
 //!   `exact_cost()`, which hypotheses interact (`interactions`), an element's counts (`counts`), cell predictions (`predict`), what one
 //!   hypothesis is expected to cost against another (`divergence`) and how well the scans pin elements down, one or
 //!   several jointly (`information`). A bad element id or scan index raises.
-//! - **The foliage field:** `foliage` is a dict `lo`, `hi` (the box, 3 each), `voxel`, `prior_path` and `margin`
-//!   (m); the field is then the elements' residual there (`FoliageBox`), held through moves. `refit_foliage()`,
+//! - **The foliage field:** `foliage` is a dict `lo`, `hi` (the box, 3 each), `voxel` and `margin` (m; its prior is
+//!   the settings' `field_prior_*`); the field is then the elements' residual there (`FoliageBox`), its marginal in
+//!   the cost and what a pulse meets of it held through moves. `refit_foliage()`,
 //!   `promote(element)` and `demote(id)` move mass between the field and the elements; `foliage_voxels()` gives it
 //!   per voxel and `transmission(image, cells)` its optical depth across the box along other images' rays.
 
@@ -286,7 +287,7 @@ fn rows_dict<'py>(py: Python<'py>, rows: &[ElementScan]) -> PyResult<Bound<'py, 
     type F = fn(&ElementScan) -> f64;
     for (k, f) in [("arc", (|r| r.arc) as F), ("footprints_across", |r| r.footprints_across), ("cost", |r| r.cost), ("ray_on", |r| r.ray_on), ("ray_empty", |r| r.ray_empty),
                    ("ray_in_front", |r| r.ray_in_front), ("ray_behind", |r| r.ray_behind), ("alignment", |r| r.alignment),
-                   ("discount", |r| r.discount), ("align_shift", |r| r.align_shift), ("align_sd", |r| r.align_sd), ("front_shift", |r| r.front_shift),
+                   ("field", |r| r.field), ("discount", |r| r.discount), ("align_shift", |r| r.align_shift), ("align_sd", |r| r.align_sd), ("front_shift", |r| r.front_shift),
                    ("front_shift_sd", |r| r.front_shift_sd), ("refl_level", |r| r.refl_level), ("refl_level_sd", |r| r.refl_level_sd)] {
         d.set_item(k, rows.iter().map(f).collect::<Vec<_>>().into_pyarray(py))?;
     }
@@ -362,7 +363,7 @@ impl PyScene {
         let spec = foliage.map(|d| -> PyResult<FoliageBox> {
             let req = |k: &str| d.get_item(k)?.ok_or_else(|| bad(k));
             Ok(FoliageBox { lo: req("lo")?.extract()?, hi: req("hi")?.extract()?, voxel: req("voxel")?.extract()?,
-                            prior_path: req("prior_path")?.extract()?, margin: req("margin")?.extract()? })
+                            margin: req("margin")?.extract()? })
         }).transpose()?;
         let vs: Vec<Arc<RangeImage>> = images.iter().map(|v| v.inner.clone()).collect();
         Ok(PyScene { inner: py.detach(|| Scene::new(vs, &el, em, bg, spec, ref_epoch)), em })
@@ -453,16 +454,23 @@ impl PyScene {
 
     /// Per (term, scan) (scene::ElementScan): elem (a group's first member), group (-1 alone), scan, cells, cells_on, arc (rad), footprints_across, surface; its cost
     /// and the parts it sums (ray_on, ray_empty, ray_in_front, ray_behind, and alignment: its own nodes' prior and
-    /// log-determinant; each scan's alignment part is `alignment_parts()`); the evidence discount (discount); the
+    /// log-determinant; each scan's alignment part is `alignment_parts()`, the field's `field_part()`); beside it, not
+    /// in it, field: the foliage field's part of its cost to remove in this scan; the evidence discount (discount); the
     /// posterior along the beam at it, the alignment held: align_shift, align_sd, front_shift, front_shift_sd (m); and
     /// its reflectance level's: refl_level, refl_level_sd (dB).
     fn rows<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
         rows_dict(py, &self.inner.rows())
     }
 
-    /// Each scan's alignment part (its cost less its rows'), so the rows and these sum to `cost()`.
+    /// Each scan's alignment part (its cost less its rows'), so the rows, these and `field_part()` sum to `cost()`.
     fn alignment_parts<'py>(&self, py: Python<'py>) -> Bound<'py, PyArray1<f64>> {
         self.inner.alignment_parts().into_pyarray(py)
+    }
+
+    /// The foliage field's part of the cost: its marginal against the empty scene's, less the plug-in the cells'
+    /// ratios already read (0 without a field, or with one held from elsewhere).
+    fn field_part(&self) -> f64 {
+        self.inner.field_part()
     }
 
     /// Add elements: their ids and the cost change.
@@ -497,24 +505,26 @@ impl PyScene {
         Ok(py.detach(|| c.change(id, e)))
     }
 
-    /// Many hypotheses' costs to add, each alone, per scan: `hypotheses` a list of element dicts (one or more elements
-    /// each); returns (hypotheses, scans), the scene unchanged and its alignment held.
+    /// Many hypotheses' costs to add, each alone, per scan and then, in a scene with a foliage field, the field's part:
+    /// `hypotheses` a list of element dicts (one or more elements each); returns (hypotheses, scans), or (hypotheses,
+    /// scans + 1) with a field, the scene unchanged and its alignment held. A row sums to the move.
     fn costs_to_add<'py>(&self, py: Python<'py>, hypotheses: Vec<Bound<'py, PyDict>>) -> PyResult<Bound<'py, numpy::PyArray2<f64>>> {
         let hs: Vec<Vec<Element>> = hypotheses.iter().map(|d| elements_from_py(d, &self.em)).collect::<PyResult<_>>()?;
         let c = &self.inner;
         let out = py.detach(|| c.costs_to_add(&hs));
-        let (n, m) = (out.len(), self.inner.n_scans());
+        let (n, m) = (out.len(), out.first().map_or(self.inner.n_scans(), Vec::len));
         Ok(out.into_iter().flatten().collect::<Vec<f64>>().into_pyarray(py).reshape([n, m])?)
     }
 
-    /// Each element's cost to remove, per scan: `ids` live element ids; returns (ids, scans), the scene unchanged.
+    /// Each element's cost to remove, per scan and then, with a field, the field's part (as `costs_to_add`): `ids`
+    /// live element ids; returns (ids, scans) or (ids, scans + 1), the scene unchanged.
     fn costs_to_remove<'py>(&self, py: Python<'py>, ids: Vec<u32>) -> PyResult<Bound<'py, numpy::PyArray2<f64>>> {
         for &id in &ids {
             self.inner.check_id(id).map_err(scene_err)?;
         }
         let c = &self.inner;
         let out = py.detach(|| c.costs_to_remove(&ids));
-        let (n, m) = (out.len(), self.inner.n_scans());
+        let (n, m) = (out.len(), out.first().map_or(self.inner.n_scans(), Vec::len));
         Ok(out.into_iter().flatten().collect::<Vec<f64>>().into_pyarray(py).reshape([n, m])?)
     }
 

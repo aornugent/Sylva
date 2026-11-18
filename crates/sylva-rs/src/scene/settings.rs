@@ -142,12 +142,20 @@ params! {
         /// instead (the review after slice 15).
         pub front_shift_base: f64 = 0.001,
         pub front_shift_slope: f64 = 0.1,
+        /// The foliage field's prior per voxel ([`super::foliage`]): a Gamma of mean `field_prior_mean` (1/m) worth
+        /// `field_prior_path` (m of weighted ray), measured as the type-II maximum of the empty scene's counts on
+        /// 0.125 m voxels (`collapsed.py prior`, 3dtrees research 130: AM's about the second box no held-out check
+        /// holds out, from its three day-1 scans there). The field's term in the cost is its marginal, so the prior is
+        /// in the evidence and is measured, not declared.
+        pub field_prior_mean: f64 = 0.09056,
+        pub field_prior_path: f64 = 0.7234,
     }
 }
 
 params! {
     /// What lies behind the elements, crudely: a diffuse extinction `kappa` (1/m) along every ray (the foliage field
-    /// outside its box, and its prior mean inside: [`super::foliage`]) and a ground plane's height (NaN for none).
+    /// outside its box, and within an element's margin inside: [`super::foliage`]) and a ground plane's height (NaN
+    /// for none).
     /// κ is declared at 0.05, the checks' setting; `extinction.py kappa` measures it per site (AM 0.034, the stand
     /// 0.019).
     #[derive(Debug, Clone, Copy)]
