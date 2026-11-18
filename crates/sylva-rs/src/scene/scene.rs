@@ -94,7 +94,7 @@
 
 use super::dual::{Dual, Real};
 use super::settings::{Background, Settings, ALIGN_SPACING, P_OUTLIER, T_MAX};
-use super::foliage::{self, FieldCounts, FixedCounts, Foliage, FoliageBox};
+use super::foliage::{self, FieldCounts, FixedCounts, Foliage, FoliageBox, Medium};
 use super::range_image::{Cell, RangeImage};
 use std::sync::Arc;
 use crate::transform::{cross, dot, norm, normalize, sub};
@@ -832,7 +832,7 @@ fn receiver<T: Real>(occ: &[Occluder], shift: T, level: T, em: &Settings) -> Rec
 /// separation from the layer's echo ([`Settings::p_resolve`]) at the energy ratio of the layer's echo (at its mean
 /// fill) to a medium echo in beam b (at the medium's mean reflectance, `refl_background_mean`); and the pull at the
 /// merged surface's mean separation (over eight stretches of the integral, within 2 m behind).
-fn merges(occ: &mut [Occluder], o: &Point, w: &Point, em: &Settings, ext: &Foliage) {
+fn merges(occ: &mut [Occluder], m: &Medium, em: &Settings) {
     let mut beam = 1.0;
     for i in 0..occ.len() {
         let Surface::Layer(ly, _) = occ[i].surface else { continue };
@@ -848,12 +848,12 @@ fn merges(occ: &mut [Occluder], o: &Point, w: &Point, em: &Settings, ext: &Folia
         let (lo, hi) = (ly.far, next.min(ly.t + 2.0));
         let parts: Vec<(f64, f64)> = (0..8).map(|k| {
             let (a, b) = (lo + (hi - lo) * k as f64 / 8.0, lo + (hi - lo) * (k + 1) as f64 / 8.0);
-            (0.5 * (a + b) - ly.t, ext.merge_integral(o, w, ly.t, a, b, z0, em.res_b))
+            (0.5 * (a + b) - ly.t, m.merge_integral(ly.t, a, b, z0, em.res_b))
         }).collect();
-        let m = ext.merge_integral(o, w, ly.t, lo, next, z0, em.res_b);
+        let whole = m.merge_integral(ly.t, lo, next, z0, em.res_b);
         let near: f64 = parts.iter().map(|p| p.1).sum();
         let d = if near > 0.0 { parts.iter().map(|p| p.0 * p.1).sum::<f64>() / near } else { 0.0 };
-        occ[i].merge = Merge { share: em.merge_share(1.0 - (-beam * m).exp(), ly.t, ly.f), energy: beam * 10f64.powf(em.refl_background_mean / 10.0), pull: em.pull(d, e) };
+        occ[i].merge = Merge { share: em.merge_share(1.0 - (-beam * whole).exp(), ly.t, ly.f), energy: beam * 10f64.powf(em.refl_background_mean / 10.0), pull: em.pull(d, e) };
     }
 }
 
@@ -894,20 +894,17 @@ impl<T> Reading<T> {
 
 impl Pulse {
     /// The pulse of a ray from `o` along `w` with its `echoes` (their reflectances `refls`; the scan's target cap
-    /// `cap`) against occluders `occ` ([`occluders`]) and the foliage field `ext`: each occluder's optical depth and
-    /// merge, and the medium along the ray.
+    /// `cap`) against occluders `occ` ([`occluders`]) and the foliage field `ext`, its ray walked once through the
+    /// field's voxels ([`Medium`]): each occluder's optical depth and merge, and the medium along the ray.
     #[allow(clippy::too_many_arguments)]
     fn new(mut occ: Vec<Occluder>, o: &Point, w: &Point, echoes: &[f32], refls: &[f32], cap: usize, em: &Settings, ext: &Foliage) -> Pulse {
-        let t_end = Pulse::end(&occ);
+        let m = ext.medium(o, w);
         for x in occ.iter_mut() {
-            x.tau = ext.tau(o, w, x.t);
+            x.tau = m.tau(x.t);
         }
-        merges(&mut occ, o, w, em, ext);
-        let medium = echoes.iter().map(|&r| {
-            let (tau, sig) = ext.tau_hazard(o, w, r as f64);
-            [tau, sig, ext.tau(o, w, r as f64 + em.resolution())]
-        }).collect();
-        Pulse { echoes: echoes.to_vec(), refls: refls.to_vec(), cap, occluders: occ, tau_end: ext.tau(o, w, t_end), medium }
+        merges(&mut occ, &m, em);
+        let medium = echoes.iter().map(|&r| [m.tau(r as f64), m.hazard(r as f64), m.tau(r as f64 + em.resolution())]).collect();
+        Pulse { echoes: echoes.to_vec(), refls: refls.to_vec(), cap, tau_end: m.tau(Pulse::end(&occ)), occluders: occ, medium }
     }
 
     /// The range the beam of a pulse with occluders `occ` ends at: the ground's, else [`T_MAX`].
@@ -1874,7 +1871,10 @@ impl Scene {
         cells.par_iter().map(|&k| {
             let w = v.direction((k / v.n_cols) as f64, (k % v.n_cols) as f64);
             match foliage::clip(&sp, &v.origin, &w) {
-                Some((a, b)) => (self.ext.tau(&v.origin, &w, b) - self.ext.tau(&v.origin, &w, a), a, b),
+                Some((a, b)) => {
+                    let m = self.ext.medium(&v.origin, &w);
+                    (m.tau(b) - m.tau(a), a, b)
+                }
                 None => (f64::NAN, f64::NAN, f64::NAN),
             }
         }).collect()

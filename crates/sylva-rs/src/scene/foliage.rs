@@ -31,6 +31,10 @@
 //!   have merged with it: [`Settings::resolution`]). The report is the first K returns in time (research 130 slice
 //!   12b), so after the last echo the path on is transmission only if the pulse returned fewer echoes than the
 //!   instrument records ([`RangeImage::capped`]): a pulse at its cap says nothing about what lies beyond.
+//! - **One walk per ray** (3dtrees research 130 slice-structure): a cell's ray is traversed through the box once
+//!   ([`Walk`]). The pulse reads its optical depths and hazards as prefix sums over the walk's segments, and its merge
+//!   integrals as sums over them ([`Medium`]); the field's counts deposit onto the same segments ([`recount`]: both
+//!   cuts on one walk), and [`free_space`] carves along them.
 //! - **Energy after an echo.** A pulse's echo energies are bounded by its emitted energy (synthesis §4): an echo's
 //!   reflectance against a full-footprint hit on the dimmest canopy surface ([`Settings::refl_full_hit`]) is the
 //!   share of the beam it took ([`Settings::beam_left`], as the pulse reads it), so a full hit on leaf or wood reads
@@ -140,42 +144,70 @@ impl Foliage {
         self.post.get(k).map_or(self.kappa, |&(a, b)| a / b)
     }
 
-    /// The optical depth along the ray from `o` in direction `w` to range `t`, and the hazard of an echo at `t`.
-    pub fn tau_hazard(&self, o: &Point, w: &Point, t: f64) -> (f64, f64) {
-        let (mut tau, mut hazard) = (self.kappa * t, self.kappa);
-        if let Some(sp) = self.spec {
-            traverse(&sp, o, w, 0.0, t, |k, a, b| {
-                let sig = self.sigma(&k);
-                tau += (sig - self.kappa) * (b - a);
-                hazard = if b >= t { sig } else { self.kappa };
-            });
-            let x = [0, 1, 2].map(|j| o[j] + w[j] * t);
-            if !inside(&sp, &x) {
-                hazard = self.kappa;
-            }
-        }
-        (tau, hazard)
+    /// What the ray from `o` in direction `w` meets of the field ([`Medium`]), from one walk through the box.
+    pub fn medium(&self, o: &Point, w: &Point) -> Medium {
+        let mut before = 0.0;
+        let segs = self.spec.map_or(Vec::new(), |sp| Walk::new(&sp, o, w).0.into_iter().map(|(k, a, b)| {
+            let sig = self.sigma(&k);
+            let s = [a, b, sig, before];
+            before += (sig - self.kappa) * (b - a);
+            s
+        }).collect());
+        Medium { kappa: self.kappa, segs }
+    }
+}
+
+/// A ray's voxel segments through a box, walked once (one traversal; 3dtrees research 130 slice-structure): (voxel,
+/// from, to), in order, tiling the ray where it is inside the box.
+pub struct Walk(Vec<([i32; 3], f64, f64)>);
+
+impl Walk {
+    pub fn new(sp: &FoliageBox, o: &Point, w: &Point) -> Walk {
+        let mut segs = Vec::new();
+        traverse(sp, o, w, 0.0, f64::INFINITY, |k, a, b| segs.push((k, a, b)));
+        Walk(segs)
     }
 
-    /// The optical depth along the ray from `o` in direction `w` to range `t`.
-    pub fn tau(&self, o: &Point, w: &Point, t: f64) -> f64 {
-        self.tau_hazard(o, w, t).0
+    /// Its segments clipped to the ranges `from` to `to`, in order.
+    fn within(&self, from: f64, to: f64) -> impl Iterator<Item = ([i32; 3], f64, f64)> + '_ {
+        let i = self.0.partition_point(|s| s.2 <= from);
+        self.0[i..].iter().take_while(move |s| s.1 < to).map(move |&(k, a, b)| (k, a.max(from), b.min(to))).filter(|s| s.2 > s.1)
+    }
+}
+
+/// What one ray meets of the foliage field ([`Foliage::medium`]): κ, and per segment of its walk inside the box (from,
+/// to, σ there, and the optical depth's departure from κ's before it), so its optical depths and hazards are prefix
+/// sums and its merge integrals sums over the segments, never another traversal.
+pub struct Medium {
+    kappa: f64,
+    segs: Vec<[f64; 4]>,
+}
+
+impl Medium {
+    /// The optical depth from the ray's origin to range `t`.
+    pub fn tau(&self, t: f64) -> f64 {
+        let i = self.segs.partition_point(|s| s[0] < t);
+        let past = if i == 0 { 0.0 } else { let s = self.segs[i - 1]; s[3] + (s[2] - self.kappa) * (t.min(s[1]) - s[0]) };
+        self.kappa * t + past
     }
 
-    /// The ray's merge integral behind a return at range `at` whose resolving logit is `z0 + slope (u − at)` at range u
+    /// The hazard of an echo at range `t`: σ in the voxel the ray is in there (κ outside the box).
+    pub fn hazard(&self, t: f64) -> f64 {
+        let i = self.segs.partition_point(|s| s[1] < t);
+        self.segs.get(i).filter(|s| s[0] < t).map_or(self.kappa, |s| s[2])
+    }
+
+    /// The merge integral behind a return at range `at` whose resolving logit is `z0 + slope (u − at)` at range u
     /// ([`Settings::p_resolve`]): `∫ σ(u) (1 − p(u)) du` from `from` to `to`, exact over σ's voxels (each constant).
-    pub fn merge_integral(&self, o: &Point, w: &Point, at: f64, from: f64, to: f64, z0: f64, slope: f64) -> f64 {
+    pub fn merge_integral(&self, at: f64, from: f64, to: f64, z0: f64, slope: f64) -> f64 {
         if to <= from {
             return 0.0;
         }
         // ∫ (1 − p) du = u − softplus(z0 + slope (u − at)) / slope
         let softplus = |z: f64| if z > 30.0 { z } else { z.exp().ln_1p() };
         let part = |a: f64, b: f64| (b - a) - (softplus(z0 + slope * (b - at)) - softplus(z0 + slope * (a - at))) / slope;
-        let mut total = self.kappa * part(from, to);
-        if let Some(sp) = self.spec {
-            traverse(&sp, o, w, from, to, |k, a, b| total += (self.sigma(&k) - self.kappa) * part(a, b));
-        }
-        total
+        let i = self.segs.partition_point(|s| s[1] <= from);
+        self.segs[i..].iter().take_while(|s| s[0] < to).fold(self.kappa * part(from, to), |total, s| total + (s[2] - self.kappa) * part(s[0].max(from), s[1].min(to)))
     }
 }
 
@@ -243,12 +275,12 @@ fn traverse(sp: &FoliageBox, o: &Point, w: &Point, t_min: f64, t_max: f64, mut f
     }
 }
 
-/// One cell's ray through the box up to range `cut` (∞ for a ray no element fronts; the module docs say what the fit
-/// reads): `add(voxel, hits, path)` for each echo before the cut and each stretch of transmission, weighted by
-/// [`Settings::cell_weight`]. The path after the last echo before the cut runs on to the cut, unless the pulse is
-/// capped and that echo was its last. Echoes and voxel stretches that end before `after` are left out: they are the
-/// same whatever the cut beyond it.
-fn ray(v: &RangeImage, sp: &FoliageBox, em: &Settings, k: usize, cut: f64, after: f64, mut add: impl FnMut([i32; 3], f64, f64)) {
+/// One cell's ray through the box, walked once ([`Walk`]) and counted up to each of `cuts` with its sign into `acc` (a
+/// cut ∞ for a ray no element fronts; the module docs say what the fit reads): each echo before the cut a hit and each
+/// stretch of transmission its path, weighted by [`Settings::cell_weight`]. The path after the last echo before the cut
+/// runs on to the cut, unless the pulse is capped and that echo was its last. Echoes and voxel stretches that end
+/// before `after` are left out: they are the same whatever the cut beyond it.
+fn ray(v: &RangeImage, sp: &FoliageBox, em: &Settings, k: usize, cuts: &[(f64, i64)], after: f64, acc: &mut FixedCounts) {
     let w = v.direction((k / v.n_cols) as f64, (k % v.n_cols) as f64);
     let Some((_, t1)) = clip(sp, &v.origin, &w) else { return };
     if v.cell[k] == Cell::NoPulse {
@@ -257,26 +289,28 @@ fn ray(v: &RangeImage, sp: &FoliageBox, em: &Settings, k: usize, cut: f64, after
     let echoes: &[f32] = if v.cell[k] == Cell::Echoes { v.echoes(k) } else { &[] };
     let refls = if v.cell[k] == Cell::Echoes { v.echo_refls(k) } else { &[] };
     let wt = em.cell_weight(echoes.first().map_or(t1, |&r| r as f64), v.step());
-    let (mut start, mut beam) = (0.0, 1.0);
-    for (i, &r) in echoes.iter().enumerate() {
-        let r = r as f64;
-        if r >= cut {
-            break;
-        }
-        let b0 = beam;
-        traverse(sp, &v.origin, &w, start, r, |key, a, b| if b >= after { add(key, 0.0, wt * b0 * (b - a)) });
-        let x = [0, 1, 2].map(|a| v.origin[a] + w[a] * r);
-        if r >= after && inside(sp, &x) {
-            add(key(sp, &x), wt * b0, 0.0);
-        }
-        if let Some(&db) = refls.get(i) {
-            beam *= em.beam_left(db as f64);
-        }
-        start = r + em.resolution();
-    }
     let known = if v.capped(k) { echoes.last().map_or(f64::INFINITY, |&r| r as f64) } else { f64::INFINITY };
-    let b0 = beam;
-    traverse(sp, &v.origin, &w, start, cut.min(known), |key, a, b| if b >= after { add(key, 0.0, wt * b0 * (b - a)) });
+    let walk = Walk::new(sp, &v.origin, &w);
+    for &(cut, sign) in cuts {
+        let (mut start, mut beam) = (0.0, 1.0);
+        for (i, &r) in echoes.iter().enumerate().take_while(|(_, &r)| (r as f64) < cut) {
+            let r = r as f64;
+            for (key, a, b) in walk.within(start, r).filter(|s| s.2 >= after) {
+                accumulate(acc, key, 0.0, wt * beam * (b - a), sign);
+            }
+            let x = [0, 1, 2].map(|a| v.origin[a] + w[a] * r);
+            if r >= after && inside(sp, &x) {
+                accumulate(acc, key(sp, &x), wt * beam, 0.0, sign);
+            }
+            if let Some(&db) = refls.get(i) {
+                beam *= em.beam_left(db as f64);
+            }
+            start = r + em.resolution();
+        }
+        for (key, a, b) in walk.within(start, cut.min(known)).filter(|s| s.2 >= after) {
+            accumulate(acc, key, 0.0, wt * beam * (b - a), sign);
+        }
+    }
 }
 
 /// Free space in one scan, per voxel of a box (3dtrees research 130 slice 7: the wood map's bounds on hidden wood).
@@ -295,12 +329,12 @@ pub fn free_space(v: &RangeImage, lo: Point, hi: Point, voxel: f64, em: &Setting
         let w = v.direction((k / v.n_cols) as f64, (k % v.n_cols) as f64);
         let first = if v.cell[k] == Cell::Echoes { v.range[k] as f64 } else { f64::INFINITY };
         let free = em.free_to(first);
-        traverse(&sp, &v.origin, &w, 0.0, f64::INFINITY, |key, a, b| {
+        for &(key, a, b) in &Walk::new(&sp, &v.origin, &w).0 {
             let i = (key[0] as usize * n[1] + key[1] as usize) * n[2] + key[2] as usize;
             counts[0][i].fetch_add(1, Relaxed);
             counts[1][i].fetch_add((a < first) as u32, Relaxed);
             counts[2][i].fetch_add((b <= free) as u32, Relaxed);
-        });
+        }
     });
     counts.map(|c| c.into_iter().map(AtomicU32::into_inner).collect())
 }
@@ -318,9 +352,7 @@ fn accumulate(acc: &mut FixedCounts, key: [i32; 3], h: f64, l: f64, sign: i64) {
 /// Image `v`'s cell `k` counted up to `to` in place of `from`: its change to the counts, added to `acc`.
 pub fn recount(v: &RangeImage, sp: &FoliageBox, em: &Settings, k: usize, from: f64, to: f64, acc: &mut FixedCounts) {
     if from != to {
-        let after = from.min(to);
-        ray(v, sp, em, k, from, after, |key, h, l| accumulate(acc, key, h, l, -1));
-        ray(v, sp, em, k, to, after, |key, h, l| accumulate(acc, key, h, l, 1));
+        ray(v, sp, em, k, &[(from, -1), (to, 1)], from.min(to), acc);
     }
 }
 
@@ -373,7 +405,7 @@ impl FieldCounts {
         let prior = (em.field_prior_mean * em.field_prior_path, em.field_prior_path);
         let counts = views.iter().map(|v| {
             (0..v.cell.len()).into_par_iter().fold(FixedCounts::default, |mut acc, k| {
-                ray(v, &spec, em, k, f64::INFINITY, 0.0, |key, h, l| accumulate(&mut acc, key, h, l, 1));
+                ray(v, &spec, em, k, &[(f64::INFINITY, 1)], 0.0, &mut acc);
                 acc
             }).reduce(FixedCounts::default, merged)
         }).fold(FixedCounts::default(), merged);
@@ -494,6 +526,7 @@ impl FieldCounts {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::transform::norm;
 
     /// A ray through a box of 1 m voxels: the segments tile the clipped ray, and a uniform field's optical depth is κ t.
     #[test]
@@ -510,22 +543,71 @@ mod tests {
         assert!((len - (t1 - t0)).abs() < 1e-9, "{len} vs {}", t1 - t0);
         assert_eq!(keys.first(), Some(&[0, 1, 0]));
         let e = Foliage::uniform(0.05);
-        assert_eq!(e.tau(&o, &w, 7.0), 0.05 * 7.0);
+        assert_eq!(e.medium(&o, &w).tau(7.0), 0.05 * 7.0);
         let mut f = Foliage::from_counts(0.05, sp, &Counts::from([([0, 0, 0], (0.0, 0.0))]), (0.05, 1.0));
         f.post.insert([0, 1, 0], (1.05 * 1000.0, 1000.0));
-        let through = f.tau(&o, &w, 100.0) - f.tau(&o, &w, 0.0);
+        let through = f.medium(&o, &w).tau(100.0) - f.medium(&o, &w).tau(0.0);
         assert!(through > 0.05 * 100.0, "{through}");
         // σ's posterior mean, however much data it rests on (slice 2c)
-        let seg = |f: &Foliage| f.tau(&o, &w, 100.0) - 0.05 * 100.0;
+        let seg = |f: &Foliage| f.medium(&o, &w).tau(100.0) - 0.05 * 100.0;
         let plug = seg(&f);
         f.post.insert([0, 1, 0], (1.05, 1.0));
         assert!((seg(&f) - plug).abs() < 1e-9, "{} vs {plug}", seg(&f));
         // the merge integral: κ's exact over a ray that misses the box, and nothing past a resolved return
         let (z0, slope) = (-2.563, 2.693);
-        let flat = Foliage::uniform(0.05);
-        let m = flat.merge_integral(&o, &w, 10.0, 10.0, 100.0, z0, slope);
+        let flat = Foliage::uniform(0.05).medium(&o, &w);
+        let m = flat.merge_integral(10.0, 10.0, 100.0, z0, slope);
         let numeric: f64 = (0..20000).map(|i| 0.05 * 0.005 / (1.0 + (z0 + slope * (i as f64 + 0.5) * 0.005).exp())).sum();
         assert!((m - numeric).abs() < 1e-6, "{m} vs {numeric}");
-        assert!(flat.merge_integral(&o, &w, 10.0, 20.0, 30.0, z0, slope) < 1e-10);
+        assert!(flat.merge_integral(10.0, 20.0, 30.0, z0, slope) < 1e-10);
+    }
+
+    /// One walk per ray (3dtrees research 130 slice-structure): the medium's optical depths, hazards and merge
+    /// integrals, as sums over the walk's segments, equal a traversal of their own for each (36f7313's), to float
+    /// order (1e-12), on rays through a box of uneven σ, at ranges in it, on voxel faces, before it and past it.
+    #[test]
+    fn one_walk_reads_the_medium_as_traversals_did() {
+        let sp = FoliageBox { lo: [0.0, 0.0, 0.0], hi: [4.0, 4.0, 2.5], voxel: 0.5, margin: 0.0 };
+        let mut f = Foliage::from_counts(0.05, sp, &Counts::new(), (0.05, 1.0));
+        for i in 0..8 {
+            for j in 0..8 {
+                for l in 0..5 {
+                    f.post.insert([i, j, l], (((i * 7 + j * 3 + l) % 5) as f64 * 0.7 + 0.01, 1.0));
+                }
+            }
+        }
+        // a traversal per query, as before
+        let tau_hazard = |o: &Point, w: &Point, t: f64| {
+            let (mut tau, mut hazard) = (f.kappa * t, f.kappa);
+            traverse(&sp, o, w, 0.0, t, |k, a, b| {
+                tau += (f.sigma(&k) - f.kappa) * (b - a);
+                hazard = if b >= t { f.sigma(&k) } else { f.kappa };
+            });
+            if !inside(&sp, &[0, 1, 2].map(|j| o[j] + w[j] * t)) {
+                hazard = f.kappa;
+            }
+            (tau, hazard)
+        };
+        let (z0, slope) = (-2.563, 2.693);
+        let merge = |o: &Point, w: &Point, at: f64, from: f64, to: f64| {
+            let softplus = |z: f64| if z > 30.0 { z } else { z.exp().ln_1p() };
+            let part = |a: f64, b: f64| (b - a) - (softplus(z0 + slope * (b - at)) - softplus(z0 + slope * (a - at))) / slope;
+            let mut total = f.kappa * part(from, to);
+            traverse(&sp, o, w, from, to, |k, a, b| total += (f.sigma(&k) - f.kappa) * part(a, b));
+            total
+        };
+        let rays = [([-1.0, 0.3, 1.2], [0.8, 0.6, 0.0]), ([-0.5, -0.7, 0.1], [0.6, 0.7, 0.3873]), ([5.0, 2.2, 2.0], [-0.9, 0.1, -0.4243])];
+        for (o, w) in rays {
+            let w = [0, 1, 2].map(|j| w[j] / norm(&w));
+            let m = f.medium(&o, &w);
+            for t in (0..140).map(|i| i as f64 * 0.05 + 0.013).chain([1.25, 2.5, 3.0]) {
+                let (tau, hazard) = tau_hazard(&o, &w, t);
+                assert!((m.tau(t) - tau).abs() < 1e-12 * tau.max(1.0), "tau at {t}: {} vs {tau}", m.tau(t));
+                assert_eq!(m.hazard(t), hazard, "hazard at {t}");
+                let at = t + 0.02;
+                let (a, b) = (merge(&o, &w, t, at, at + 1.3), m.merge_integral(t, at, at + 1.3, z0, slope));
+                assert!((a - b).abs() < 1e-12 * a.max(1.0), "merge at {t}: {b} vs {a}");
+            }
+        }
     }
 }
