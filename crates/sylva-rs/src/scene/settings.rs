@@ -298,6 +298,13 @@ impl Settings {
         self.refl_wood.min(self.refl_leaf)
     }
 
+    /// The share of the beam an echo of reflectance `x` (dB) leaves: what its share against a full hit
+    /// ([`Settings::refl_full_hit`]) says it didn't take; the whole beam where its reflectance is unknown. The pulse's
+    /// medium and the foliage field's counts read an echo the same way.
+    pub fn beam_left(&self, x: f64) -> f64 {
+        if x.is_finite() { (1.0 - 10f64.powf((x - self.refl_full_hit()) / 10.0)).clamp(0.0, 1.0) } else { 1.0 }
+    }
+
     /// The stem front shift's prior sd (m) at radius r.
     pub fn front_shift_sd(&self, r: f64) -> f64 {
         self.front_shift_base + self.front_shift_slope * r

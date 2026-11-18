@@ -33,8 +33,8 @@
 //!   instrument records ([`RangeImage::capped`]): a pulse at its cap says nothing about what lies beyond.
 //! - **Energy after an echo.** A pulse's echo energies are bounded by its emitted energy (synthesis §4): an echo's
 //!   reflectance against a full-footprint hit on the dimmest canopy surface ([`Settings::refl_full_hit`]) is the
-//!   share of the beam it took, so a full hit on leaf or wood reads as the whole beam, and only the rest goes on. So
-//!   each stretch after an echo counts as transmission in proportion to the beam left: none past an opaque hit, most
+//!   share of the beam it took ([`Settings::beam_left`], as the pulse reads it), so a full hit on leaf or wood reads
+//!   as the whole beam, and only the rest goes on. So each stretch after an echo counts as transmission in proportion to the beam left: none past an opaque hit, most
 //!   past a sliver. Where echoes carry no reflectance, the beam is taken to go on whole. (On held-out transmission
 //!   this reading is as good as the first echo's alone or better: research 130 slices 12c, 13b. A clumping factor Ω
 //!   on the optical depth wasn't supported: slice 12c.) Each ray counts [`Settings::cell_weight`] at its first echo's
@@ -300,7 +300,7 @@ fn ray(v: &RangeImage, sp: &FoliageBox, em: &Settings, k: usize, cut: f64, after
             add(key(sp, &x), wt * b0, 0.0);
         }
         if let Some(&db) = refls.get(i) {
-            beam *= (1.0 - 10f64.powf((db as f64 - em.refl_full_hit()) / 10.0)).clamp(0.0, 1.0);
+            beam *= em.beam_left(db as f64);
         }
         start = r + em.resolution();
     }

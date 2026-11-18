@@ -26,6 +26,10 @@
 //! | what a pulse meets that isn't a surface it resolves | occluders; the medium | the elements' layers and the ground; the foliage field, κ outside its box |
 //! | the share of a return that merges with the medium behind its far side | merge share | `merge_share`, the site's calibrated map of the field's `1 − exp(−b ∫ σ (1 − p_resolve))`; a mixture inside the return |
 //! | how far a merge moves an echo back from the nearer return's range | pull | `pull`, by separation and energy ratio, measured |
+//! | a cell's pulse and what made its echoes | pulse; owners | `Pulse`: its echoes against its owners, the layers, the ground and the medium (and outliers) |
+//! | the receiver's reading of a pulse's occluders | receiver | `Receiver`: which returns merge, which are recorded, the cap; the expected number of returns it records (`predict`'s `returns`) |
+//! | one reading of a pulse that gives every quantity the scene takes from it | the pass | `Pulse::read`: the likelihood with its derivatives, the receiver, the beam each owner leaves (`predict`'s `beam`), each echo's responsibilities (3dtrees research 130 slice-pulse) |
+//! | the posterior over which owner made an echo | responsibility | per echo, over the members, the medium and an outlier, summing to one; reported (`predict`'s `owned`), not yet in the cost |
 //! | the most echoes the instrument records per pulse | the target cap | `max_targets`; a pulse at it is capped (`RangeImage::capped`), and says nothing past its last echo |
 //! | the range up to which a pulse shows clear space | free space | `free_to`: the first echo less the receiver's resolution; per voxel, [`foliage::free_space`]'s rays crossing, reaching and clearing it (3dtrees research 130 slice 7) |
 //! | a proposed part of the scene | element | a form (a stick, an axis and radius; or a patch, a ball) and a class |

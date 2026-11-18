@@ -270,7 +270,8 @@ fn predictions_dict<'py>(py: Python<'py>, p: &[CellPrediction]) -> PyResult<Boun
     d.set_item("read", p.iter().map(|x| x.read).collect::<Vec<_>>().into_pyarray(py))?;
     type F = fn(&CellPrediction) -> f64;
     for (k, f) in [("fill", (|x| x.fill) as F), ("recorded", |x| x.recorded), ("arrives", |x| x.arrives), ("depth", |x| x.depth), ("sd", |x| x.sd),
-                   ("refl", |x| x.refl), ("cos", |x| x.cos), ("merge", |x| x.merge), ("obs", |x| x.obs), ("obs_refl", |x| x.obs_refl), ("weight", |x| x.weight), ("footprint", |x| x.footprint), ("across", |x| x.across), ("along", |x| x.along)] {
+                   ("refl", |x| x.refl), ("cos", |x| x.cos), ("merge", |x| x.merge), ("obs", |x| x.obs), ("obs_refl", |x| x.obs_refl), ("weight", |x| x.weight), ("footprint", |x| x.footprint), ("across", |x| x.across), ("along", |x| x.along),
+                   ("returns", |x| x.returns), ("beam", |x| x.beam), ("owned", |x| x.owned)] {
         d.set_item(k, p.iter().map(f).collect::<Vec<_>>().into_pyarray(py))?;
     }
     Ok(d)
@@ -602,7 +603,9 @@ impl PyScene {
     /// recorded, arrives, depth, sd, refl (the echo's predicted reflectance, dB), cos (the mean cos ι where the element
     /// meets the footprint), obs, obs_refl (the first echo's reflectance, dB), read (any echo the likelihood reads is
     /// on it), merge (its merge share with the medium behind), weight (the cell weight), footprint (m), across and
-    /// along (where the ray passes the axis).
+    /// along (where the ray passes the axis); from the same pass over each pulse, returns (the expected number of echoes
+    /// the receiver records from the cell's layers and ground), beam (the share of the beam the element leaves) and
+    /// owned (how many of the pulse's echoes are the element's in expectation).
     #[pyo3(signature = (elements, scan=0))]
     fn predict<'py>(&self, py: Python<'py>, elements: &Bound<'_, PyDict>, scan: usize) -> PyResult<Bound<'py, PyDict>> {
         self.inner.check_scan(scan).map_err(scene_err)?;
