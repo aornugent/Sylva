@@ -26,7 +26,7 @@
 //!   - **One pass per pulse** ([`Pulse::read`]; 3dtrees research 130 formulation.md, slice-pulse.md): the cell's
 //!     owners (its layers, the ground, the medium) and the receiver ([`Receiver`]: merges, detection, the cap) are read
 //!     once, and that pass gives everything the scene reads of the pulse: its log-likelihood with its slope and
-//!     curvature in the own nodes ([`Dual`]), the element's echo ([`front_echo`]), each owner's beam left and
+//!     curvature in the own nodes ([`Dual2`]; with the geometry, its slope in [`Scene::information`]: [`Dual`]), the element's echo ([`front_echo`]), each owner's beam left and
 //!     expected echoes, and each echo's responsibilities over the owners. The cost keeps the hard attribution (a
 //!     cell's evidence is its front element's term's, the field's cut); the responsibilities are reported, for the
 //!     soft attribution to come.
@@ -90,16 +90,17 @@
 //! - **The scene** ([`Scene`]) holds elements against range images, each rendered once. A move (add, remove,
 //!   change) returns its cost change with the alignment held, recomputing only the terms of the elements whose cells
 //!   it touches; `refit_alignment` re-solves the alignment. Its rows ([`ElementScan`]) split each (element, scan)'s cost into its parts, and
-//!   [`Scene::information`] gives the curvature of an element's cost in its geometry.
+//!   [`Scene::information`] gives the slope and Fisher information of an element's cost in its geometry.
 //!
 //! Cells no element touches cancel. Context (neighbours, competitors) enters as more elements in the set.
 
-use super::dual::{Dual, Real};
+use super::dual::{Dual, Dual2, Over, Real};
+use nalgebra::{Matrix2, Vector2};
 use super::settings::{Background, Settings, ALIGN_SPACING, P_OUTLIER, T_MAX};
 use super::foliage::{self, FieldCounts, FixedCounts, Foliage, FoliageBox, Medium};
 use super::range_image::{Cell, RangeImage};
 use std::sync::Arc;
-use crate::transform::{cross, dot, norm, normalize, sub};
+use crate::transform::{cross, norm, normalize, sub};
 use crate::Point;
 use rayon::prelude::*;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
@@ -265,17 +266,19 @@ impl Outcome {
     }
 }
 
+/// One element's layer in one cell: what the ray likelihood reads of it, its geometry's quantities in `P` (`f64`, or a
+/// [`Dual`] carrying their slope in the element's parameters: [`Scene::information`]).
 #[derive(Debug, Clone, Copy)]
-struct Layer {
-    t: f64,
+struct Layer<P = f64> {
+    t: P,
     /// The range of the section's far side where the beam meets it: where the medium behind it starts.
-    far: f64,
-    spread: f64,
+    far: P,
+    spread: P,
     /// The fill: its mean over the mismatch (`f`), and at section radii r − √3 m, r and r + √3 m (`fq`, the
     /// mismatch's three-point Gauss–Hermite rule, weights 1/6, 2/3, 1/6).
-    f: f64,
-    fq: [f64; 3],
-    cos: f64,
+    f: P,
+    fq: [P; 3],
+    cos: P,
     /// The surface's reflectance (dB at full fill, face-on), by the element's class.
     db: f64,
     elem: u32,
@@ -286,10 +289,19 @@ struct Layer {
     s: f64,
 }
 
-impl Layer {
+impl<P: Real> Layer<P> {
     /// Whether the layer enters the k-buffer: its widest fill reaches [`MIN_FILL`].
     fn fronts(&self) -> bool {
-        self.fq[2] >= MIN_FILL
+        self.fq[2].v() >= MIN_FILL
+    }
+}
+
+impl Layer {
+    /// The layer in another number type, its quantities constants there.
+    fn lift<P: Real>(&self) -> Layer<P> {
+        let c = P::c;
+        Layer { t: c(self.t), far: c(self.far), spread: c(self.spread), f: c(self.f), fq: self.fq.map(c), cos: c(self.cos), db: self.db, elem: self.elem,
+                op: self.op, x: self.x, s: self.s }
     }
 
     /// Where the foliage field's fit stops reading a ray this layer fronts ([`foliage`]'s module docs): an echo before
@@ -348,14 +360,57 @@ pub struct ElementScan {
 
 /// The share of a uniform disc's energy (radius 1) nearer than a line `z` radii from its centre: the CDF of its 1-D
 /// marginal, a semicircle.
-fn disc_cdf(z: f64) -> f64 {
+fn disc_cdf<P: Real>(z: P) -> P {
     let z = z.clamp(-1.0, 1.0);
-    0.5 + (z * (1.0 - z * z).sqrt() + z.asin()) / std::f64::consts::PI
+    (z * (P::c(1.0) - z * z).sqrt() + z.asin()) / std::f64::consts::PI + 0.5
 }
 
 fn t_pdf<T: Real>(x: T, nu: f64) -> T {
     let c = super::settings::t_log_norm(nu);
     (-((x * x / nu + 1.0).ln() * (0.5 * (nu + 1.0))) + c).exp()
+}
+
+fn dot3<P: Real>(a: &[P; 3], b: &[P; 3]) -> P {
+    a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
+}
+
+/// An element placed in one view ([`placed`]): its section's radius, its middle from the scanner (`c`) and, a stick's,
+/// its unit axis, its half-length and the unit normal to the axis and `c` (the side `across` is positive on).
+struct Placed<P> {
+    r: P,
+    c: [P; 3],
+    axis: Option<([P; 3], P, [P; 3])>,
+}
+
+/// Element `e` placed in a view from `o`, moved by `th` in its parameters if given ([`Scene::information`]'s): a
+/// stick's ln r, its axis moved across itself (along p₁ and p₂, perpendicular to it) and its ends by the tilts about
+/// its middle (the same directions, rad at its half-length); a patch's ln r and its centre moved (x, y, z).
+fn placed<P: Real>(e: &Element, o: &Point, th: Option<&[P]>) -> Placed<P> {
+    let lift = |p: &Point| p.map(P::c);
+    let (a, b) = match (e.form, th) {
+        (Form::Stick { a, b }, None) => (lift(&a), Some(lift(&b))),
+        (Form::Stick { a, b }, Some(th)) => {
+            let ax = sub(&b, &a);
+            let half = 0.5 * norm(&ax);
+            let u = ax.map(|x| x / (2.0 * half));
+            let p1 = normalize(&cross(&u, &if u[2].abs() < 0.9 { [0.0, 0.0, 1.0] } else { [1.0, 0.0, 0.0] }));
+            let p2 = cross(&u, &p1);
+            let mv = |p: &Point, end: f64| [0, 1, 2].map(|k| (th[1] + th[3] * (end * half)) * p1[k] + (th[2] + th[4] * (end * half)) * p2[k] + p[k]);
+            (mv(&a, -1.0), Some(mv(&b, 1.0)))
+        }
+        (Form::Patch { centre }, None) => (lift(&centre), None),
+        (Form::Patch { centre }, Some(th)) => ([0, 1, 2].map(|k| th[k + 1] + centre[k]), None),
+    };
+    let r = th.map_or(P::c(e.r), |th| th[0].exp() * e.r);
+    let Some(b) = b else { return Placed { r, c: [0, 1, 2].map(|k| a[k] - o[k]), axis: None } };
+    let ax = [0, 1, 2].map(|k| b[k] - a[k]);
+    let len = dot3(&ax, &ax).sqrt();
+    let u = ax.map(|x| x / len);
+    let c = [0, 1, 2].map(|k| (a[k] + b[k]) * 0.5 - o[k]);
+    let n = [u[1] * c[2] - u[2] * c[1], u[2] * c[0] - u[0] * c[2], u[0] * c[1] - u[1] * c[0]];
+    let nn = dot3(&n, &n).sqrt();
+    let n = if nn.v() > 0.0 { let k = P::c(1.0) / nn; n.map(|x| x * k) } else { [0.0, 0.0, 1.0].map(P::c) };
+    Placed { r, c, axis: Some((u, len * 0.5, n)) }
 }
 
 /// One element's layers in one view, out to the beam's edge and two cells past its section.
@@ -364,14 +419,9 @@ fn render(v: &RangeImage, e: &Element, id: u32, em: &Settings) -> Vec<(usize, La
     if e.invalid().is_some() {
         return out;
     }
-    let db = e.refl(em);
-    let (u, half) = match e.form {
-        Form::Stick { a, b } => {
-            let ax = sub(&b, &a);
-            let len = norm(&ax);
-            (Some(ax.map(|x| x / len)), 0.5 * len)
-        }
-        Form::Patch { .. } => (None, 0.0),
+    let half = match e.form {
+        Form::Stick { a, b } => 0.5 * norm(&sub(&b, &a)),
+        Form::Patch { .. } => 0.0,
     };
     let mid = e.mid();
     let c = sub(&mid, &v.origin);
@@ -383,67 +433,76 @@ fn render(v: &RangeImage, e: &Element, id: u32, em: &Settings) -> Vec<(usize, La
     let dl = (alpha / (az * sin_z)).min(4000.0).ceil() as i64 + 1;
     let dc = (alpha / zs).min(4000.0).ceil() as i64 + 1;
     let (li, ki) = (l0.round() as i64, k0.round() as i64);
+    let p = placed(e, &v.origin, None);
     for l in (li - dl).max(0)..=(li + dl).min(v.n_lines as i64 - 1) {
         for k in (ki - dc).max(0)..=(ki + dc).min(v.n_cols as i64 - 1) {
             let w = v.direction(l as f64, k as f64);
-            // the ray's closest approach to the axis (to the centre for a patch): range, distance, signed place
-            // across, place along, and the sine of the ray's angle to the axis
-            let (tm, d, x, along, sin) = match u {
-                None => {
-                    let tm = dot(&w, &c);
-                    let d = norm(&[0, 1, 2].map(|j| tm * w[j] - c[j]));
-                    (tm, d, d, 0.0, 1.0)
-                }
-                Some(u) => {
-                    let wu = dot(&w, &u);
-                    let a = [0, 1, 2].map(|j| w[j] - wu * u[j]);
-                    let aa = dot(&a, &a);
-                    if aa < 1e-12 {
-                        continue;
-                    }
-                    let cu = dot(&c, &u);
-                    let bv = [0, 1, 2].map(|j| cu * u[j] - c[j]);
-                    let ab = dot(&a, &bv);
-                    let tm = -ab / aa;
-                    let along = tm * wu - cu;
-                    let q = [0, 1, 2].map(|j| tm * w[j] - c[j] - along * u[j]);
-                    (tm, norm(&q), dot(&q, &normalize(&cross(&u, &c))), along, aa.sqrt())
-                }
-            };
-            if tm <= 0.0 || along.abs() > half {
-                continue;
+            if let Some(ly) = layer(&p, &w, e, id, em, v.step()) {
+                out.push((l as usize * v.n_cols + k as usize, ly));
             }
-            let a = 0.5 * em.footprint(tm);
-            let wide = e.r + 3f64.sqrt() * e.mismatch;
-            if d > wide + a + 2.0 * v.step() * tm {
-                continue;
-            }
-            let fq = [-1.0, 0.0, 1.0].map(|z: f64| {
-                let r = (e.r + z * 3f64.sqrt() * e.mismatch).max(0.0);
-                disc_cdf((r - d) / a) - disc_cdf((-r - d) / a)
-            });
-            let f = (fq[0] + 4.0 * fq[1] + fq[2]) / 6.0;
-            let (t, spread, cos) = footprint_depth(tm, d, e.r, sin, a);
-            let inner = ((d - a).max(0.0) / e.r).min(1.0);
-            out.push((
-                l as usize * v.n_cols + k as usize,
-                Layer {
-                    t,
-                    far: tm + e.r * (1.0 - inner * inner).sqrt() / sin,
-                    spread: (spread * spread + e.mismatch * e.mismatch).sqrt(),
-                    f,
-                    fq,
-                    cos: (cos * sin).max(0.05),
-                    db,
-                    elem: id,
-                    op: e.opacity,
-                    x,
-                    s: along,
-                },
-            ));
         }
     }
     out
+}
+
+/// Element `e`'s layer (as `id`) in the cell whose ray from the scanner is `w`, placed as `p` ([`placed`]), on a lattice
+/// of step `step`: none past the beam's edge and two cells past its section, or past a stick's ends (cut square).
+fn layer<P: Real>(p: &Placed<P>, w: &Point, e: &Element, id: u32, em: &Settings, step: f64) -> Option<Layer<P>> {
+    let (c, w) = (&p.c, w.map(P::c));
+    // the ray's closest approach to the axis (to the centre for a patch): range, distance, signed place across, place
+    // along, and the sine of the ray's angle to the axis
+    let (tm, d, x, along, sin) = match &p.axis {
+        None => {
+            let tm = dot3(&w, c);
+            let q = [0, 1, 2].map(|j| tm * w[j] - c[j]);
+            let d = dot3(&q, &q).sqrt();
+            (tm, d, d, P::c(0.0), P::c(1.0))
+        }
+        Some((u, half, n)) => {
+            let wu = dot3(&w, u);
+            let a = [0, 1, 2].map(|j| w[j] - wu * u[j]);
+            let aa = dot3(&a, &a);
+            if aa.v() < 1e-12 {
+                return None;
+            }
+            let cu = dot3(c, u);
+            let bv = [0, 1, 2].map(|j| cu * u[j] - c[j]);
+            let ab = dot3(&a, &bv);
+            let tm = -ab / aa;
+            let along = tm * wu - cu;
+            if along.v().abs() > half.v() {
+                return None;
+            }
+            let q = [0, 1, 2].map(|j| tm * w[j] - c[j] - along * u[j]);
+            (tm, dot3(&q, &q).sqrt(), dot3(&q, n), along, aa.sqrt())
+        }
+    };
+    let r = p.r;
+    let a = em.footprint(tm) * 0.5;
+    let wide = r + 3f64.sqrt() * e.mismatch;
+    if tm.v() <= 0.0 || d.v() > (wide + a + tm * (2.0 * step)).v() {
+        return None;
+    }
+    let fq = [-1.0, 0.0, 1.0].map(|z: f64| {
+        let r = (r + z * 3f64.sqrt() * e.mismatch).max(0.0);
+        disc_cdf((r - d) / a) - disc_cdf((-r - d) / a)
+    });
+    let f = (fq[0] + fq[1] * 4.0 + fq[2]) / 6.0;
+    let (t, spread, cos) = footprint_depth(tm, d, r, sin, a);
+    let inner = ((d - a).max(0.0) / r).min(1.0);
+    Some(Layer {
+        t,
+        far: tm + r * (P::c(1.0) - inner * inner).sqrt() / sin,
+        spread: (spread * spread + e.mismatch * e.mismatch).sqrt(),
+        f,
+        fq,
+        cos: (cos * sin).max(0.05),
+        db: e.refl(em),
+        elem: id,
+        op: e.opacity,
+        x: x.v(),
+        s: along.v(),
+    })
 }
 
 /// The echo's depth over a footprint (a disc of radius `a`, across the section its semicircle marginal) whose centre
@@ -452,28 +511,31 @@ fn render(v: &RangeImage, e: &Element, id: u32, em: &Settings) -> Vec<(usize, La
 /// it meets. The mismatch stays out: it spreads the depth about the form but doesn't move it. Quadrature: 24 midpoints
 /// over the part the footprint meets, so a sliver at the edge is resolved as well as the middle (its cosine sets a
 /// located edge's reflectance; 9 nodes over the whole footprint read a 4 % sliver's as the grazing 0.05).
-fn footprint_depth(tm: f64, d: f64, r: f64, sin: f64, a: f64) -> (f64, f64, f64) {
-    let (lo, hi) = ((d - a).max(-r), (d + a).min(r));
-    if hi <= lo {
-        // past the edge: the grazing surface
-        let c = (1.0 - (d.min(r) / r).powi(2)).max(0.0).sqrt();
-        return (tm - r * c / sin, 0.0, c);
+fn footprint_depth<P: Real>(tm: P, d: P, r: P, sin: P, a: P) -> (P, P, P) {
+    let (lo, hi) = ((d - a).larger(-r), (d + a).smaller(r));
+    // past the edge: the grazing surface
+    let grazing = || {
+        let c = (P::c(1.0) - (d.smaller(r) / r).sq()).max(0.0).sqrt();
+        (tm - r * c / sin, P::c(0.0), c)
+    };
+    if hi.v() <= lo.v() {
+        return grazing();
     }
-    let (mut sw, mut swc, mut sz, mut szz) = (0.0, 0.0, 0.0, 0.0);
+    let z0 = P::c(0.0);
+    let (mut sw, mut swc, mut sz, mut szz) = (z0, z0, z0, z0);
     const N: usize = 24;
     for j in 0..N {
         let x = lo + (hi - lo) * (j as f64 + 0.5) / N as f64;
-        let w = (1.0 - ((x - d) / a).powi(2)).max(0.0).sqrt();
-        let c = (1.0 - (x / r).powi(2)).max(0.0).sqrt();
+        let w = (P::c(1.0) - ((x - d) / a).sq()).max(0.0).sqrt();
+        let c = (P::c(1.0) - (x / r).sq()).max(0.0).sqrt();
         let z = -r * c / sin;
         sw += w;
         swc += w * c;
         sz += w * c * z;
         szz += w * c * z * z;
     }
-    if swc <= 0.0 {
-        let c = (1.0 - (d.min(r) / r).powi(2)).max(0.0).sqrt();
-        return (tm - r * c / sin, 0.0, c);
+    if swc.v() <= 0.0 {
+        return grazing();
     }
     let z = sz / swc;
     (tm + z, (szz / swc - z * z).max(0.0).sqrt(), swc / sw)
@@ -508,18 +570,18 @@ fn obs_ground(v: &RangeImage, cell: usize, sc: &Background) -> (f64, Option<(f64
 }
 
 /// A cell as the likelihood reads it: its pulse ([`Pulse`]), its first echo (NaN for none) and its weight
-/// ([`Settings::cell_weight`], at its first echo's range or else its front layer's).
-struct CellView {
+/// ([`Settings::cell_weight`], at its first echo's range or else its front layer's), in the layers' numbers `P`.
+struct CellView<P = f64> {
     obs: f64,
-    wt: f64,
-    pulse: Pulse,
+    wt: P,
+    pulse: Pulse<P>,
 }
 
 /// Cell `cell` of image `v` with `layers` in front of it (nearest first), read at the cell's surface class
 /// ([`cell_class`]), against the foliage field `ext` and the background's ground.
-fn cell_view(v: &RangeImage, cell: usize, layers: Vec<Layer>, em: &Settings, sc: &Background, ext: &Foliage) -> CellView {
+fn cell_view<P: Real>(v: &RangeImage, cell: usize, layers: Vec<Layer<P>>, em: &Settings, sc: &Background, ext: &Foliage) -> CellView<P> {
     let (obs, ground, w) = obs_ground(v, cell, sc);
-    let wt = em.cell_weight(if obs.is_finite() { obs } else { layers[0].t }, v.step());
+    let wt = em.cell_weight(if obs.is_finite() { P::c(obs) } else { layers[0].t }, v.step());
     let pulse = Pulse::new(occluders(layers, ground), cell_class(v, cell, em), &v.origin, &w, v.echoes(cell), v.echo_refls(cell), v.max_targets, em, ext);
     CellView { obs, wt, pulse }
 }
@@ -605,17 +667,24 @@ pub struct CellPrediction {
 /// the share of pulses whose return from it merges with a medium surface behind it, that surface's energy share
 /// when it does (the beam the layer leaves, at the medium's mean reflectance), and how far the merge pulls the echo
 /// back ([`Settings::pull`], at the merged surface's mean separation).
-#[derive(Debug, Clone, Copy, Default)]
-struct Merge {
-    share: f64,
-    energy: f64,
-    pull: f64,
+#[derive(Debug, Clone, Copy)]
+struct Merge<P = f64> {
+    share: P,
+    energy: P,
+    pull: P,
+}
+
+impl<P: Real> Merge<P> {
+    /// No merge.
+    fn none() -> Self {
+        Merge { share: P::c(0.0), energy: P::c(0.0), pull: P::c(0.0) }
+    }
 }
 
 /// What a pulse meets as a surface: an element's layer, or the ground plane, at the cosine of incidence along the ray.
 #[derive(Debug, Clone, Copy)]
-enum Surface {
-    Layer(Layer),
+enum Surface<P = f64> {
+    Layer(Layer<P>),
     Ground(f64),
 }
 
@@ -623,20 +692,20 @@ enum Surface {
 /// along the ray): its surface, its range, the foliage field's optical depth to it and its merge with the medium behind
 /// it ([`merges`]; none for the ground). The ground, where the background has one, is the last: the beam ends there.
 #[derive(Debug, Clone, Copy)]
-struct Occluder {
-    surface: Surface,
-    t: f64,
-    tau: f64,
-    merge: Merge,
+struct Occluder<P = f64> {
+    surface: Surface<P>,
+    t: P,
+    tau: P,
+    merge: Merge<P>,
 }
 
 /// A cell's occluders: its `layers` (nearest first) in front of the ground at `ground` = (range, cos), then the
 /// ground; no optical depths or merges yet ([`Pulse::new`] reads them).
-fn occluders(layers: Vec<Layer>, ground: Option<(f64, f64)>) -> Vec<Occluder> {
+fn occluders<P: Real>(layers: Vec<Layer<P>>, ground: Option<(f64, f64)>) -> Vec<Occluder<P>> {
     let t_end = ground.map_or(T_MAX, |g| g.0);
-    let bare = |surface, t| Occluder { surface, t, tau: 0.0, merge: Merge::default() };
-    layers.into_iter().take_while(|l| l.t < t_end).map(|l| bare(Surface::Layer(l), l.t))
-        .chain(ground.map(|(t, cos)| bare(Surface::Ground(cos), t))).collect()
+    let bare = |surface, t| Occluder { surface, t, tau: P::c(0.0), merge: Merge::none() };
+    layers.into_iter().take_while(|l| l.t.v() < t_end).map(|l| bare(Surface::Layer(l), l.t))
+        .chain(ground.map(|(t, cos)| bare(Surface::Ground(cos), P::c(t)))).collect()
 }
 
 /// One return a pulse can record: a run of occluders within the receiver's resolution of its first, merged, from
@@ -645,8 +714,9 @@ fn occluders(layers: Vec<Layer>, ground: Option<(f64, f64)>) -> Vec<Occluder> {
 /// bright near-full hit: [`Settings::p_miss`]), `mu` and `sd` its echo's depth and spread; `s_q` the chance it is
 /// recorded, `db` its echo's predicted reflectance (dB) and `fill` the share of the beam it meets, at the shape
 /// mismatch's three section radii (as [`Layer`]'s `fq`).
+/// Its geometry's quantities are in `P` and what the own nodes move in `T` ([`Over`]).
 #[derive(Clone, Copy)]
-struct Return<T = f64> {
+struct Return<P = f64, T = P> {
     first: usize,
     last: usize,
     mu: T,
@@ -655,17 +725,25 @@ struct Return<T = f64> {
     q: T,
     s_q: [T; 3],
     db: [T; 3],
-    fill: [f64; 3],
+    fill: [P; 3],
 }
 
-impl<T: Real> Return<T> {
+impl<P: Real, T: Over<P>> Return<P, T> {
+    /// Its echo's reflectance (dB) at its mean energy share over the shape mismatch's three section radii (their rule
+    /// weights; the energy share is linear in the fill, so this is the echo at the mean fill). [`Scene::information`]
+    /// reads it, not the middle radius's: a radius's share grows from 0 as the chord where its section enters the beam,
+    /// smoothly, but its reflectance as `10 log10` of it, whose slope is unbounded there.
+    fn reflectance(&self) -> T {
+        ((self.db[0] / 10.0).exp10() + (self.db[1] / 10.0).exp10() * 4.0 + (self.db[2] / 10.0).exp10()).log10() * 10.0 - 10.0 * 6f64.log10()
+    }
+
     /// The density of its echo's reflectance `x` (dB) as recorded ([`Settings::refl_density`], at range `t`), with
     /// `add` more energy share merged into it (a medium surface's, read at the medium's spread for its part): a mixture
     /// over the shape mismatch's three section radii, each weighted by its rule weight and its chance of being recorded
     /// (a radius whose section misses the beam records nothing, so it says nothing of the reflectance), each widened by
     /// the reflectance's spread between adjacent radii. Three sharp points would leave gaps between them that a
     /// reflectance noise of tenths of a dB reads as misfits.
-    fn refl_density(&self, x: f64, em: &Settings, add: f64, t: f64) -> T {
+    fn refl_density(&self, x: f64, em: &Settings, add: P, t: P) -> T {
         if !x.is_finite() || em.refl_noise <= 0.0 {
             return T::c(1.0);
         }
@@ -674,11 +752,11 @@ impl<T: Real> Return<T> {
         if total.v() <= 0.0 {
             return T::c(1.0);
         }
-        let db = self.db.map(|d| if add > 0.0 { ((d / 10.0).exp10() + add).log10() * 10.0 } else { d });
+        let db = self.db.map(|d| if add.v() > 0.0 { ((d / 10.0).exp10() + add).log10() * 10.0 } else { d });
         let gap = |a: T, b: T| if a.v() > -200.0 && b.v() > -200.0 { (if a.v() < b.v() { b - a } else { a - b }) / 2.0 } else { T::c(0.0) };
         let (g1, g2) = (gap(db[1], db[0]), gap(db[2], db[1]));
         let spread = if g2.v() > g1.v() { g2 } else { g1 };
-        let medium = |q: usize| if add > 0.0 { T::c(em.refl_background_sd * add) / (db[q] / 10.0).exp10() } else { T::c(0.0) };
+        let medium = |q: usize| if add.v() > 0.0 { T::from(add * em.refl_background_sd) / (db[q] / 10.0).exp10() } else { T::c(0.0) };
         (0..3).filter(|&q| w[q].v() > 0.0).map(|q| w[q] * em.refl_density(x, db[q], spread.hypot(medium(q)), self.fill[q], t)).sum::<T>() / total
     }
 
@@ -686,15 +764,15 @@ impl<T: Real> Return<T> {
     /// echo, or, in its merge share, merged with the medium surface behind it, pulled back by the measured pull
     /// ([`Settings::pull`], its sd as large) and brighter by that surface's energy (3dtrees research 130 slice 2c: a
     /// mixture inside the return, never another return).
-    fn density(&self, o: f64, x: f64, em: &Settings, occ: &[Occluder]) -> T {
+    fn density(&self, o: f64, x: f64, em: &Settings, occ: &[Occluder<P>]) -> T {
         let (t, merge) = (occ[self.first].t, occ[self.last].merge);
-        let alone = t_pdf((T::c(o) - self.mu) / self.sd, em.noise_dof) / self.sd * self.refl_density(x, em, 0.0, t);
+        let alone = t_pdf((T::c(o) - self.mu) / self.sd, em.noise_dof) / self.sd * self.refl_density(x, em, P::c(0.0), t);
         let m = merge.share;
-        if m <= 0.0 {
+        if m.v() <= 0.0 {
             return alone;
         }
-        let sd = self.sd.hypot(T::c(merge.pull));
-        alone * (1.0 - m) + t_pdf((T::c(o) - self.mu - merge.pull) / sd, em.noise_dof) * m / sd * self.refl_density(x, em, merge.energy, t)
+        let sd = self.sd.hypot(T::from(merge.pull));
+        alone * (P::c(1.0) - m) + t_pdf((T::c(o) - self.mu - merge.pull) / sd, em.noise_dof) * m / sd * self.refl_density(x, em, merge.energy, t)
     }
 }
 
@@ -702,29 +780,29 @@ impl<T: Real> Return<T> {
 /// cancellation) not, its energy (opacity × the beam it meets × cos ι × reflectance), its energy share when it is hit
 /// and the share of the beam it meets, at the shape mismatch's three section radii (the share without the opacity; its
 /// echo's reflectance is `10 log10` of it), and the beam left behind it.
-struct Member<T> {
+struct Member<P, T> {
     depth: T,
-    sd: f64,
+    sd: P,
     s: T,
     q: T,
     s_q: [T; 3],
     energy: T,
     share: [T; 3],
-    fill: [f64; 3],
-    beam: f64,
+    fill: [P; 3],
+    beam: P,
 }
 
 /// What the receiver makes of a pulse's occluders (3dtrees research 130 formulation.md: the owners deposit energy
 /// along the ray, the receiver turns it into echoes): its `members`, one per occluder, and the ways they come back
 /// (`patterns`, each a set of returns, nearest first, and its chance) ([`receiver`]).
-struct Receiver<T> {
-    members: Vec<Member<T>>,
-    patterns: Vec<(T, Vec<Return<T>>)>,
+struct Receiver<P = f64, T = P> {
+    members: Vec<Member<P, T>>,
+    patterns: Vec<(T, Vec<Return<P, T>>)>,
 }
 
-impl<T: Real> Receiver<T> {
+impl<P: Real, T: Over<P>> Receiver<P, T> {
     /// The first return of the most likely pattern (none without an occluder).
-    fn front(&self) -> Option<Return<T>> {
+    fn front(&self) -> Option<Return<P, T>> {
         self.patterns.iter().max_by(|a, b| a.0.v().total_cmp(&b.0.v())).and_then(|p| p.1.first().copied())
     }
 
@@ -756,9 +834,9 @@ impl<T: Real> Receiver<T> {
 /// separation and energy ratio, else merge, summing their energy shares, into one echo pulled back from the nearest
 /// member's by the measured pull ([`Settings::pull`], at the others' energy and energy-weighted separation; 3dtrees
 /// research 130 slice 2c, before which it sat at their energy-weighted depth); patterns under 1e-4 are dropped.
-fn receiver<T: Real>(occ: &[Occluder], k: u8, shift: T, level: T, em: &Settings) -> Receiver<T> {
-    let mut beam = 1.0;
-    let m: Vec<Member<T>> = occ.iter().map(|o| match o.surface {
+fn receiver<P: Real, T: Over<P>>(occ: &[Occluder<P>], k: u8, shift: T, level: T, em: &Settings) -> Receiver<P, T> {
+    let mut beam = P::c(1.0);
+    let m: Vec<Member<P, T>> = occ.iter().map(|o| match o.surface {
         Surface::Layer(ly) => {
             let db = level + ly.db;
             let cos = ly.cos.powf(em.refl_incidence);
@@ -768,17 +846,17 @@ fn receiver<T: Real>(occ: &[Occluder], k: u8, shift: T, level: T, em: &Settings)
             let q = (q_q[0] + q_q[1] * 4.0 + q_q[2]) / 6.0;
             let (b0, unit) = (beam, (db / 10.0).exp10() * (beam * cos));
             let share = ly.fq.map(|f| unit * f);
-            beam *= 1.0 - ly.f * ly.op;
-            Member { depth: shift + (ly.t + em.depth_bias(k, ly.t)), sd: em.depth_sd(k, ly.spread), s, q, s_q, energy: unit * (ly.op * ly.f), share,
+            beam *= P::c(1.0) - ly.f * ly.op;
+            Member { depth: shift + (ly.t + em.depth_bias(k, ly.t)), sd: em.depth_sd(k, ly.spread), s, q, s_q, energy: unit * (ly.f * ly.op), share,
                      fill: ly.fq.map(|f| f * b0), beam }
         }
         Surface::Ground(cos) => {
             let cg = cos.powf(em.refl_incidence);
             let share = beam * cg * 10f64.powf(em.refl_ground / 10.0);
-            let s = em.ground_echo * em.p_detect(em.refl_ground, beam * cg, o.t);
-            let q = em.ground_echo * em.p_miss(em.refl_ground, beam * cg, o.t) + (1.0 - em.ground_echo);
-            Member { depth: T::c(o.t), sd: em.noise(2).hypot(em.ground_sd / cos), s: T::c(s), q: T::c(q), s_q: [T::c(s); 3], energy: T::c(em.ground_echo * share),
-                     share: [T::c(share); 3], fill: [beam; 3], beam: 0.0 }
+            let s = em.p_detect::<P, P>(P::c(em.refl_ground), beam * cg, o.t) * em.ground_echo;
+            let q = em.p_miss::<P, P>(P::c(em.refl_ground), beam * cg, o.t) * em.ground_echo + (1.0 - em.ground_echo);
+            Member { depth: T::from(o.t), sd: P::c(em.noise(2).hypot(em.ground_sd / cos)), s: T::from(s), q: T::from(q), s_q: [T::from(s); 3],
+                     energy: T::from(share * em.ground_echo), share: [T::from(share); 3], fill: [beam; 3], beam: P::c(0.0) }
         }
     }).collect();
     let n = m.len();
@@ -790,9 +868,9 @@ fn receiver<T: Real>(occ: &[Occluder], k: u8, shift: T, level: T, em: &Settings)
     let group = |first: usize, last: usize| {
         let g = &m[first..=last];
         let db = [0, 1, 2].map(|q| g.iter().map(|x| x.share[q]).sum::<T>().max(1e-30).log10() * 10.0);
-        let fill = [0, 1, 2].map(|q| g.iter().map(|x| x.fill[q]).sum::<f64>().min(1.0));
+        let fill = [0, 1, 2].map(|q| g.iter().map(|x| x.fill[q]).sum::<P>().min(1.0));
         if g.len() == 1 {
-            return Return { first, last, mu: g[0].depth, sd: T::c(g[0].sd), s: g[0].s, q: g[0].q, s_q: g[0].s_q, db, fill };
+            return Return { first, last, mu: g[0].depth, sd: T::from(g[0].sd), s: g[0].s, q: g[0].q, s_q: g[0].s_q, db, fill };
         }
         // the merged echo follows the nearest member, pulled back by the rest
         let rest: T = g[1..].iter().map(|x| x.energy).sum();
@@ -800,7 +878,7 @@ fn receiver<T: Real>(occ: &[Occluder], k: u8, shift: T, level: T, em: &Settings)
         let pull = em.pull(d, (g[0].energy.max(1e-300) / rest.max(1e-300)).log10() * 10.0);
         let none: T = g.iter().map(|x| x.q).product();
         let s_q = [0, 1, 2].map(|q| T::c(1.0) - g.iter().map(|x| T::c(1.0) - x.s_q[q]).product::<T>());
-        Return { first, last, mu: g[0].depth + pull, sd: T::c(g[0].sd).hypot(pull), s: T::c(1.0) - none, q: none, s_q, db, fill }
+        Return { first, last, mu: g[0].depth + pull, sd: T::from(g[0].sd).hypot(pull), s: T::c(1.0) - none, q: none, s_q, db, fill }
     };
     let mut out = Vec::new();
     for mask in 0u32..(1 << n.saturating_sub(1)) {
@@ -829,28 +907,29 @@ fn receiver<T: Real>(occ: &[Occluder], k: u8, shift: T, level: T, em: &Settings)
 /// separation from the layer's echo ([`Settings::p_resolve`]) at the energy ratio of the layer's echo (at its mean
 /// fill) to a medium echo in beam b (at the medium's mean reflectance, `refl_background_mean`); and the pull at the
 /// merged surface's mean separation (over eight stretches of the integral, within 2 m behind).
-fn merges(occ: &mut [Occluder], m: &Medium, em: &Settings) {
-    let mut beam = 1.0;
+fn merges<P: Real>(occ: &mut [Occluder<P>], m: &Medium, em: &Settings) {
+    let mut beam = P::c(1.0);
     for i in 0..occ.len() {
         let Surface::Layer(ly) = occ[i].surface else { continue };
-        let echo = ly.db + 10.0 * (ly.f * beam * ly.cos.powf(em.refl_incidence)).max(1e-12).log10();
-        beam *= 1.0 - ly.f * ly.op;
-        if beam < 1e-6 {
+        let echo = (ly.f * beam * ly.cos.powf(em.refl_incidence)).max(1e-12).log10() * 10.0 + ly.db;
+        beam *= P::c(1.0) - ly.f * ly.op;
+        if beam.v() < 1e-6 {
             continue;
         }
-        let medium = em.refl_background_mean + 10.0 * beam.log10();
-        let next = occ.get(i + 1).map_or(T_MAX, |l| l.t);
+        let medium = beam.log10() * 10.0 + em.refl_background_mean;
+        let next = occ.get(i + 1).map_or(P::c(T_MAX), |l| l.t);
         let e = (echo - medium).clamp(-60.0, 60.0);
-        let z0 = em.res_a + em.res_c * e;
-        let (lo, hi) = (ly.far, next.min(ly.t + 2.0));
-        let parts: Vec<(f64, f64)> = (0..8).map(|k| {
+        let z0 = e * em.res_c + em.res_a;
+        let (lo, hi) = (ly.far, next.smaller(ly.t + 2.0));
+        let parts: Vec<(P, P)> = (0..8).map(|k| {
             let (a, b) = (lo + (hi - lo) * k as f64 / 8.0, lo + (hi - lo) * (k + 1) as f64 / 8.0);
-            (0.5 * (a + b) - ly.t, m.merge_integral(ly.t, a, b, z0, em.res_b))
+            ((a + b) * 0.5 - ly.t, m.merge_integral(ly.t, a, b, z0, em.res_b))
         }).collect();
         let whole = m.merge_integral(ly.t, lo, next, z0, em.res_b);
-        let near: f64 = parts.iter().map(|p| p.1).sum();
-        let d = if near > 0.0 { parts.iter().map(|p| p.0 * p.1).sum::<f64>() / near } else { 0.0 };
-        occ[i].merge = Merge { share: em.merge_share(1.0 - (-beam * whole).exp(), ly.t, ly.f), energy: beam * 10f64.powf(em.refl_background_mean / 10.0), pull: em.pull(d, e) };
+        let near: P = parts.iter().map(|p| p.1).sum();
+        let d = if near.v() > 0.0 { parts.iter().map(|p| p.0 * p.1).sum::<P>() / near } else { P::c(0.0) };
+        occ[i].merge = Merge { share: em.merge_share(P::c(1.0) - (-beam * whole).exp(), ly.t, ly.f), energy: beam * 10f64.powf(em.refl_background_mean / 10.0),
+                               pull: em.pull(d, e) };
     }
 }
 
@@ -860,30 +939,31 @@ fn merges(occ: &mut [Occluder], m: &Medium, em: &Settings) {
 /// they are read at (its cell's: [`cell_class`]) and what its ray
 /// meets of the foliage field besides: the optical depth to the beam's end (`tau_end`) and, per echo (`medium`), the
 /// optical depth to it, σ at it and the optical depth to it plus the receiver's resolution, where the medium's path
-/// restarts after it. [`Pulse::read`] is the one pass over it.
+/// restarts after it. [`Pulse::read`] is the one pass over it. Its occluders' geometry is in `P` (`f64`; a [`Dual`] in
+/// [`Scene::information`]).
 #[derive(Clone)]
-struct Pulse {
+struct Pulse<P = f64> {
     echoes: Vec<f32>,
     refls: Vec<f32>,
     cap: usize,
-    occluders: Vec<Occluder>,
+    occluders: Vec<Occluder<P>>,
     class: u8,
     tau_end: f64,
     medium: Vec<[f64; 3]>,
 }
 
-/// What one pass over a pulse gives ([`Pulse::read`]): its log-likelihood (with its slope and curvature as a [`Dual`]),
-/// the receiver's reading of its occluders ([`Receiver`]: the most likely pattern's first return, each member's beam
-/// left, chance recorded and expected echoes), and, per echo, its responsibilities over the pulse's owners (the
-/// posterior over who made it): each occluder, by the return it heads, then the medium, then an outlier, a row of
-/// `occluders + 2` summing to one.
-struct Reading<T> {
+/// What one pass over a pulse gives ([`Pulse::read`]): its log-likelihood (with its derivatives as a [`Dual2`] or a
+/// [`Dual`]), the receiver's reading of its occluders ([`Receiver`]: the most likely pattern's first return, each
+/// member's beam left, chance recorded and expected echoes), and, per echo, its responsibilities over the pulse's
+/// owners (the posterior over who made it): each occluder, by the return it heads, then the medium, then an outlier, a
+/// row of `occluders + 2` summing to one.
+struct Reading<P, T> {
     ll: T,
-    rx: Receiver<T>,
+    rx: Receiver<P, T>,
     resp: Vec<f64>,
 }
 
-impl<T> Reading<T> {
+impl<P, T> Reading<P, T> {
     /// Occluder `o`'s responsibilities summed over the echoes: how many of the pulse's echoes are its in expectation.
     fn owned(&self, o: usize) -> f64 {
         let n = self.rx.members.len() + 2;
@@ -891,25 +971,25 @@ impl<T> Reading<T> {
     }
 }
 
-impl Pulse {
+impl<P: Real> Pulse<P> {
     /// The pulse of a ray from `o` along `w` with its `echoes` (their reflectances `refls`; the scan's target cap
     /// `cap`) against occluders `occ` ([`occluders`]) read at surface class `class` and the foliage field `ext`, its ray
     /// walked once through the field's voxels ([`Medium`]): each occluder's optical depth and merge, and the medium
     /// along the ray.
     #[allow(clippy::too_many_arguments)]
-    fn new(mut occ: Vec<Occluder>, class: u8, o: &Point, w: &Point, echoes: &[f32], refls: &[f32], cap: usize, em: &Settings, ext: &Foliage) -> Pulse {
+    fn new(mut occ: Vec<Occluder<P>>, class: u8, o: &Point, w: &Point, echoes: &[f32], refls: &[f32], cap: usize, em: &Settings, ext: &Foliage) -> Self {
         let m = ext.medium(o, w);
         for x in occ.iter_mut() {
             x.tau = m.tau(x.t);
         }
         merges(&mut occ, &m, em);
         let medium = echoes.iter().map(|&r| [m.tau(r as f64), m.hazard(r as f64), m.tau(r as f64 + em.resolution())]).collect();
-        Pulse { echoes: echoes.to_vec(), refls: refls.to_vec(), cap, tau_end: m.tau(Pulse::end(&occ)), occluders: occ, class, medium }
+        Pulse { echoes: echoes.to_vec(), refls: refls.to_vec(), cap, tau_end: m.tau(Self::end(&occ)), occluders: occ, class, medium }
     }
 
     /// The range the beam of a pulse with occluders `occ` ends at: the ground's, else [`T_MAX`].
-    fn end(occ: &[Occluder]) -> f64 {
-        occ.last().filter(|o| matches!(o.surface, Surface::Ground(_))).map_or(T_MAX, |o| o.t)
+    fn end(occ: &[Occluder<P>]) -> f64 {
+        occ.last().filter(|o| matches!(o.surface, Surface::Ground(_))).map_or(T_MAX, |o| o.t.v())
     }
 
     fn capped(&self) -> bool {
@@ -918,7 +998,7 @@ impl Pulse {
 
     /// The receiver's reading of its occluders, the layers shifted by `shift` along the beam and `level` in
     /// reflectance ([`receiver`]).
-    fn receiver<T: Real>(&self, shift: T, level: T, em: &Settings) -> Receiver<T> {
+    fn receiver<T: Over<P>>(&self, shift: T, level: T, em: &Settings) -> Receiver<P, T> {
         receiver(&self.occluders, self.class, shift, level, em)
     }
 
@@ -926,12 +1006,12 @@ impl Pulse {
     /// give ([`receiver`], each with its merge with the medium behind it) and the medium along its ray, the layers
     /// shifted by `shift` along the beam and `level` in reflectance. The likelihood is the mixture over the merge
     /// patterns of [`Pass::lik`]'s recursion over the echoes; the responsibilities are each branch's share of it.
-    fn read<T: Real>(&self, shift: T, level: T, em: &Settings) -> Reading<T> {
+    fn read<T: Over<P>>(&self, shift: T, level: T, em: &Settings) -> Reading<P, T> {
         let rx = self.receiver(shift, level, em);
         let owners = rx.members.len() + 2;
         let mut resp = vec![0.0; self.echoes.len() * owners];
-        let pass = Pass { pulse: self, rx: &rx, em, t_end: Pulse::end(&self.occluders), capped: self.capped(), owners };
-        let total = rx.patterns.iter().map(|(p, rets)| *p * pass.lik(rets, 0, 0, 1.0, 1.0, 1.0, 0.0, p.v(), &mut resp)).sum::<T>();
+        let pass = Pass { pulse: self, rx: &rx, em, t_end: Self::end(&self.occluders), capped: self.capped(), owners };
+        let total = rx.patterns.iter().map(|(p, rets)| *p * pass.lik(rets, 0, 0, P::c(1.0), 1.0, 1.0, 0.0, p.v(), &mut resp)).sum::<T>();
         if total.v() > 0.0 {
             resp.iter_mut().for_each(|r| *r /= total.v());
         }
@@ -939,23 +1019,23 @@ impl Pulse {
     }
 
     /// The same pulse in the empty scene: the medium and the ground alone, the same for every hypothesis.
-    fn empty(&self) -> Pulse {
+    fn empty(&self) -> Self {
         Pulse { occluders: self.occluders.iter().filter(|o| matches!(o.surface, Surface::Ground(_))).copied().collect(), ..self.clone() }
     }
 }
 
 /// One pulse's echoes against one way its returns come back ([`Pulse::read`]): the receiver's members, and `owners`
 /// columns per echo in the responsibilities.
-struct Pass<'a, T> {
-    pulse: &'a Pulse,
-    rx: &'a Receiver<T>,
+struct Pass<'a, P, T> {
+    pulse: &'a Pulse<P>,
+    rx: &'a Receiver<P, T>,
     em: &'a Settings,
     t_end: f64,
     capped: bool,
     owners: usize,
 }
 
-impl<T: Real> Pass<'_, T> {
+impl<P: Real, T: Over<P>> Pass<'_, P, T> {
     /// The chance of echoes `i..` given returns `rets[j..]` not yet accounted for: the pulse meets occluders (the
     /// returns) and a medium (the foliage field), and after any echo the next surface is the medium's (3dtrees
     /// research 130 slice 2c; step 3c's reading, kept where sound). Each echo is one of those returns (the ones before
@@ -981,7 +1061,7 @@ impl<T: Real> Pass<'_, T> {
     /// `prefix` is the chance of the path to here (the pattern's and each earlier echo's branch); each branch adds
     /// `prefix` × its share × what follows to echo i's row of `resp`, under the owner it reads the echo as.
     #[allow(clippy::too_many_arguments)]
-    fn lik(&self, rets: &[Return<T>], i: usize, j: usize, scene: f64, taken: f64, seen: f64, tau0: f64, prefix: f64, resp: &mut [f64]) -> T {
+    fn lik(&self, rets: &[Return<P, T>], i: usize, j: usize, scene: P, taken: f64, seen: f64, tau0: f64, prefix: f64, resp: &mut [f64]) -> T {
         let (em, p, row) = (self.em, self.pulse, i * self.owners);
         let occ = &p.occluders;
         if i == p.echoes.len() {
@@ -997,7 +1077,7 @@ impl<T: Real> Pass<'_, T> {
         // one of the returns
         let mut none = T::c(1.0);
         for (k, r) in rets.iter().enumerate().skip(j) {
-            let d = none * (-seen * (occ[r.first].tau - tau0).max(0.0)).exp() * r.s * taken * r.density(o, x, em, occ);
+            let d = none * ((occ[r.first].tau - tau0).max(0.0) * -seen).exp() * r.s * taken * r.density(o, x, em, occ);
             if d.v() > 0.0 {
                 let f = d * (1.0 - P_OUTLIER);
                 let rest = self.lik(rets, i + 1, k + 1, self.rx.members[r.last].beam, taken, seen * left, tau_after, prefix * f.v(), resp);
@@ -1008,9 +1088,9 @@ impl<T: Real> Pass<'_, T> {
         }
         // the medium's
         if o < self.t_end && seen > 0.0 {
-            let jn = (j..rets.len()).find(|&k| occ[rets[k].first].t >= o).unwrap_or(rets.len());
+            let jn = (j..rets.len()).find(|&k| occ[rets[k].first].t.v() >= o).unwrap_or(rets.len());
             let none: T = rets[j..jn].iter().map(|r| r.q * taken + (1.0 - taken)).product();
-            let d = none * (seen * sig_o * (-seen * (tau_o - tau0).max(0.0)).exp()) * em.refl_background(x - 10.0 * (scene * taken).max(1e-6).log10());
+            let d = none * (seen * sig_o * (-seen * (tau_o - tau0).max(0.0)).exp()) * em.refl_background(P::c(x) - (scene * taken).max(1e-6).log10() * 10.0);
             if d.v() > 0.0 {
                 let f = d * (1.0 - P_OUTLIER);
                 let rest = self.lik(rets, i + 1, jn, scene, taken * left, seen * left, tau_after, prefix * f.v(), resp);
@@ -1051,73 +1131,66 @@ struct ElemData {
     on_across: [f64; 2],
     across: f64,
     align: Vec<([i64; 3], f64)>,
-    own_sd: [f64; 2],
+    own_sd: Vector2<f64>,
 }
 
 impl ElemData {
     /// (δ, reflectance level) at alignment shift `a` and own nodes `y`.
-    fn at(&self, a: f64, y: [f64; 2]) -> (f64, f64) {
+    fn at(&self, a: f64, y: Vector2<f64>) -> (f64, f64) {
         (a + self.own_sd[0] * y[0], self.own_sd[1] * y[1])
     }
 
     /// Its ray likelihood at `x` = (δ, reflectance level), in total and by [`Outcome`] (in its order), and −ll's slope
-    /// and curvature in (δ, level) there, in closed form, one pass over its cells ([`Dual`]; the value is the `f64`
-    /// one), the curvature's negative directions dropped. Without a level node only δ's are filled.
+    /// and curvature in (δ, level) there, in closed form, one pass over its cells ([`Dual2`]; the value is the `f64`
+    /// one), the curvature's negative eigenvalues set to 0. Without a level node only δ's are filled.
     fn quad(&self, x: (f64, f64), em: &Settings) -> Local {
-        let level = if self.own_sd[1] > 0.0 { Dual::var(x.1, 1) } else { Dual::c(x.1) };
-        let (mut total, mut parts) = (Dual::c(0.0), [0.0; 4]);
+        let level = if self.own_sd[1] > 0.0 { Dual2::var(x.1, 1) } else { Dual2::c(x.1) };
+        let (mut total, mut parts) = (Dual2::<2>::c(0.0), [0.0; 4]);
         for c in &self.cells {
-            let l = (c.pulse.read(Dual::var(x.0, 0), level, em).ll - c.base) * c.wt;
+            let l = (c.pulse.read(Dual2::var(x.0, 0), level, em).ll - c.base) * c.wt;
             total += l;
             parts[c.outcome as usize] += l.v;
         }
-        let g = [-total.g[0], -total.g[1]];
-        let (a, b, c) = (-total.h[0], -total.h[1], -total.h[2]);
-        // the 2 × 2 curvature's eigen-decomposition, negative eigenvalues set to 0
-        let (m, d) = (0.5 * (a + c), (0.25 * (a - c).powi(2) + b * b).sqrt());
-        let (l1, l2) = (m + d, m - d);
-        let hess = if l2 >= 0.0 {
-            [[a, b], [b, c]]
-        } else if l1 <= 0.0 {
-            [[0.0; 2]; 2]
+        let hess = -total.h;
+        let hess = if hess[(0, 0)] >= 0.0 && hess[(1, 1)] >= 0.0 && hess.determinant() >= 0.0 {
+            hess
         } else {
-            // the positive eigenvalue's direction
-            let v = if b.abs() > 1e-300 { [b, l1 - a] } else if a >= c { [1.0, 0.0] } else { [0.0, 1.0] };
-            let n2 = v[0] * v[0] + v[1] * v[1];
-            [[l1 * v[0] * v[0] / n2, l1 * v[0] * v[1] / n2], [l1 * v[0] * v[1] / n2, l1 * v[1] * v[1] / n2]]
+            let mut eig = hess.symmetric_eigen();
+            eig.eigenvalues = eig.eigenvalues.map(|l| l.max(0.0));
+            eig.recompose()
         };
-        Local { ll: total.v, parts, g, hess }
+        Local { ll: total.v, parts, g: -total.g, hess }
     }
 
     /// Its curvature over (a, y) at own nodes `y` given its likelihood there (`at`), with y eliminated: over (a, y),
     /// M = Jᵀ Q J + diag(0, I) with J = [[1, s0, 0], [0, 0, s1]], so P = diag(s) Q diag(s) + I over y and the a–y block
     /// is `link`; the slope over y; and the cost's slope and curvature in a, y eliminated (the Schur complement).
-    fn eliminate(&self, at: &Local, y: [f64; 2]) -> Eliminated {
+    fn eliminate(&self, at: &Local, y: Vector2<f64>) -> Eliminated {
         let (s, q, g) = (self.own_sd, at.hess, at.g);
-        let p = [[s[0] * s[0] * q[0][0] + 1.0, s[0] * s[1] * q[0][1]], [s[0] * s[1] * q[0][1], s[1] * s[1] * q[1][1] + 1.0]];
-        let det = p[0][0] * p[1][1] - p[0][1] * p[1][0];
-        let pi = [[p[1][1] / det, -p[0][1] / det], [-p[1][0] / det, p[0][0] / det]];
-        let link = [q[0][0] * s[0], q[0][1] * s[1]];
-        let (pl, gy) = (mul2(pi, link), [s[0] * g[0] + y[0], s[1] * g[1] + y[1]]);
-        Eliminated { pi, det, link, pl, gy, slope: g[0] - pl[0] * gy[0] - pl[1] * gy[1], curv: q[0][0] - link[0] * pl[0] - link[1] * pl[1] }
+        let off = s[0] * s[1] * q[(0, 1)];
+        let p = Matrix2::new(s[0] * s[0] * q[(0, 0)] + 1.0, off, off, s[1] * s[1] * q[(1, 1)] + 1.0);
+        let pi = p.try_inverse().expect("P is the unit prior's precision plus a positive semi-definite part");
+        let link = Vector2::new(q[(0, 0)] * s[0], q[(0, 1)] * s[1]);
+        let (pl, gy) = (pi * link, s.component_mul(&g) + y);
+        Eliminated { pi, det: p.determinant(), link, pl, gy, slope: g[0] - pl[0] * gy[0] - pl[1] * gy[1], curv: q[(0, 0)] - link[0] * pl[0] - link[1] * pl[1] }
     }
 
     /// Its term at alignment shift `a` (m): its own nodes y at their mode given `a` (Newton from `start`, a step at
     /// most 3 prior sds, halved until the cost falls, stopping under a micronat), the Laplace step over them, and its
     /// cost's slope and curvature in `a` with them eliminated (the Schur complement of its curvature over (a, y)).
-    fn term(&self, a: f64, start: [f64; 2], em: &Settings) -> Term {
+    fn term(&self, a: f64, start: Vector2<f64>, em: &Settings) -> Term {
         let s = self.own_sd;
-        let prior = |y: [f64; 2]| 0.5 * (y[0] * y[0] + y[1] * y[1]);
-        let mut y = if s == [0.0; 2] { [0.0; 2] } else { start };
+        let prior = |y: Vector2<f64>| 0.5 * (y[0] * y[0] + y[1] * y[1]);
+        let mut y = if s == Vector2::zeros() { Vector2::zeros() } else { start };
         let mut at = self.quad(self.at(a, y), em);
-        if s != [0.0; 2] {
+        if s != Vector2::zeros() {
             let mut f_now = -at.ll + prior(y);
             for _ in 0..MAX_NEWTON {
                 let e = self.eliminate(&at, y);
-                let step = cap(mul2(e.pi, e.gy));
+                let step = cap(e.pi * e.gy);
                 let (mut t, mut fall) = (1.0, None);
                 while t >= 1e-3 {
-                    let yn = [y[0] - t * step[0], y[1] - t * step[1]];
+                    let yn = y - step * t;
                     let next = self.quad(self.at(a, yn), em);
                     let f_new = -next.ll + prior(yn);
                     if f_new <= f_now {
@@ -1160,22 +1233,18 @@ impl ElemData {
 /// A term's curvature with its own nodes eliminated ([`ElemData::eliminate`]): P⁻¹ and |P| over y, the a–y link
 /// and P⁻¹ link, the slope over y, and the cost's slope and curvature in the alignment shift a.
 struct Eliminated {
-    pi: [[f64; 2]; 2],
+    pi: Matrix2<f64>,
     det: f64,
-    link: [f64; 2],
-    pl: [f64; 2],
-    gy: [f64; 2],
+    link: Vector2<f64>,
+    pl: Vector2<f64>,
+    gy: Vector2<f64>,
     slope: f64,
     curv: f64,
 }
 
-fn mul2(m: [[f64; 2]; 2], x: [f64; 2]) -> [f64; 2] {
-    [m[0][0] * x[0] + m[0][1] * x[1], m[1][0] * x[0] + m[1][1] * x[1]]
-}
-
 /// A step over a term's own nodes scaled to at most 3 prior sds.
-fn cap(step: [f64; 2]) -> [f64; 2] {
-    step.map(|x| x / (step[0].abs().max(step[1].abs()).max(3.0) / 3.0))
+fn cap(step: Vector2<f64>) -> Vector2<f64> {
+    step / (step.amax().max(3.0) / 3.0)
 }
 
 /// One term's ray likelihood at a point (δ, reflectance level), by outcome, and −ll's slope and curvature there
@@ -1183,8 +1252,8 @@ fn cap(step: [f64; 2]) -> [f64; 2] {
 struct Local {
     ll: f64,
     parts: [f64; 4],
-    g: [f64; 2],
-    hess: [[f64; 2]; 2],
+    g: Vector2<f64>,
+    hess: Matrix2<f64>,
 }
 
 /// One (element, scan)'s part of its scan's cost at an alignment shift, `fit + logdet`: `fit` its ray likelihood's
@@ -1200,11 +1269,11 @@ struct Term {
     logdet: f64,
     slope: f64,
     curv: f64,
-    own: [f64; 2],
-    start: [f64; 2],
-    own_sd: [f64; 2],
-    own_cov: [[f64; 2]; 2],
-    own_link: [f64; 2],
+    own: Vector2<f64>,
+    start: Vector2<f64>,
+    own_sd: Vector2<f64>,
+    own_cov: Matrix2<f64>,
+    own_link: Vector2<f64>,
     ray: [f64; 4],
     cells: u32,
     cells_on: u32,
@@ -1271,7 +1340,7 @@ fn elem_data(v: &RangeImage, rendered: &[Vec<(usize, Layer)>], elems: &[Element]
         let s_along = em.align_sd(k, other);
         ElemData { cells: Vec::new(), surface: k, cells_on: 0, on_across: [f64::INFINITY, f64::NEG_INFINITY],
                    across: mean_of(&es, |e| 2.0 * e.r / em.footprint(norm(&sub(&e.mid(), &v.origin)))),
-                   align: hs.into_iter().map(|(key, w)| (key, w * s_along)).collect(), own_sd: [front, level], members: ms }
+                   align: hs.into_iter().map(|(key, w)| (key, w * s_along)).collect(), own_sd: Vector2::new(front, level), members: ms }
     }).collect();
     // cells in index order, so an element's sums run in the same order in every run (the k-buffer is a hash map)
     let mut order: Vec<usize> = buf.keys().copied().collect();
@@ -1412,11 +1481,11 @@ fn solve_alignment(data: &[ElemData], em: &Settings) -> (Held, Vec<Term>) {
     let index = alignment_nodes(data);
     let n = index.len();
     let shift = |el: &ElemData, z: &[f64]| -> f64 { el.align.iter().map(|(k, w)| w * z[index[k]]).sum() };
-    let read = |z: &[f64], ys: &[[f64; 2]]| -> Vec<Local> { data.par_iter().zip(ys).map(|(el, y)| el.quad(el.at(shift(el, z), *y), em)).collect() };
-    let objective = |z: &[f64], ys: &[[f64; 2]], ls: &[Local]| {
+    let read = |z: &[f64], ys: &[Vector2<f64>]| -> Vec<Local> { data.par_iter().zip(ys).map(|(el, y)| el.quad(el.at(shift(el, z), *y), em)).collect() };
+    let objective = |z: &[f64], ys: &[Vector2<f64>], ls: &[Local]| {
         0.5 * z.iter().map(|x| x * x).sum::<f64>() + ls.iter().zip(ys).map(|(l, y)| -l.ll + 0.5 * (y[0] * y[0] + y[1] * y[1])).sum::<f64>()
     };
-    let (mut z, mut ys) = (vec![0.0; n], vec![[0.0; 2]; data.len()]);
+    let (mut z, mut ys) = (vec![0.0; n], vec![Vector2::zeros(); data.len()]);
     let mut ls = read(&z, &ys);
     for _ in 0..MAX_NEWTON {
         let es: Vec<Eliminated> = data.iter().zip(&ls).zip(&ys).map(|((el, l), y)| el.eliminate(l, *y)).collect();
@@ -1429,18 +1498,18 @@ fn solve_alignment(data: &[ElemData], em: &Settings) -> (Held, Vec<Term>) {
             None => nalgebra::DVector::zeros(n),
         };
         // each term's own step given its shift's, Δa = −rᵀ step
-        let dys: Vec<[f64; 2]> = data.iter().zip(&es).map(|(el, e)| {
-            if el.own_sd == [0.0; 2] {
-                return [0.0; 2];
+        let dys: Vec<Vector2<f64>> = data.iter().zip(&es).map(|(el, e)| {
+            if el.own_sd == Vector2::zeros() {
+                return Vector2::zeros();
             }
             let da = -el.align.iter().map(|(k, w)| w * step[index[k]]).sum::<f64>();
-            cap(mul2(e.pi, [e.gy[0] + e.link[0] * da, e.gy[1] + e.link[1] * da]).map(|x| -x))
+            -cap(e.pi * (e.gy + e.link * da))
         }).collect();
         let f_now = objective(&z, &ys, &ls);
         let (mut t, mut fall) = (1.0, None);
         while t >= 1e-3 {
             let zn: Vec<f64> = z.iter().zip(step.iter()).map(|(a, b)| a - t * b).collect();
-            let yn: Vec<[f64; 2]> = ys.iter().zip(&dys).map(|(y, d)| [y[0] + t * d[0], y[1] + t * d[1]]).collect();
+            let yn: Vec<Vector2<f64>> = ys.iter().zip(&dys).map(|(y, d)| y + d * t).collect();
             let ln = read(&zn, &yn);
             let f_new = objective(&zn, &yn, &ln);
             if f_new <= f_now {
@@ -1498,13 +1567,12 @@ impl Fit {
     }
 }
 
-/// How well one scan pins an element's geometry down ([`Scene::information`]): in its parameters (n of them), the
-/// cost's slope (n) and observed curvature (n × n, row-major), the expected information (n × n) and the gradient's
-/// variance were the cells independent (n × n).
+/// How well one scan pins some elements' geometry down ([`Scene::information`]): in their parameters (n of them), the
+/// cost's slope (n), the expected (Fisher) information (n × n, row-major) and the slope's variance were the cells
+/// independent (n × n).
 #[derive(Debug, Clone)]
 pub struct Information {
-    pub gradient: Vec<f64>,
-    pub hessian: Vec<f64>,
+    pub slope: Vec<f64>,
     pub expected: Vec<f64>,
     pub gradient_variance: Vec<f64>,
 }
@@ -1593,33 +1661,31 @@ fn segment(e: &Element) -> (Point, Point) {
     }
 }
 
-/// An element's parameters in [`Scene::information`]: their steps (0.05 in ln r, 2 mm in place, and that over a
-/// stick's half-length in tilt).
-fn steps(e: &Element) -> Vec<f64> {
-    match e.form {
-        Form::Stick { a, b } => {
-            let half = 0.5 * norm(&sub(&b, &a));
-            vec![0.05, 0.002, 0.002, 0.002 / half, 0.002 / half]
-        }
-        Form::Patch { .. } => vec![0.05, 0.002, 0.002, 0.002],
-    }
+/// The numbers of [`Scene::information`]'s pass: the slope in an element's parameters (its first five; a patch's
+/// first four) and in the cell's own nodes, its shift along the beam ([`SHIFT`]) and its reflectance level ([`LEVEL`]).
+type Geometry = Dual<7>;
+const SHIFT: usize = 5;
+const LEVEL: usize = 6;
+
+/// What a cell's echo tells per unit of its slope (research 130 step 3a), the one reading of a cell [`Scene::information`]
+/// and [`Scene::divergence`] share: in its chance of an echo `p` (a Bernoulli, `p` kept within [1e-3, 1 − 1e-3]) and,
+/// given one, in its depth (of variance `var`, the return's own, without the shifts' spread) and in its reflectance (the
+/// per-echo noise, wider at fill `fill`), each of these two a t density's share `(ν + 1) / (ν + 3)` of a Gaussian's.
+fn cell_information(em: &Settings, p: f64, var: f64, fill: f64) -> [f64; 3] {
+    let p = p.clamp(1e-3, 1.0 - 1e-3);
+    let (k_depth, k_refl) = ((em.noise_dof + 1.0) / (em.noise_dof + 3.0), (em.refl_dof + 1.0) / (em.refl_dof + 3.0));
+    [1.0 / (p * (1.0 - p)), p * k_depth / var.max(1e-12), p * k_refl / em.refl_noise.hypot(em.refl_edge * (1.0 - fill.clamp(0.0, 1.0))).powi(2)]
 }
 
-/// The element moved by `th` in its parameters ([`Scene::information`]).
-fn moved(e: &Element, th: &[f64]) -> Element {
-    let form = match e.form {
-        Form::Stick { a, b } => {
-            let ax = sub(&b, &a);
-            let half = 0.5 * norm(&ax);
-            let u = ax.map(|x| x / (2.0 * half));
-            let p1 = normalize(&cross(&u, &if u[2].abs() < 0.9 { [0.0, 0.0, 1.0] } else { [1.0, 0.0, 0.0] }));
-            let p2 = cross(&u, &p1);
-            let mv = |p: &Point, sign: f64| [0, 1, 2].map(|k| p[k] + (th[1] + sign * half * th[3]) * p1[k] + (th[2] + sign * half * th[4]) * p2[k]);
-            Form::Stick { a: mv(&a, -1.0), b: mv(&b, 1.0) }
-        }
-        Form::Patch { centre } => Form::Patch { centre: [centre[0] + th[1], centre[1] + th[2], centre[2] + th[3]] },
-    };
-    Element { form, r: e.r * th[0].exp(), ..*e }
+/// One cell as [`Scene::information`] reads it, in the numbers `P` of its pass: its share of the cost (its weighted log
+/// likelihood against the empty scene's, with the sign the cost has), its weight's value, and the element's echo there
+/// (the front return of its most likely way back, [`Receiver::front`]): the chance the pulse returns it (it arrives,
+/// and is recorded), its depth and its reflectance at its mean fill ([`Return::reflectance`]; −200 dB or less where
+/// no section radius meets the beam), with its depth's own sd.
+struct CellReading<P> {
+    cost: P,
+    weight: f64,
+    echo: Option<([P; 3], f64)>,
 }
 
 /// One scan's evidence on n quantities from the cells of some elements, with the latents the cells share
@@ -1656,16 +1722,20 @@ impl Shared {
         Shared { n, nodes, elems, m: nalgebra::DMatrix::zeros(size, size), j: nalgebra::DMatrix::zeros(size, size) }
     }
 
-    /// A depth's loading on the nodes, in element `k`'s cell: its alignment shift (the cell's class's along-beam
-    /// spread `align_sd` over its hats) and its term's stem front shift.
-    fn depth(&self, k: usize, align_sd: f64) -> Vec<(usize, f64)> {
+    /// An observable's loading on the nodes, in element `k`'s cell, from its slope in the cell's shift along the beam
+    /// (`d_shift`: over the term's alignment hats, each at its class's along-beam spread `align_sd`, and its stem front
+    /// shift) and in its reflectance level (`d_level`, at that node's prior sd `level_sd`).
+    fn load(&self, k: usize, align_sd: f64, d_shift: f64, d_level: f64, level_sd: f64) -> Vec<(usize, f64)> {
         let (h, own, front) = &self.elems[k];
-        h.iter().map(|(key, w)| (self.nodes[key], w * align_sd)).chain([(*own, *front)]).collect()
-    }
-
-    /// A reflectance's loading on the nodes, in element `k`'s cell: its reflectance level.
-    fn refl(&self, k: usize, level_sd: f64) -> Vec<(usize, f64)> {
-        vec![(self.elems[k].1 + 1, level_sd)]
+        let mut out = Vec::new();
+        if d_shift != 0.0 {
+            out.extend(h.iter().map(|(key, w)| (self.nodes[key], w * align_sd * d_shift)));
+            out.push((*own, front * d_shift));
+        }
+        if d_level != 0.0 {
+            out.push((own + 1, level_sd * d_level));
+        }
+        out
     }
 
     fn add(&mut self, g: &[f64], load: &[(usize, f64)], info: f64, w: f64) {
@@ -1919,7 +1989,7 @@ impl Scene {
                 };
                 // the shift's posterior from the held alignment, and the own nodes' with it marginalised
                 let var = fit.held.between(&t.align, &t.align);
-                let own_sd = |j: usize| t.own_sd[j] * (t.own_cov[j][j] + t.own_link[j] * t.own_link[j] * var).max(0.0).sqrt();
+                let own_sd = |j: usize| t.own_sd[j] * (t.own_cov[(j, j)] + t.own_link[j] * t.own_link[j] * var).max(0.0).sqrt();
                 rows.push(ElementScan {
                     elem: i, group, scan: s as u32, cells: t.cells, cells_on: t.cells_on, arc: t.arc, footprints_across: t.across, surface: t.surface,
                     cost: t.cost(), ray_on: t.ray[0], ray_empty: t.ray[1], ray_in_front: t.ray[2], ray_behind: t.ray[3],
@@ -2098,7 +2168,7 @@ impl Scene {
         // a held term's own nodes start where its reference's did, so an unchanged term is recomputed exactly
         let mut terms: Vec<(Owner, Option<Term>)> = data.par_iter().map(|d| {
             let o = owners[d.members[0]];
-            (o, Some(d.term(fit.held.shift(&d.align), fit.held.reference.get(&o).map_or([0.0; 2], |t| t.start), em)))
+            (o, Some(d.term(fit.held.shift(&d.align), fit.held.reference.get(&o).map_or(Vector2::zeros(), |t| t.start), em)))
         }).collect();
         // the owners of the elements taken out or unseen now, unless a member is still scored
         let kept: HashSet<Owner> = terms.iter().map(|t| t.0).collect();
@@ -2112,11 +2182,6 @@ impl Scene {
     /// [`cell_view`]): they are rendered for this, not added, and only the scene's layers in their cells enter their
     /// k-buffer, so their front cells and classes are those of the whole set.
     pub fn predict(&self, es: &[Element], s: usize) -> Vec<CellPrediction> {
-        self.predict_without(es, s, &[])
-    }
-
-    /// [`Scene::predict`] against the scene with the live elements `without` left out.
-    fn predict_without(&self, es: &[Element], s: usize, without: &[u32]) -> Vec<CellPrediction> {
         let (v, em) = (&*self.views[s], &self.em);
         let mut per: Vec<Vec<(usize, Layer)>> = es.iter().enumerate().map(|(k, e)| render(v, e, k as u32, em)).collect();
         let cells: HashSet<usize> = per.iter().flatten().map(|&(c, _)| c).collect();
@@ -2124,7 +2189,7 @@ impl Scene {
         let n = self.elems.len() as u32;
         let mut owners: Vec<Owner> = es.iter().enumerate().map(|(k, e)| owner(n + k as u32, e)).collect();
         for (i, el) in self.elems.iter().enumerate() {
-            let Some(el) = el.as_ref().filter(|_| !without.contains(&(i as u32))) else { continue };
+            let Some(el) = el.as_ref() else { continue };
             let k = per.len() as u32;
             let l: Vec<(usize, Layer)> = self.rendered[s][i].iter().filter(|(c, _)| cells.contains(c)).map(|&(c, ly)| (c, Layer { elem: k, ..ly })).collect();
             if !l.is_empty() {
@@ -2188,158 +2253,161 @@ impl Scene {
     }
 
     /// How well the scans pin some live elements' geometry down ([`Scene::check_id`]; one element, or several
-    /// jointly): per scan, the curvature of their cost (nats; the observed information under the evidence discount)
-    /// in their parameters, each element's in turn, with the rest of the scene held, by central differences about the
-    /// elements as they are. A stick's parameters are `ln r`, its axis moved
-    /// across itself (two directions perpendicular to it, m) and tilted about its middle (the same two directions, rad
-    /// at its ends' half-length); a patch's are `ln r` and its centre moved (x, y, z, m). The parameter frame is the
-    /// element's own, the same in every scan, so scans' information adds. Steps: 0.05 in `ln r`, 2 mm in place (about
-    /// the depth noise: wider steps read a heavy-tailed cost's secant) and that over the half-length in tilt. Per scan,
-    /// the cost's slope (n) and curvature (n × n, row-major; n 5 for a stick, 4 for a patch), so `−H⁻¹ g` is how far
-    /// the scan's best fit sits from the element; a scan that doesn't see it (or sees it only hidden) gives zeros.
+    /// jointly): per scan, the cost's slope and its expected (Fisher) information in their parameters, each element's
+    /// in turn, the rest of the scene held. A stick's parameters are `ln r`, its axis moved across itself (two
+    /// directions perpendicular to it, m) and tilted about its middle (the same two directions, rad at its ends'
+    /// half-length); a patch's are `ln r` and its centre moved (x, y, z, m): n is 5 a stick, 4 a patch. The frame is
+    /// the element's own, the same in every scan, so scans' information adds. A scan that doesn't see them gives zeros.
     ///
-    /// Beside it, the **expected information** (n × n; research 130 step 3a, synthesis §9 item 5, §16): what the
-    /// element's own cells would tell on average, from what it predicts in them ([`Scene::predict`], the rest of the
-    /// scene held) under the same steps. Each cell is read as an echo or none (a Bernoulli in the chance p it returns
-    /// an echo) and, given one, its depth and reflectance (t densities of the noise's degrees of freedom ν, which carry
-    /// `(ν + 1) / (ν + 3)` of a Gaussian's information): `Σ_c w_c [∂p ∂pᵀ / (p (1 − p)) + p (k_d ∂μ ∂μᵀ / sd² +
-    /// k_r ∂ρ ∂ρᵀ / s_ρ²)]`, w_c the cell weight and sd the depth's own (without the shifts' spread); then the
-    /// latents every cell shares are marginalised out under their priors (the depth's shift, alignment and stem
-    /// front, and the reflectance level: a Schur complement). It is positive semi-definite and reads a direction the
-    /// cells don't see as 0, where the observed curvature reads the cost's roughness (half the far views' pairs read
-    /// a negative direction: step 2). It leaves out what other elements' cells say.
+    /// **One pass per cell** (research 130 slice-derivatives): the ray likelihood read with each element's layer in
+    /// [`Geometry`] numbers, forward derivatives in its parameters (through its rendering: the fill, the depth over
+    /// the footprint, the far side) and in the cell's own nodes (its shift along the beam and its reflectance level),
+    /// at the alignment held and each term's own nodes at their mode. From it:
+    /// - **`slope`** (n): the cost's slope, over every cell an element's layer is in (its own, and those it lies
+    ///   behind another's front in), each at its term's nodes: the slope of the fit with the nuisances at their modes
+    ///   (an envelope: their own slopes vanish there), the Laplace steps' log-determinants held.
+    /// - **`expected`** (n × n, row-major; research 130 step 3a): what the elements' own cells would tell on average.
+    ///   Each cell is read as an echo or none (a Bernoulli in the chance p the element's echo comes back) and, given one,
+    ///   its depth μ and reflectance ρ (at its mean fill: [`Return::reflectance`]; [`cell_information`]):
+    ///   `Σ_c w_c [∂p ∂pᵀ / (p (1 − p)) + p (k_d ∂μ ∂μᵀ / sd² +
+    ///   k_r ∂ρ ∂ρᵀ / s_ρ²)]`, w_c the cell weight and sd the depth's own. Each observable also loads the latents the
+    ///   cells share by its slope in the cell's own nodes (the depth on the shift, so on the alignment's hats and the
+    ///   stem front shift; the reflectance and the chance of an echo on the level), and they are marginalised out
+    ///   under their priors (a Schur complement, [`Shared`]). It is positive semi-definite, reads a direction the cells
+    ///   don't see as 0, and leaves out what other elements' cells say.
+    ///
+    /// The observed curvature is not given: the fill's curvature is unbounded at the beam's edge, and the expected
+    /// information is the calibrated one (research 130 step 3b; optimisation.md). Slope and expected information
+    /// together are a Fisher-scoring step.
     ///
     /// **Several elements** (research 130 slice 4: a pair's joint information): each element's cells are read with
-    /// the others in place, and the latents are marginalised once over all of them ([`Shared`]): each element's own
-    /// stem front shift and reflectance level, and the alignment's nodes, which neighbours share. So the alignment,
-    /// which moves neighbours' depths together, cancels in their depth difference, where each element's own
-    /// information charges it in full. Far apart (no node or cell in common) the information is the elements' own,
-    /// side by side. Members of one group (a chain) share one term's nodes ([`Owner`]), as their cost does when `ids`
-    /// are the whole group; a chain's knots are a Jacobian away from its sticks' parameters (research 130 slice 6).
+    /// the others in place, a cell's observables in every element whose layer is in it, and the latents are
+    /// marginalised once over all of them ([`Shared`]): each element's own stem front shift and reflectance level, and
+    /// the alignment's nodes, which neighbours share. So the alignment, which moves neighbours' depths together,
+    /// cancels in their depth difference, where each element's own information charges it in full. Far apart (no node
+    /// or cell in common) the information is the elements' own, side by side. Members of one group (a chain) share
+    /// one term's nodes ([`Owner`]), as their cost does when `ids` are the whole group; a chain's knots are a Jacobian
+    /// away from its sticks' parameters (research 130 slice 6).
     ///
     /// **What it means under the evidence discount** (research 130 step 3b). Each cell's log-likelihood counts
     /// `w_c = 1 / (φ m)`, so the cost is a quasi-likelihood and E is its curvature: an sd read from E⁻¹ is honest only
     /// where the cells' errors are correlated as φ m declares. In general the estimate's variance is the sandwich
     /// `E⁻¹ J E⁻¹`, J the gradient's actual variance (the inverse of Godambe's information `E J⁻¹ E`), and model
     /// comparison by cost differences needs the composite-likelihood penalty `tr(J E⁻¹)`, not a parameter count. φ
-    /// enters E once, and J twice: beside E comes the **gradient's variance were the cells independent** (the same
-    /// sums at `w_c²`, its latents' share taken out as E's is, their priors' included), so `E⁻¹ J E⁻¹` is the variance
-    /// with no correlation between cells, a lower bound, and E⁻¹ the variance at the declared φ. On the stand's true
-    /// sticks (step3b.md), fits from the truth fall within 1.96 sd of E⁻¹ along the sloppiest direction 95 % of the
-    /// time at 3 footprints across or more, and within 1 sd 92–96 % (the core is narrower than E says, the tail as
-    /// wide); the sandwich's sds are 1.5–2.6 times too small (the cells are correlated); and below 1.5 footprints
-    /// across the cost has minima far from the truth that a local curvature can't see, so E's sds don't hold there.
+    /// enters E once, and J twice: beside E comes the **gradient's variance were the cells independent**
+    /// (`gradient_variance`: the same sums at `w_c²`, its latents' share taken out as E's is, their priors' included),
+    /// so `E⁻¹ J E⁻¹` is the variance with no correlation between cells, a lower bound, and E⁻¹ the variance at the
+    /// declared φ. On the stand's true sticks (step3b.md), fits from the truth fall within 1.96 sd of E⁻¹ along the
+    /// sloppiest direction 95 % of the time at 3 footprints across or more; the sandwich's sds are 1.5–2.6 times too
+    /// small (the cells are correlated); and below 1.5 footprints across the cost has minima far from the truth that a
+    /// local curvature can't see, so E's sds don't hold there.
     ///
     /// **ln r is the space radius is unbiased in:** the stand's fitted ln r sits −0.003 from the truth (median, R ≥
     /// 1 cm); r's own mean is `exp(ln r + ½ sd²)`, so an average of radii should be taken in ln r.
-    ///
-    /// Without `observed`, the stencil is skipped (about two thirds of the cost: research 130 step 3b) and the slope
-    /// and observed curvature read NaN, for a consumer that reads the expected information alone.
-    pub fn information(&self, ids: &[u32], observed: bool) -> Vec<Information> {
+    pub fn information(&self, ids: &[u32]) -> Vec<Information> {
         let es: Vec<Element> = ids.iter().map(|&id| self.elems[id as usize].expect("a live element")).collect();
-        let steps: Vec<f64> = es.iter().flat_map(steps).collect();
-        let n = steps.len();
-        let at = |th: &[f64]| -> Vec<Element> {
-            let mut o = 0;
-            es.iter().map(|e| {
-                let k = if let Form::Stick { .. } = e.form { 5 } else { 4 };
-                o += k;
-                moved(e, &th[o - k..o])
-            }).collect()
-        };
-        // the stencil: the centre, ± each step, and (observed) the four corners of each pair
-        let mut pts: Vec<Vec<f64>> = vec![vec![0.0; n]];
-        for i in 0..n {
-            for sg in [1.0, -1.0] {
-                let mut t = vec![0.0; n];
-                t[i] = sg * steps[i];
-                pts.push(t);
-            }
-        }
-        for i in (0..n).filter(|_| observed) {
-            for j in i + 1..n {
-                for (si, sj) in [(1.0, 1.0), (1.0, -1.0), (-1.0, 1.0), (-1.0, -1.0)] {
-                    let mut t = vec![0.0; n];
-                    t[i] = si * steps[i];
-                    t[j] = sj * steps[j];
-                    pts.push(t);
-                }
-            }
-        }
-        let items: Vec<(Vec<Element>, Vec<u32>)> = if observed { pts.iter().map(|t| (at(t), ids.to_vec())).collect() } else { Vec::new() };
-        let c = self.costs_replacing(&items);
+        let dims: Vec<usize> = es.iter().map(|e| if let Form::Stick { .. } = e.form { 5 } else { 4 }).collect();
+        let offset: Vec<usize> = dims.iter().scan(0, |o, d| Some(std::mem::replace(o, *o + d))).collect();
+        let n: usize = dims.iter().sum();
         let em = &self.em;
-        let (k_depth, k_refl) = ((em.noise_dof + 1.0) / (em.noise_dof + 3.0), (em.refl_dof + 1.0) / (em.refl_dof + 3.0));
-        let expected: Vec<[Vec<f64>; 2]> = (0..self.views.len()).into_par_iter().map(|s| {
-            let pred = |t: &[f64]| -> HashMap<usize, CellPrediction> { self.predict_without(&at(t), s, ids).into_iter().map(|p| (p.cell, p)).collect() };
-            let sides: Vec<[HashMap<usize, CellPrediction>; 2]> = (0..n).map(|i| [pred(&pts[1 + 2 * i]), pred(&pts[2 + 2 * i])]).collect();
-            let refl = em.refl_noise > 0.0 && !self.views[s].echo_refl.is_empty();
-            let other = self.views[s].epoch != self.ref_epoch;
-            let mut shared = Shared::new(n, &es, em);
-            // cells in index order, so the sums run in the same order in every run
-            let mut centre: Vec<CellPrediction> = pred(&pts[0]).into_values().collect();
-            centre.sort_unstable_by_key(|p| p.cell);
-            for p in centre {
-                let cell = p.cell;
-                // each observable's slope over the steps (0 where a side doesn't hold it, or it isn't finite)
-                let slope = |f: &dyn Fn(&CellPrediction) -> f64, absent: Option<f64>| -> Vec<f64> {
-                    (0..n).map(|i| {
-                        let [a, b] = [0, 1].map(|k| sides[i][k].get(&cell).map(f).or(absent));
-                        match (a, b) {
-                            (Some(a), Some(b)) if (a - b).is_finite() => (a - b) / (2.0 * steps[i]),
-                            _ => 0.0,
-                        }
-                    }).collect()
-                };
-                let echo = |q: &CellPrediction| q.arrives * q.recorded;
-                let pc = echo(&p).clamp(1e-3, 1.0 - 1e-3);
-                shared.add(&slope(&echo, Some(0.0)), &[], 1.0 / (pc * (1.0 - pc)), p.weight);
-                // the depth's own sd, without the shifts' spread `predict` widens it by
-                let k = p.elem as usize;
-                let (align, front) = (em.align_sd(p.surface, other), es[k].front_shift_sd(em));
-                let load = shared.depth(k, align);
-                shared.add(&slope(&|q| q.depth, None), &load, pc * k_depth / (p.sd * p.sd - align * align - front * front).max(1e-12), p.weight);
-                if refl && p.refl.is_finite() {
-                    let load = shared.refl(k, em.refl_level_sd);
-                    shared.add(&slope(&|q| q.refl, None), &load, pc * k_refl / em.refl_noise.hypot(em.refl_edge * (1.0 - p.fill.clamp(0.0, 1.0))).powi(2), p.weight);
-                }
-            }
-            shared.finish()
-        }).collect();
         (0..self.views.len()).map(|s| {
-            let [expected, gradient_variance] = expected[s].clone();
-            if !observed {
-                return Information { gradient: vec![f64::NAN; n], hessian: vec![f64::NAN; n * n], expected, gradient_variance };
-            }
-            let f = |k: usize| c[k][s];
-            let g: Vec<f64> = (0..n).map(|i| (f(1 + 2 * i) - f(2 + 2 * i)) / (2.0 * steps[i])).collect();
-            let mut m = vec![0.0; n * n];
-            for i in 0..n {
-                m[i * n + i] = (f(1 + 2 * i) + f(2 + 2 * i) - 2.0 * f(0)) / (steps[i] * steps[i]);
-            }
-            let mut k = 1 + 2 * n;
-            for i in 0..n {
-                for j in i + 1..n {
-                    let x = (f(k) - f(k + 1) - f(k + 2) + f(k + 3)) / (4.0 * steps[i] * steps[j]);
-                    m[i * n + j] = x;
-                    m[j * n + i] = x;
-                    k += 4;
+            let v = &*self.views[s];
+            let refl = em.refl_noise > 0.0 && !v.echo_refl.is_empty();
+            let other = v.epoch != self.ref_epoch;
+            let shared = Shared::new(n, &es, em);
+            // per cell: its slope's part, and the element's echo's observables with their loadings and weights
+            type Rows = Vec<(Vec<f64>, Vec<(usize, f64)>, f64, f64)>;
+            let parts: Vec<(Vec<f64>, Rows)> = self.cells_of(s, ids).into_par_iter().map(|(cell, ls, term, [shift, level])| {
+                let front = ls[0].elem;
+                let nodes = [Geometry::var(shift, SHIFT), if term.own_sd[1] > 0.0 { Geometry::var(level, LEVEL) } else { Geometry::c(level) }];
+                let mut slope = vec![0.0; n];
+                let mut x = [vec![0.0; n], vec![0.0; n], vec![0.0; n]];
+                let mut echo = None;
+                for (j, ly) in ls.iter().enumerate() {
+                    let Some(k) = ids.iter().position(|&i| i == ly.elem) else { continue };
+                    let th: Vec<Geometry> = (0..dims[k]).map(|i| Geometry::var(0.0, i)).collect();
+                    let r = self.read_cell(s, cell, &ls, j, &es[k], &th, nodes);
+                    for i in 0..dims[k] {
+                        slope[offset[k] + i] = r.cost.g[i];
+                    }
+                    if let Some((q, sd)) = r.echo {
+                        for (xo, q) in x.iter_mut().zip(q) {
+                            xo[offset[k]..offset[k] + dims[k]].copy_from_slice(&q.g.as_slice()[..dims[k]]);
+                        }
+                        echo = Some((q, sd, r.weight));
+                    }
+                }
+                let mut rows = Rows::new();
+                if let (Some(k), Some(([p, mu, rho], sd, w))) = (ids.iter().position(|&i| i == front), echo) {
+                    let info = cell_information(em, p.v(), sd * sd, ls[0].f);
+                    let align = em.align_sd(term.surface, other);
+                    let load = |d: &Geometry| shared.load(k, align, d.g[SHIFT], d.g[LEVEL], em.refl_level_sd);
+                    let [xp, xmu, xrho] = x;
+                    rows.push((xp, load(&p), info[0], w));
+                    rows.push((xmu, load(&mu), info[1], w));
+                    if refl && rho.v() > -200.0 {
+                        rows.push((xrho, load(&rho), info[2], w));
+                    }
+                }
+                (slope, rows)
+            }).collect();
+            let (mut shared, mut slope) = (shared, vec![0.0; n]);
+            for (g, rows) in parts {
+                slope.iter_mut().zip(g).for_each(|(a, b)| *a += b);
+                for (x, load, info, w) in rows {
+                    shared.add(&x, &load, info, w);
                 }
             }
-            Information { gradient: g, hessian: m, expected, gradient_variance }
+            let [expected, gradient_variance] = shared.finish();
+            Information { slope, expected, gradient_variance }
         }).collect()
+    }
+
+    /// The cells of scan `s` that any of the live elements `ids` fronts and that hold a pulse, in index order, each with
+    /// its k-buffer (nearest first, ties by id, as the cost's), the term of its front element and that term's own
+    /// nodes as the fit holds them: the shift along the beam (the held alignment's and the stem front shift's) and the
+    /// reflectance level.
+    fn cells_of(&self, s: usize, ids: &[u32]) -> Vec<(usize, Vec<Layer>, &Term, [f64; 2])> {
+        let (v, fit, rendered) = (&*self.views[s], &self.fits[s], &self.rendered[s]);
+        let mut cells: Vec<usize> = ids.iter().flat_map(|&id| rendered[id as usize].iter().filter(|(_, l)| l.fronts()).map(|(c, _)| *c)).collect();
+        cells.sort_unstable();
+        cells.dedup();
+        cells.into_iter().filter(|&c| v.cell[c] != Cell::NoPulse).filter_map(|cell| {
+            let mut ls: Vec<Layer> = self.cells[s][&cell].iter().map(|&(id, _, _)| id).collect::<BTreeSet<u32>>().into_iter()
+                .map(|id| rendered[id as usize][rendered[id as usize].binary_search_by_key(&cell, |x| x.0).expect("an indexed layer")].1).collect();
+            ls.sort_by(|a, b| a.t.total_cmp(&b.t));
+            ls.truncate(K);
+            let front = ls[0].elem;
+            let term = fit.terms.get(&owner(front, &self.elems[front as usize]?))?;
+            let nodes = [fit.held.shift(&term.align) + term.own_sd[0] * term.own[0], term.own_sd[1] * term.own[1]];
+            Some((cell, ls, term, nodes))
+        }).collect()
+    }
+
+    /// Cell `cell` of scan `s` as [`Scene::information`] reads it ([`CellReading`]), its k-buffer `ls` with the `j`th
+    /// layer element `e`'s moved by `th` in its parameters ([`placed`]) and the cell's own nodes at `nodes` (its shift
+    /// along the beam, its reflectance level), all in the numbers `P`.
+    #[allow(clippy::too_many_arguments)]
+    fn read_cell<P: Real>(&self, s: usize, cell: usize, ls: &[Layer], j: usize, e: &Element, th: &[P], nodes: [P; 2]) -> CellReading<P> {
+        let (v, em) = (&*self.views[s], &self.em);
+        let w = v.direction((cell / v.n_cols) as f64, (cell % v.n_cols) as f64);
+        let moved = layer(&placed(e, &v.origin, Some(th)), &w, e, ls[j].elem, em, v.step()).expect("a layer it fronts");
+        let cv = cell_view(v, cell, ls.iter().enumerate().map(|(i, l)| if i == j { moved } else { l.lift() }).collect(), em, &self.sc, &self.ext);
+        let r = cv.pulse.read(nodes[0], nodes[1], em);
+        let base = cv.pulse.empty().read(P::c(0.0), P::c(0.0), em).ll;
+        let echo = r.rx.front().map(|f| ([(-cv.pulse.occluders[f.first].tau).exp() * f.s, f.mu, f.reflectance()], f.sd.v()));
+        CellReading { cost: -((r.ll - base) * cv.wt), weight: cv.wt.v(), echo }
     }
 
     /// What hypothesis `q` is expected to cost against hypothesis `p` were `p` true, per scan (nats): `E_p[cost(q) −
     /// cost(p)]`, the divergence of `q`'s predictions from `p`'s (each against the scene, [`Scene::predict`]), with
-    /// [`Scene::information`]'s reading of a cell: its echo or none, a Bernoulli, exact; given an echo in both, its
-    /// depth and reflectance at their own sds, the latents they load marginalised as `information` does (`p`'s
-    /// elements' nodes). A cell only one of them fronts reads the other's chance of an echo as 0 (1e-3), as
-    /// `information` reads a cell that leaves. Beside an observed cost difference it separates data that are balanced
-    /// (observed ≈ 0, expected large: a misfit) from data that are silent (both ≈ 0).
+    /// [`Scene::information`]'s reading of a cell ([`cell_information`]): its echo or none, a Bernoulli, exact; given
+    /// an echo in both, its depth and reflectance at their own sds, the latents they load marginalised as
+    /// `information` does (`p`'s elements' nodes). A cell only one of them fronts reads the other's chance of an echo
+    /// as 0 (1e-3). Beside an observed cost difference it separates data that are balanced (observed ≈ 0, expected
+    /// large: a misfit) from data that are silent (both ≈ 0).
     pub fn divergence(&self, p: &[Element], q: &[Element]) -> Vec<f64> {
         let em = &self.em;
-        let (k_depth, k_refl) = ((em.noise_dof + 1.0) / (em.noise_dof + 3.0), (em.refl_dof + 1.0) / (em.refl_dof + 3.0));
         (0..self.views.len()).into_par_iter().map(|s| {
             let at = |es: &[Element]| -> BTreeMap<usize, CellPrediction> { self.predict(es, s).into_iter().map(|c| (c.cell, c)).collect() };
             let (pp, qq) = (at(p), at(q));
@@ -2357,11 +2425,12 @@ impl Scene {
                 let (Some(a), Some(b)) = (a, b) else { continue };
                 let k = a.elem as usize;
                 let (align, front) = (em.align_sd(a.surface, other), p[k].front_shift_sd(em));
-                let load = shared.depth(k, align);
-                shared.add(&[b.depth - a.depth], &load, ea * k_depth / (a.sd * a.sd - align * align - front * front).max(1e-12), w);
+                let [_, depth, refl_info] = cell_information(em, ea, a.sd * a.sd - align * align - front * front, a.fill);
+                let load = shared.load(k, align, 1.0, 0.0, em.refl_level_sd);
+                shared.add(&[b.depth - a.depth], &load, depth, w);
                 if refl && (b.refl - a.refl).is_finite() {
-                    let load = shared.refl(k, em.refl_level_sd);
-                    shared.add(&[b.refl - a.refl], &load, ea * k_refl / em.refl_noise.hypot(em.refl_edge * (1.0 - a.fill.clamp(0.0, 1.0))).powi(2), w);
+                    let load = shared.load(k, align, 0.0, 1.0, em.refl_level_sd);
+                    shared.add(&[b.refl - a.refl], &load, refl_info, w);
                 }
             }
             bernoulli + 0.5 * shared.finish()[0][0]
@@ -2468,7 +2537,7 @@ mod tests {
         let index = alignment_nodes(data);
         let n = index.len();
         let terms_at = |z: &[f64], from: &[Term]| -> Vec<Term> {
-            data.par_iter().enumerate().map(|(i, el)| el.term(el.align.iter().map(|(k, w)| w * z[index[k]]).sum(), from.get(i).map_or([0.0; 2], |t| t.own), em)).collect()
+            data.par_iter().enumerate().map(|(i, el)| el.term(el.align.iter().map(|(k, w)| w * z[index[k]]).sum(), from.get(i).map_or(Vector2::zeros(), |t| t.own), em)).collect()
         };
         let objective = |z: &[f64], t: &[Term]| 0.5 * z.iter().map(|x| x * x).sum::<f64>() + t.iter().map(|t| t.fit).sum::<f64>();
         let system = |z: &[f64], t: &[Term]| alignment_system(&index, z, t.iter().map(|t| (&t.align[..], t.slope, t.curv)));
@@ -2868,12 +2937,12 @@ mod tests {
                 for i in 0..2 {
                     assert!((q.g[i] - g[i]).abs() < 1e-4 * (g[i].abs() + 1.0), "{x:?} slope {:?} vs {g:?}", q.g);
                 }
-                let raw = [q.hess[0][0], q.hess[0][1], q.hess[1][1]];
+                let raw = [q.hess[(0, 0)], q.hess[(0, 1)], q.hess[(1, 1)]];
                 for i in 0..3 {
                     assert!((raw[i] - hess[i]).abs() < 1e-3 * (hess[0].abs() * hess[2].abs()).sqrt().max(1.0), "{x:?} curvature {raw:?} vs {hess:?}");
                 }
             }
-            let (cold, warm) = (d.term(0.0, [0.0; 2], &em), d.term(0.0, [0.5, -0.5], &em));
+            let (cold, warm) = (d.term(0.0, Vector2::zeros(), &em), d.term(0.0, Vector2::new(0.5, -0.5), &em));
             assert!((cold.own[0] - warm.own[0]).abs() < 1e-3 && (cold.own[1] - warm.own[1]).abs() < 1e-3, "{:?} vs {:?}", cold.own, warm.own);
             assert!((cold.cost() - warm.cost()).abs() < 1e-5, "{} vs {}", cold.cost(), warm.cost());
             let at = d.quad(d.at(0.0, cold.own), &em);
@@ -2931,7 +3000,7 @@ mod tests {
             for s in 0..c.n_scans() {
                 let fit = &c.fits[s];
                 let fresh: BTreeMap<Owner, f64> = c.data(s).into_iter()
-                    .map(|(o, d)| (o, d.term(fit.held.shift(&d.align), fit.held.reference.get(&o).map_or([0.0; 2], |t| t.start), &em).cost())).collect();
+                    .map(|(o, d)| (o, d.term(fit.held.shift(&d.align), fit.held.reference.get(&o).map_or(Vector2::zeros(), |t| t.start), &em).cost())).collect();
                 assert_eq!(fresh, fit.terms.iter().map(|(o, t)| (*o, t.cost())).collect::<BTreeMap<Owner, f64>>());
             }
         };
@@ -3135,27 +3204,136 @@ mod tests {
         assert!(rows[1].align_sd > rows[0].align_sd, "{:?}", rows);
     }
 
-    /// How well a scan pins a pole down: its cost curves up in every direction of a stick's geometry about the truth,
-    /// most in place across the beam (the silhouette) and least in tilt, and the expected information agrees within a
-    /// factor 4 in ln r and place; a row's parts sum to its cost, and the rows and the scans' alignment parts to the
-    /// scene's.
+    /// How well a scan pins a pole down: its expected information is positive in every direction of a stick's
+    /// geometry; a row's parts sum to its cost, and the rows and the scans' alignment parts to the scene's.
     #[test]
     fn the_pole_is_pinned_down_and_rows_split_their_cost() {
         let v = pole_view();
         let (em, sc) = (Settings::default(), Background::default());
         let c = Scene::new(vec![v.clone()], &[stick(0.0, 4.0, 0.03)], em, sc, None, 0);
-        let info = &c.information(&[0], true)[0];
-        let (m, x) = (&info.hessian, &info.expected);
-        for i in 0..3 {
-            assert!(m[i * 5 + i] > 0.0, "{i}: {m:?}");
-            // the expected information agrees with the observed where the pole is seen well
-            assert!(x[i * 5 + i] > 0.25 * m[i * 5 + i] && x[i * 5 + i] < 4.0 * m[i * 5 + i], "{i}: expected {x:?} observed {m:?}");
+        let x = &c.information(&[0])[0].expected;
+        for i in 0..5 {
+            assert!(x[i * 5 + i] > 0.0, "{i}: {x:?}");
         }
         let r = c.rows()[0];
         let parts = r.ray_on + r.ray_empty + r.ray_in_front + r.ray_behind + r.alignment;
         assert!((parts - r.cost).abs() < 1e-9, "{parts} vs {}", r.cost);
         assert!((r.cost + c.alignment_parts()[0] - c.cost()).abs() < 1e-9);
         assert_eq!(r.discount, em.discount);
+    }
+
+    /// Element `e` moved by `th` in [`Scene::information`]'s parameters, as an element (the referee for [`placed`]).
+    fn moved(e: &Element, th: &[f64]) -> Element {
+        let form = match e.form {
+            Form::Stick { a, b } => {
+                let ax = sub(&b, &a);
+                let half = 0.5 * norm(&ax);
+                let u = ax.map(|x| x / (2.0 * half));
+                let p1 = normalize(&cross(&u, &if u[2].abs() < 0.9 { [0.0, 0.0, 1.0] } else { [1.0, 0.0, 0.0] }));
+                let p2 = cross(&u, &p1);
+                let mv = |p: &Point, sign: f64| [0, 1, 2].map(|k| p[k] + (th[1] + sign * half * th[3]) * p1[k] + (th[2] + sign * half * th[4]) * p2[k]);
+                Form::Stick { a: mv(&a, -1.0), b: mv(&b, 1.0) }
+            }
+            Form::Patch { centre } => Form::Patch { centre: [centre[0] + th[1], centre[1] + th[2], centre[2] + th[3]] },
+        };
+        Element { form, r: e.r * th[0].exp(), ..*e }
+    }
+
+    /// The forward slope (research 130 slice-derivatives) matches central differences of the cost of the cells the
+    /// element's layer is in, each read with that layer moved (the same reading in `f64`) at its term's nodes: a stick
+    /// off the pole, behind a thinner stick (cells it lies behind another's front in) and that stick, and a patch;
+    /// the pass's value is the `f64` one bit for bit; and a moved layer is the moved element's rendered. Off the
+    /// pole: the test scan's echoes sit at the true pole's layers' ranges, where a layer passing an echo switches
+    /// the returns the medium's echo may precede (a jump of a few micronats, measure zero on real data).
+    #[test]
+    fn forward_slopes_match_finite_differences() {
+        let v = pole_view();
+        let (em, sc) = (Settings::default(), Background::default());
+        let patch = Element { form: Form::Patch { centre: [0.001, 4.002, 0.0] }, class: Class::Leaf, r: 0.029, opacity: 1.0, mismatch: 0.002, group: None };
+        let (pole, front) = (stick(0.002, 4.003, 0.028), stick(0.02, 3.9, 0.02));
+        for (els, id) in [(vec![pole], 0), (vec![pole, front], 0), (vec![pole, front], 1), (vec![patch], 0)] {
+            let c = Scene::new(vec![v.clone()], &els, em, sc, None, 0);
+            let e = els[id as usize];
+            let n = if let Form::Stick { .. } = e.form { 5 } else { 4 };
+            let slope = &c.information(&[id])[0].slope;
+            let cells = c.cells_of(0, &[id]);
+            let cost = |th: &[f64]| -> f64 {
+                cells.iter().map(|(cell, ls, _, nodes)| c.read_cell(0, *cell, ls, ls.iter().position(|l| l.elem == id).unwrap(), &e, th, *nodes).cost).sum()
+            };
+            let th0: Vec<Geometry> = (0..n).map(|i| Geometry::var(0.0, i)).collect();
+            for (cell, ls, _, nodes) in &cells {
+                let j = ls.iter().position(|l| l.elem == id).unwrap();
+                assert_eq!(c.read_cell(0, *cell, ls, j, &e, &th0, nodes.map(Geometry::c)).cost.v, c.read_cell(0, *cell, ls, j, &e, &vec![0.0; n], *nodes).cost);
+            }
+            assert!(cells.iter().any(|(_, ls, _, _)| ls[0].elem != id) == (els.len() > 1 && id == 0));
+            let th = [0.02, 0.001, -0.002, 0.003, 0.001];
+            for (cell, ly) in render(&v, &moved(&e, &th[..n]), id, &em).iter().filter(|(_, l)| l.fronts()) {
+                let w = v.direction((cell / v.n_cols) as f64, (cell % v.n_cols) as f64);
+                let at = super::layer(&placed(&e, &v.origin, Some(&th[..n])), &w, &e, id, &em, v.step()).unwrap();
+                assert!((at.t - ly.t).abs() < 1e-12 && (at.f - ly.f).abs() < 1e-12, "{at:?} vs {ly:?}");
+            }
+            for i in 0..n {
+                let h = [1e-6, 1e-7, 1e-7, 1e-6, 1e-6][i];
+                let mut th = vec![0.0; n];
+                th[i] = h;
+                let up = cost(&th);
+                th[i] = -h;
+                let fd = (up - cost(&th)) / (2.0 * h);
+                assert!((slope[i] - fd).abs() < 1e-4 * slope[i].abs().max(fd.abs()) + 1e-3, "{id} parameter {i}: forward {} central {fd}", slope[i]);
+            }
+        }
+    }
+
+    /// The expected information from the forward pass is the limit of the finite-difference stencil it replaced
+    /// (research 130 step 3a's, kept here as the referee): the element's predictions at ± a step in each parameter
+    /// differenced, its own nodes at 0 and its chance of an echo loading no node. On the pole drawn sharp (no shape
+    /// mismatch, so the recorded echo's mean reflectance is the middle radius's the stencil read), at a thousandth of
+    /// the old steps (0.05 in ln r, 2 mm in place, that over the half-length in tilt) every entry agrees to 1e-5 of
+    /// the matrix's norm (the diagonals to 3e-6); at the old steps the stencil read ln r's information 17 % low and
+    /// place across the beam 28 % low, its steps reaching past the edge cells' fills.
+    #[test]
+    fn expected_information_is_the_old_stencils_limit() {
+        let v = pole_view();
+        let (em, sc) = (Settings::default(), Background::default());
+        let pole = Element { mismatch: 0.0, ..stick(0.0, 4.0, 0.03) };
+        let new = Scene::new(vec![v.clone()], &[pole], em, sc, None, 0).information(&[0]).remove(0).expected;
+        let empty = Scene::new(vec![v.clone()], &[], em, sc, None, 0);
+        let pred = |th: &[f64]| -> HashMap<usize, CellPrediction> { empty.predict(&[moved(&pole, th)], 0).into_iter().map(|p| (p.cell, p)).collect() };
+        let stencil = |k: f64| -> Vec<f64> {
+            let steps = [0.05, 0.002, 0.002, 0.002 / 0.2, 0.002 / 0.2].map(|x| x * k);
+            let sides: Vec<[HashMap<usize, CellPrediction>; 2]> = (0..5).map(|i| [1.0, -1.0].map(|sg| {
+                let mut t = [0.0; 5];
+                t[i] = sg * steps[i];
+                pred(&t)
+            })).collect();
+            let mut shared = Shared::new(5, &[pole], &em);
+            let mut centre: Vec<CellPrediction> = pred(&[0.0; 5]).into_values().collect();
+            centre.sort_by_key(|p| p.cell);
+            for p in centre {
+                let slope = |f: &dyn Fn(&CellPrediction) -> f64, absent: Option<f64>| -> Vec<f64> {
+                    (0..5).map(|i| match [0, 1].map(|k| sides[i][k].get(&p.cell).map(f).or(absent)) {
+                        [Some(a), Some(b)] if (a - b).is_finite() => (a - b) / (2.0 * steps[i]),
+                        _ => 0.0,
+                    }).collect()
+                };
+                let echo = |q: &CellPrediction| q.arrives * q.recorded;
+                let (align, front) = (em.align_sd(p.surface, false), pole.front_shift_sd(&em));
+                let info = cell_information(&em, echo(&p), p.sd * p.sd - align * align - front * front, p.fill);
+                shared.add(&slope(&echo, Some(0.0)), &[], info[0], p.weight);
+                let load = shared.load(0, align, 1.0, 0.0, em.refl_level_sd);
+                shared.add(&slope(&|q| q.depth, None), &load, info[1], p.weight);
+                if p.refl.is_finite() {
+                    let load = shared.load(0, align, 0.0, 1.0, em.refl_level_sd);
+                    shared.add(&slope(&|q| q.refl, None), &load, info[2], p.weight);
+                }
+            }
+            shared.finish()[0].clone()
+        };
+        let norm = new.iter().map(|x| x * x).sum::<f64>().sqrt();
+        let fine = stencil(1e-3);
+        assert!(new.iter().zip(&fine).all(|(a, b)| (a - b).abs() < 1e-5 * norm), "{new:?}\n{fine:?}");
+        let old = stencil(1.0);
+        assert!((old[0] / new[0] - 0.83).abs() < 0.02 && (old[12] / new[12] - 0.72).abs() < 0.02, "{new:?}\n{old:?}");
     }
 
     /// Several elements' information (research 130 slice 4). Far apart (no alignment node or cell in common), a pair's
@@ -3174,8 +3352,8 @@ mod tests {
         // far apart: the pole, and a stick 2.5 m behind it and to the side (other nodes, other cells)
         let (pole, far) = (stick(0.0, 4.0, 0.03), stick(0.25, 6.5, 0.03));
         let c = Scene::new(vec![v.clone()], &[pole, far], em, sc, None, 0);
-        let joint = c.information(&[0, 1], false).remove(0).expected;
-        let (a, b) = (c.information(&[0], false).remove(0).expected, c.information(&[1], false).remove(0).expected);
+        let joint = c.information(&[0, 1]).remove(0).expected;
+        let (a, b) = (c.information(&[0]).remove(0).expected, c.information(&[1]).remove(0).expected);
         assert!(a[0] > 0.0 && b[0] > 0.0);
         assert!(close(&block(&joint, 10, 0, 5), &a) && close(&block(&joint, 10, 5, 5), &b), "{joint:?}\n{a:?}\n{b:?}");
         assert!((0..5).all(|i| (5..10).all(|j| joint[i * 10 + j].abs() <= 1e-9 * joint[i * 11].max(joint[j * 11]))), "{joint:?}");
@@ -3186,11 +3364,11 @@ mod tests {
             let d = nalgebra::DVector::from_column_slice(d);
             d.dot(&(m.try_inverse().unwrap() * &d))
         };
-        let joint = near.information(&[0, 1], false).remove(0).expected;
+        let joint = near.information(&[0, 1]).remove(0).expected;
         let mut d = vec![0.0; 10];
         (d[1], d[6]) = (1.0, -1.0);
         let unit = [0.0, 1.0, 0.0, 0.0, 0.0];
-        let own: f64 = [0, 1].map(|k| var(&near.information(&[k], false).remove(0).expected, 5, &unit)).iter().sum();
+        let own: f64 = [0, 1].map(|k| var(&near.information(&[k]).remove(0).expected, 5, &unit)).iter().sum();
         assert!(var(&joint, 10, &d) < 0.1 * own, "joint {} own {own}", var(&joint, 10, &d));
         // predictions over several elements, and the divergence
         let empty = Scene::new(vec![v.clone()], &[], em, sc, None, 0);
@@ -3199,7 +3377,7 @@ mod tests {
         assert_eq!(both.len(), alone[0].len() + alone[1].len());
         assert!(both.iter().all(|p| alone[p.elem as usize].iter().any(|q| q.cell == p.cell && q.depth == p.depth)));
         assert_eq!(empty.divergence(&[pole], &[pole])[0], 0.0);
-        let info = Scene::new(vec![v.clone()], &[pole], em, sc, None, 0).information(&[0], false).remove(0).expected;
+        let info = Scene::new(vec![v.clone()], &[pole], em, sc, None, 0).information(&[0]).remove(0).expected;
         for i in [0, 2] {
             let mut th = [0.0; 5];
             th[i] = if i == 0 { 0.05 } else { 0.002 };
@@ -3219,7 +3397,7 @@ mod tests {
         let sc = Background::default();
         let at = |phi: f64| {
             let c = Scene::new(vec![v.clone()], &[stick(0.0, 4.0, 0.03)], Settings { discount: phi, ..Settings::default() }, sc, None, 0);
-            let i = c.information(&[0], true).remove(0);
+            let i = c.information(&[0]).remove(0);
             (i.expected[12], i.gradient_variance[12], c.rows()[0].arc)
         };
         let ((e1, j1, arc), (e2, j2, _)) = (at(10.0), at(20.0));
@@ -3238,7 +3416,7 @@ mod tests {
         let sc = Background::default();
         for (r, y) in [(0.01, 6.0), (0.006, 6.0)] {
             let v = thin_pole_view(r, y);
-            let info = |em: Settings| Scene::new(vec![v.clone()], &[stick(0.0, y, r)], em, sc, None, 0).information(&[0], true)[0].hessian[0];
+            let info = |em: Settings| Scene::new(vec![v.clone()], &[stick(0.0, y, r)], em, sc, None, 0).information(&[0])[0].expected[0];
             let (with, without) = (info(Settings::default()), info(Settings { refl_noise: 0.0, ..Settings::default() }));
             assert!(with > 1.5 * without, "r {r}: with reflectance {with}, without {without}");
         }
@@ -3385,7 +3563,7 @@ mod tests {
         let x = 10.0 * (10f64.powf(r.db[1] / 10.0) + m.energy).log10();
         assert!(m.pull > 0.0 && m.pull < 0.5, "{m:?}");
         let at = r.mu + m.pull;
-        let plain = [Occluder { merge: Merge::default(), ..p.occluders[0] }];
+        let plain = [Occluder { merge: Merge::none(), ..p.occluders[0] }];
         let (merged, alone) = (r.density(at, x, &em, &p.occluders), r.density(at, x, &em, &plain));
         assert!(merged > 1.5 * alone, "{merged} vs {alone}");
         // two layers within the resolution merge into one echo the measured pull behind the nearer
@@ -3425,7 +3603,7 @@ mod tests {
         let flat = Foliage::uniform(0.05);
         let (o, w) = ([0.0; 3], [0.0, 0.96f64.sqrt(), -0.2]);
         let ll = |echoes: &[f32], refls: &[f32], em: &Settings| {
-            Pulse::new(occluders(Vec::new(), Some((10.0, 0.2))), 1, &o, &w, echoes, refls, usize::MAX, em, &flat).read(0.0, 0.0, em).ll
+            Pulse::new(occluders::<f64>(Vec::new(), Some((10.0, 0.2))), 1, &o, &w, echoes, refls, usize::MAX, em, &flat).read(0.0, 0.0, em).ll
         };
         let x = (em.refl_ground + 10.0 * 0.2f64.powf(em.refl_incidence).log10()) as f32;
         let tight = Settings { ground_sd: 0.0, ..em };
@@ -3450,7 +3628,7 @@ mod tests {
         let shared = Shared::new(1, &es, &em);
         for (k, e) in es.iter().enumerate() {
             assert!((e.front_shift_sd(&em) - d[0].own_sd[0]).abs() > 1e-4);
-            assert_eq!(shared.depth(k, 0.0).last().unwrap().1, d[0].own_sd[0]);
+            assert_eq!(shared.load(k, 0.0, 1.0, 0.0, 0.0).last().unwrap().1, d[0].own_sd[0]);
         }
     }
 

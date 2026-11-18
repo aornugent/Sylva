@@ -12,7 +12,7 @@
 //! the outlier share and the longest range. The lattice step is each image's own
 //! ([`super::range_image::RangeImage::step`]).
 
-use super::dual::Real;
+use super::dual::{Over, Real};
 
 /// The range the depth bias's slope is taken from (m).
 pub const BIAS_REF: f64 = 4.0;
@@ -186,20 +186,20 @@ pub fn t_log_norm(nu: f64) -> f64 {
 
 impl Settings {
     /// The beam's diameter (m) at a range.
-    pub fn footprint(&self, range: f64) -> f64 {
-        self.beam_exit + self.beam_divergence * range
+    pub fn footprint<P: Real>(&self, range: P) -> P {
+        range * self.beam_divergence + self.beam_exit
     }
 
     /// Footprints per cell, `(footprint / cell)²`, at least 1, on a lattice of step `step` (rad): how many cells see
     /// the same spot.
-    pub fn multiplicity(&self, range: f64, step: f64) -> f64 {
-        (self.footprint(range) / (step * range)).powi(2).max(1.0)
+    pub fn multiplicity<P: Real>(&self, range: P, step: f64) -> P {
+        (self.footprint(range) / (range * step)).sq().max(1.0)
     }
 
     /// The one weight a cell's evidence counts with everywhere (the ray likelihood, the foliage field, predictions):
     /// `1 / (φ m(ρ))`, at ρ the cell's first echo's range, or its predicted range where it has none.
-    pub fn cell_weight(&self, range: f64, step: f64) -> f64 {
-        1.0 / (self.discount * self.multiplicity(range, step))
+    pub fn cell_weight<P: Real>(&self, range: P, step: f64) -> P {
+        P::c(1.0) / (self.multiplicity(range, step) * self.discount)
     }
 
     /// The per-echo noise sd (m) of class `k`.
@@ -208,8 +208,8 @@ impl Settings {
     }
 
     /// An echo's depth sd for a surface of class `k` whose depth spreads by `spread` over the footprint (m).
-    pub fn depth_sd(&self, k: u8, spread: f64) -> f64 {
-        (self.noise(k).powi(2) + spread * spread).sqrt()
+    pub fn depth_sd<P: Real>(&self, k: u8, spread: P) -> P {
+        (spread * spread + self.noise(k).powi(2)).sqrt()
     }
 
     /// The surface class (0 solid, 1 mid, 2 fragmented) of an excess; NaN reads fragmented.
@@ -224,20 +224,20 @@ impl Settings {
     }
 
     /// The detection floor (dB) at range `range`.
-    pub fn floor(&self, range: f64) -> f64 {
-        self.floor_db + self.floor_slope * (range.max(self.floor_ref) / self.floor_ref).log10()
+    pub fn floor<P: Real>(&self, range: P) -> P {
+        (range.max(self.floor_ref) / self.floor_ref).log10() * self.floor_slope + self.floor_db
     }
 
     /// The chance an echo of energy share `e` (fill × cos) off a surface of reflectance `db` (dB) at range `range` is
     /// recorded: above the detection floor.
-    pub fn p_detect<T: Real>(&self, db: T, e: f64, range: f64) -> T {
-        (-((db + 10.0 * e.max(1e-12).log10() - self.floor(range)) / self.detect_sd) / std::f64::consts::SQRT_2).erfc() * 0.5
+    pub fn p_detect<P: Real, T: Over<P>>(&self, db: T, e: P, range: P) -> T {
+        (-((db + e.max(1e-12).log10() * 10.0 - self.floor(range)) / self.detect_sd) / std::f64::consts::SQRT_2).erfc() * 0.5
     }
 
     /// The chance it is not recorded: `1 − p_detect`, computed as its own tail. `1 − p_detect` cancels to 0 once
     /// p_detect rounds to 1 (z > 8.3, a bright near-full hit; 3dtrees research 130 rca-level-modes.md).
-    pub fn p_miss<T: Real>(&self, db: T, e: f64, range: f64) -> T {
-        (((db + 10.0 * e.max(1e-12).log10() - self.floor(range)) / self.detect_sd) / std::f64::consts::SQRT_2).erfc() * 0.5
+    pub fn p_miss<P: Real, T: Over<P>>(&self, db: T, e: P, range: P) -> T {
+        (((db + e.max(1e-12).log10() * 10.0 - self.floor(range)) / self.detect_sd) / std::f64::consts::SQRT_2).erfc() * 0.5
     }
 
     /// The density of an echo's reflectance `x` (dB) given its return's predicted reflectance `pred`, give or take
@@ -245,26 +245,26 @@ impl Settings {
     /// truncated by the detection floor (its chance of clearing the floor is the return's own, so this is the
     /// reflectance's density given that it was recorded; the truncation is read as a Gaussian's). 1 when `x` is
     /// unknown or reflectance is off.
-    pub fn refl_density<T: Real>(&self, x: f64, pred: T, spread: T, fill: f64, range: f64) -> T {
+    pub fn refl_density<P: Real, T: Over<P>>(&self, x: f64, pred: T, spread: T, fill: P, range: P) -> T {
         if !x.is_finite() || self.refl_noise <= 0.0 {
             return T::c(1.0);
         }
-        let s = T::c(self.refl_noise.hypot(self.refl_edge * (1.0 - fill.clamp(0.0, 1.0)))).hypot(spread);
+        let s = T::from(P::c(self.refl_noise).hypot((P::c(1.0) - fill.clamp(0.0, 1.0)) * self.refl_edge)).hypot(spread);
         let fl = self.floor(range);
         let nu = self.refl_dof;
         let t = (-((-(pred - x) / s).sq() / nu + 1.0).ln() * (0.5 * (nu + 1.0)) + t_log_norm(nu)).exp() / s;
-        t * (0.5 * libm::erfc(-((x - fl) / self.detect_sd) / std::f64::consts::SQRT_2))
+        t * ((-((P::c(x) - fl) / self.detect_sd) / std::f64::consts::SQRT_2).erfc() * 0.5)
             / ((-((pred - fl) / (s * s + self.detect_sd * self.detect_sd).sqrt()) / std::f64::consts::SQRT_2).erfc() * 0.5).max(1e-12)
     }
 
     /// The density of the reflectance `x` (dB) of an echo nothing in the scene explains; 1 when `x` is unknown or
     /// reflectance is off.
-    pub fn refl_background(&self, x: f64) -> f64 {
-        if !x.is_finite() || self.refl_noise <= 0.0 {
-            return 1.0;
+    pub fn refl_background<P: Real>(&self, x: P) -> P {
+        if !x.v().is_finite() || self.refl_noise <= 0.0 {
+            return P::c(1.0);
         }
         let z = (x - self.refl_background_mean) / self.refl_background_sd;
-        (-0.5 * z * z).exp() / (self.refl_background_sd * (2.0 * std::f64::consts::PI).sqrt())
+        (z * -0.5 * z).exp() / (self.refl_background_sd * (2.0 * std::f64::consts::PI).sqrt())
     }
 
     /// The receiver's resolution (m): the separation at which two equal returns come back as two echoes half the
@@ -288,13 +288,13 @@ impl Settings {
 
     /// The merge share behind a layer at range `t` (m) and fill `f` whose foliage field's share is `m` (the calibrated
     /// map above).
-    pub fn merge_share(&self, m: f64, t: f64, f: f64) -> f64 {
-        1.0 / (1.0 + (-(self.merge_a + self.merge_field * m + self.merge_range * t + self.merge_fill * f)).exp())
+    pub fn merge_share<P: Real>(&self, m: P, t: P, f: P) -> P {
+        P::c(1.0) / ((-(m * self.merge_field + self.merge_a + t * self.merge_range + f * self.merge_fill)).exp() + 1.0)
     }
 
     /// The chance two returns `d` m apart, energies `e` dB apart (nearer over farther), come back as two echoes.
-    pub fn p_resolve<T: Real>(&self, d: f64, e: T) -> T {
-        T::c(1.0) / ((-(e * self.res_c + (self.res_a + self.res_b * d))).exp() + 1.0)
+    pub fn p_resolve<P: Real, T: Over<P>>(&self, d: P, e: T) -> T {
+        T::c(1.0) / ((-(e * self.res_c + (d * self.res_b + self.res_a))).exp() + 1.0)
     }
 
     /// The reflectance (dB) the foliage field reads a full hit at, an echo's energy share being its reflectance
@@ -322,10 +322,10 @@ impl Settings {
     }
 
     /// How far behind its surface an echo of class `k` at `range` reads (m).
-    pub fn depth_bias(&self, k: u8, range: f64) -> f64 {
+    pub fn depth_bias<P: Real>(&self, k: u8, range: P) -> P {
         let (b, c) = [(self.bias_solid, self.bias_slope_solid), (self.bias_mid, self.bias_slope_mid),
                       (self.bias_fragmented, self.bias_slope_fragmented)][k as usize];
-        -(b + c * (range - BIAS_REF))
+        -((range - BIAS_REF) * c + b)
     }
 
     /// The scan alignment error's along-beam spread (m) at an element of class `k`, with the other-epoch part if

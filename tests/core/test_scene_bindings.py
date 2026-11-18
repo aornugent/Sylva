@@ -68,8 +68,9 @@ def test_an_empty_scene_costs_nothing_and_a_pole_is_pinned_down():
     parts = sum(rows[k] for k in ('ray_on', 'ray_empty', 'ray_in_front', 'ray_behind', 'alignment'))
     assert np.allclose(parts, rows['cost']) and rows['cost'][0] < 0
     info = sc.information([0])
-    assert info['hessian'].shape == (1, 5, 5) and np.isfinite(info['hessian']).all() and np.diag(info['hessian'][0]).max() > 0
+    assert info['slope'].shape == (1, 5) and np.isfinite(info['slope']).all()
     assert info['expected'].shape == (1, 5, 5) and np.linalg.eigvalsh(info['expected'][0]).min() > -1e-6 * np.abs(info['expected'][0]).max()
+    assert np.diag(info['expected'][0]).min() > 0
     j = info['gradient_variance'][0]
     assert j.shape == (5, 5) and np.linalg.eigvalsh(j).min() > -1e-6 * np.abs(j).max() and j[2, 2] < info['expected'][0][2, 2]
     assert 0 < rows['arc'][0] <= np.pi
@@ -105,14 +106,15 @@ def test_the_held_alignment_crosses_the_binding():
     assert list(pairs['i']) == [0] and list(pairs['j']) == [1] and pairs['cells'][0] and pairs['nodes'][0]
 
 
-def test_expected_information_alone_and_free_space_cross_the_binding():
-    """Research 130 step 3c: `information` without the observed stencil gives the same expected information and NaN
-    for the observed part; the image gives each cell's free space (its first echo less the receiver's resolution, the
-    longest range for a miss) under the settings."""
+def test_a_fisher_step_and_free_space_cross_the_binding():
+    """Research 130 slice-derivatives: `information`'s slope and expected information make a Fisher-scoring step that
+    moves a stick too wide toward the pole's radius; the image gives each cell's free space (its first echo less the
+    receiver's resolution, the longest range for a miss) under the settings."""
     v = pole_image()
-    sc = _core.Scene([v], pole())
-    full, alone = sc.information([0]), sc.information([0], observed=False)
-    assert np.allclose(full['expected'], alone['expected']) and np.isnan(alone['hessian']).all() and np.isnan(alone['gradient']).all()
+    sc = _core.Scene([v], pole(r=0.036))
+    info = sc.information([0])
+    step = -np.linalg.solve(info['expected'].sum(0) + np.eye(5), info['slope'].sum(0))
+    assert np.log(0.03 / 0.036) < step[0] < 0
     d = _core.settings_defaults()
     A = v.arrays(d)
     echo = A['cell'] == 0

@@ -10,7 +10,8 @@
 //! - [`moments`]: surfel moments per (voxel, scan), and the candidate elements read off them.
 //! - [`settings`]: the instrument and site settings and the background.
 //! - [`foliage`]: the foliage field, a residual extinction on voxels.
-//! - [`dual`]: second-order forward derivatives, for the own nodes' Newton in closed form.
+//! - [`dual`]: forward derivatives in any number of variables: second order for the own nodes' Newton, first order
+//!   for the geometry's slope and Fisher information.
 //! - [`scene`]: elements, their rendering, the scan alignment error and the [`scene::Scene`] that holds them.
 //!
 //! # Glossary
@@ -63,7 +64,7 @@
 //! | what a pulse meets of the field behind an element's front | the held field | σ's posterior mean, read by the ray likelihood (τ, the medium's echoes, the merge), held between refits as the alignment is; within `margin` of an element's surface it reads κ |
 //! | κ outside the field, and a ground plane | background | `Background` |
 //! | the chance the pulse meets no foliage before a return | chance a pulse arrives | `arrives`; `predict`'s `read`: an echo of the pulse on the element |
-//! | the cost's curvature in an element's geometry | information | how well a scan pins the element down; `expected` its average over the cells' outcomes; over several elements jointly (a pair's), the latents they share counted once |
+//! | the cost's expected curvature in an element's geometry | information | how well a scan pins the element down: `expected`, the Fisher information (the curvature's average over the cells' outcomes, from first derivatives), beside the cost's `slope`, both from one forward pass per cell; over several elements jointly (a pair's), the latents they share counted once |
 //! | what one hypothesis is expected to cost against another were the other true | divergence | `divergence(p, q)`: `E_p[cost(q) − cost(p)]` from their predictions |
 //! | the variance of the cost's slope were the cells independent | gradient's variance | `gradient_variance`; with E, the sandwich `E⁻¹ J E⁻¹` |
 //! | the arc of a stick's outline a scan's echoes on it span | arc | the support function's coverage, per (element, scan) and per candidate |

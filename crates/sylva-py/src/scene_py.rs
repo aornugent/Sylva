@@ -545,15 +545,14 @@ impl PyScene {
         Ok(d)
     }
 
-    /// How well the scans pin elements `ids` down, one or several jointly (scene::Scene::information): per scan, the
-    /// cost's slope `gradient` (scans, n) and curvature `hessian` (scans, n, n) in their parameters, each element's in
-    /// turn: a stick's ln r, its axis moved across itself (two directions, m) and tilted (rad); a patch's ln r and its
-    /// centre moved (x, y, z, m). Beside them the expected information `expected` (scans, n, n): what their cells would
-    /// tell on average, positive semi-definite, the latents they share marginalised once; and `gradient_variance`
-    /// (scans, n, n): the slope's variance were the cells independent, for the sandwich `E⁻¹ J E⁻¹`. With `observed`
-    /// false the stencil is skipped (two thirds of the cost for one element) and `gradient` and `hessian` read NaN.
-    #[pyo3(signature = (ids, observed=true))]
-    fn information<'py>(&self, py: Python<'py>, ids: Vec<u32>, observed: bool) -> PyResult<Bound<'py, PyDict>> {
+    /// How well the scans pin elements `ids` down, one or several jointly (scene::Scene::information), from one forward
+    /// pass per cell: per scan, the cost's `slope` (scans, n) and its expected (Fisher) information `expected` (scans,
+    /// n, n) in their parameters, each element's in turn: a stick's ln r, its axis moved across itself (two
+    /// directions, m) and tilted (rad); a patch's ln r and its centre moved (x, y, z, m). `expected` is positive
+    /// semi-definite, the latents the cells share marginalised once, so summed over scans with `slope` it gives a
+    /// Fisher-scoring step; `gradient_variance` (scans, n, n) is the slope's variance were the cells independent, for
+    /// the sandwich `E⁻¹ J E⁻¹`.
+    fn information<'py>(&self, py: Python<'py>, ids: Vec<u32>) -> PyResult<Bound<'py, PyDict>> {
         for (k, &id) in ids.iter().enumerate() {
             self.inner.check_id(id).map_err(scene_err)?;
             if ids[..k].contains(&id) {
@@ -561,12 +560,11 @@ impl PyScene {
             }
         }
         let c = &self.inner;
-        let out = py.detach(|| c.information(&ids, observed));
-        let (s, n) = (out.len(), out.first().map_or(0, |m| m.gradient.len()));
+        let out = py.detach(|| c.information(&ids));
+        let (s, n) = (out.len(), out.first().map_or(0, |m| m.slope.len()));
         let d = PyDict::new(py);
-        d.set_item("gradient", out.iter().flat_map(|x| x.gradient.clone()).collect::<Vec<f64>>().into_pyarray(py).reshape([s, n])?)?;
+        d.set_item("slope", out.iter().flat_map(|x| x.slope.clone()).collect::<Vec<f64>>().into_pyarray(py).reshape([s, n])?)?;
         let square = |f: fn(&Information) -> &Vec<f64>| out.iter().flat_map(|x| f(x).clone()).collect::<Vec<f64>>().into_pyarray(py).reshape([s, n, n]);
-        d.set_item("hessian", square(|x| &x.hessian)?)?;
         d.set_item("expected", square(|x| &x.expected)?)?;
         d.set_item("gradient_variance", square(|x| &x.gradient_variance)?)?;
         Ok(d)

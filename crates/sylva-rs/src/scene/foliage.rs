@@ -59,6 +59,7 @@
 //!   `refit_foliage` re-reads it from the counts. The field's own term is never stale; only that reading is held.
 //! - **Counts and the term are fixed point** ([`FIXED`]): integer sums are exact in any order, so a move and its undo
 //!   restore them exactly and a count over threads is reproducible.
+use super::dual::Real;
 use super::settings::Settings;
 use super::range_image::{Cell, RangeImage};
 use crate::Point;
@@ -185,10 +186,10 @@ pub struct Medium {
 
 impl Medium {
     /// The optical depth from the ray's origin to range `t`.
-    pub fn tau(&self, t: f64) -> f64 {
-        let i = self.segs.partition_point(|s| s[0] < t);
-        let past = if i == 0 { 0.0 } else { let s = self.segs[i - 1]; s[3] + (s[2] - self.kappa) * (t.min(s[1]) - s[0]) };
-        self.kappa * t + past
+    pub fn tau<P: Real>(&self, t: P) -> P {
+        let i = self.segs.partition_point(|s| s[0] < t.v());
+        let past = if i == 0 { P::c(0.0) } else { let s = self.segs[i - 1]; (t.min(s[1]) - s[0]) * (s[2] - self.kappa) + s[3] };
+        t * self.kappa + past
     }
 
     /// The hazard of an echo at range `t`: σ in the voxel the ray is in there (κ outside the box).
@@ -199,15 +200,16 @@ impl Medium {
 
     /// The merge integral behind a return at range `at` whose resolving logit is `z0 + slope (u − at)` at range u
     /// ([`Settings::p_resolve`]): `∫ σ(u) (1 − p(u)) du` from `from` to `to`, exact over σ's voxels (each constant).
-    pub fn merge_integral(&self, at: f64, from: f64, to: f64, z0: f64, slope: f64) -> f64 {
-        if to <= from {
-            return 0.0;
+    pub fn merge_integral<P: Real>(&self, at: P, from: P, to: P, z0: P, slope: f64) -> P {
+        if to.v() <= from.v() {
+            return P::c(0.0);
         }
         // ∫ (1 − p) du = u − softplus(z0 + slope (u − at)) / slope
-        let softplus = |z: f64| if z > 30.0 { z } else { z.exp().ln_1p() };
-        let part = |a: f64, b: f64| (b - a) - (softplus(z0 + slope * (b - at)) - softplus(z0 + slope * (a - at))) / slope;
-        let i = self.segs.partition_point(|s| s[1] <= from);
-        self.segs[i..].iter().take_while(|s| s[0] < to).fold(self.kappa * part(from, to), |total, s| total + (s[2] - self.kappa) * part(s[0].max(from), s[1].min(to)))
+        let softplus = |z: P| if z.v() > 30.0 { z } else { z.exp().ln_1p() };
+        let part = |a: P, b: P| (b - a) - (softplus(z0 + (b - at) * slope) - softplus(z0 + (a - at) * slope)) / slope;
+        let i = self.segs.partition_point(|s| s[1] <= from.v());
+        self.segs[i..].iter().take_while(|s| s[0] < to.v())
+            .fold(part(from, to) * self.kappa, |total, s| total + part(from.larger(P::c(s[0])), to.smaller(P::c(s[1]))) * (s[2] - self.kappa))
     }
 }
 
