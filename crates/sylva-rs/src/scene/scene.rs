@@ -943,27 +943,32 @@ impl ElemData {
         Local { ll: total.v, parts, g, hess }
     }
 
+    /// Its curvature over (a, y) at own nodes `y` given its likelihood there (`at`), with y eliminated: over (a, y),
+    /// M = Jᵀ Q J + diag(0, I) with J = [[1, s0, 0], [0, 0, s1]], so P = diag(s) Q diag(s) + I over y and the a–y block
+    /// is `link`; the slope over y; and the cost's slope and curvature in a, y eliminated (the Schur complement).
+    fn eliminate(&self, at: &Local, y: [f64; 2]) -> Eliminated {
+        let (s, q, g) = (self.own_sd, at.hess, at.g);
+        let p = [[s[0] * s[0] * q[0][0] + 1.0, s[0] * s[1] * q[0][1]], [s[0] * s[1] * q[0][1], s[1] * s[1] * q[1][1] + 1.0]];
+        let det = p[0][0] * p[1][1] - p[0][1] * p[1][0];
+        let pi = [[p[1][1] / det, -p[0][1] / det], [-p[1][0] / det, p[0][0] / det]];
+        let link = [q[0][0] * s[0], q[0][1] * s[1]];
+        let (pl, gy) = (mul2(pi, link), [s[0] * g[0] + y[0], s[1] * g[1] + y[1]]);
+        Eliminated { pi, det, link, pl, gy, slope: g[0] - pl[0] * gy[0] - pl[1] * gy[1], curv: q[0][0] - link[0] * pl[0] - link[1] * pl[1] }
+    }
+
     /// Its term at alignment shift `a` (m): its own nodes y at their mode given `a` (Newton from `start`, a step at
     /// most 3 prior sds, halved until the cost falls, stopping under a micronat), the Laplace step over them, and its
     /// cost's slope and curvature in `a` with them eliminated (the Schur complement of its curvature over (a, y)).
     fn term(&self, a: f64, start: [f64; 2], em: &Settings) -> Term {
         let s = self.own_sd;
         let prior = |y: [f64; 2]| 0.5 * (y[0] * y[0] + y[1] * y[1]);
-        // the curvature over y, P = diag(s) Q diag(s) + I, its inverse and determinant; the slope over y
-        let own = |q: [[f64; 2]; 2]| {
-            let p = [[s[0] * s[0] * q[0][0] + 1.0, s[0] * s[1] * q[0][1]], [s[0] * s[1] * q[0][1], s[1] * s[1] * q[1][1] + 1.0]];
-            let det = p[0][0] * p[1][1] - p[0][1] * p[1][0];
-            ([[p[1][1] / det, -p[0][1] / det], [-p[1][0] / det, p[0][0] / det]], det)
-        };
-        let slope_y = |g: [f64; 2], y: [f64; 2]| [s[0] * g[0] + y[0], s[1] * g[1] + y[1]];
-        let mul = |m: [[f64; 2]; 2], x: [f64; 2]| [m[0][0] * x[0] + m[0][1] * x[1], m[1][0] * x[0] + m[1][1] * x[1]];
         let mut y = if s == [0.0; 2] { [0.0; 2] } else { start };
         let mut at = self.quad(self.at(a, y), em);
         if s != [0.0; 2] {
             let mut f_now = -at.ll + prior(y);
             for _ in 0..MAX_NEWTON {
-                let mut step = mul(own(at.hess).0, slope_y(at.g, y));
-                step = step.map(|x| x / (step[0].abs().max(step[1].abs()).max(3.0) / 3.0));
+                let e = self.eliminate(&at, y);
+                let step = cap(mul2(e.pi, e.gy));
                 let (mut t, mut fall) = (1.0, None);
                 while t >= 1e-3 {
                     let yn = [y[0] - t * step[0], y[1] - t * step[1]];
@@ -981,24 +986,19 @@ impl ElemData {
                 }
             }
         }
-        let (g, q, ll, parts) = (at.g, at.hess, at.ll, at.parts);
-        // over (a, y): M = Jᵀ Q J + diag(0, I), J = [[1, s0, 0], [0, 0, s1]]; its a–y block is `link`
-        let (pi, det) = own(q);
-        let link = [q[0][0] * s[0], q[0][1] * s[1]];
-        let pl = mul(pi, link);
-        let gy = slope_y(g, y);
+        let e = self.eliminate(&at, y);
         Term {
             align: self.align.clone(),
-            fit: -ll + 0.5 * (y[0] * y[0] + y[1] * y[1]),
-            logdet: 0.5 * det.ln(),
-            slope: g[0] - pl[0] * gy[0] - pl[1] * gy[1],
-            curv: q[0][0] - link[0] * pl[0] - link[1] * pl[1],
+            fit: -at.ll + prior(y),
+            logdet: 0.5 * e.det.ln(),
+            slope: e.slope,
+            curv: e.curv,
             own: y,
             start,
             own_sd: s,
-            own_cov: pi,
-            own_link: pl,
-            ray: parts.map(|x| -x),
+            own_cov: e.pi,
+            own_link: e.pl,
+            ray: at.parts.map(|x| -x),
             cells: self.cells.len() as u32,
             cells_on: self.cells_on,
             arc: match self.on_across {
@@ -1009,6 +1009,27 @@ impl ElemData {
             surface: self.surface,
         }
     }
+}
+
+/// A term's curvature with its own nodes eliminated ([`ElemData::eliminate`]): P⁻¹ and |P| over y, the a–y link
+/// and P⁻¹ link, the slope over y, and the cost's slope and curvature in the alignment shift a.
+struct Eliminated {
+    pi: [[f64; 2]; 2],
+    det: f64,
+    link: [f64; 2],
+    pl: [f64; 2],
+    gy: [f64; 2],
+    slope: f64,
+    curv: f64,
+}
+
+fn mul2(m: [[f64; 2]; 2], x: [f64; 2]) -> [f64; 2] {
+    [m[0][0] * x[0] + m[0][1] * x[1], m[1][0] * x[0] + m[1][1] * x[1]]
+}
+
+/// A step over a term's own nodes scaled to at most 3 prior sds.
+fn cap(step: [f64; 2]) -> [f64; 2] {
+    step.map(|x| x / (step[0].abs().max(step[1].abs()).max(3.0) / 3.0))
 }
 
 /// One term's ray likelihood at a point (δ, reflectance level), by outcome, and −ll's slope and curvature there
@@ -1191,12 +1212,9 @@ impl Held {
     }
 }
 
-/// A scan's exact Laplace marginal over the alignment error's nodes, given each element's data (the referee for the
-/// held alignment, and its refit): Newton on the nodes with each element's own nodes profiled out at every step
-/// ([`ElemData::term`]); a step at most 3 prior sds, halved until the cost falls, stopping under a millinat; the
-/// precision is the final mode's. Its value is the held alignment's at its own reference ([`Held::part`] with no
-/// columns).
-fn solve_alignment(data: &[ElemData], em: &Settings) -> (Held, Vec<Term>) {
+/// The alignment's nodes over some terms (by first appearance), and its Newton system at nodes `z` from each term's
+/// weights, slope and curvature in its shift: the gradient `z + Σ γ r` and the precision `I + Σ h r rᵀ`.
+fn alignment_nodes(data: &[ElemData]) -> HashMap<[i64; 3], usize> {
     let mut index: HashMap<[i64; 3], usize> = HashMap::new();
     for el in data {
         for (k, _) in &el.align {
@@ -1204,52 +1222,29 @@ fn solve_alignment(data: &[ElemData], em: &Settings) -> (Held, Vec<Term>) {
             index.entry(*k).or_insert(n);
         }
     }
+    index
+}
+
+fn alignment_system<'a>(index: &HashMap<[i64; 3], usize>, z: &[f64], terms: impl Iterator<Item = (&'a [([i64; 3], f64)], f64, f64)>)
+    -> (nalgebra::DVector<f64>, nalgebra::DMatrix<f64>) {
     let n = index.len();
-    // each term's own nodes start from their mode at the last step (warm), from 0 at the first
-    let terms_at = |z: &[f64], from: &[Term]| -> Vec<Term> {
-        data.par_iter().enumerate().map(|(i, el)| el.term(el.align.iter().map(|(k, w)| w * z[index[k]]).sum(), from.get(i).map_or([0.0; 2], |t| t.own), em)).collect()
-    };
-    let objective = |z: &[f64], t: &[Term]| 0.5 * z.iter().map(|x| x * x).sum::<f64>() + t.iter().map(|t| t.fit).sum::<f64>();
-    let assemble = |z: &[f64], t: &[Term]| {
-        let mut grad = nalgebra::DVector::from_column_slice(z);
-        let mut hess = nalgebra::DMatrix::<f64>::identity(n, n);
-        for t in t {
-            for &(a, wa) in &t.align {
-                let i = index[&a];
-                grad[i] += t.slope * wa;
-                for &(b, wb) in &t.align {
-                    hess[(i, index[&b])] += t.curv * wa * wb;
-                }
+    let mut grad = nalgebra::DVector::from_column_slice(z);
+    let mut hess = nalgebra::DMatrix::<f64>::identity(n, n);
+    for (align, slope, curv) in terms {
+        for &(a, wa) in align {
+            let i = index[&a];
+            grad[i] += slope * wa;
+            for &(b, wb) in align {
+                hess[(i, index[&b])] += curv * wa * wb;
             }
-        }
-        (grad, hess)
-    };
-    let mut z = vec![0.0; n];
-    let mut terms = terms_at(&z, &[]);
-    let (mut grad, mut hess) = assemble(&z, &terms);
-    for _ in 0..MAX_NEWTON {
-        let Some(ch) = (n > 0).then(|| hess.clone().cholesky()).flatten() else { break };
-        let mut step = ch.solve(&grad);
-        step /= step.amax().max(3.0) / 3.0;
-        let f_now = objective(&z, &terms);
-        let (mut t, mut fall) = (1.0, None);
-        while t >= 1e-3 {
-            let zn: Vec<f64> = z.iter().zip(step.iter()).map(|(a, b)| a - t * b).collect();
-            let tn = terms_at(&zn, &terms);
-            let f_new = objective(&zn, &tn);
-            if f_new <= f_now {
-                fall = Some(f_now - f_new);
-                (z, terms) = (zn, tn);
-                break;
-            }
-            t *= 0.5;
-        }
-        let Some(fall) = fall else { break };
-        (grad, hess) = assemble(&z, &terms);
-        if fall < 1e-3 {
-            break;
         }
     }
+    (grad, hess)
+}
+
+/// The alignment held at nodes `z` with the system (`grad`, `hess`) there ([`Held`]; its reference set by the caller).
+fn held(index: HashMap<[i64; 3], usize>, z: Vec<f64>, grad: nalgebra::DVector<f64>, hess: nalgebra::DMatrix<f64>) -> Held {
+    let n = index.len();
     // the precision is the unit prior plus positive semi-definite terms, so only a non-finite cost fails
     let (logdet, cov) = match hess.cholesky() {
         Some(c) => (2.0 * c.l().diagonal().iter().map(|x| x.ln()).sum::<f64>(), c.inverse()),
@@ -1257,7 +1252,67 @@ fn solve_alignment(data: &[ElemData], em: &Settings) -> (Held, Vec<Term>) {
     };
     let m: Vec<f64> = (&cov * &grad).iter().copied().collect();
     let gm = grad.iter().zip(&m).map(|(a, b)| a * b).sum();
-    (Held { index, z, cov, m, gm, logdet, reference: BTreeMap::new() }, terms)
+    Held { index, z, cov, m, gm, logdet, reference: BTreeMap::new() }
+}
+
+/// A scan's exact Laplace marginal over the alignment error's nodes, given each element's data (the referee for the
+/// held alignment, and its refit; 3dtrees research 130 optimisation.md): one Newton over the nodes and every term's
+/// own nodes together. Terms are independent given the alignment and each meets it through its shift alone, so the
+/// joint curvature is an arrowhead: each term's own block is eliminated by its Schur complement
+/// ([`ElemData::eliminate`]), the nodes step on the system that leaves, and each term's own nodes follow, `−P⁻¹(g_y +
+/// link Δa)`; both steps at most 3 prior sds, halved together until the total cost falls (each term read once a
+/// trial), stopping under a millinat. Then each term's own Newton finishes from the joint mode ([`ElemData::term`]),
+/// so its [`Term`] is what the nested solver (the test's referee) defines; the precision is the final terms'. Its value
+/// is the held alignment's at its own reference ([`Held::part`] with no columns).
+fn solve_alignment(data: &[ElemData], em: &Settings) -> (Held, Vec<Term>) {
+    let index = alignment_nodes(data);
+    let n = index.len();
+    let shift = |el: &ElemData, z: &[f64]| -> f64 { el.align.iter().map(|(k, w)| w * z[index[k]]).sum() };
+    let read = |z: &[f64], ys: &[[f64; 2]]| -> Vec<Local> { data.par_iter().zip(ys).map(|(el, y)| el.quad(el.at(shift(el, z), *y), em)).collect() };
+    let objective = |z: &[f64], ys: &[[f64; 2]], ls: &[Local]| {
+        0.5 * z.iter().map(|x| x * x).sum::<f64>() + ls.iter().zip(ys).map(|(l, y)| -l.ll + 0.5 * (y[0] * y[0] + y[1] * y[1])).sum::<f64>()
+    };
+    let (mut z, mut ys) = (vec![0.0; n], vec![[0.0; 2]; data.len()]);
+    let mut ls = read(&z, &ys);
+    for _ in 0..MAX_NEWTON {
+        let es: Vec<Eliminated> = data.iter().zip(&ls).zip(&ys).map(|((el, l), y)| el.eliminate(l, *y)).collect();
+        let (grad, hess) = alignment_system(&index, &z, data.iter().zip(&es).map(|(el, e)| (&el.align[..], e.slope, e.curv)));
+        let step = match (n > 0).then(|| hess.cholesky()).flatten() {
+            Some(ch) => {
+                let step = ch.solve(&grad);
+                &step / (step.amax().max(3.0) / 3.0)
+            }
+            None => nalgebra::DVector::zeros(n),
+        };
+        // each term's own step given its shift's, Δa = −rᵀ step
+        let dys: Vec<[f64; 2]> = data.iter().zip(&es).map(|(el, e)| {
+            if el.own_sd == [0.0; 2] {
+                return [0.0; 2];
+            }
+            let da = -el.align.iter().map(|(k, w)| w * step[index[k]]).sum::<f64>();
+            cap(mul2(e.pi, [e.gy[0] + e.link[0] * da, e.gy[1] + e.link[1] * da]).map(|x| -x))
+        }).collect();
+        let f_now = objective(&z, &ys, &ls);
+        let (mut t, mut fall) = (1.0, None);
+        while t >= 1e-3 {
+            let zn: Vec<f64> = z.iter().zip(step.iter()).map(|(a, b)| a - t * b).collect();
+            let yn: Vec<[f64; 2]> = ys.iter().zip(&dys).map(|(y, d)| [y[0] + t * d[0], y[1] + t * d[1]]).collect();
+            let ln = read(&zn, &yn);
+            let f_new = objective(&zn, &yn, &ln);
+            if f_new <= f_now {
+                fall = Some(f_now - f_new);
+                (z, ys, ls) = (zn, yn, ln);
+                break;
+            }
+            t *= 0.5;
+        }
+        if fall.is_none_or(|f| f < 1e-3) {
+            break;
+        }
+    }
+    let terms: Vec<Term> = data.par_iter().zip(&ys).map(|(el, y)| el.term(shift(el, &z), *y, em)).collect();
+    let (grad, hess) = alignment_system(&index, &z, terms.iter().map(|t| (&t.align[..], t.slope, t.curv)));
+    (held(index, z, grad, hess), terms)
 }
 
 /// One scan's fit: per element id its surface class, per [`Owner`] its term (none where the scan doesn't see it), the
@@ -2297,6 +2352,72 @@ impl Scene {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The nested solver the joint one replaced (3dtrees research 130 optimisation.md), kept as its referee: Newton on
+    /// the alignment's nodes with each term's own nodes re-solved at every step.
+    fn solve_alignment_nested(data: &[ElemData], em: &Settings) -> (Held, Vec<Term>) {
+        let index = alignment_nodes(data);
+        let n = index.len();
+        let terms_at = |z: &[f64], from: &[Term]| -> Vec<Term> {
+            data.par_iter().enumerate().map(|(i, el)| el.term(el.align.iter().map(|(k, w)| w * z[index[k]]).sum(), from.get(i).map_or([0.0; 2], |t| t.own), em)).collect()
+        };
+        let objective = |z: &[f64], t: &[Term]| 0.5 * z.iter().map(|x| x * x).sum::<f64>() + t.iter().map(|t| t.fit).sum::<f64>();
+        let system = |z: &[f64], t: &[Term]| alignment_system(&index, z, t.iter().map(|t| (&t.align[..], t.slope, t.curv)));
+        let mut z = vec![0.0; n];
+        let mut terms = terms_at(&z, &[]);
+        let (mut grad, mut hess) = system(&z, &terms);
+        for _ in 0..MAX_NEWTON {
+            let Some(ch) = (n > 0).then(|| hess.clone().cholesky()).flatten() else { break };
+            let mut step = ch.solve(&grad);
+            step /= step.amax().max(3.0) / 3.0;
+            let f_now = objective(&z, &terms);
+            let (mut t, mut fall) = (1.0, None);
+            while t >= 1e-3 {
+                let zn: Vec<f64> = z.iter().zip(step.iter()).map(|(a, b)| a - t * b).collect();
+                let tn = terms_at(&zn, &terms);
+                let f_new = objective(&zn, &tn);
+                if f_new <= f_now {
+                    fall = Some(f_now - f_new);
+                    (z, terms) = (zn, tn);
+                    break;
+                }
+                t *= 0.5;
+            }
+            let Some(fall) = fall else { break };
+            (grad, hess) = system(&z, &terms);
+            if fall < 1e-3 {
+                break;
+            }
+        }
+        (held(index, z, grad, hess), terms)
+    }
+
+    /// The joint arrowhead Newton finds the nested solver's alignment and terms: on the pole alone and with a stick
+    /// beside it (sharing its node), one scan and two.
+    #[test]
+    fn the_joint_newton_matches_the_nested_one() {
+        let v = pole_view();
+        let (em, sc) = (Settings::default(), Background::default());
+        let scene = |els: &[Element], n: usize| Scene::new(vec![v.clone(); n], els, em, sc, None, 0);
+        for (els, n) in [(vec![stick(0.0, 4.0, 0.03)], 1), (vec![stick(0.0, 4.0, 0.03), stick(0.15, 4.5, 0.02)], 2)] {
+            let c = scene(&els, n);
+            for s in 0..n {
+                let vv = &*c.views[s];
+                let ids: Vec<u32> = (0..els.len() as u32).collect();
+                let rendered: Vec<Vec<(usize, Layer)>> = ids.iter().map(|&i| c.rendered[s][i as usize].clone()).collect();
+                let slot = slots(&ids.iter().map(|&i| owner(i, &els[i as usize])).collect::<Vec<_>>());
+                let cls = classes(vv, &kbuffer(&rendered), &els, &slot, &em, &sc, false);
+                let data = elem_data(vv, &rendered, &els, &cls, &slot, &(0..els.len()).collect::<Vec<_>>(), 0, &em, &sc, &c.ext);
+                let ((hj, tj), (hn, tn)) = (solve_alignment(&data, &em), solve_alignment_nested(&data, &em));
+                let total = |h: &Held, t: &[Term]| t.iter().map(Term::cost).sum::<f64>() + 0.5 * h.z.iter().map(|x| x * x).sum::<f64>() + 0.5 * h.logdet - 0.5 * h.gm;
+                assert!((total(&hj, &tj) - total(&hn, &tn)).abs() < 1e-4, "{} vs {}", total(&hj, &tj), total(&hn, &tn));
+                for (a, b) in tj.iter().zip(&tn) {
+                    assert!((a.cost() - b.cost()).abs() < 1e-4 && (a.own[1] - b.own[1]).abs() < 1e-3, "{:?} vs {:?}", (a.cost(), a.own), (b.cost(), b.own));
+                }
+                assert!(hj.z.iter().zip(&hn.z).all(|(a, b)| (a - b).abs() < 1e-3), "{:?} vs {:?}", hj.z, hn.z);
+            }
+        }
+    }
     use crate::shots::reconstruct::dir;
     use crate::scene::range_image::RangeImageParams;
     
