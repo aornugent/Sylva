@@ -27,9 +27,9 @@
 //!     owners (its layers, the ground, the medium) and the receiver ([`Receiver`]: merges, detection, the cap) are read
 //!     once, and that pass gives everything the scene reads of the pulse: its log-likelihood with its slope and
 //!     curvature in the own nodes ([`Dual2`]; with the geometry, its slope in [`Scene::information`]: [`Dual`]), the element's echo ([`front_echo`]), each owner's beam left and
-//!     expected echoes, and each echo's responsibilities over the owners. The cost keeps the hard attribution (a
-//!     cell's evidence is its front element's term's, the field's cut); the responsibilities are reported, for the
-//!     soft attribution to come.
+//!     expected echoes, and each echo's responsibilities over the owners. With a foliage field, the responsibilities
+//!     at each term's nodes share each echo between the field and the elements (soft attribution: the term's deposit,
+//!     [`ElemData::deposit`]; 3dtrees research 130 slice-soft).
 //!   - The beam reaches layer i with energy `e_i = f_i Π_{j<i} (1 − op_j f_j)`, and its echo is recorded with
 //!     `op_i det_i`, where `det_i` is the chance it clears the detection floor ([`Settings::p_detect`]):
 //!     `Φ((ρ_dB + 10 log10(e_i cos ι_i) − floor(t_i)) / σ)`.
@@ -104,7 +104,7 @@
 use super::dual::{Dual, Dual2, Over, Real};
 use nalgebra::{Matrix2, Vector2};
 use super::settings::{Background, Settings, ALIGN_SPACING, P_OUTLIER, T_MAX};
-use super::foliage::{self, FieldCounts, FixedCounts, Foliage, FoliageBox, Medium};
+use super::foliage::{self, Deposit, FieldCounts, FixedCounts, Foliage, FoliageBox, Medium};
 use super::range_image::{Cell, RangeImage};
 use std::sync::Arc;
 use crate::transform::{cross, norm, normalize, sub};
@@ -261,18 +261,13 @@ impl Outcome {
     pub fn of(obs: f64, depth: f64, sd: f64) -> Outcome {
         if !obs.is_finite() {
             Outcome::Empty
-        } else if obs < Outcome::in_front_of(depth, sd) {
+        } else if obs < depth - 3.0 * sd - 0.03 {
             Outcome::InFront
         } else if (obs - depth).abs() < 3.0 * sd + 0.01 {
             Outcome::On
         } else {
             Outcome::Behind
         }
-    }
-
-    /// The range an echo is in front of the element's echo (at `depth`, sd `sd`) before: `3 sd + 3 cm` short of it.
-    pub fn in_front_of(depth: f64, sd: f64) -> f64 {
-        depth - 3.0 * sd - 0.03
     }
 }
 
@@ -325,14 +320,6 @@ impl Layer {
         Layer { t: c(self.t), far: c(self.far), spread: c(self.spread), f: c(self.f), fq: self.fq.map(c), cos: c(self.cos), db: self.db, elem: self.elem,
                 op: self.op, x: self.x, s: self.s }
     }
-
-    /// Where the foliage field's fit stops reading a ray this layer fronts ([`foliage`]'s module docs): an echo before
-    /// it is in front of the layer ([`Outcome::in_front_of`] its depth, at the noisiest surface class's sd), one at or
-    /// after it is the layer's or behind it. A partial layer ([`Layer::full`] false) cuts nothing (∞): the field's cut
-    /// is hard, so it stays where it was, at [`FULL_FILL`] (3dtrees research 130 slice-trim).
-    fn cut(&self, em: &Settings) -> f64 {
-        if self.full() { Outcome::in_front_of(self.t, em.depth_sd(2, self.spread)) } else { f64::INFINITY }
-    }
 }
 
 /// What one scan says about one element, or one group ([`Owner`]: `group`, and `elem` its first member), its cost
@@ -349,8 +336,9 @@ impl Layer {
 /// - `alignment`: its own nodes' (stem front shift, reflectance level) prior and log-determinant terms. The scan's alignment part is the scan's, not shared out among its
 ///   elements ([`Scene::alignment_parts`]), so the rows, those parts and the field's part ([`Scene::field_part`]) sum
 ///   to the scene's cost.
-/// - `field`: beside `cost`, not in it: the foliage field's part of its cost to remove, were its cuts in this scan
-///   lifted (the field's term is non-linear in the counts, so these don't sum over elements or scans).
+/// - `field`: beside `cost`, not in it: the foliage field's part of its cost to remove, were its deposit in this scan
+///   given back ([`ElemData::deposit`]; the field's term is non-linear in the counts, so these don't sum over elements
+///   or scans).
 /// - `discount`: the evidence discount φ every cell's evidence was divided by.
 /// - The posterior at the element in this scan, along the beam (m): the scan alignment error's shift and sd, and the
 ///   stem front shift's (0 when it is off); and its reflectance level's (dB; 0 while reflectance isn't read). Shifts
@@ -1136,6 +1124,13 @@ impl<P: Real> Pulse<P> {
         Reading { ll: total.max(1e-300).ln(), rx, resp }
     }
 
+    /// Per echo, the share of it its elements' layers take in `r` (their responsibilities summed; the ground, the medium
+    /// and an outlier take the rest).
+    fn taken<T>(&self, r: &Reading<P, T>) -> Vec<f64> {
+        let layers: Vec<usize> = (0..self.occluders.len()).filter(|&o| matches!(self.occluders[o].surface, Surface::Layer(_))).collect();
+        r.resp.chunks(self.occluders.len() + 2).map(|row| layers.iter().map(|&o| row[o]).sum()).collect()
+    }
+
     /// The same pulse in the empty scene: the medium and the ground alone, the same for every hypothesis.
     fn empty(&self) -> Self {
         Pulse { occluders: self.occluders.iter().filter(|o| matches!(o.surface, Surface::Ground(_))).copied().collect(), ..self.clone() }
@@ -1226,13 +1221,31 @@ impl<P: Real, T: Over<P>> Pass<'_, P, T> {
 
 /// One cell a term has a front share in, as its ray likelihood scores it: its pulse per subset of its mixture
 /// ([`CellView`]), its weight times the term's front share ([`front_shares`]), its log-likelihood under the empty
-/// scene (the medium and the ground alone: the same for every hypothesis), and what its first echo says about its
-/// front element.
+/// scene (the medium and the ground alone: the same for every hypothesis), what its first echo says about its
+/// front element, and, with a foliage field, the hits the field counts of its echoes ([`foliage::hits`]: the echo, its
+/// voxel, its weight times the term's front share).
 struct CellData {
     pulses: Vec<(f64, Pulse)>,
     wt: f64,
     base: f64,
     outcome: Outcome,
+    hits: Vec<(usize, [i32; 3], f64)>,
+}
+
+/// Per echo of a cell's pulse (`pulses`, per subset of its mixture), the share its elements' layers take at shift and
+/// reflectance level `x`: each subset's ([`Pulse::taken`]) by the subset's posterior.
+fn taken(pulses: &[(f64, Pulse)], x: (f64, f64), em: &Settings) -> Vec<f64> {
+    let reads: Vec<_> = pulses.iter().map(|(w, p)| (*w, p, p.read(x.0, x.1, em))).collect();
+    let m = reads.iter().map(|r| r.2.ll).fold(f64::NEG_INFINITY, f64::max);
+    let post: Vec<f64> = reads.iter().map(|(w, _, r)| w * (r.ll - m).exp()).collect();
+    let total: f64 = post.iter().sum();
+    let mut out = vec![0.0; pulses[0].1.echoes.len()];
+    for ((_, p, r), q) in reads.iter().zip(&post) {
+        for (o, t) in out.iter_mut().zip(p.taken(r)) {
+            *o += q / total * t;
+        }
+    }
+    out
 }
 
 /// One term's data in one scan (an element's, or a group's: [`Owner`]): the cells its members own (its evidence:
@@ -1345,7 +1358,18 @@ impl ElemData {
             },
             across: self.across,
             surface: self.surface,
+            deposit: self.deposit(|c| taken(&c.pulses, self.at(a, y), em)),
         }
+    }
+
+    /// What its elements take of the foliage field's hits in its cells (soft attribution; [`foliage`]'s module docs):
+    /// per hit, its weight (front share included) times `taken`'s share of its echo, per cell. At its term's nodes
+    /// (`term`), `taken` is the share the cell's layers take by their responsibilities ([`taken`]).
+    fn deposit(&self, taken: impl Fn(&CellData) -> Vec<f64>) -> Deposit {
+        foliage::deposit(self.cells.iter().filter(|c| !c.hits.is_empty()).flat_map(|c| {
+            let t = taken(c);
+            c.hits.iter().map(move |&(i, k, w)| (k, w * t[i])).collect::<Vec<_>>()
+        }))
     }
 }
 
@@ -1380,7 +1404,8 @@ struct Local {
 /// cost's `slope` and `curv`ature in its alignment shift (its own nodes
 /// eliminated), where its own nodes' Newton began (`start`: a move recomputes a held term from its reference's, so an
 /// unchanged term comes out the same), and what its row reports: ŷ, its own nodes' covariance given the shift P⁻¹ and how they follow it
-/// (`own_link`: ŷ moves by −`own_link` per unit of shift), the ray likelihood's cost by outcome, and its cells.
+/// (`own_link`: ŷ moves by −`own_link` per unit of shift), the ray likelihood's cost by outcome, and its cells; and,
+/// with a foliage field, the hits its elements take from it at its nodes ([`ElemData::deposit`]).
 #[derive(Debug, Clone)]
 struct Term {
     align: Vec<([i64; 3], f64)>,
@@ -1399,6 +1424,7 @@ struct Term {
     arc: f64,
     across: f64,
     surface: u8,
+    deposit: Deposit,
 }
 
 impl Term {
@@ -1436,10 +1462,11 @@ const MAX_NEWTON: usize = 40;
 /// One scan's data for the elements `score` (indices into `elems`, each with its layers in `rendered`), one per term
 /// (`slot`, per element: [`slots`]), against the k-buffer of every element's layers. A cell's evidence belongs to its
 /// layers' terms by their front shares ([`front_shares`]: wholly its front element's where that is wholly in it); its echoes read the cell's own surface class ([`cell_class`]) and its shift the term's
-/// alignment spread ([`term_classes`]), so a term depends on no other term's class.
+/// alignment spread ([`term_classes`]), so a term depends on no other term's class. With the foliage field's box
+/// `field`, each cell holds the hits the field counts of its echoes, for the terms' deposits.
 #[allow(clippy::too_many_arguments)]
 fn elem_data(v: &RangeImage, rendered: &[Vec<(usize, Layer)>], elems: &[Element], slot: &[usize], score: &[usize], ref_epoch: u32,
-             em: &Settings, sc: &Background, ext: &Foliage) -> Vec<ElemData> {
+             em: &Settings, sc: &Background, ext: &Foliage, field: Option<&FoliageBox>) -> Vec<ElemData> {
     let buf = kbuffer(rendered);
     let cls = term_classes(v, &buf, slot, em);
     let other = v.epoch != ref_epoch;
@@ -1491,8 +1518,9 @@ fn elem_data(v: &RangeImage, rendered: &[Vec<(usize, Layer)>], elems: &[Element]
             }
         }
         let base = cv.pulses[0].1.empty().read(0.0, 0.0, em).ll;
+        let hits = field.map_or(Vec::new(), |sp| foliage::hits(v, sp, em, cell));
         for (d, s) in shares {
-            data[d].cells.push(CellData { pulses: cv.pulses.clone(), wt: cv.wt * s, base, outcome });
+            data[d].cells.push(CellData { pulses: cv.pulses.clone(), wt: cv.wt * s, base, outcome, hits: hits.iter().map(|&(i, k, w)| (i, k, w * s)).collect() });
         }
     }
     data
@@ -1746,6 +1774,10 @@ impl std::error::Error for SceneError {}
 ///   it touches. So a move recomputes only the terms of the elements whose cells it touches, not the scan, and
 ///   removing an element restores the cost exactly (synthesis §18 invariant 7). [`Scene::refit_alignment`] re-solves the alignment (a move like `refit_foliage`), after which
 ///   the cost is the exact Laplace marginal ([`Scene::exact_cost`], the referee); the scene is built refitted.
+/// - With a foliage field, each term's deposit (the hits its elements take from the field, [`ElemData::deposit`])
+///   changes with the term, so a move changes the field's counts by its terms' old deposits less their new ones. A scene
+///   is built by one step of EM from κ: the terms read the background, their deposits make the field, and the terms
+///   read it ([`Scene::refit_foliage`], another step).
 /// - Element ids are stable and never reused.
 /// - The reference epoch (the scanning day the alignment error's spread is stated for) is declared: a scan of another epoch adds the other-epoch part
 ///   to its alignment error.
@@ -1767,19 +1799,17 @@ pub struct Scene {
     fits: Vec<Fit>,
 }
 
-/// An element's layer in a cell's index: its id, range, [`Layer::cut`] and whether it is wholly in the cell
-/// ([`Layer::full`]).
+/// An element's layer in a cell's index: its id, range and whether it is wholly in the cell ([`Layer::full`]).
 #[derive(Debug, Clone, Copy)]
 struct Entered {
     id: u32,
     t: f64,
-    cut: f64,
     full: bool,
 }
 
 impl Entered {
-    fn of(id: u32, l: &Layer, em: &Settings) -> Entered {
-        Entered { id, t: l.t, cut: l.cut(em), full: l.full() }
+    fn of(id: u32, l: &Layer) -> Entered {
+        Entered { id, t: l.t, full: l.full() }
     }
 }
 
@@ -1792,28 +1822,36 @@ fn kept(mut e: Vec<Entered>) -> (Vec<u32>, usize) {
 }
 
 /// Enter an element's layers in one image's cell index ([`Layer::enters`]), or take them out.
-fn index(cells: &mut HashMap<usize, Vec<Entered>>, id: u32, layers: &[(usize, Layer)], enter: bool, em: &Settings) {
+fn index(cells: &mut HashMap<usize, Vec<Entered>>, id: u32, layers: &[(usize, Layer)], enter: bool) {
     for (c, l) in layers.iter().filter(|(_, l)| l.enters()) {
         let e = cells.entry(*c).or_default();
         if enter {
-            e.push(Entered::of(id, l, em));
+            e.push(Entered::of(id, l));
         } else {
             e.retain(|x| x.id != id);
         }
     }
 }
 
-/// Where the foliage field's fit stops reading cell `c`'s ray: the nearest cut of the layers in it (∞ for none).
-fn cut_at(cells: &HashMap<usize, Vec<Entered>>, c: usize) -> f64 {
-    cells.get(&c).into_iter().flatten().map(|x| x.cut).fold(f64::INFINITY, f64::min)
+/// The change to the foliage field's counts were a term `old` replaced by `new` (none: no term), added to `acc`: its
+/// old deposit given back, its new one taken ([`ElemData::deposit`]).
+fn redeposit(acc: &mut FixedCounts, old: Option<&Term>, new: Option<&Term>) {
+    if let Some(t) = old {
+        foliage::give(acc, &t.deposit, 1);
+    }
+    if let Some(t) = new {
+        foliage::give(acc, &t.deposit, -1);
+    }
 }
 
-/// An element's segment for [`FieldCounts::claim`]: a stick's ends, or a patch's centre twice.
-fn segment(e: &Element) -> (Point, Point) {
-    match e.form {
-        Form::Stick { a, b } => (a, b),
-        Form::Patch { centre } => (centre, centre),
+/// The change to the foliage field's counts from scans' fits `old` (none for a scan not yet fitted) to `new`.
+fn redeposits(old: &[Fit], new: &[Fit]) -> FixedCounts {
+    let mut acc = FixedCounts::default();
+    for (s, fit) in new.iter().enumerate() {
+        old.get(s).into_iter().flat_map(|f| f.terms.values()).for_each(|t| redeposit(&mut acc, Some(t), None));
+        fit.terms.values().for_each(|t| redeposit(&mut acc, None, Some(t)));
     }
+    acc
 }
 
 /// The numbers of [`Scene::information`]'s pass: the slope in an element's parameters (its first five; a patch's
@@ -1932,21 +1970,14 @@ impl Scene {
         c.rendered = c.views.par_iter().map(|v| render_all(v, elems, &c.em)).collect();
         for (cells, rendered) in c.cells.iter_mut().zip(&c.rendered) {
             for (i, ls) in rendered.iter().enumerate() {
-                index(cells, i as u32, ls, true, &em);
+                index(cells, i as u32, ls, true);
             }
         }
-        if let Some(sp) = spec {
-            let cuts: Vec<HashMap<usize, f64>> = c.cells.iter().map(|cs| cs.keys().map(|&k| (k, cut_at(cs, k))).collect()).collect();
-            let mut f = FieldCounts::new(sp, &c.views.iter().map(|v| &**v).collect::<Vec<_>>(), &em, &cuts, sc.kappa);
-            for e in elems {
-                let (a, b) = segment(e);
-                f.claim(&a, &b, e.r, true);
-            }
-            c.ext = f.field(sc.kappa);
-            f.reread(&c.ext);
-            c.field = Some(f);
+        c.field = spec.map(|sp| FieldCounts::new(sp, &c.views.iter().map(|v| &**v).collect::<Vec<_>>(), &em));
+        c.refit_alignment();
+        if c.field.is_some() {
+            c.refit_foliage();
         }
-        c.fits = (0..n).into_par_iter().map(|s| c.solve(s)).collect();
         c
     }
 
@@ -1963,21 +1994,28 @@ impl Scene {
     }
 
     /// The scene's exact cost: each scan's Laplace marginal over the alignment error re-solved for the elements as
-    /// they are (the referee for the held alignment; the scene unchanged).
+    /// they are, and the field's part with the re-solved terms' deposits (the referee for the held alignment; the
+    /// scene unchanged).
     pub fn exact_cost(&self) -> f64 {
-        (0..self.views.len()).into_par_iter().map(|s| self.solve(s).cost).collect::<Vec<f64>>().iter().sum::<f64>() + self.field_part()
+        let fits: Vec<Fit> = (0..self.views.len()).into_par_iter().map(|s| self.solve(s)).collect();
+        let field = self.field.as_ref().map_or(0.0, |f| f.change(&redeposits(&self.fits, &fits), &self.ext));
+        fits.iter().map(|f| f.cost).sum::<f64>() + self.field_part() + field
     }
 
-    /// Re-solve the scan alignment error for the elements as they are (a move: its cost change); after it the cost
-    /// is [`Scene::exact_cost`], and moves hold the new mode and precision.
+    /// Re-solve the scan alignment error for the elements as they are, and the field's counts with the terms' deposits
+    /// (a move: its cost change); after it the cost is [`Scene::exact_cost`], and moves hold the new mode and precision.
     pub fn refit_alignment(&mut self) -> f64 {
         let before = self.cost();
-        self.fits = (0..self.views.len()).into_par_iter().map(|s| self.solve(s)).collect();
+        let fits: Vec<Fit> = (0..self.views.len()).into_par_iter().map(|s| self.solve(s)).collect();
+        let delta = redeposits(&self.fits, &fits);
+        self.fits = fits;
+        self.give(delta);
         self.cost() - before
     }
 
     /// Re-read the foliage field a pulse meets from the counts the moves since the last refit kept, and refit the
-    /// alignment (a move: its cost change). Moves hold that field; after this one the scene's cost is a fresh scene's.
+    /// alignment, the terms' responsibilities and so their deposits with it (a move: its cost change; one step of EM).
+    /// Moves hold that field.
     pub fn refit_foliage(&mut self) -> f64 {
         let before = self.cost();
         let Some(f) = &mut self.field else { return 0.0 };
@@ -1995,53 +2033,17 @@ impl Scene {
         self.refit_alignment()
     }
 
-    /// Image `s`'s cell index after element `id`'s layers `old` give way to `new`, and the change to the field's
-    /// counts added to `delta`: each cell whose cut moves is counted again ([`foliage::recount`]).
-    fn reindex(&mut self, s: usize, id: u32, old: &[(usize, Layer)], new: &[(usize, Layer)], delta: &mut FixedCounts) {
-        let em = self.em;
-        let touched: BTreeSet<usize> = old.iter().chain(new).filter(|(_, l)| l.full()).map(|(c, _)| *c).collect();
-        let before: Vec<f64> = touched.iter().map(|&c| cut_at(&self.cells[s], c)).collect();
-        index(&mut self.cells[s], id, old, false, &em);
-        index(&mut self.cells[s], id, new, true, &em);
-        if let Some(f) = &self.field {
-            for (&c, from) in touched.iter().zip(before) {
-                foliage::recount(&self.views[s], &f.spec, &em, c, from, cut_at(&self.cells[s], c), delta);
-            }
-        }
+    /// Image `s`'s cell index after element `id`'s layers `old` give way to `new`.
+    fn reindex(&mut self, s: usize, id: u32, old: &[(usize, Layer)], new: &[(usize, Layer)]) {
+        index(&mut self.cells[s], id, old, false);
+        index(&mut self.cells[s], id, new, true);
     }
 
-    /// Change the field's counts by `delta`: the change in its part of the cost.
-    fn recount(&mut self, delta: FixedCounts) -> f64 {
+    /// Change the field's counts by `delta` (deposits given back and taken): the change in its part of the cost.
+    fn give(&mut self, delta: FixedCounts) -> f64 {
         match &mut self.field {
             Some(f) => f.apply(delta, &self.ext),
             None => 0.0,
-        }
-    }
-
-    /// Image `s`'s change to the field's counts were the live elements `without` taken out and elements of layers
-    /// `with` put in, added to `delta`, the scene unchanged.
-    fn field_delta(&self, s: usize, without: &[u32], with: &[Vec<(usize, Layer)>], delta: &mut FixedCounts) {
-        let Some(f) = &self.field else { return };
-        let fronting = |ls: &[(usize, Layer)]| ls.iter().filter(|(_, l)| l.full()).map(|(c, l)| (*c, l.cut(&self.em))).collect::<Vec<_>>();
-        let index = &self.cells[s];
-        // per touched cell, the least cut of the layers put in front of it
-        let mut put: BTreeMap<usize, f64> = BTreeMap::new();
-        let gone = without.iter().flat_map(|&w| fronting(&self.rendered[s][w as usize])).map(|(c, _)| (c, f64::INFINITY));
-        for (c, cut) in with.iter().flat_map(|ls| fronting(ls)).chain(gone) {
-            let e = put.entry(c).or_insert(f64::INFINITY);
-            *e = e.min(cut);
-        }
-        for (c, cut) in put {
-            let kept = index.get(&c).into_iter().flatten().filter(|x| !without.contains(&x.id)).map(|x| x.cut).fold(cut, f64::min);
-            foliage::recount(&self.views[s], &f.spec, &self.em, c, cut_at(index, c), kept, delta);
-        }
-    }
-
-    /// Element `e` claims the field's voxels within its margin (or, `enter` false, releases them).
-    fn claim(&mut self, e: &Element, enter: bool) {
-        if let Some(f) = &mut self.field {
-            let (a, b) = segment(e);
-            f.claim(&a, &b, e.r, enter);
         }
     }
 
@@ -2080,11 +2082,11 @@ impl Scene {
         d + self.refit_foliage()
     }
 
-    /// The foliage field and its counts: per voxel with counts, (voxel, σ as held, the counts as the scene now is,
-    /// whether an element's margin claims it). Empty when the field is held from elsewhere.
-    pub fn foliage(&self) -> (Option<FoliageBox>, Vec<([i32; 3], f64, (f64, f64), bool)>) {
+    /// The foliage field and its counts: per voxel with counts, (voxel, σ as held, the counts as the scene now is).
+    /// Empty when the field is held from elsewhere.
+    pub fn foliage(&self) -> (Option<FoliageBox>, Vec<([i32; 3], f64, (f64, f64))>) {
         let Some(f) = &self.field else { return (self.ext.spec, Vec::new()) };
-        let mut out: Vec<_> = f.counts().into_iter().map(|(k, c)| (k, self.ext.sigma(&k), c, f.claimed.contains_key(&k))).collect();
+        let mut out: Vec<_> = f.counts().into_iter().map(|(k, c)| (k, self.ext.sigma(&k), c)).collect();
         out.sort_by_key(|x| x.0);
         (self.ext.spec, out)
     }
@@ -2119,24 +2121,12 @@ impl Scene {
                 first.insert(g, i as u32);
             }
         }
-        // per (scan, term): its live members, and the field's part of its cost to remove there
-        let members: Vec<((usize, Owner), Vec<u32>)> = (0..self.views.len()).flat_map(|s| {
-            let mut by: BTreeMap<Owner, Vec<u32>> = BTreeMap::new();
-            for (i, e) in self.elems.iter().enumerate() {
-                if let Some(e) = e.filter(|_| !self.rendered[s][i].is_empty()) {
-                    by.entry(owner(i as u32, &e)).or_default().push(i as u32);
-                }
-            }
-            by.into_iter().map(move |(o, ids)| ((s, o), ids))
-        }).collect();
-        let field: HashMap<(usize, Owner), f64> = match &self.field {
-            Some(f) => members.par_iter().map(|(k, ids)| {
-                let mut delta = FixedCounts::default();
-                self.field_delta(k.0, ids, &[], &mut delta);
-                (*k, -f.change(&delta, &self.ext))
-            }).collect(),
-            None => HashMap::new(),
-        };
+        // the field's part of a term's cost to remove: its deposit given back
+        let field = |t: &Term| self.field.as_ref().map_or(0.0, |f| {
+            let mut back = FixedCounts::default();
+            redeposit(&mut back, Some(t), None);
+            -f.change(&back, &self.ext)
+        });
         let mut rows = Vec::new();
         for (s, fit) in self.fits.iter().enumerate() {
             for (o, t) in &fit.terms {
@@ -2150,7 +2140,7 @@ impl Scene {
                 rows.push(ElementScan {
                     elem: i, group, scan: s as u32, cells: t.cells, cells_on: t.cells_on, arc: t.arc, footprints_across: t.across, surface: t.surface,
                     cost: t.cost(), ray_on: t.ray[0], ray_empty: t.ray[1], ray_in_front: t.ray[2], ray_behind: t.ray[3],
-                    alignment: t.fit - t.ray.iter().sum::<f64>() + t.logdet, field: field.get(&(s, *o)).copied().unwrap_or(0.0),
+                    alignment: t.fit - t.ray.iter().sum::<f64>() + t.logdet, field: field(t),
                     discount: self.em.discount,
                     align_shift: fit.held.shift(&t.align), align_sd: var.max(0.0).sqrt(), front_shift: t.own_sd[0] * t.own[0], front_shift_sd: own_sd(0),
                     refl_level: t.own_sd[1] * t.own[1], refl_level_sd: own_sd(1),
@@ -2169,14 +2159,13 @@ impl Scene {
         let changes: Vec<Changes> = (0..self.views.len()).into_par_iter()
             .map(|s| if layers[s].is_empty() { Changes::default() } else { self.reterm(s, &[], &[(e, layers[s].clone())], id) }).collect();
         self.elems.push(Some(e));
-        self.claim(&e, true);
         let (mut d, mut delta) = (0.0, FixedCounts::default());
         for (s, (l, ch)) in layers.into_iter().zip(changes).enumerate() {
-            self.reindex(s, id, &[], &l, &mut delta);
+            self.reindex(s, id, &[], &l);
             self.rendered[s].push(l);
-            d += self.apply(s, ch);
+            d += self.apply(s, ch, &mut delta);
         }
-        (id, d + self.recount(delta))
+        (id, d + self.give(delta))
     }
 
     /// Remove a live element ([`Scene::check_id`]): the cost change.
@@ -2184,16 +2173,14 @@ impl Scene {
         let first = self.elems.len() as u32;
         let changes: Vec<Changes> = (0..self.views.len()).into_par_iter()
             .map(|s| if self.rendered[s][id as usize].is_empty() { Changes::default() } else { self.reterm(s, &[id], &[], first) }).collect();
-        if let Some(e) = self.elems[id as usize].take() {
-            self.claim(&e, false);
-        }
+        self.elems[id as usize] = None;
         let (mut d, mut delta) = (0.0, FixedCounts::default());
         for (s, ch) in changes.into_iter().enumerate() {
             let old = std::mem::take(&mut self.rendered[s][id as usize]);
-            self.reindex(s, id, &old, &[], &mut delta);
-            d += self.apply(s, ch);
+            self.reindex(s, id, &old, &[]);
+            d += self.apply(s, ch, &mut delta);
         }
-        d + self.recount(delta)
+        d + self.give(delta)
     }
 
     /// Replace a live element ([`Scene::check_id`]): the cost change.
@@ -2203,31 +2190,29 @@ impl Scene {
         let changes: Vec<Changes> = (0..self.views.len()).into_par_iter().map(|s| {
             if layers[s].is_empty() && self.rendered[s][id as usize].is_empty() { Changes::default() } else { self.reterm(s, &[id], &[(e, layers[s].clone())], id) }
         }).collect();
-        if let Some(old) = self.elems[id as usize].replace(e) {
-            self.claim(&old, false);
-        }
-        self.claim(&e, true);
+        self.elems[id as usize] = Some(e);
         let (mut d, mut delta) = (0.0, FixedCounts::default());
         for (s, (l, ch)) in layers.into_iter().zip(changes).enumerate() {
             let old = std::mem::take(&mut self.rendered[s][id as usize]);
-            self.reindex(s, id, &old, &l, &mut delta);
+            self.reindex(s, id, &old, &l);
             self.rendered[s][id as usize] = l;
-            d += self.apply(s, ch);
+            d += self.apply(s, ch, &mut delta);
         }
-        d + self.recount(delta)
+        d + self.give(delta)
     }
 
-    /// Put a move's new terms into scan `s`'s fit: the cost change.
-    fn apply(&mut self, s: usize, terms: Changes) -> f64 {
+    /// Put a move's new terms into scan `s`'s fit, their deposits' change added to `delta`: the fit's cost change.
+    fn apply(&mut self, s: usize, terms: Changes, delta: &mut FixedCounts) -> f64 {
         if terms.is_empty() {
             return 0.0;
         }
         let fit = &mut self.fits[s];
         for (o, t) in terms {
-            match t {
+            let old = match t {
                 Some(t) => fit.terms.insert(o, t),
                 None => fit.terms.remove(&o),
             };
+            redeposit(delta, old.as_ref(), fit.terms.get(&o));
         }
         let before = fit.cost;
         fit.cost = fit.total(&HashMap::new());
@@ -2241,7 +2226,8 @@ impl Scene {
         let rendered: Vec<Vec<(usize, Layer)>> = ids.iter().enumerate()
             .map(|(k, &i)| self.rendered[s][i as usize].iter().map(|&(c, l)| (c, Layer { elem: k as u32, ..l })).collect()).collect();
         let owners: Vec<Owner> = ids.iter().zip(&elems).map(|(&i, e)| owner(i, e)).collect();
-        let data = elem_data(&self.views[s], &rendered, &elems, &slots(&owners), &(0..ids.len()).collect::<Vec<_>>(), self.ref_epoch, &self.em, &self.sc, &self.ext);
+        let data = elem_data(&self.views[s], &rendered, &elems, &slots(&owners), &(0..ids.len()).collect::<Vec<_>>(), self.ref_epoch, &self.em, &self.sc, &self.ext,
+                             self.field.as_ref().map(|f| &f.spec));
         data.into_iter().map(|d| (owners[d.members[0]], d)).collect()
     }
 
@@ -2273,7 +2259,7 @@ impl Scene {
         let mut fresh: HashMap<usize, Vec<Entered>> = HashMap::new();
         for (k, (_, ls)) in with.iter().enumerate() {
             for (c, l) in ls.iter().filter(|(_, l)| l.enters()) {
-                fresh.entry(*c).or_default().push(Entered::of(first + k as u32, l, em));
+                fresh.entry(*c).or_default().push(Entered::of(first + k as u32, l));
             }
         }
         // a cell's k-buffer, before the move and after it: its elements, nearest first, and how many have a front share
@@ -2317,7 +2303,8 @@ impl Scene {
             .map(|(k, &i)| layers(i).iter().filter(|(c, _)| cells.contains(c)).map(|&(c, l)| (c, Layer { elem: k as u32, ..l })).collect()).collect();
         let el: Vec<Element> = ids.iter().map(|&i| element(i)).collect();
         let owners: Vec<Owner> = ids.iter().map(|&i| owner_of(i)).collect();
-        let data = elem_data(v, &r, &el, &slots(&owners), &(0..near.len()).collect::<Vec<_>>(), self.ref_epoch, em, &self.sc, &self.ext);
+        let data = elem_data(v, &r, &el, &slots(&owners), &(0..near.len()).collect::<Vec<_>>(), self.ref_epoch, em, &self.sc, &self.ext,
+                             self.field.as_ref().map(|f| &f.spec));
         // a held term's own nodes start where its reference's did, so an unchanged term is recomputed exactly
         let mut terms: Vec<(Owner, Option<Term>)> = data.par_iter().map(|d| {
             let o = owners[d.members[0]];
@@ -2632,19 +2619,19 @@ impl Scene {
         let first = self.elems.len() as u32;
         items.par_iter().map(|(h, without)| {
             let layers: Vec<Vec<Vec<(usize, Layer)>>> = self.views.iter().map(|v| h.iter().map(|e| render(v, e, 0, &self.em)).collect()).collect();
+            let mut delta = FixedCounts::default();
             let mut out: Vec<f64> = layers.iter().enumerate().map(|(s, ls)| {
                 if ls.iter().all(Vec::is_empty) && without.iter().all(|&w| self.rendered[s][w as usize].is_empty()) {
                     return 0.0;
                 }
                 let with: Vec<(Element, Vec<(usize, Layer)>)> = h.iter().copied().zip(ls.iter().cloned()).collect();
                 let over: HashMap<Owner, Option<Term>> = self.reterm(s, without, &with, first).into_iter().collect();
+                for (o, t) in &over {
+                    redeposit(&mut delta, self.fits[s].terms.get(o), t.as_ref());
+                }
                 self.fits[s].total(&over) - self.fits[s].cost
             }).collect();
             if let Some(f) = &self.field {
-                let mut delta = FixedCounts::default();
-                for (s, ls) in layers.iter().enumerate() {
-                    self.field_delta(s, without, ls, &mut delta);
-                }
                 out.push(f.change(&delta, &self.ext));
             }
             out
@@ -2759,7 +2746,7 @@ mod tests {
                 let ids: Vec<u32> = (0..els.len() as u32).collect();
                 let rendered: Vec<Vec<(usize, Layer)>> = ids.iter().map(|&i| c.rendered[s][i as usize].clone()).collect();
                 let slot = slots(&ids.iter().map(|&i| owner(i, &els[i as usize])).collect::<Vec<_>>());
-                let data = elem_data(vv, &rendered, &els, &slot, &(0..els.len()).collect::<Vec<_>>(), 0, &em, &sc, &c.ext);
+                let data = elem_data(vv, &rendered, &els, &slot, &(0..els.len()).collect::<Vec<_>>(), 0, &em, &sc, &c.ext, None);
                 let ((hj, tj), (hn, tn)) = (solve_alignment(&data, &em), solve_alignment_nested(&data, &em));
                 let total = |h: &Held, t: &[Term]| t.iter().map(Term::cost).sum::<f64>() + 0.5 * h.z.iter().map(|x| x * x).sum::<f64>() + 0.5 * h.logdet - 0.5 * h.gm;
                 assert!((total(&hj, &tj) - total(&hn, &tn)).abs() < 1e-4, "{} vs {}", total(&hj, &tj), total(&hn, &tn));
@@ -2917,69 +2904,120 @@ mod tests {
         }
     }
 
-    /// The foliage field is a residual: the empty scene's field holds the pole's echoes (its voxel is dense), and
-    /// promoting the pole takes them out of the field. Promotion and demotion are exact: the cost after a promotion
-    /// is a fresh scene's, its change is that cost, the pole's rows hold all of it, and demotion restores the empty
-    /// scene.
+    /// The foliage field is what the elements leave: the empty scene's field holds the pole's echoes (its voxel is
+    /// dense), and promoting the pole takes its share of them out. The cost after a promotion is near a fresh scene's
+    /// (one step of EM each, from different fields: the empty scene's and κ), its change is that cost, the rows, the
+    /// alignment parts and the field's part sum to it, and demotion restores the empty scene exactly.
     #[test]
-    fn the_field_is_a_residual_and_its_moves_are_exact() {
+    fn the_field_is_what_the_elements_leave() {
         let v = pole_view();
         let (em, sc) = (Settings::default(), Background::default());
-        let spec = Some(FoliageBox { lo: [-0.5, 2.9, -0.3], hi: [0.5, 8.9, 0.3], voxel: 0.1, margin: 0.0 });
         let pole = stick(0.0, 4.0, 0.03);
         let sigma = |c: &Scene| c.foliage().1.iter().find(|x| x.0 == [5, 10, 3]).map_or(f64::NAN, |x| x.1);
-        let mut c = Scene::new(vec![v.clone()], &[], em, sc, spec, 0);
+        let mut c = Scene::new(vec![v.clone()], &[], em, sc, Some(field_box()), 0);
         assert_eq!(c.cost(), 0.0);
         let dense = sigma(&c);
         assert!(dense > 1.0, "{dense}");
         let (id, d) = c.promote(pole);
-        let fresh = Scene::new(vec![v.clone()], &[pole], em, sc, spec, 0);
-        assert!((c.cost() - fresh.cost()).abs() < 1e-6 * fresh.cost().abs().max(1.0), "{} vs {}", c.cost(), fresh.cost());
-        assert!((d - fresh.cost()).abs() < 1e-6 * d.abs().max(1.0));
+        let fresh = Scene::new(vec![v.clone()], &[pole], em, sc, Some(field_box()), 0);
+        assert!((c.cost() - fresh.cost()).abs() < 1e-3 * fresh.cost().abs(), "{} vs {}", c.cost(), fresh.cost());
+        assert!((d - c.cost()).abs() < 1e-9 * d.abs().max(1.0));
         assert!(d < 0.0, "{d}");
         assert!(sigma(&c) < 0.5 * dense, "{} vs {dense}", sigma(&c));
-        // each ray is scored once: the elements' cells hold the whole cost (the field's own rays cancel against the
-        // empty scene's; before step 2 a plug-in Poisson term scored every ray's counts again)
+        // each datum is scored once: the elements' cells and the field's part hold the whole cost
         let rows: f64 = c.rows().iter().map(|r| r.cost).sum::<f64>() + c.alignment_parts().iter().sum::<f64>() + c.field_part();
         assert!((rows - c.cost()).abs() < 1e-9 * c.cost().abs().max(1.0), "{rows} vs {}", c.cost());
         c.demote(id);
-        assert!(c.cost().abs() < 1e-9, "{}", c.cost());
+        assert_eq!(c.cost(), 0.0);
     }
 
-    /// What the field's fit reads (research 130 slice 2b): a ray the pole fronts keeps its clear path in front of it
-    /// (a voxel there holds the empty scene's path) and loses the rest (a voxel in its shadow holds less); the voxels
-    /// within the margin of its surface are left out (σ is κ).
+    /// Soft attribution (research 130 slice-soft): with the pole in (and a thin stick partly in front of its edge, two
+    /// terms sharing cells), every voxel keeps the empty scene's path, since the likelihood reads the medium's path in
+    /// every way it explains a pulse; and each voxel's hits are the empty scene's less what the elements take, between
+    /// none and all of them: each echo's mass sums to one. At the pole's surface the elements take nearly all of it, in
+    /// front of the pole none.
     #[test]
-    fn the_field_reads_the_clear_path_in_front_of_wood() {
+    fn the_field_keeps_every_path_and_shares_each_echo() {
         let v = pole_view();
         let (em, sc) = (Settings::default(), Background::default());
-        let spec = Some(FoliageBox { lo: [-0.5, 2.9, -0.3], hi: [0.5, 8.9, 0.3], voxel: 0.1, margin: 0.1 });
-        let empty = Scene::new(vec![v.clone()], &[], em, sc, spec, 0);
-        let pole = Scene::new(vec![v.clone()], &[stick(0.0, 4.0, 0.03)], em, sc, spec, 0);
-        let at = |c: &Scene, k: [i32; 3]| c.foliage().1.into_iter().find(|x| x.0 == k).unwrap();
-        // in front (y 3.5–3.6 m), in the shadow (y 6.0–6.1 m), at the surface (y 3.9–4.0 m)
-        let (front, shadow, surface) = ([5, 6, 3], [5, 31, 3], [5, 10, 3]);
-        assert!(at(&empty, front).2 .1 > 0.0);
-        assert!((at(&pole, front).2 .1 - at(&empty, front).2 .1).abs() < 1e-9 * at(&empty, front).2 .1);
-        assert!(at(&pole, shadow).2 .1 < 0.95 * at(&empty, shadow).2 .1, "{:?} vs {:?}", at(&pole, shadow), at(&empty, shadow));
-        let s = at(&pole, surface);
-        assert!(s.3 && s.1 == sc.kappa && !at(&empty, surface).3, "{s:?}");
+        let counts = |els: &[Element]| -> HashMap<[i32; 3], (f64, f64)> {
+            Scene::new(vec![v.clone()], els, em, sc, Some(field_box()), 0).foliage().1.into_iter().map(|x| (x.0, x.2)).collect()
+        };
+        let (empty, pole) = (counts(&[]), counts(&[stick(0.0, 4.0, 0.03), stick(0.0365, 3.9, 0.008)]));
+        let mut taken = 0.0;
+        for (k, &(h, l)) in &empty {
+            let (hp, lp) = pole.get(k).copied().unwrap_or((0.0, 0.0));
+            assert_eq!(lp, l, "{k:?}");
+            assert!(hp >= 0.0 && hp <= h, "{k:?}: {hp} of {h}");
+            taken += h - hp;
+        }
+        assert!(pole.keys().all(|k| empty.contains_key(k)) && taken > 0.0);
+        // in front (y 3.5–3.6 m) and at the surface (y 3.9–4.0 m: the elements take 87 % of its hits; the rest are its
+        // edges' and the medium's)
+        let (front, surface) = ([5, 6, 3], [5, 10, 3]);
+        assert_eq!(pole[&front], empty[&front]);
+        assert!(pole[&surface].0 < 0.2 * empty[&surface].0, "{:?} vs {:?}", pole[&surface], empty[&surface]);
     }
 
-    /// The field is held through moves (research 130 slice 2b), as the alignment is: moves keep its counts (after
-    /// any of them, `refit_foliage` gives a fresh scene's counts and cost), adding then removing an element and moving
-    /// one there and back restore the cost exactly, and after a small move the held cost is near the refitted one.
-    /// After a move to a wrong, wider stick it isn't: the move takes the wall's echoes behind the stick's extra edge
-    /// cells (seen by those rays alone here) out of the counts, but what a pulse meets is held, so the stick's pulses
-    /// read them as the dense medium they were and it looks better held than refitted (by 27 nats on this one scan).
-    /// The field's term scores that change at once; what a pulse meets behind an element waits for the refit (the
-    /// hold formulation.md keeps). Before the field was collapsed the empty scene read those echoes the same way, and
-    /// the held cost erred the other way.
+    /// With hard responsibilities the field's hits are the old hard cut's (research 130 slice 2b): in a cell a layer is
+    /// wholly in, an echo at or behind its cut (`3 sd + 3 cm` before its depth, at the noisiest surface class's sd) the
+    /// element's, one before it the medium's; in a cell it is partly in, none. A term's deposit under those equals the
+    /// hits the cut took out of each fronted ray, counted afresh from the image (2d25264's `ray`, its hits); under the
+    /// soft responsibilities at the term's nodes the pole's interior (fill over 0.99), where who made each echo is
+    /// plain, is within 1 % of it.
+    #[test]
+    fn hard_responsibilities_reproduce_the_cut() {
+        let v = pole_view();
+        let (em, sc, sp) = (Settings::default(), Background::default(), field_box());
+        let e = stick(0.0, 4.0, 0.03);
+        let rendered = render_all(&v, &[e], &em);
+        let buf = kbuffer(&rendered);
+        let d = &elem_data(&v, &rendered, &[e], &[0], &[0], 0, &em, &sc, &Foliage::uniform(sc.kappa), Some(&sp))[0];
+        // the cells in elem_data's order, each with its cut (∞ where the layer is partly in)
+        let mut order: Vec<usize> = buf.keys().copied().filter(|&c| v.cell[c] != Cell::NoPulse).collect();
+        order.sort_unstable();
+        let cut = |l: &Layer| if l.full() { l.t - 3.0 * em.depth_sd(2, l.spread) - 0.03 } else { f64::INFINITY };
+        let cuts: Vec<f64> = order.iter().map(|c| cut(&buf[c][0])).collect();
+        assert_eq!(d.cells.len(), order.len());
+        let at = |c: &CellData| d.cells.iter().position(|x| std::ptr::eq(x, c)).unwrap();
+        let hard = d.deposit(|c| c.pulses[0].1.echoes.iter().map(|&r| (r as f64 >= cuts[at(c)]) as u8 as f64).collect());
+        // the referee: the hits behind each cut, from the image
+        let referee = foliage::deposit(order.iter().zip(&cuts).filter(|(&k, _)| v.cell[k] == Cell::Echoes).flat_map(|(&k, &cut)| {
+            let w = v.direction((k / v.n_cols) as f64, (k % v.n_cols) as f64);
+            let (echoes, refls) = (v.echoes(k), v.echo_refls(k));
+            let wt = em.cell_weight(echoes[0] as f64, v.step());
+            let mut beam = 1.0;
+            let mut out = Vec::new();
+            for (i, &r) in echoes.iter().enumerate() {
+                let x = [0, 1, 2].map(|a| v.origin[a] + w[a] * r as f64);
+                if r as f64 >= cut && (0..3).all(|a| x[a] >= sp.lo[a] && x[a] < sp.hi[a]) {
+                    out.push(([0, 1, 2].map(|a| ((x[a] - sp.lo[a]) / sp.voxel).floor() as i32), wt * beam));
+                }
+                beam *= em.beam_left(refls[i] as f64);
+            }
+            out
+        }));
+        assert!(!referee.is_empty());
+        assert_eq!(hard, referee);
+        let interior: Vec<bool> = order.iter().map(|c| buf[c][0].f > 0.99).collect();
+        let full = |c: &CellData| interior[at(c)];
+        let hard = d.deposit(|c| c.pulses[0].1.echoes.iter().map(|&r| (full(c) && r as f64 >= cuts[at(c)]) as u8 as f64).collect());
+        let soft = d.deposit(|c| if full(c) { taken(&c.pulses, (0.0, 0.0), &em) } else { vec![0.0; c.pulses[0].1.echoes.len()] });
+        let total = |d: &Deposit| d.iter().map(|x| x.1 as f64).sum::<f64>();
+        assert!((total(&soft) / total(&hard) - 1.0).abs() < 0.01, "{} vs {}", total(&soft), total(&hard));
+    }
+
+    /// The field is held through moves (research 130 slice 2b), as the alignment is: moves keep its counts exactly (the
+    /// empty scene's less every term's deposit, recomputed from scratch), adding then removing an element and moving
+    /// one there and back restore the cost exactly, and after a small move, or one to a wrong, wider stick, the held
+    /// cost is near the refitted one. Before soft attribution the wrong stick looked 27 nats better held than refitted:
+    /// the cut took the wall's echoes behind its extra edge cells out of the counts, while the pulses still read the
+    /// dense medium they had made. Now those echoes stay the medium's, held and refitted alike.
     #[test]
     fn held_moves_keep_the_fields_counts() {
         let v = pole_view();
         let (em, sc) = (Settings::default(), Background::default());
-        let spec = Some(FoliageBox { lo: [-0.5, 2.9, -0.3], hi: [0.5, 8.9, 0.3], voxel: 0.1, margin: 0.1 });
+        let spec = Some(field_box());
         let (pole, nudged, wrong, side) = (stick(0.0, 4.0, 0.03), stick(0.002, 4.0, 0.03), stick(0.01, 4.0, 0.033), stick(0.15, 4.5, 0.02));
         let mut c = Scene::new(vec![v.clone()], &[pole], em, sc, spec, 0);
         let e0 = c.cost();
@@ -2987,27 +3025,16 @@ mod tests {
         c.remove(id);
         assert_eq!(c.cost(), e0);
         c.change(0, wrong);
+        assert_eq!(c.field.as_ref().unwrap().counts(), recounted(&c));
         c.change(0, pole);
         assert_eq!(c.cost(), e0);
-        let counts = |c: &Scene| c.foliage().1.into_iter().map(|x| (x.0, x.2, x.3)).collect::<Vec<_>>();
-        let same = |a: &Scene, b: &Scene| {
-            let (x, y) = (counts(a), counts(b));
-            x.len() == y.len() && x.iter().zip(&y).all(|(x, y)| x.0 == y.0 && x.2 == y.2 && (x.1 .0 - y.1 .0).abs() < 1e-9 && (x.1 .1 - y.1 .1).abs() < 1e-9)
-        };
-        assert!(same(&c, &Scene::new(vec![v.clone()], &[pole], em, sc, spec, 0)));
-        for (e, close) in [(nudged, true), (wrong, false)] {
+        // held against refitted, nats: 0.0004 nudged, 0.4 wrong (27 under the cut and margin)
+        for (e, tol) in [(nudged, 0.01), (wrong, 1.0)] {
             let mut c = Scene::new(vec![v.clone()], &[pole], em, sc, spec, 0);
             c.change(0, e);
             let held = c.cost();
             c.refit_foliage();
-            let fresh = Scene::new(vec![v.clone()], &[e], em, sc, spec, 0);
-            assert!(same(&c, &fresh));
-            assert!((c.cost() - fresh.cost()).abs() < 1e-6 * fresh.cost().abs(), "{} vs {}", c.cost(), fresh.cost());
-            if close {
-                assert!((held - c.cost()).abs() < 0.01 * c.cost().abs(), "held {held} vs refitted {}", c.cost());
-            } else {
-                assert!(held < c.cost() - 10.0, "held {held} vs refitted {}", c.cost());
-            }
+            assert!((held - c.cost()).abs() < tol, "held {held} vs refitted {}", c.cost());
         }
     }
 
@@ -3054,7 +3081,7 @@ mod tests {
     fn costs_to_add_match_add_then_remove() {
         let v = pole_view();
         let (em, sc) = (Settings::default(), Background::default());
-        let mut c = Scene::new(vec![v.clone(), v.clone()], &[stick(0.0, 4.0, 0.03)], em, sc, Some(field_box(0.1)), 0);
+        let mut c = Scene::new(vec![v.clone(), v.clone()], &[stick(0.0, 4.0, 0.03)], em, sc, Some(field_box()), 0);
         let hyps = vec![vec![stick(0.0, 4.0, 0.02)], vec![stick(0.2, 6.0, 0.03), stick(0.25, 6.0, 0.01)], vec![stick(5.0, 4.0, 0.03)], vec![stick(0.0365, 3.9, 0.008)]];
         let e0 = c.cost();
         let all = c.costs_to_add(&hyps);
@@ -3072,25 +3099,34 @@ mod tests {
             assert!((total - d).abs() < 1e-6 * d.abs().max(1.0), "{total} vs {d}");
             assert_eq!(c.cost(), e0);
         }
-        // a thinner stick behind the pole's front and one outside the box change no cut
-        assert!(all[0][2] == 0.0 && all[1][2] != 0.0 && all[2][2] == 0.0, "{all:?}");
+        // a stick outside the box takes nothing from the field
+        assert!(all[1][2] != 0.0 && all[2][2] == 0.0, "{all:?}");
     }
 
-    /// The field's box about the test scan's pole and wall, its margin `margin`.
-    fn field_box(margin: f64) -> FoliageBox {
-        FoliageBox { lo: [-0.5, 2.9, -0.3], hi: [0.5, 8.9, 0.3], voxel: 0.1, margin }
+    /// The field's box about the test scan's pole and wall.
+    fn field_box() -> FoliageBox {
+        FoliageBox { lo: [-0.5, 2.9, -0.3], hi: [0.5, 8.9, 0.3], voxel: 0.1 }
+    }
+
+    /// The field's counts recomputed from scratch: the empty scene's, less every term's deposit as it now stands.
+    fn recounted(c: &Scene) -> foliage::Counts {
+        let f = c.field.as_ref().unwrap();
+        let mut fresh = FieldCounts::new(f.spec, &c.views.iter().map(|v| &**v).collect::<Vec<_>>(), &c.em);
+        fresh.apply(redeposits(&[], &c.fits), &c.ext);
+        fresh.counts()
     }
 
     /// The field collapsed (research 130 formulation.md): its term, `Σ ln NB` over the counts, is exact through moves
-    /// (a fresh scene's, bit for bit, and a recompute from the counts); a move's change to the field's part is the
-    /// change in that part (the plug-in held); and adding then removing restores it exactly.
+    /// (its counts are the empty scene's less the terms' deposits recomputed from scratch, and the term a recompute
+    /// from the counts); a move's change to the field's part is the change in that part (the plug-in held); and adding
+    /// then removing restores it exactly.
     #[test]
     fn the_fields_marginal_is_exact_through_moves() {
         let v = pole_view();
         let (em, sc) = (Settings::default(), Background::default());
         let (pole, wrong, side) = (stick(0.0, 4.0, 0.03), stick(0.01, 4.0, 0.033), stick(0.15, 4.5, 0.02));
         let field = |c: &Scene| c.field.clone().unwrap();
-        let mut c = Scene::new(vec![v.clone(), v.clone()], &[pole], em, sc, Some(field_box(0.1)), 0);
+        let mut c = Scene::new(vec![v.clone(), v.clone()], &[pole], em, sc, Some(field_box()), 0);
         let (f0, e0) = (c.field_part(), c.cost());
         let (id, _) = c.add(side);
         c.change(0, wrong);
@@ -3098,29 +3134,28 @@ mod tests {
         c.change(0, pole);
         assert_eq!((c.field_part(), c.cost()), (f0, e0));
         c.change(0, wrong);
-        let fresh = Scene::new(vec![v.clone(), v.clone()], &[wrong], em, sc, Some(field_box(0.1)), 0);
-        assert_eq!(field(&c).marginal(), field(&fresh).marginal());
+        assert_eq!(field(&c).counts(), recounted(&c));
         let (a0, b0) = field(&c).prior;
         let recomputed: f64 = field(&c).counts().values().map(|&(h, l)| foliage::ln_nb(h, l, a0, b0)).sum();
         assert!((recomputed - field(&c).marginal()).abs() < 1e-9 * recomputed.abs(), "{recomputed} vs {}", field(&c).marginal());
         c.refit_foliage();
-        assert_eq!(c.field_part(), fresh.field_part());
+        assert_eq!(field(&c).counts(), recounted(&c));
         let before = c.field_part();
         let per = c.costs_to_add(&[vec![side]]);
         c.add(side);
         assert!((per[0][2] - (c.field_part() - before)).abs() < 1e-9, "{} vs {}", per[0][2], c.field_part() - before);
     }
 
-    /// With the field collapsed and a margin about the pole, the pole's cost to add hardly depends on whether the
-    /// field it is scored against was fitted with it in (2 nats here), where the scans' parts alone, the plug-in
-    /// reading before the collapse, differ by 125: the field's term is a function of the scene alone.
+    /// With the field collapsed, the pole's cost to add hardly depends on whether the field it is scored against was
+    /// fitted with it in, where the scans' parts alone, the plug-in reading before the collapse, differ by far more:
+    /// the field's term is a function of the scene alone.
     #[test]
     fn a_hypothesiss_cost_does_not_depend_on_the_last_refit() {
         let v = pole_view();
         let (em, sc) = (Settings::default(), Background::default());
         let pole = stick(0.0, 4.0, 0.03);
-        let out = Scene::new(vec![v.clone()], &[], em, sc, Some(field_box(0.1)), 0).costs_to_add(&[vec![pole]])[0].clone();
-        let mut c = Scene::new(vec![v.clone()], &[pole], em, sc, Some(field_box(0.1)), 0);
+        let out = Scene::new(vec![v.clone()], &[], em, sc, Some(field_box()), 0).costs_to_add(&[vec![pole]])[0].clone();
+        let mut c = Scene::new(vec![v.clone()], &[pole], em, sc, Some(field_box()), 0);
         let inn: Vec<f64> = c.costs_to_remove(&[0])[0].iter().map(|x| -x).collect();
         let (collapsed, today) = ((out[0] + out[1]) - (inn[0] + inn[1]), out[0] - inn[0]);
         assert!(collapsed.abs() < 0.1 * today.abs(), "collapsed {collapsed} vs today {today}");
@@ -3136,7 +3171,7 @@ mod tests {
         let (em, sc) = (Settings::default(), Background::default());
         for e in [stick(0.0, 4.0, 0.03), stick(0.004, 4.0, 0.025)] {
             let rendered = render_all(&v, &[e], &em);
-            let d = &elem_data(&v, &rendered, &[e], &[0], &[0], 0, &em, &sc, &Foliage::uniform(sc.kappa))[0];
+            let d = &elem_data(&v, &rendered, &[e], &[0], &[0], 0, &em, &sc, &Foliage::uniform(sc.kappa), None)[0];
             assert!(d.own_sd[0] > 0.0 && d.own_sd[1] > 0.0);
             for x in [(0.0, 0.0), (0.002, -0.4)] {
                 let q = d.quad(x, &em);
@@ -3198,23 +3233,28 @@ mod tests {
         assert!((c.cost() - full(&[wide])).abs() < 1e-9 * c.cost().abs().max(1.0), "{} vs {}", c.cost(), full(&[wide]));
     }
 
-    /// A move's change is a full recompute's (3dtrees research 130 slice-structure): each cell read at its own surface
-    /// class, a term depends on no other term's class, so after adds, changes and removes among neighbours that share
-    /// cells (a group among them), every scan's terms equal its terms recomputed from scratch at the held alignment
-    /// (each from its reference's start), bit for bit; and the moves undone restore the cost exactly.
+    /// A move's change is a full recompute's (3dtrees research 130 slice-structure, slice-soft): each cell read at its
+    /// own surface class, a term depends on no other term's class, so after adds, changes and removes among neighbours
+    /// that share cells (a group among them), every scan's terms, their deposits included, equal its terms recomputed
+    /// from scratch at the held alignment (each from its reference's start), bit for bit, and so do the field's counts;
+    /// and the moves undone restore the cost exactly.
     #[test]
     fn a_moves_terms_are_a_full_recompute() {
         let v = pole_view();
         let (em, sc) = (Settings::default(), Background::default());
         let front = stick(0.02, 3.9, 0.02);
-        let mut c = Scene::new(vec![v.clone(), v.clone()], &[stick(0.0, 4.0, 0.03), front, piece_of(-0.2, 0.0, Some(5))], em, sc, Some(field_box(0.1)), 0);
+        let mut c = Scene::new(vec![v.clone(), v.clone()], &[stick(0.0, 4.0, 0.03), front, piece_of(-0.2, 0.0, Some(5))], em, sc, Some(field_box()), 0);
         let check = |c: &Scene| {
             for s in 0..c.n_scans() {
                 let fit = &c.fits[s];
-                let fresh: BTreeMap<Owner, f64> = c.data(s).into_iter()
-                    .map(|(o, d)| (o, d.term(fit.held.shift(&d.align), fit.held.reference.get(&o).map_or(Vector2::zeros(), |t| t.start), &em).cost())).collect();
-                assert_eq!(fresh, fit.terms.iter().map(|(o, t)| (*o, t.cost())).collect::<BTreeMap<Owner, f64>>());
+                let fresh: BTreeMap<Owner, (f64, Deposit)> = c.data(s).into_iter().map(|(o, d)| {
+                    let t = d.term(fit.held.shift(&d.align), fit.held.reference.get(&o).map_or(Vector2::zeros(), |t| t.start), &em);
+                    (o, (t.cost(), t.deposit))
+                }).collect();
+                assert_eq!(fresh, fit.terms.iter().map(|(o, t)| (*o, (t.cost(), t.deposit.clone()))).collect::<BTreeMap<Owner, _>>());
             }
+            assert!(c.fits.iter().flat_map(|f| f.terms.values()).any(|t| !t.deposit.is_empty()));
+            assert_eq!(c.field.as_ref().unwrap().counts(), recounted(c));
         };
         let e0 = c.cost();
         let (a, _) = c.add(stick(0.01, 3.95, 0.025));
@@ -3770,7 +3810,7 @@ mod tests {
     #[test]
     fn a_merge_with_the_medium_reads_the_measured_pull() {
         let em = Settings { pull_a: 1.2, pull_b: 0.075, merge_a: -1.7258, merge_field: 14.9334, merge_range: -0.0844, merge_fill: 1.9841, ..Settings::default() };
-        let spec = FoliageBox { lo: [-0.5, 4.0, -0.5], hi: [0.5, 5.0, 0.5], voxel: 1.0, margin: 0.0 };
+        let spec = FoliageBox { lo: [-0.5, 4.0, -0.5], hi: [0.5, 5.0, 0.5], voxel: 1.0 };
         let dense = Foliage { kappa: 0.05, spec: Some(spec), post: HashMap::from([([0, 0, 0], (5.0, 1.0))]) };
         let merge = |f: f64, ext: &Foliage| pulse_in(&em, &[], &[], false, &[layer(4.0, f, 1.0)], None, ext).occluders[0].merge;
         let p = pulse_in(&em, &[], &[], false, &[layer(4.0, 0.3, 1.0)], None, &dense);
@@ -3802,7 +3842,7 @@ mod tests {
         let ext = Foliage::uniform(sc.kappa);
         let bases = |e: Element| -> HashMap<usize, f64> {
             let rendered = render_all(&v, &[e], &em);
-            let d = elem_data(&v, &rendered, &[e], &[0], &[0], 0, &em, &sc, &ext);
+            let d = elem_data(&v, &rendered, &[e], &[0], &[0], 0, &em, &sc, &ext, None);
             let cells: Vec<usize> = { let mut c: Vec<usize> = kbuffer(&rendered).keys().copied().collect(); c.sort_unstable(); c.retain(|&k| v.cell[k] != Cell::NoPulse); c };
             cells.into_iter().zip(d[0].cells.iter().map(|c| c.base)).collect()
         };
@@ -3842,7 +3882,7 @@ mod tests {
         let (em, sc) = (Settings::default(), Background::default());
         let es = [Element { r: 0.03, ..piece_of(-0.2, 0.0, Some(3)) }, Element { r: 0.015, ..piece_of(0.0, 0.2, Some(3)) }];
         let rendered = render_all(&v, &es, &em);
-        let d = elem_data(&v, &rendered, &es, &[0, 0], &[0, 1], 0, &em, &sc, &Foliage::uniform(sc.kappa));
+        let d = elem_data(&v, &rendered, &es, &[0, 0], &[0, 1], 0, &em, &sc, &Foliage::uniform(sc.kappa), None);
         assert_eq!(d.len(), 1);
         let shared = Shared::new(1, &es, &em);
         for (k, e) in es.iter().enumerate() {
@@ -3879,9 +3919,9 @@ mod tests {
         let (em, sc) = (Settings::default(), Background::default());
         let es = [stick(0.0, 4.0, 0.03), Element { opacity: 0.4, ..stick(0.03, 3.9, 0.045) }];
         let rendered = render_all(&v, &es, &em);
-        let data = elem_data(&v, &rendered, &es, &[0, 1], &[0, 1], 0, &em, &sc, &Foliage::uniform(sc.kappa));
+        let data = elem_data(&v, &rendered, &es, &[0, 1], &[0, 1], 0, &em, &sc, &Foliage::uniform(sc.kappa), None);
         let mut out: Vec<Pulse> = data.into_iter().flat_map(|d| d.cells.into_iter().flat_map(|c| c.pulses.into_iter().map(|p| p.1))).collect();
-        let spec = FoliageBox { lo: [-0.5, 4.0, -0.5], hi: [0.5, 5.0, 0.5], voxel: 1.0, margin: 0.0 };
+        let spec = FoliageBox { lo: [-0.5, 4.0, -0.5], hi: [0.5, 5.0, 0.5], voxel: 1.0 };
         let dense = Foliage { kappa: 0.05, spec: Some(spec), post: HashMap::from([([0, 0, 0], (5.0, 1.0))]) };
         let (flat, wood) = (Foliage::uniform(0.05), em.refl_wood as f32);
         out.push(pulse_of(&[4.0, 4.3, 7.0], &[wood - 5.0, wood - 3.0, -20.0], false, &[layer(4.0, 0.5, 1.0), layer(4.3, 1.0, 1.0)], None, &flat));

@@ -156,7 +156,7 @@ params! {
 
 params! {
     /// What lies behind the elements, crudely: a diffuse extinction `kappa` (1/m) along every ray (the foliage field
-    /// outside its box, and within an element's margin inside: [`super::foliage`]) and a ground plane's height (NaN
+    /// outside its box: [`super::foliage`]) and a ground plane's height (NaN
     /// for none).
     /// κ is declared at 0.05, the checks' setting; `extinction.py kappa` measures it per site (AM 0.034, the stand
     /// 0.019).

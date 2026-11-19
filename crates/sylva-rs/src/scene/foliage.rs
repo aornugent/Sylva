@@ -16,11 +16,11 @@
 //!   σ the Gamma posterior `(a₀ + h, b₀ + L)`.
 //! - **The field's term in the cost** (3dtrees research 130 formulation.md: the field collapsed). σ integrated out,
 //!   a voxel's counts have the closed-form marginal `ln NB(h, L) = ln Γ(a₀ + h) − ln Γ(a₀) + a₀ ln b₀ − (a₀ + h)
-//!   ln(b₀ + L)` (a Gamma-mixed Poisson), and the field's term is its sum over the voxels, every count scored (the
-//!   margin's voxels too). It depends on the scene only through the counts, so a move changes it on the voxels its
-//!   cuts change, exactly ([`FieldCounts`]); the scene's cost holds its change against the empty scene's counts (every
-//!   ray whole). So an element whose echoes a denser medium could explain pays for them: the medium's alternative is
-//!   read with its Occam factor, not at a σ̂ the element's own echoes were left out of.
+//!   ln(b₀ + L)` (a Gamma-mixed Poisson), and the field's term is its sum over the voxels, every count scored. It
+//!   depends on the scene only through the counts, so a move changes it on the voxels whose hits its terms' deposits
+//!   change, exactly ([`FieldCounts`]); the scene's cost holds its change against the empty scene's counts. So an
+//!   element whose echoes a denser medium could explain pays for them: the medium's alternative is read with its Occam
+//!   factor, not at a σ̂ the element's own echoes were left out of.
 //! - **What a pulse meets behind an element's front** (the medium behind its returns, their merges and τ inside the
 //!   ray likelihood) is σ's posterior mean `α / β` per voxel, for the optical depth, the hazard and the merge share
 //!   alike (3dtrees research 130 slice 2c: one medium, read the same at every point of a pulse; the Gamma–Poisson
@@ -33,8 +33,8 @@
 //!   instrument records ([`RangeImage::capped`]): a pulse at its cap says nothing about what lies beyond.
 //! - **One walk per ray** (3dtrees research 130 slice-structure): a cell's ray is traversed through the box once
 //!   ([`Walk`]). The pulse reads its optical depths and hazards as prefix sums over the walk's segments, and its merge
-//!   integrals as sums over them ([`Medium`]); the field's counts deposit onto the same segments ([`recount`]: both
-//!   cuts on one walk), and [`free_space`] carves along them.
+//!   integrals as sums over them ([`Medium`]); the field's counts lay its path on the same segments, and
+//!   [`free_space`] carves along them.
 //! - **Energy after an echo.** A pulse's echo energies are bounded by its emitted energy (synthesis §4): an echo's
 //!   reflectance against a full-footprint hit on the dimmest canopy surface ([`Settings::refl_full_hit`]) is the
 //!   share of the beam it took ([`Settings::beam_left`], as the pulse reads it), so a full hit on leaf or wood reads
@@ -44,19 +44,22 @@
 //!   on the optical depth wasn't supported: slice 12c.) Each ray counts [`Settings::cell_weight`] at its first echo's
 //!   range, or where it leaves the box. φ there is a compound Poisson's clump size: mulga's leaf hits are clumped,
 //!   and their dispersion is flat in cell size (synthesis §2).
-//! - **A residual: what the fit reads** (3dtrees research 130 slice 2b). The field is fitted from the parts of rays no
-//!   element explains. A ray no element fronts counts whole. A ray an element fronts counts up to its front
-//!   element's front surface ([`ray`]'s `cut`): its clear path there and its echoes in front of it, so the field
-//!   keeps the clear lines of sight to wood; its echoes at and behind the element stay out, as the element's. So each
-//!   datum is scored once, by the field's term in front of the cut or by the element's pulse at and behind it. Voxels
-//!   within [`FoliageBox::margin`] of an element's surface read the background's κ where a pulse meets them (above),
-//!   so an element's radius error doesn't leak into σ beside it; their counts are scored all the same. (Before, a
-//!   fronted ray was dropped whole: the field lost the clear path in front of wood and over-blocked there, research
-//!   130 slices 12c, 13b.)
-//! - **Held during moves** ([`FieldCounts`]), as the scan alignment is: a move updates the counts of the rays whose
-//!   cut it changes, the field's term with them, and the voxels its margin claims; what a pulse meets stays the field
-//!   of the last refit, so the cost is a function of the scene and that reference, not of the moves that led to it.
-//!   `refit_foliage` re-reads it from the counts. The field's own term is never stale; only that reading is held.
+//! - **Soft attribution: what the field counts** (3dtrees research 130 slice-soft; formulation.md "Soft attribution
+//!   and the representation under it"). Every ray counts its whole path, in the beam its echoes left: the ray
+//!   likelihood reads the medium's path in every way it explains a pulse (an echo is the medium's, an element's or an
+//!   outlier's, and the path to it and on from it is the medium's all the same), so the field does too. Each echo is a
+//!   hit, less the share the scene's elements take of it: their responsibilities for it, the posterior over who made
+//!   it from the pass over its pulse at its term's nodes, shared among a cell's terms by their front shares (a
+//!   term's [`Deposit`]). So each echo's mass sums to one between the field and the elements, and nothing about an
+//!   element is set aside: no cut along its rays, no margin about it. With responsibilities 0 or 1 the hits are the
+//!   old hard cut's (an echo at or behind the element's front surface the element's); the path is not split, as the
+//!   cut split it. The empty scene's counts read every echo as the medium's.
+//! - **Held during moves** ([`FieldCounts`]), as the scan alignment is: a move changes the deposits of the terms it
+//!   recomputes (each term's old deposit back, its new one out), and the field's term with them, exactly; what a pulse
+//!   meets stays the field of the last refit (the responsibilities read it), so the cost is a function of the scene
+//!   and that reference, not of the moves that led to it. `refit_foliage` re-reads it from the counts: one step of EM
+//!   (the responsibilities given the field, then the field given them). The field's own term is never stale; only
+//!   that reading is held.
 //! - **Counts and the term are fixed point** ([`FIXED`]): integer sums are exact in any order, so a move and its undo
 //!   restore them exactly and a count over threads is reproducible.
 use super::dual::Real;
@@ -66,15 +69,12 @@ use crate::Point;
 use rayon::prelude::*;
 use std::collections::HashMap;
 
-/// Where the field is estimated: a box `lo`-`hi`, its voxel (m), and the `margin` (m) about each element's surface
-/// where a pulse reads κ: a voxel whose centre is within it (within `r + margin` of a stick's axis or a patch's
-/// centre).
+/// Where the field is estimated: a box `lo`-`hi` and its voxel (m).
 #[derive(Debug, Clone, Copy)]
 pub struct FoliageBox {
     pub lo: Point,
     pub hi: Point,
     pub voxel: f64,
-    pub margin: f64,
 }
 
 /// Weighted counts per voxel: (echoes in it, ray length through it).
@@ -85,6 +85,31 @@ pub const FIXED: f64 = (1u64 << 40) as f64;
 
 /// Weighted counts per voxel in fixed point ([`FIXED`]): [hits, path].
 pub type FixedCounts = HashMap<[i32; 3], [i64; 2], std::hash::BuildHasherDefault<VoxelHasher>>;
+
+/// The hits a term's elements take from the field (the module docs: soft attribution), per voxel in fixed point, in
+/// voxel order: a function of the term alone, so a move's change to the counts is its terms' old deposits less
+/// their new ones, exactly.
+pub type Deposit = Vec<([i32; 3], i64)>;
+
+/// A deposit from (voxel, hits) pairs: each voxel's sum, in the pairs' order, in fixed point.
+pub fn deposit(hits: impl Iterator<Item = ([i32; 3], f64)>) -> Deposit {
+    let mut by: std::collections::BTreeMap<[i32; 3], f64> = Default::default();
+    for (k, h) in hits {
+        *by.entry(k).or_default() += h;
+    }
+    by.into_iter().map(|(k, h)| (k, (h * FIXED).round() as i64)).filter(|x| x.1 != 0).collect()
+}
+
+/// Add a deposit's hits to `acc` with `sign` (+1 back to the field, −1 out of it).
+pub fn give(acc: &mut FixedCounts, d: &Deposit, sign: i64) {
+    for &(k, h) in d {
+        let e = acc.entry(k).or_insert([0, 0]);
+        e[0] += sign * h;
+        if *e == [0, 0] {
+            acc.remove(&k);
+        }
+    }
+}
 
 /// A fast hash for voxel keys (FxHash's multiply and rotate): a query recounts millions of voxel stretches.
 #[derive(Default, Clone, Copy)]
@@ -277,12 +302,36 @@ fn traverse(sp: &FoliageBox, o: &Point, w: &Point, t_min: f64, t_max: f64, mut f
     }
 }
 
-/// One cell's ray through the box, walked once ([`Walk`]) and counted up to each of `cuts` with its sign into `acc` (a
-/// cut ∞ for a ray no element fronts; the module docs say what the fit reads): each echo before the cut a hit and each
-/// stretch of transmission its path, weighted by [`Settings::cell_weight`]. The path after the last echo before the cut
-/// runs on to the cut, unless the pulse is capped and that echo was its last. Echoes and voxel stretches that end
-/// before `after` are left out: they are the same whatever the cut beyond it.
-fn ray(v: &RangeImage, sp: &FoliageBox, em: &Settings, k: usize, cuts: &[(f64, i64)], after: f64, acc: &mut FixedCounts) {
+/// The echoes of image `v`'s cell `k` the field counts as hits, those inside the box: (the echo's index in its
+/// pulse, its voxel, its weight), the weight [`Settings::cell_weight`] at the first echo's range times the beam the
+/// echoes before it left ([`Settings::beam_left`]). The empty scene counts each whole; a scene's elements take their
+/// responsibilities' share (the module docs).
+pub fn hits(v: &RangeImage, sp: &FoliageBox, em: &Settings, k: usize) -> Vec<(usize, [i32; 3], f64)> {
+    if v.cell[k] != Cell::Echoes {
+        return Vec::new();
+    }
+    let w = v.direction((k / v.n_cols) as f64, (k % v.n_cols) as f64);
+    let (echoes, refls) = (v.echoes(k), v.echo_refls(k));
+    let wt = em.cell_weight(echoes[0] as f64, v.step());
+    let mut beam = 1.0;
+    let mut out = Vec::new();
+    for (i, &r) in echoes.iter().enumerate() {
+        let x = [0, 1, 2].map(|a| v.origin[a] + w[a] * r as f64);
+        if inside(sp, &x) {
+            out.push((i, key(sp, &x), wt * beam));
+        }
+        if let Some(&db) = refls.get(i) {
+            beam *= em.beam_left(db as f64);
+        }
+    }
+    out
+}
+
+/// One cell's ray through the box, walked once ([`Walk`]), counted whole into `acc` (the empty scene's reading; the
+/// module docs): each echo a hit ([`hits`]) and each stretch of transmission its path, weighted as its hits are. The
+/// path runs from the origin to the first echo, then from each echo plus the receiver's resolution to the next, and
+/// after the last on through the box, unless the pulse is capped.
+fn ray(v: &RangeImage, sp: &FoliageBox, em: &Settings, k: usize, acc: &mut FixedCounts) {
     let w = v.direction((k / v.n_cols) as f64, (k % v.n_cols) as f64);
     let Some((_, t1)) = clip(sp, &v.origin, &w) else { return };
     if v.cell[k] == Cell::NoPulse {
@@ -293,25 +342,21 @@ fn ray(v: &RangeImage, sp: &FoliageBox, em: &Settings, k: usize, cuts: &[(f64, i
     let wt = em.cell_weight(echoes.first().map_or(t1, |&r| r as f64), v.step());
     let known = if v.capped(k) { echoes.last().map_or(f64::INFINITY, |&r| r as f64) } else { f64::INFINITY };
     let walk = Walk::new(sp, &v.origin, &w);
-    for &(cut, sign) in cuts {
-        let (mut start, mut beam) = (0.0, 1.0);
-        for (i, &r) in echoes.iter().enumerate().take_while(|(_, &r)| (r as f64) < cut) {
-            let r = r as f64;
-            for (key, a, b) in walk.within(start, r).filter(|s| s.2 >= after) {
-                accumulate(acc, key, 0.0, wt * beam * (b - a), sign);
-            }
-            let x = [0, 1, 2].map(|a| v.origin[a] + w[a] * r);
-            if r >= after && inside(sp, &x) {
-                accumulate(acc, key(sp, &x), wt * beam, 0.0, sign);
-            }
-            if let Some(&db) = refls.get(i) {
-                beam *= em.beam_left(db as f64);
-            }
-            start = r + em.resolution();
+    let (mut start, mut beam) = (0.0, 1.0);
+    for (i, &r) in echoes.iter().enumerate() {
+        for (key, a, b) in walk.within(start, r as f64) {
+            accumulate(acc, key, 0.0, wt * beam * (b - a));
         }
-        for (key, a, b) in walk.within(start, cut.min(known)).filter(|s| s.2 >= after) {
-            accumulate(acc, key, 0.0, wt * beam * (b - a), sign);
+        if let Some(&db) = refls.get(i) {
+            beam *= em.beam_left(db as f64);
         }
+        start = r as f64 + em.resolution();
+    }
+    for (key, a, b) in walk.within(start, known) {
+        accumulate(acc, key, 0.0, wt * beam * (b - a));
+    }
+    for (_, key, h) in hits(v, sp, em, k) {
+        accumulate(acc, key, h, 0.0);
     }
 }
 
@@ -324,7 +369,7 @@ fn ray(v: &RangeImage, sp: &FoliageBox, em: &Settings, k: usize, cuts: &[(f64, i
 /// `(i · ny + j) · nz + l`.
 pub fn free_space(v: &RangeImage, lo: Point, hi: Point, voxel: f64, em: &Settings) -> [Vec<u32>; 3] {
     use std::sync::atomic::{AtomicU32, Ordering::Relaxed};
-    let sp = FoliageBox { lo, hi, voxel, margin: 0.0 };
+    let sp = FoliageBox { lo, hi, voxel };
     let n = [0, 1, 2].map(|a| ((hi[a] - lo[a]) / voxel).ceil() as usize);
     let counts: [Vec<AtomicU32>; 3] = std::array::from_fn(|_| (0..n[0] * n[1] * n[2]).map(|_| AtomicU32::new(0)).collect());
     (0..v.cell.len()).into_par_iter().filter(|&k| v.cell[k] != Cell::NoPulse).for_each(|k| {
@@ -341,20 +386,13 @@ pub fn free_space(v: &RangeImage, lo: Point, hi: Point, voxel: f64, em: &Setting
     counts.map(|c| c.into_iter().map(AtomicU32::into_inner).collect())
 }
 
-/// Add (h, l), signed by `sign`, to a voxel's counts in fixed point; a voxel whose counts fall to nothing is dropped.
-fn accumulate(acc: &mut FixedCounts, key: [i32; 3], h: f64, l: f64, sign: i64) {
+/// Add (h, l) to a voxel's counts in fixed point; a voxel whose counts come to nothing is dropped.
+fn accumulate(acc: &mut FixedCounts, key: [i32; 3], h: f64, l: f64) {
     let e = acc.entry(key).or_insert([0, 0]);
-    e[0] += sign * (h * FIXED).round() as i64;
-    e[1] += sign * (l * FIXED).round() as i64;
+    e[0] += (h * FIXED).round() as i64;
+    e[1] += (l * FIXED).round() as i64;
     if *e == [0, 0] {
         acc.remove(&key);
-    }
-}
-
-/// Image `v`'s cell `k` counted up to `to` in place of `from`: its change to the counts, added to `acc`.
-pub fn recount(v: &RangeImage, sp: &FoliageBox, em: &Settings, k: usize, from: f64, to: f64, acc: &mut FixedCounts) {
-    if from != to {
-        ray(v, sp, em, k, &[(from, -1), (to, 1)], from.min(to), acc);
     }
 }
 
@@ -370,26 +408,24 @@ fn merged(mut a: FixedCounts, b: FixedCounts) -> FixedCounts {
     a
 }
 
-/// The field's counts, its part of the cost and the voxels elements' margins claim, kept as the scene changes (the
-/// module docs).
+/// The field's counts and its part of the cost, kept as the scene changes (the module docs).
 ///
 /// Its part of the cost is `ln NB(∅) − ln NB(E) − plug-in`, each summed over the voxels: the field's term of the
-/// empty scene's counts (every ray whole) less the scene's, less the plug-in `Σ h ln σ̂ − σ̂ L` of the counts the
-/// elements' cuts take out (`behind`) at the field a pulse meets. The plug-in is how the empty scene's pulses already
-/// read those segments inside each fronted cell's ratio ([`super::scene`]'s ray likelihood), so the field's part
-/// swaps that reading for the predictive: the segments are scored once (3dtrees research 130 formulation.md).
+/// empty scene's counts (every echo the medium's) less the scene's, less the plug-in `Σ h ln σ̂` of the hits the
+/// elements take (`taken`, the terms' deposits summed) at the field a pulse meets. The plug-in is how the empty scene's
+/// pulses already read those echoes inside each cell's ratio ([`super::scene`]'s ray likelihood), so the field's part
+/// swaps that reading for the predictive: each echo is scored once, its responsibilities sharing it (3dtrees research
+/// 130 formulation.md, slice-soft).
 #[derive(Debug, Clone)]
 pub struct FieldCounts {
     pub spec: FoliageBox,
     /// The prior's shape and rate.
     pub prior: (f64, f64),
-    /// Per voxel, the weighted counts of the parts of rays no element explains, and of the parts they do: the empty
-    /// scene's counts less the scene's.
+    /// Per voxel, the weighted counts the field explains: the empty scene's less the hits the elements take
+    /// (`taken`, the scene's deposits).
     counts: FixedCounts,
-    behind: FixedCounts,
-    /// Per voxel, how many elements' margins claim it.
-    pub claimed: HashMap<[i32; 3], u32>,
-    /// In fixed point: the field's term `Σ ln NB`, the empty scene's, and the plug-in of `behind`.
+    taken: FixedCounts,
+    /// In fixed point: the field's term `Σ ln NB`, the empty scene's, and the plug-in of `taken`.
     term: i128,
     empty: i128,
     plug: i128,
@@ -400,27 +436,19 @@ fn fixed(x: f64) -> i128 {
 }
 
 impl FieldCounts {
-    /// The counts of images `views`, each cell's ray up to its cut in `cuts` (per image, by cell; ∞ where absent),
-    /// under the prior in `em`, nothing claimed yet: the empty scene's counts, then each fronted cell recounted. Its
-    /// plug-in is read at κ `kappa` until [`FieldCounts::reread`].
-    pub fn new(spec: FoliageBox, views: &[&RangeImage], em: &Settings, cuts: &[HashMap<usize, f64>], kappa: f64) -> Self {
+    /// The empty scene's counts of images `views` (every ray whole, every echo the medium's), under the prior in `em`;
+    /// nothing taken yet.
+    pub fn new(spec: FoliageBox, views: &[&RangeImage], em: &Settings) -> Self {
         let prior = (em.field_prior_mean * em.field_prior_path, em.field_prior_path);
         let counts = views.iter().map(|v| {
             (0..v.cell.len()).into_par_iter().fold(FixedCounts::default, |mut acc, k| {
-                ray(v, &spec, em, k, &[(f64::INFINITY, 1)], 0.0, &mut acc);
+                ray(v, &spec, em, k, &mut acc);
                 acc
             }).reduce(FixedCounts::default, merged)
         }).fold(FixedCounts::default(), merged);
-        let mut f = FieldCounts { spec, prior, counts, behind: FixedCounts::default(), claimed: HashMap::new(), term: 0, empty: 0, plug: 0 };
+        let mut f = FieldCounts { spec, prior, counts, taken: FixedCounts::default(), term: 0, empty: 0, plug: 0 };
         f.term = f.counts.values().map(|&c| f.fixed_term(c)).sum();
         f.empty = f.term;
-        let fronted = views.iter().zip(cuts).map(|(v, cut)| {
-            cut.par_iter().fold(FixedCounts::default, |mut acc, (&k, &c)| {
-                recount(v, &spec, em, k, f64::INFINITY, c, &mut acc);
-                acc
-            }).reduce(FixedCounts::default, merged)
-        }).fold(FixedCounts::default(), merged);
-        f.apply(fronted, &Foliage::uniform(kappa));
         f
     }
 
@@ -429,7 +457,7 @@ impl FieldCounts {
         fixed(ln_nb(h as f64 / FIXED, l as f64 / FIXED, self.prior.0, self.prior.1))
     }
 
-    /// The plug-in of counts `behind` in voxel `k` at the field `ext`, in fixed point.
+    /// The plug-in of counts `taken` in voxel `k` at the field `ext`, in fixed point.
     fn fixed_plug(k: &[i32; 3], [h, l]: [i64; 2], ext: &Foliage) -> i128 {
         if h == 0 && l == 0 {
             return 0;
@@ -442,14 +470,14 @@ impl FieldCounts {
     fn fixed_change(&self, delta: &FixedCounts, ext: &Foliage) -> (i128, i128) {
         delta.iter().fold((0, 0), |(t, p), (k, d)| {
             let c = self.counts.get(k).copied().unwrap_or([0, 0]);
-            let b = self.behind.get(k).copied().unwrap_or([0, 0]);
+            let b = self.taken.get(k).copied().unwrap_or([0, 0]);
             (t + self.fixed_term([c[0] + d[0], c[1] + d[1]]) - self.fixed_term(c),
              p + Self::fixed_plug(k, [b[0] - d[0], b[1] - d[1]], ext) - Self::fixed_plug(k, b, ext))
         })
     }
 
-    /// The change in the field's part of the cost were the counts changed by `delta` ([`recount`]), its plug-in read
-    /// at `ext`; the counts stay as they are.
+    /// The change in the field's part of the cost were the counts changed by `delta` (deposits given back or taken:
+    /// [`give`]), its plug-in read at `ext`; the counts stay as they are.
     pub fn change(&self, delta: &FixedCounts, ext: &Foliage) -> f64 {
         let (t, p) = self.fixed_change(delta, ext);
         -(t + p) as f64 / FIXED
@@ -460,14 +488,14 @@ impl FieldCounts {
         let (t, p) = self.fixed_change(&delta, ext);
         (self.term, self.plug) = (self.term + t, self.plug + p);
         let neg: FixedCounts = delta.iter().map(|(&k, &[h, l])| (k, [-h, -l])).collect();
-        self.behind = merged(std::mem::take(&mut self.behind), neg);
+        self.taken = merged(std::mem::take(&mut self.taken), neg);
         self.counts = merged(std::mem::take(&mut self.counts), delta);
         -(t + p) as f64 / FIXED
     }
 
     /// Read the plug-in at the field `ext` (the field a pulse now meets, after a refit).
     pub fn reread(&mut self, ext: &Foliage) {
-        self.plug = self.behind.iter().map(|(k, &b)| Self::fixed_plug(k, b, ext)).sum();
+        self.plug = self.taken.iter().map(|(k, &b)| Self::fixed_plug(k, b, ext)).sum();
     }
 
     /// The field's part of the scene's cost (above).
@@ -485,43 +513,9 @@ impl FieldCounts {
         self.counts.iter().map(|(&k, &[h, l])| (k, (h as f64 / FIXED, l as f64 / FIXED))).collect()
     }
 
-    /// Claim (or, `enter` false, release) the voxels within the margin of an element's surface: a stick from `a` to
-    /// `b` of radius `r`, or a patch about `a` (`b` = `a`) of extent `r`.
-    pub fn claim(&mut self, a: &Point, b: &Point, r: f64, enter: bool) {
-        let sp = self.spec;
-        let reach = r + sp.margin;
-        let ab = [0, 1, 2].map(|j| b[j] - a[j]);
-        let len2: f64 = ab.iter().map(|x| x * x).sum();
-        let n = [0, 1, 2].map(|j| ((sp.hi[j] - sp.lo[j]) / sp.voxel).ceil() as i32);
-        let lo = [0, 1, 2].map(|j| (((a[j].min(b[j]) - reach - sp.lo[j]) / sp.voxel).floor() as i32).max(0));
-        let hi = [0, 1, 2].map(|j| (((a[j].max(b[j]) + reach - sp.lo[j]) / sp.voxel).floor() as i32).min(n[j] - 1));
-        for i in lo[0]..=hi[0] {
-            for j in lo[1]..=hi[1] {
-                for l in lo[2]..=hi[2] {
-                    let c = [i, j, l];
-                    let x = [0, 1, 2].map(|q| sp.lo[q] + (c[q] as f64 + 0.5) * sp.voxel - a[q]);
-                    let s = if len2 > 0.0 { ((0..3).map(|q| x[q] * ab[q]).sum::<f64>() / len2).clamp(0.0, 1.0) } else { 0.0 };
-                    if (0..3).map(|q| (x[q] - s * ab[q]).powi(2)).sum::<f64>() >= reach * reach {
-                        continue;
-                    }
-                    let e = self.claimed.entry(c).or_insert(0);
-                    if enter {
-                        *e += 1;
-                    } else {
-                        *e -= 1;
-                        if *e == 0 {
-                            self.claimed.remove(&c);
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    /// The field a pulse meets: the posterior from the counts, the claimed voxels left out (κ there).
+    /// The field a pulse meets: the posterior from the counts.
     pub fn field(&self, kappa: f64) -> Foliage {
-        let free: Counts = self.counts().into_iter().filter(|(k, _)| !self.claimed.contains_key(k)).collect();
-        Foliage::from_counts(kappa, self.spec, &free, self.prior)
+        Foliage::from_counts(kappa, self.spec, &self.counts(), self.prior)
     }
 }
 
@@ -533,7 +527,7 @@ mod tests {
     /// A ray through a box of 1 m voxels: the segments tile the clipped ray, and a uniform field's optical depth is κ t.
     #[test]
     fn the_traversal_tiles_the_ray() {
-        let sp = FoliageBox { lo: [0.0, 0.0, 0.0], hi: [4.0, 4.0, 4.0], voxel: 1.0, margin: 0.0 };
+        let sp = FoliageBox { lo: [0.0, 0.0, 0.0], hi: [4.0, 4.0, 4.0], voxel: 1.0 };
         let (o, w) = ([-1.0, 0.5, 0.5], [0.8, 0.6, 0.0]);
         let mut len = 0.0;
         let mut keys = Vec::new();
@@ -569,7 +563,7 @@ mod tests {
     /// order (1e-12), on rays through a box of uneven σ, at ranges in it, on voxel faces, before it and past it.
     #[test]
     fn one_walk_reads_the_medium_as_traversals_did() {
-        let sp = FoliageBox { lo: [0.0, 0.0, 0.0], hi: [4.0, 4.0, 2.5], voxel: 0.5, margin: 0.0 };
+        let sp = FoliageBox { lo: [0.0, 0.0, 0.0], hi: [4.0, 4.0, 2.5], voxel: 0.5 };
         let mut f = Foliage::from_counts(0.05, sp, &Counts::new(), (0.05, 1.0));
         for i in 0..8 {
             for j in 0..8 {

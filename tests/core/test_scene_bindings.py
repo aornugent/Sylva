@@ -151,7 +151,7 @@ def test_the_collapsed_field_crosses_the_binding():
     move, the rows carry a `field` part beside the cost, and the rows, the alignment parts and `field_part()` sum to
     the cost."""
     v = pole_image()
-    box = dict(lo=[-0.5, 2.9, -0.3], hi=[0.5, 8.9, 0.3], voxel=0.1, margin=0.1)
+    box = dict(lo=[-0.5, 2.9, -0.3], hi=[0.5, 8.9, 0.3], voxel=0.1)
     side = dict(a=np.array([[0.2, 4.0, -0.1]]), b=np.array([[0.2, 4.0, 0.1]]), r=np.array([0.02]))
     sc = _core.Scene([v], side, None, None, box)
     c = sc.costs_to_add([pole()])
