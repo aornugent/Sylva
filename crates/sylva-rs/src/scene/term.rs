@@ -71,26 +71,42 @@ pub(super) fn term_nodes(es: &[&Element], em: &Settings) -> (Vec<([i64; 3], f64)
 /// spread: the median class of the cells its members mostly fill ([`MOSTLY`]) that hold an echo with a surface fit (mid
 /// where none). The echoes themselves read their own cells' class ([`cell_class`]).
 pub(super) fn term_classes(v: &RangeImage, buf: &HashMap<usize, Vec<Layer>>, slot: &[usize], em: &Settings) -> Vec<u8> {
-    let mut ks: Vec<Vec<u8>> = vec![Vec::new(); slot.iter().max().map_or(0, |m| m + 1)];
+    let mut ks: Vec<[u32; 3]> = vec![[0; 3]; slot.iter().max().map_or(0, |m| m + 1)];
     for (&cell, ls) in buf {
-        let Some(front) = ls.iter().find(|l| l.full()) else { continue };
-        if front.f > MOSTLY && v.cell[cell] == Cell::Echoes && v.excess[cell].is_finite() {
-            ks[slot[front.elem as usize]].push(em.surface(v.excess[cell] as f64));
+        if let Some((e, k)) = vote(v, cell, ls, em) {
+            ks[slot[e as usize]][k as usize] += 1;
         }
     }
-    let per: Vec<u8> = ks.iter_mut().map(|k| {
-        k.sort_unstable();
-        k.get(k.len() / 2).copied().unwrap_or(1)
-    }).collect();
-    slot.iter().map(|&t| per[t]).collect()
+    slot.iter().map(|&t| median_class(&ks[t])).collect()
 }
 
-/// One cell a term has a front share in, as its ray likelihood scores it: its pulse per subset of its mixture
+/// A cell's vote for a term's surface class ([`term_classes`]): the element of its first layer wholly in it, and the
+/// cell's class, where that layer mostly fills it and the cell holds an echo with a surface fit.
+pub(super) fn vote(v: &RangeImage, cell: usize, ls: &[Layer], em: &Settings) -> Option<(u32, u8)> {
+    let front = ls.iter().find(|l| l.full())?;
+    (front.f > MOSTLY && v.cell[cell] == Cell::Echoes && v.excess[cell].is_finite()).then(|| (front.elem, em.surface(v.excess[cell] as f64)))
+}
+
+/// The median of a term's votes, counted by class (mid where it has none).
+pub(super) fn median_class(n: &[u32; 3]) -> u8 {
+    let total: u32 = n.iter().sum();
+    if total == 0 {
+        return 1;
+    }
+    let mut seen = 0;
+    (0..3u8).find(|&k| {
+        seen += n[k as usize];
+        seen > total / 2
+    }).unwrap_or(1)
+}
+
+/// One cell a term has a front share in (`cell`, its index), as its ray likelihood scores it: its pulse per subset of its mixture
 /// ([`CellView`]), its weight times the term's front share ([`front_shares`]), its log-likelihood under the empty
 /// scene (the medium and the ground alone: the same for every hypothesis), what its first echo says about its
 /// front element, and, with a foliage field, the hits the field counts of its echoes ([`foliage::hits`]: the echo, its
 /// voxel, its weight times the term's front share).
 pub(super) struct CellData {
+    pub(super) cell: usize,
     pub(super) pulses: Vec<(f64, Pulse)>,
     pub(super) wt: f64,
     pub(super) base: f64,
@@ -130,81 +146,39 @@ impl ElemData {
         let level = if self.own_sd[1] > 0.0 { Dual2::var(x.1, 1) } else { Dual2::c(x.1) };
         let (mut total, mut parts, mut hits) = (Dual2::<2>::c(0.0), [0.0; 4], Vec::new());
         for c in &self.cells {
-            let ll = if deposit && !c.hits.is_empty() {
+            let l = if deposit && !c.hits.is_empty() {
                 let (ll, taken) = mixture_taken(&c.pulses, Dual2::var(x.0, 0), level, em);
                 hits.extend(c.hits.iter().map(|&(i, k, w)| (k, w * taken[i])));
-                ll
+                (ll - c.base) * c.wt
             } else {
-                mixture_ll(&c.pulses, Dual2::var(x.0, 0), level, em)
+                c.read(Dual2::var(x.0, 0), level, em)
             };
-            let l = (ll - c.base) * c.wt;
             total += l;
             parts[c.outcome as usize] += l.v;
         }
-        let hess = -total.h;
-        let hess = if hess[(0, 0)] >= 0.0 && hess[(1, 1)] >= 0.0 && hess.determinant() >= 0.0 {
-            hess
-        } else {
-            let mut eig = hess.symmetric_eigen();
-            eig.eigenvalues = eig.eigenvalues.map(|l| l.max(0.0));
-            eig.recompose()
-        };
-        Local { ll: total.v, parts, g: -total.g, hess, deposit: foliage::deposit(hits.into_iter()) }
+        Local { ll: total.v, parts, g: -total.g, hess: clipped(-total.h), deposit: foliage::deposit(hits.into_iter()) }
     }
 
-    /// Its curvature over (a, y) at own nodes `y` given its likelihood there (`at`), with y eliminated: over (a, y),
-    /// M = Jᵀ Q J + diag(0, I) with J = [[1, s0, 0], [0, 0, s1]], so P = diag(s) Q diag(s) + I over y and the a–y block
-    /// is `link`; the slope over y; and the cost's slope and curvature in a, y eliminated (the Schur complement).
+    /// Its curvature with its own nodes `y` eliminated ([`eliminate`]).
     pub(super) fn eliminate(&self, at: &Local, y: Vector2<f64>) -> Eliminated {
-        let (s, q, g) = (self.own_sd, at.hess, at.g);
-        let off = s[0] * s[1] * q[(0, 1)];
-        let p = Matrix2::new(s[0] * s[0] * q[(0, 0)] + 1.0, off, off, s[1] * s[1] * q[(1, 1)] + 1.0);
-        let pi = p.try_inverse().expect("P is the unit prior's precision plus a positive semi-definite part");
-        let link = Vector2::new(q[(0, 0)] * s[0], q[(0, 1)] * s[1]);
-        let (pl, gy) = (pi * link, s.component_mul(&g) + y);
-        Eliminated { pi, det: p.determinant(), link, pl, gy, slope: g[0] - pl[0] * gy[0] - pl[1] * gy[1], curv: q[(0, 0)] - link[0] * pl[0] - link[1] * pl[1] }
+        eliminate(self.own_sd, at, y)
     }
 
-    /// Its term at alignment shift `a` (m): its own nodes y at their mode given `a` (Newton from `start`, a step at
-    /// most 3 prior sds, halved until the cost falls, stopping under a micronat), the Laplace step over them, and its
-    /// cost's slope and curvature in `a` with them eliminated (the Schur complement of its curvature over (a, y)).
+    /// Its term at alignment shift `a` (m): its own nodes y at their mode given `a` ([`settle`], from `start`), the
+    /// Laplace step over them, and its cost's slope and curvature in `a` with them eliminated (the Schur complement of
+    /// its curvature over (a, y)).
     pub(super) fn term(&self, a: f64, start: Vector2<f64>, em: &Settings) -> Term {
-        let s = self.own_sd;
-        let prior = |y: Vector2<f64>| 0.5 * (y[0] * y[0] + y[1] * y[1]);
-        let mut y = if s == Vector2::zeros() { Vector2::zeros() } else { start };
-        let mut at = self.quad(self.at(a, y), em, true);
-        if s != Vector2::zeros() {
-            let mut f_now = -at.ll + prior(y);
-            for _ in 0..MAX_NEWTON {
-                let e = self.eliminate(&at, y);
-                let step = cap(e.pi * e.gy);
-                let (mut t, mut fall) = (1.0, None);
-                while t >= 1e-3 {
-                    let yn = y - step * t;
-                    let next = self.quad(self.at(a, yn), em, true);
-                    let f_new = -next.ll + prior(yn);
-                    if f_new <= f_now {
-                        fall = Some(f_now - f_new);
-                        (y, f_now, at) = (yn, f_new, next);
-                        break;
-                    }
-                    t *= 0.5;
-                }
-                if fall.is_none_or(|f| f < 1e-6) {
-                    break;
-                }
-            }
-        }
-        let e = self.eliminate(&at, y);
+        let (y, at) = settle(self.own_sd, start, |y| self.quad(self.at(a, y), em, true));
+        let e = eliminate(self.own_sd, &at, y);
         Term {
             align: self.align.clone(),
-            fit: -at.ll + prior(y),
+            fit: -at.ll + 0.5 * (y[0] * y[0] + y[1] * y[1]),
             logdet: 0.5 * e.det.ln(),
             slope: e.slope,
             curv: e.curv,
             own: y,
             start,
-            own_sd: s,
+            own_sd: self.own_sd,
             own_cov: e.pi,
             own_link: e.pl,
             ray: at.parts.map(|x| -x),
@@ -219,6 +193,69 @@ impl ElemData {
             deposit: at.deposit,
         }
     }
+}
+
+impl CellData {
+    /// Its part of its term's log-likelihood at shift `shift` and reflectance level `level`: against the empty scene,
+    /// weighted.
+    pub(super) fn read(&self, shift: Dual2<2>, level: Dual2<2>, em: &Settings) -> Dual2<2> {
+        (mixture_ll(&self.pulses, shift, level, em) - self.base) * self.wt
+    }
+}
+
+/// A curvature with its negative eigenvalues set to 0.
+pub(super) fn clipped(hess: Matrix2<f64>) -> Matrix2<f64> {
+    if hess[(0, 0)] >= 0.0 && hess[(1, 1)] >= 0.0 && hess.determinant() >= 0.0 {
+        return hess;
+    }
+    let mut eig = hess.symmetric_eigen();
+    eig.eigenvalues = eig.eigenvalues.map(|l| l.max(0.0));
+    eig.recompose()
+}
+
+/// A term's own nodes' mode (Newton from `start`, a step at most 3 prior sds, halved until the cost falls, stopping
+/// under a micronat) and its likelihood there; `read` gives its likelihood at own nodes y, `s` their prior sds.
+pub(super) fn settle(s: Vector2<f64>, start: Vector2<f64>, read: impl Fn(Vector2<f64>) -> Local) -> (Vector2<f64>, Local) {
+    let prior = |y: Vector2<f64>| 0.5 * (y[0] * y[0] + y[1] * y[1]);
+    let mut y = if s == Vector2::zeros() { Vector2::zeros() } else { start };
+    let mut at = read(y);
+    if s != Vector2::zeros() {
+        let mut f_now = -at.ll + prior(y);
+        for _ in 0..MAX_NEWTON {
+            let e = eliminate(s, &at, y);
+            let step = cap(e.pi * e.gy);
+            let (mut t, mut fall) = (1.0, None);
+            while t >= 1e-3 {
+                let yn = y - step * t;
+                let next = read(yn);
+                let f_new = -next.ll + prior(yn);
+                if f_new <= f_now {
+                    fall = Some(f_now - f_new);
+                    (y, f_now, at) = (yn, f_new, next);
+                    break;
+                }
+                t *= 0.5;
+            }
+            if fall.is_none_or(|f| f < 1e-6) {
+                break;
+            }
+        }
+    }
+    (y, at)
+}
+
+/// A term's curvature over (a, y) at own nodes `y` (prior sds `s`) given its likelihood there (`at`), with y
+/// eliminated: over (a, y), M = Jᵀ Q J + diag(0, I) with J = [[1, s0, 0], [0, 0, s1]], so P = diag(s) Q diag(s) + I
+/// over y and the a–y block is `link`; the slope over y; and the cost's slope and curvature in a, y eliminated (the
+/// Schur complement).
+pub(super) fn eliminate(s: Vector2<f64>, at: &Local, y: Vector2<f64>) -> Eliminated {
+    let (q, g) = (at.hess, at.g);
+    let off = s[0] * s[1] * q[(0, 1)];
+    let p = Matrix2::new(s[0] * s[0] * q[(0, 0)] + 1.0, off, off, s[1] * s[1] * q[(1, 1)] + 1.0);
+    let pi = p.try_inverse().expect("P is the unit prior's precision plus a positive semi-definite part");
+    let link = Vector2::new(q[(0, 0)] * s[0], q[(0, 1)] * s[1]);
+    let (pl, gy) = (pi * link, s.component_mul(&g) + y);
+    Eliminated { pi, det: p.determinant(), link, pl, gy, slope: g[0] - pl[0] * gy[0] - pl[1] * gy[1], curv: q[(0, 0)] - link[0] * pl[0] - link[1] * pl[1] }
 }
 
 /// A term's curvature with its own nodes eliminated ([`ElemData::eliminate`]): P⁻¹ and |P| over y, the a–y link
@@ -348,7 +385,7 @@ pub(super) fn elem_data(v: &RangeImage, rendered: &[Vec<(usize, Layer)>], elems:
         let base = cv.pulses[0].1.empty().read(0.0, 0.0, em).ll;
         let hits = field.map_or(Vec::new(), |sp| foliage::hits(v, sp, em, cell));
         for (d, s) in shares {
-            data[d].cells.push(CellData { pulses: cv.pulses.clone(), wt: cv.wt * s, base, outcome, hits: hits.iter().map(|&(i, k, w)| (i, k, w * s)).collect() });
+            data[d].cells.push(CellData { cell, pulses: cv.pulses.clone(), wt: cv.wt * s, base, outcome, hits: hits.iter().map(|&(i, k, w)| (i, k, w * s)).collect() });
         }
     }
     data

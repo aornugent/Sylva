@@ -146,6 +146,18 @@ def test_a_chain_crosses_the_binding():
     assert list(_core.Scene([v], halves).rows()['group']) == [-1, -1]
 
 
+def test_the_grower_and_the_coupling_cross_the_binding():
+    """Research 130 slice-grower: a seed on the pole grows into a chain along it inside the region a Python test
+    gives, read exactly; the coupling row of its sticks is pure geometry."""
+    v = pole_image()
+    seed = dict(a=np.array([[0.0, 4.0, -0.02]]), b=np.array([[0.0, 4.0, 0.02]]), r=np.array([0.03]))
+    (g,) = _core.Scene([v], dict(a=np.zeros((0, 3)), b=np.zeros((0, 3)), r=np.zeros(0))).grow(seed, lambda p: np.abs(p[:, 2]) < 0.2)
+    assert g['sticks'].shape[1] == 7 and g['length'] > 0.2 and g['cost'] < g['seed_cost'] < 0
+    assert np.isclose(g['scan'].sum(), g['cost']) and np.allclose(g['sticks'][:, 1], 4.0)
+    row = _core.coupling(g['sticks'])
+    assert np.isclose(row['length'], g['length']) and row['gap'] < 1e-9
+
+
 def test_the_collapsed_field_crosses_the_binding():
     """With a foliage field (its prior the settings'), `costs_to_add` carries the field's part last and sums to the
     move, the rows carry a `field` part beside the cost, and the rows, the alignment parts and `field_part()` sum to

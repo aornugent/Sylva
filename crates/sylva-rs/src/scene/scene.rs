@@ -528,22 +528,35 @@ impl Scene {
     /// together, so every present member of a group one of those (or an element taken out) belongs to is rescored with
     /// it, and its pooled evidence never goes stale.
     pub(super) fn reterm(&self, s: usize, without: &[u32], with: &[(Element, Vec<(usize, Layer)>)], first: u32) -> Changes {
-        let (v, em, fit, index) = (&*self.views[s], &self.em, &self.fits[s], &self.cells[s]);
-        let added = |i: u32| i >= first && ((i - first) as usize) < with.len();
-        let layers = |i: u32| -> &[(usize, Layer)] { if added(i) { &with[(i - first) as usize].1 } else { &self.rendered[s][i as usize] } };
-        let element = |i: u32| if added(i) { with[(i - first) as usize].0 } else { self.elems[i as usize].unwrap() };
-        let present = |i: u32| !layers(i).is_empty() && (added(i) || !without.contains(&i));
-        let fronting = |i: u32| layers(i).iter().filter(|(_, l)| l.enters()).map(|(c, _)| *c);
         let mut fresh: HashMap<usize, Vec<Entered>> = HashMap::new();
         for (k, (_, ls)) in with.iter().enumerate() {
             for (c, l) in ls.iter().filter(|(_, l)| l.enters()) {
                 fresh.entry(*c).or_default().push(Entered::of(first + k as u32, l));
             }
         }
+        let touched: HashSet<usize> = without.iter().flat_map(|&w| self.rendered[s][w as usize].iter()).filter(|(_, l)| l.enters()).map(|(c, _)| *c)
+            .chain(fresh.keys().copied()).collect();
+        let with: Vec<(Element, &[(usize, Layer)])> = with.iter().map(|(e, ls)| (*e, &ls[..])).collect();
+        let start: Vec<u32> = (0..with.len() as u32).map(|k| first + k).collect();
+        self.terms_after(s, without, &with, first, &|c| fresh.get(&c).cloned().unwrap_or_default(), &touched, &start, None)
+    }
+
+    /// [`Scene::reterm`]'s rule, for a move that touches the cells `touched` and adds the elements `start` (its
+    /// elements `with` put in from `first`, their entered layers in a cell `fresh`), leaving out the term of `skip`
+    /// (a chain grown beside the scene: [`super::chain`], which keeps its own term).
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn terms_after(&self, s: usize, without: &[u32], with: &[(Element, &[(usize, Layer)])], first: u32, fresh: &dyn Fn(usize) -> Vec<Entered>,
+                              touched: &HashSet<usize>, start: &[u32], skip: Option<Owner>) -> Changes {
+        let (v, em, fit, index) = (&*self.views[s], &self.em, &self.fits[s], &self.cells[s]);
+        let added = |i: u32| i >= first && ((i - first) as usize) < with.len();
+        let layers = |i: u32| -> &[(usize, Layer)] { if added(i) { with[(i - first) as usize].1 } else { &self.rendered[s][i as usize] } };
+        let element = |i: u32| if added(i) { with[(i - first) as usize].0 } else { self.elems[i as usize].unwrap() };
+        let present = |i: u32| !layers(i).is_empty() && (added(i) || !without.contains(&i)) && Some(owner(i, &element(i))) != skip;
+        let fronting = |i: u32| layers(i).iter().filter(|(_, l)| l.enters()).map(|(c, _)| *c);
         // a cell's k-buffer, before the move and after it: its elements, nearest first, and how many have a front share
         let before = |c: usize| kept(index.get(&c).cloned().unwrap_or_default());
         let after = |c: usize| kept(index.get(&c).into_iter().flatten().filter(|x| !without.contains(&x.id) && !added(x.id))
-            .chain(fresh.get(&c).into_iter().flatten()).copied().collect());
+            .copied().chain(fresh(c)).collect());
         let owner_of = |i: u32| owner(i, &element(i));
         // every present member of the groups of `ids` and of the elements taken out
         let whole = |ids: &mut BTreeSet<u32>| {
@@ -556,10 +569,8 @@ impl Scene {
             ids.retain(|&i| present(i));
         };
         // the terms with a front share in the cells the move touches, and the elements it adds
-        let touched: HashSet<usize> = without.iter().flat_map(|&w| self.rendered[s][w as usize].iter()).filter(|(_, l)| l.enters()).map(|(c, _)| *c)
-            .chain(fresh.keys().copied()).collect();
-        let mut near: BTreeSet<u32> = (0..with.len() as u32).map(|k| first + k).collect();
-        for &c in &touched {
+        let mut near: BTreeSet<u32> = start.iter().copied().collect();
+        for &c in touched {
             for (ids, n) in [before(c), after(c)] {
                 near.extend(&ids[..n]);
             }
@@ -590,7 +601,7 @@ impl Scene {
         // the owners of the elements taken out or unseen now, unless a member is still scored
         let scored: HashSet<Owner> = terms.iter().map(|t| t.0).collect();
         let left = without.iter().map(|&i| owner(i, &self.elems[i as usize].unwrap())).chain((0..with.len() as u32).map(|k| owner_of(first + k)));
-        terms.extend(left.collect::<BTreeSet<Owner>>().into_iter().filter(|o| !scored.contains(o)).map(|o| (o, None)));
+        terms.extend(left.collect::<BTreeSet<Owner>>().into_iter().filter(|o| !scored.contains(o) && Some(*o) != skip).map(|o| (o, None)));
         terms
     }
 

@@ -34,6 +34,7 @@ use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
 use std::sync::Arc;
+use sylva_rs::scene::chain::{Coupling, Grow};
 use sylva_rs::scene::foliage::FoliageBox;
 use sylva_rs::scene::moments::{Candidate, Moments};
 use sylva_rs::scene::range_image::{Cell, RangeImage, RangeImageParams};
@@ -151,6 +152,32 @@ fn beam_fill<'py>(py: Python<'py>, d: PyReadonlyArray1<f64>, r: f64, a: PyReadon
 fn field_ln_nb<'py>(py: Python<'py>, hits: PyReadonlyArray1<f64>, path: PyReadonlyArray1<f64>, mean: f64, prior_path: f64) -> PyResult<Bound<'py, PyArray1<f64>>> {
     Ok(hits.as_slice()?.iter().zip(path.as_slice()?).map(|(&h, &l)| sylva_rs::scene::foliage::ln_nb(h, l, mean * prior_path, prior_path))
         .collect::<Vec<_>>().into_pyarray(py))
+}
+
+/// The coupling row (scene::chain::Coupling::row) along sticks (n, 7: a, b, r) joined end to end in order: length and
+/// gap (m), and the declared coupling's cost of their radii and bends (nats), beside the cost, never in it.
+#[pyfunction]
+fn coupling<'py>(py: Python<'py>, sticks: PyReadonlyArray2<f64>) -> PyResult<Bound<'py, PyDict>> {
+    let st = sticks.as_array();
+    if st.ncols() != 7 || st.nrows() == 0 {
+        return Err(PyValueError::new_err("coupling needs sticks (n, 7), n > 0"));
+    }
+    let rows: Vec<([f64; 3], [f64; 3], f64)> = st.rows().into_iter().map(|x| ([x[0], x[1], x[2]], [x[3], x[4], x[5]], x[6])).collect();
+    let c = Coupling::default().row(&rows);
+    let d = PyDict::new(py);
+    for (k, v) in [("length", c.length), ("gap", c.gap), ("radius", c.radius), ("bend", c.bend)] {
+        d.set_item(k, v)?;
+    }
+    Ok(d)
+}
+
+/// Sticks as rows (n, 7: a, b, r).
+fn sticks_of<'py>(py: Python<'py>, es: &[Element]) -> PyResult<Bound<'py, PyArray2<f64>>> {
+    let flat: Vec<f64> = es.iter().flat_map(|e| match e.form {
+        Form::Stick { a, b } => [a[0], a[1], a[2], b[0], b[1], b[2], e.r],
+        Form::Patch { centre: c } => [c[0], c[1], c[2], c[0], c[1], c[2], e.r],
+    }).collect();
+    Ok(flat.into_pyarray(py).reshape([es.len(), 7])?)
 }
 
 fn elements_from_py(d: &Bound<'_, PyDict>, em: &Settings) -> PyResult<Vec<Element>> {
@@ -416,6 +443,7 @@ pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(mismatch_sd, m)?)?;
     m.add_function(wrap_pyfunction!(alignment_hats, m)?)?;
     m.add_function(wrap_pyfunction!(field_ln_nb, m)?)?;
+    m.add_function(wrap_pyfunction!(coupling, m)?)?;
     Ok(())
 }
 
@@ -599,6 +627,37 @@ impl PyScene {
         let out = py.detach(|| c.costs_to_add(&hs));
         let (n, m) = (out.len(), out.first().map_or(self.inner.n_scans(), Vec::len));
         Ok(out.into_iter().flatten().collect::<Vec<f64>>().into_pyarray(py).reshape([n, m])?)
+    }
+
+    /// Each seed stick (an element dict, one row a seed) grown into a chain by the likelihood (scene::chain: a beam of
+    /// `beam` continuations, pieces 4 r long within `step` m, up to `max_length` m, inside the region: `inside` takes
+    /// points (n, 3) and returns a bool per point), the scene unchanged. Per seed a dict: sticks (k, 7) in order along
+    /// the chain; cost and scan (per scan, then with a field the field's part), its cost to add read exactly; kalman
+    /// (the chain state's own cost); seed_cost; steps; coupling (the departures' ½ Σ z²); length (m).
+    #[pyo3(signature = (seeds, inside, beam=3, max_length=1.5, step=(0.03, 0.10)))]
+    fn grow<'py>(&self, py: Python<'py>, seeds: &Bound<'py, PyDict>, inside: Py<PyAny>, beam: usize, max_length: f64, step: (f64, f64))
+        -> PyResult<Vec<Bound<'py, PyDict>>> {
+        let es = elements_from_py(seeds, &self.em)?;
+        let test = |ps: &[[f64; 3]]| -> Vec<bool> {
+            Python::attach(|py| -> PyResult<Vec<bool>> {
+                let a = ps.iter().flatten().copied().collect::<Vec<f64>>().into_pyarray(py).reshape([ps.len(), 3])?;
+                let ok: PyReadonlyArray1<bool> = inside.call1(py, (a,))?.extract(py)?;
+                Ok(ok.as_array().to_vec())
+            }).unwrap_or_else(|e| panic!("grow's region test failed: {e}"))
+        };
+        let opts = Grow { beam, max_length, step, ..Grow::default() };
+        let c = &self.inner;
+        let out = py.detach(|| c.grow(&es, &test, &opts));
+        out.iter().map(|g| {
+            let d = PyDict::new(py);
+            d.set_item("sticks", sticks_of(py, &g.sticks)?)?;
+            d.set_item("scan", g.scan.clone().into_pyarray(py))?;
+            for (k, v) in [("cost", g.cost), ("kalman", g.kalman), ("seed_cost", g.seed_cost), ("coupling", g.coupling), ("length", g.length)] {
+                d.set_item(k, v)?;
+            }
+            d.set_item("steps", g.steps)?;
+            Ok(d)
+        }).collect()
     }
 
     /// Each element's cost to remove, per scan and then, with a field, the field's part (as `costs_to_add`): `ids`
