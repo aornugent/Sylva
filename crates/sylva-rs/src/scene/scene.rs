@@ -1785,6 +1785,8 @@ pub struct Scene {
     field: Option<FieldCounts>,
     ref_epoch: u32,
     elems: Vec<Option<Element>>,
+    /// Per group key, its live members' ids.
+    groups: HashMap<u32, BTreeSet<u32>>,
     /// [image][id]: the element's layers (empty when removed or unseen).
     rendered: Vec<Vec<Vec<(usize, Layer)>>>,
     /// [image]: per cell, the elements whose layers enter it ([`Entered`]).
@@ -1960,7 +1962,10 @@ impl Scene {
     pub fn new(views: Vec<Arc<RangeImage>>, elems: &[Element], em: Settings, sc: Background, spec: Option<FoliageBox>, ref_epoch: u32) -> Self {
         let n = views.len();
         let mut c = Scene { views, em, sc, ext: Foliage::uniform(sc.kappa), field: None, ref_epoch, elems: elems.iter().map(|e| Some(*e)).collect(),
-                             rendered: Vec::new(), cells: vec![HashMap::new(); n], fits: Vec::new() };
+                             groups: HashMap::new(), rendered: Vec::new(), cells: vec![HashMap::new(); n], fits: Vec::new() };
+        for (i, e) in elems.iter().enumerate() {
+            c.join(i as u32, e);
+        }
         c.rendered = c.views.par_iter().map(|v| render_all(v, elems, &c.em)).collect();
         for (cells, rendered) in c.cells.iter_mut().zip(&c.rendered) {
             for (i, ls) in rendered.iter().enumerate() {
@@ -2025,6 +2030,23 @@ impl Scene {
         self.ext = ext.clone();
         self.field = None;
         self.refit_alignment()
+    }
+
+    /// Enter element `id` in its group's members.
+    fn join(&mut self, id: u32, e: &Element) {
+        if let Some(g) = e.group {
+            self.groups.entry(g).or_default().insert(id);
+        }
+    }
+
+    /// Take element `id` out of its group's members.
+    fn leave(&mut self, id: u32, e: &Element) {
+        if let Some(set) = e.group.and_then(|g| self.groups.get_mut(&g)) {
+            set.remove(&id);
+            if set.is_empty() {
+                self.groups.remove(&e.group.unwrap());
+            }
+        }
     }
 
     /// Image `s`'s cell index after element `id`'s layers `old` give way to `new`.
@@ -2147,19 +2169,38 @@ impl Scene {
 
     /// Add an element: its id and the cost change.
     pub fn add(&mut self, e: Element) -> (u32, f64) {
-        let id = self.elems.len() as u32;
+        let (ids, d) = self.add_many(&[e]);
+        (ids[0], d)
+    }
+
+    /// Add elements together: their ids and the cost change. Every element is rendered first and each scan re-termed
+    /// once ([`Scene::reterm`]), so a chain costs its cells once: added one by one, each member re-terms its group whole.
+    /// The scene is the same, bit for bit, as after adding them one by one.
+    pub fn add_many(&mut self, es: &[Element]) -> (Vec<u32>, f64) {
+        let first = self.elems.len() as u32;
         let em = self.em;
-        let layers: Vec<Vec<(usize, Layer)>> = self.views.par_iter().map(|v| render(v, &e, id, &em)).collect();
-        let changes: Vec<Changes> = (0..self.views.len()).into_par_iter()
-            .map(|s| if layers[s].is_empty() { Changes::default() } else { self.reterm(s, &[], &[(e, layers[s].clone())], id) }).collect();
-        self.elems.push(Some(e));
+        let layers: Vec<Vec<Vec<(usize, Layer)>>> = self.views.par_iter()
+            .map(|v| es.iter().enumerate().map(|(k, e)| render(v, e, first + k as u32, &em)).collect()).collect();
+        let changes: Vec<Changes> = (0..self.views.len()).into_par_iter().map(|s| {
+            if layers[s].iter().all(Vec::is_empty) {
+                return Changes::default();
+            }
+            let with: Vec<(Element, Vec<(usize, Layer)>)> = es.iter().copied().zip(layers[s].iter().cloned()).collect();
+            self.reterm(s, &[], &with, first)
+        }).collect();
+        for (k, e) in es.iter().enumerate() {
+            self.elems.push(Some(*e));
+            self.join(first + k as u32, e);
+        }
         let (mut d, mut delta) = (0.0, FixedHits::default());
-        for (s, (l, ch)) in layers.into_iter().zip(changes).enumerate() {
-            self.reindex(s, id, &[], &l);
-            self.rendered[s].push(l);
+        for (s, (ls, ch)) in layers.into_iter().zip(changes).enumerate() {
+            for (k, l) in ls.into_iter().enumerate() {
+                self.reindex(s, first + k as u32, &[], &l);
+                self.rendered[s].push(l);
+            }
             d += self.apply(s, ch, &mut delta);
         }
-        (id, d + self.give(delta))
+        ((first..first + es.len() as u32).collect(), d + self.give(delta))
     }
 
     /// Remove a live element ([`Scene::check_id`]): the cost change.
@@ -2167,7 +2208,8 @@ impl Scene {
         let first = self.elems.len() as u32;
         let changes: Vec<Changes> = (0..self.views.len()).into_par_iter()
             .map(|s| if self.rendered[s][id as usize].is_empty() { Changes::default() } else { self.reterm(s, &[id], &[], first) }).collect();
-        self.elems[id as usize] = None;
+        let gone = self.elems[id as usize].take().expect("a live element");
+        self.leave(id, &gone);
         let (mut d, mut delta) = (0.0, FixedHits::default());
         for (s, ch) in changes.into_iter().enumerate() {
             let old = std::mem::take(&mut self.rendered[s][id as usize]);
@@ -2184,7 +2226,9 @@ impl Scene {
         let changes: Vec<Changes> = (0..self.views.len()).into_par_iter().map(|s| {
             if layers[s].is_empty() && self.rendered[s][id as usize].is_empty() { Changes::default() } else { self.reterm(s, &[id], &[(e, layers[s].clone())], id) }
         }).collect();
-        self.elems[id as usize] = Some(e);
+        let old = self.elems[id as usize].replace(e).expect("a live element");
+        self.leave(id, &old);
+        self.join(id, &e);
         let (mut d, mut delta) = (0.0, FixedHits::default());
         for (s, (l, ch)) in layers.into_iter().zip(changes).enumerate() {
             let old = std::mem::take(&mut self.rendered[s][id as usize]);
@@ -2267,9 +2311,8 @@ impl Scene {
             if groups.is_empty() {
                 return;
             }
-            let member = |e: &Element| e.group.is_some_and(|g| groups.contains(&g));
-            ids.extend((0..self.elems.len() as u32).filter(|&i| self.elems[i as usize].as_ref().is_some_and(member)));
-            ids.extend((0..with.len() as u32).filter(|&k| member(&with[k as usize].0)).map(|k| first + k));
+            ids.extend(groups.iter().filter_map(|g| self.groups.get(g)).flatten());
+            ids.extend((0..with.len() as u32).filter(|&k| with[k as usize].0.group.is_some_and(|g| groups.contains(&g))).map(|k| first + k));
             ids.retain(|&i| present(i));
         };
         // the terms with a front share in the cells the move touches, and the elements it adds
@@ -3204,6 +3247,33 @@ mod tests {
         c.change(1, front);
         check(&c);
         assert_eq!(c.cost(), e0);
+    }
+
+    /// Adding elements together is adding them one by one, bit for bit: a chain of four pieces of the pole (one group)
+    /// and a stick beside it, with a foliage field, give the same cost, rows and field counts either way; and removing
+    /// them restores the cost exactly.
+    #[test]
+    fn add_many_is_adding_one_by_one() {
+        let v = pole_view();
+        let (em, sc) = (Settings::default(), Background::default());
+        let es = [piece_of(-0.2, -0.1, Some(7)), piece_of(-0.1, 0.0, Some(7)), stick(0.15, 4.5, 0.02), piece_of(0.0, 0.1, Some(7)), piece_of(0.1, 0.2, Some(7))];
+        let build = || Scene::new(vec![v.clone(), v.clone()], &[stick(0.4, 6.0, 0.02)], em, sc, Some(field_box()), 0);
+        let (mut one, mut many) = (build(), build());
+        let e0 = one.cost();
+        for e in &es {
+            one.add(*e);
+        }
+        let (ids, d) = many.add_many(&es);
+        assert_eq!(ids, vec![1, 2, 3, 4, 5]);
+        assert_eq!(one.cost(), many.cost());
+        assert!((d - (many.cost() - e0)).abs() < 1e-9 * d.abs().max(1.0));
+        let rows = |c: &Scene| c.rows().iter().map(|r| (r.elem, r.scan, r.cost.to_bits(), r.field.to_bits())).collect::<Vec<_>>();
+        assert_eq!(rows(&one), rows(&many));
+        assert_eq!(one.field.as_ref().unwrap().counts(), many.field.as_ref().unwrap().counts());
+        for id in ids {
+            many.remove(id);
+        }
+        assert_eq!(many.cost(), e0);
     }
 
     /// Which hypotheses interact: two sticks on the pole's cells share cells and a node; one beside them in the view

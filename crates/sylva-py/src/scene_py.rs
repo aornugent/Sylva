@@ -511,15 +511,11 @@ impl PyScene {
         self.inner.field_part()
     }
 
-    /// Add elements: their ids and the cost change.
+    /// Add elements together (a chain's cells read once, scene::Scene::add_many): their ids and the cost change.
     fn add(&mut self, py: Python<'_>, elements: &Bound<'_, PyDict>) -> PyResult<(Vec<u32>, f64)> {
         let el = elements_from_py(elements, &self.em)?;
         let c = &mut self.inner;
-        Ok(py.detach(|| el.into_iter().fold((Vec::new(), 0.0), |(mut ids, d), e| {
-            let (id, de) = c.add(e);
-            ids.push(id);
-            (ids, d + de)
-        })))
+        Ok(py.detach(|| c.add_many(&el)))
     }
 
     /// Remove elements by id: the cost change.
