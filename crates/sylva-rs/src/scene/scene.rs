@@ -405,6 +405,7 @@ impl Scene {
                 None => fit.terms.remove(&o),
             };
             redeposit(delta, old.as_ref(), fit.terms.get(&o));
+            fit.note(o);
         }
         let before = fit.cost;
         fit.cost = fit.total(&HashMap::new());
@@ -428,7 +429,7 @@ impl Scene {
         let (mut held, terms) = solve_alignment(&data, &self.em);
         let fit_terms: BTreeMap<Owner, Term> = owners.into_iter().zip(terms).collect();
         held.reference = fit_terms.iter().map(|(o, t)| (*o, Reference::of(t))).collect();
-        let mut fit = Fit { terms: fit_terms, held, cost: 0.0 };
+        let mut fit = Fit { terms: fit_terms, held, moved: BTreeSet::new(), cost: 0.0 };
         fit.cost = fit.total(&HashMap::new());
         fit
     }
@@ -537,7 +538,7 @@ impl Scene {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::{BTreeMap, HashMap};
+    use std::collections::{BTreeMap, BTreeSet, HashMap};
     use crate::scene::foliage::{self, Deposit, FieldCounts, Foliage};
     use crate::scene::render::{Form, Element};
     use crate::scene::settings::{Background, Settings};
@@ -778,6 +779,10 @@ mod tests {
                     (o, (t.cost(), t.deposit))
                 }).collect();
                 assert_eq!(fresh, fit.terms.iter().map(|(o, t)| (*o, (t.cost(), t.deposit.clone()))).collect::<BTreeMap<Owner, _>>());
+                // the owners the fit notes as moved are those whose term differs from the alignment's reference
+                let moved: BTreeSet<Owner> = fit.terms.keys().chain(fit.held.reference.keys()).copied()
+                    .filter(|o| !matches!((fit.held.reference.get(o), fit.terms.get(o)), (Some(r), Some(t)) if r.same_alignment(t))).collect();
+                assert_eq!(moved, fit.moved);
             }
             assert!(c.fits.iter().flat_map(|f| f.terms.values()).any(|t| !t.deposit.is_empty()));
             assert_eq!(c.field.as_ref().unwrap().counts(), recounted(c));

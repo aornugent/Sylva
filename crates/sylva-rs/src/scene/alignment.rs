@@ -103,14 +103,20 @@ impl Held {
     }
 
     /// The scan's alignment part, given the columns (weights, curvature change, slope change) of the terms that differ
-    /// from the reference.
+    /// from the reference. Its correction is dense in the columns (k² weight pairs, a k × k solve), so it grows with the
+    /// terms moved since the last refit: a caller that has moved many refits the alignment.
     pub(super) fn part(&self, cols: &[(&[([i64; 3], f64)], f64, f64)]) -> f64 {
         let prior = 0.5 * self.z.iter().map(|x| x * x).sum::<f64>();
         let k = cols.len();
         if k == 0 {
             return prior + 0.5 * self.logdet - 0.5 * self.gm;
         }
-        let s = nalgebra::DMatrix::from_fn(k, k, |i, j| self.between(cols[i].0, cols[j].0));
+        // each column's hats with their nodes' indices, looked up once: S = Vᵀ Σ₀ V as `between` reads it
+        let at: Vec<Vec<(Option<usize>, [i64; 3], f64)>> = cols.iter().map(|c| c.0.iter().map(|(key, w)| (self.index.get(key).copied(), *key, *w)).collect()).collect();
+        let s = nalgebra::DMatrix::from_fn(k, k, |i, j| at[i].iter().map(|&(p, a, wa)| at[j].iter().map(|&(q, b, wb)| wa * wb * match (p, q) {
+            (Some(p), Some(q)) => self.cov[(p, q)],
+            _ => (a == b) as u8 as f64,
+        }).sum::<f64>()).sum::<f64>());
         let vm = nalgebra::DVector::from_iterator(k, cols.iter().map(|c| c.0.iter().map(|(key, w)| self.index.get(key).map_or(0.0, |&i| w * self.m[i])).sum()));
         let d = nalgebra::DVector::from_iterator(k, cols.iter().map(|c| c.1));
         let c = nalgebra::DVector::from_iterator(k, cols.iter().map(|c| c.2));
@@ -225,10 +231,13 @@ pub(super) fn solve_alignment(data: &[ElemData], em: &Settings) -> (Held, Vec<Te
     (held(index, z, grad, hess), terms)
 }
 
-/// One scan's fit: per [`Owner`] its term (none where the scan doesn't see it), the held alignment, and the scan's cost.
+/// One scan's fit: per [`Owner`] its term (none where the scan doesn't see it), the held alignment, the owners whose
+/// term differs from the alignment's reference (`moved`: they alone are its columns, [`Held::part`]), and the scan's
+/// cost.
 pub(super) struct Fit {
     pub(super) terms: BTreeMap<Owner, Term>,
     pub(super) held: Held,
+    pub(super) moved: BTreeSet<Owner>,
     pub(super) cost: f64,
 }
 
@@ -236,21 +245,29 @@ pub(super) struct Fit {
 pub(super) type Changes = Vec<(Owner, Option<Term>)>;
 
 impl Fit {
-    /// The scan's cost with the terms `over` (none: the term left) in place of its own: every term's cost plus the
-    /// held alignment's part ([`Held::part`]), its columns the terms that differ from the reference, in owner order.
+    /// The scan's cost with the terms `over` (none: the term left) in place of its own: every term's cost, in owner
+    /// order, plus the held alignment's part ([`Held::part`]), its columns the terms that differ from the reference
+    /// (those `moved` and in `over`), in owner order.
     pub(super) fn total(&self, over: &HashMap<Owner, Option<Term>>) -> f64 {
-        let owners: BTreeSet<Owner> = self.terms.keys().chain(self.held.reference.keys()).chain(over.keys()).copied().collect();
+        let now = |o: &Owner| match over.get(o) {
+            Some(t) => t.as_ref(),
+            None => self.terms.get(o),
+        };
+        let mut new: Vec<&Owner> = over.keys().filter(|o| !self.terms.contains_key(o)).collect();
+        new.sort_unstable();
         let mut cost = 0.0;
+        let mut add = new.into_iter().peekable();
+        for o in self.terms.keys() {
+            while let Some(n) = add.next_if(|n| *n < o) {
+                cost += now(n).map_or(0.0, Term::cost);
+            }
+            cost += now(o).map_or(0.0, Term::cost);
+        }
+        cost += add.map(|n| now(n).map_or(0.0, Term::cost)).sum::<f64>();
+        let owners: BTreeSet<&Owner> = self.moved.iter().chain(over.keys()).collect();
         let mut cols: Vec<(&[([i64; 3], f64)], f64, f64)> = Vec::new();
         for o in owners {
-            let now = match over.get(&o) {
-                Some(t) => t.as_ref(),
-                None => self.terms.get(&o),
-            };
-            let was = self.held.reference.get(&o);
-            if let Some(t) = now {
-                cost += t.cost();
-            }
+            let (was, now) = (self.held.reference.get(o), now(o));
             match (was, now) {
                 (Some(r), Some(t)) if r.same_alignment(t) => {}
                 (Some(r), Some(t)) if r.align == t.align => cols.push((&t.align, t.curv - r.curv, t.slope - r.slope)),
@@ -261,6 +278,15 @@ impl Fit {
             }
         }
         cost + self.held.part(&cols)
+    }
+
+    /// Note whether owner `o`'s term, as the fit now holds it, differs from the alignment's reference.
+    pub(super) fn note(&mut self, o: Owner) {
+        let same = match (self.held.reference.get(&o), self.terms.get(&o)) {
+            (Some(r), Some(t)) => r.same_alignment(t),
+            (r, t) => r.is_none() && t.is_none(),
+        };
+        if same { self.moved.remove(&o) } else { self.moved.insert(o) };
     }
 }
 
