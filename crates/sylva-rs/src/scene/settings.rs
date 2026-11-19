@@ -10,7 +10,11 @@
 //! `settings/<site>.json`, written by those drivers), so another scanner or plot is a file, not code. What stays
 //! constant here is method, not calibration: the alignment error's node spacing, the depth bias's reference range,
 //! the outlier share and the longest range. The lattice step is each image's own
-//! ([`super::range_image::RangeImage::step`]).
+//! ([`super::range_image::RangeImage::step`]). The values measured against the scene's own predictions
+//! (`reflectance.py site`: the reflectance model, the wood, the pull, the merge map) move as the model does, and are
+//! re-measured together (research 130 slice-consolidate). Of the drivers named here, `constants.py`, `pulses.py` and
+//! `ground.py` are at 3dtrees' tag `archive/l0-drivers-2026-11-19`, `edges.py` and `leaf.py` in its history before
+//! research 130's slice-trim.
 
 use super::dual::{Over, Real};
 
@@ -65,7 +69,7 @@ params! {
         /// is declared: `leaf.py` am's single-echo peak in rank-3 voxels plus the stand's partial-fill offset (1.9 dB);
         /// not measured (leaf-reflectance.md). AM's ground is measured on its ground echoes (`ground.py am`, slice 2d).
         /// AM's measured values come from day-1 scans about a second box that no held-out check holds out.
-        pub refl_wood: f64 = -15.1,
+        pub refl_wood: f64 = -15.2,
         pub refl_leaf: f64 = -15.6,
         pub refl_ground: f64 = -16.9,
         /// The ground plane ([`Background`]'s `ground_z`), as AM's ground echoes measure it (3dtrees research 130 slice
@@ -85,9 +89,9 @@ params! {
         /// `d / (1 + 10^(pull_a + pull_b e))` (m), e the nearer's energy over the farther's (dB), with an sd as large:
         /// a fitted peak follows the nearer unless the farther outweighs it, far less than their energy-weighted range
         /// says (3dtrees research 130 slice 2c: AM's edges with one echo and a surface within the resolution behind,
-        /// fitted by least absolute deviations, `reflectance.py site`'s `merge_summary`; slice 9).
-        pub pull_a: f64 = 2.529,
-        pub pull_b: f64 = 0.062,
+        /// fitted by least absolute deviations, `reflectance.py site`'s `merge_summary`; slices 9, consolidate).
+        pub pull_a: f64 = 2.26,
+        pub pull_b: f64 = 0.047,
         /// The merge share behind a layer, calibrated per site (3dtrees research 130 slice 2c): the foliage field's own
         /// share M (`1 − exp(−b ∫ σ (1 − p))`, [`super::scene`]'s merges) predicts a site's merges beside wood too
         /// poorly to stand alone (slice-soft), so the share is `logistic(merge_a + merge_field M + merge_range t +
@@ -95,10 +99,10 @@ params! {
         /// [`super::scene::Scene::predict`] reports it, on edges whose pulse merged with a surface within the
         /// resolution behind (`reflectance.py site`'s `merge_summary`, the field held in; AM's from day-1 scans the
         /// held-out checks never hold out: slices 2d, products).
-        pub merge_a: f64 = -1.0467,
-        pub merge_field: f64 = 5.7753,
-        pub merge_range: f64 = -0.1205,
-        pub merge_fill: f64 = 1.9335,
+        pub merge_a: f64 = -1.2105,
+        pub merge_field: f64 = 5.659,
+        pub merge_range: f64 = -0.109,
+        pub merge_fill: f64 = 1.9792,
         /// Located edges (3dtrees research 130 step 2): an echo's reflectance (dB) is read beside its range. A return's
         /// predicted reflectance is `10 log10` of its members' energy shares (each fill × the beam left × cos^k ι ×
         /// the surface's reflectance, k `refl_incidence`, which sets the detection too; a merged return sums them), so
@@ -109,12 +113,12 @@ params! {
         /// its surface's reflectance with prior sd `refl_level_sd` (dB), marginalised with the alignment error. An echo
         /// nothing in the scene explains (the foliage field's, an outlier) reads `refl_background_mean` ±
         /// `refl_background_sd` (dB). All are measured on single echoes against the scene's own predictions
-        /// (`reflectance.py site`, slice 9).
-        pub refl_noise: f64 = 0.38,
-        pub refl_dof: f64 = 3.6,
-        pub refl_edge: f64 = 9.91,
-        pub refl_incidence: f64 = 0.3,
-        pub refl_level_sd: f64 = 0.76,
+        /// (`reflectance.py site`, slice 9; re-measured at the field's EM fixed point, slice-consolidate).
+        pub refl_noise: f64 = 0.37,
+        pub refl_dof: f64 = 3.9,
+        pub refl_edge: f64 = 10.39,
+        pub refl_incidence: f64 = 0.25,
+        pub refl_level_sd: f64 = 0.78,
         pub refl_background_mean: f64 = -21.29,
         pub refl_background_sd: f64 = 6.28,
         /// The scan alignment error (research 130 offset-field-design.md): an along-beam shift per (scan, place),
@@ -135,8 +139,9 @@ params! {
         pub mismatch_slope: f64 = 0.1,
         /// The evidence discount per cell φ: each cell's log-likelihood ratio counts `1/φ` (with the footprints'
         /// `1/m`), for what the model leaves correlated between cells (departures every cell of a section shares, in
-        /// one view or all). AM's is measured from its own cross-scan residuals: per-view radii of one element
-        /// disagree by √φ times their per-view sd (`discount.py`, slice 7d; 10.5 on raw).
+        /// one view or all). Declared at 10 from AM's cross-scan residuals: per-view radii of one element disagree
+        /// by √φ times their per-view sd (`discount.py`, slice 7d: 10.5 on raw). Re-read under the current refit it is
+        /// 2.8 overall but 37 at 6-12 m and 2.0 beyond, on the box's own scans: not settled (slice-consolidate).
         pub discount: f64 = 10.0,
         /// The stem front shift (research 130 slice 14): a section's departure from round, as each view sees it, is
         /// an along-beam shift of its front per (element, scan), with prior sd
@@ -159,8 +164,8 @@ params! {
     /// What lies behind the elements, crudely: a diffuse extinction `kappa` (1/m) along every ray (the foliage field
     /// outside its box: [`super::foliage`]) and a ground plane's height (NaN
     /// for none).
-    /// κ is declared at 0.05, the checks' setting; `extinction.py kappa` measures it per site (AM 0.034, the stand
-    /// 0.019).
+    /// κ is declared at 0.05, the checks' setting (slice 13b measured AM's at 0.034 and the stand's at 0.019): it
+    /// becomes the coarse level's field with the depth pyramid (research 130 formulation.md), so it stays declared.
     #[derive(Debug, Clone, Copy)]
     pub struct Background {
         pub kappa: f64 = 0.05,
