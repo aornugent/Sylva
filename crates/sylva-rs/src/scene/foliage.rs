@@ -530,6 +530,7 @@ impl FieldCounts {
 mod tests {
     use super::*;
     use crate::transform::norm;
+    use super::super::fixtures::pole_image;
 
     /// A ray through a box of 1 m voxels: the segments tile the clipped ray, and a uniform field's optical depth is κ t.
     #[test]
@@ -612,5 +613,26 @@ mod tests {
                 assert!((a - b).abs() < 1e-12 * a.max(1.0), "merge at {t}: {b} vs {a}");
             }
         }
+    }
+
+    /// Free space (slice 7): in front of the pole every ray clears a voxel; within the receiver's resolution in front of
+    /// an echo none does, though the rays reach it; behind the pole its rays are in shadow; a ray crosses the voxels
+    /// its line meets whatever its echo.
+    #[test]
+    fn free_space_carves_only_past_the_resolution() {
+        let v = pole_image();
+        let em = Settings::default();
+        let [crossed, reached, clear] = free_space(&v, [-0.1, 1.0, -0.1], [0.1, 8.6, 0.1], 0.2, &em);
+        assert_eq!(crossed.len(), 38);
+        let at = |y: f64| ((y - 1.0) / 0.2).floor() as usize;
+        let near = at(2.1);
+        assert!(crossed[near] > 100 && clear[near] == crossed[near], "{} {}", crossed[near], clear[near]);
+        let front = at(4.0 - 0.03 - 0.5 * em.resolution()); // within the resolution in front of the pole
+        assert!(reached[front] == crossed[front] && clear[front] < crossed[front], "{} {} {}", crossed[front], reached[front], clear[front]);
+        let behind = at(5.1);
+        assert!(reached[behind] < crossed[behind] && clear[behind] > 0, "{} {} {}", crossed[behind], reached[behind], clear[behind]);
+        let wall = at(8.0 - 0.5 * em.resolution());
+        assert!(clear[wall] == 0 && reached[wall] > 0, "{} {}", reached[wall], clear[wall]);
+        assert!((0..38).all(|i| clear[i] <= reached[i] && reached[i] <= crossed[i]));
     }
 }

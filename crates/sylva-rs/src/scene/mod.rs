@@ -12,7 +12,12 @@
 //! - [`foliage`]: the foliage field, a residual extinction on voxels.
 //! - [`dual`]: forward derivatives in any number of variables: second order for the own nodes' Newton, first order
 //!   for the geometry's slope and Fisher information.
-//! - [`scene`]: elements, their rendering, the scan alignment error and the [`scene::Scene`] that holds them.
+//! - [`render`]: elements and their layers in a view's cells, the k-buffer and its mixture.
+//! - [`pulse`]: one cell's pulse against its owners and the one pass over it.
+//! - [`term`]: an element's (or a group's) term per scan: its cells, its own nodes and its deposit.
+//! - [`alignment`]: the scan alignment error, solved with the terms and held between refits.
+//! - [`query`]: what the scene predicts and how well it pins elements down, without moving them.
+//! - [`scene`]: the [`scene::Scene`] that holds elements against scans: its cost, moves and rows.
 //!
 //! # Glossary
 //!
@@ -74,10 +79,17 @@
 //! | elements read off the moments | candidates | `candidates` |
 //! | hypotheses whose cost together isn't the sum of their costs alone | interacting hypotheses | `interactions`: a shared cell or front element, or a shared alignment node |
 
+pub mod alignment;
 pub mod dual;
+#[cfg(test)]
+mod fixtures;
 pub mod foliage;
 pub mod lattice;
-pub mod settings;
 pub mod moments;
+pub mod pulse;
+pub mod query;
 pub mod range_image;
+pub mod render;
 pub mod scene;
+pub mod settings;
+pub mod term;

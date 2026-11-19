@@ -37,7 +37,9 @@ use std::sync::Arc;
 use sylva_rs::scene::foliage::FoliageBox;
 use sylva_rs::scene::moments::{Candidate, Moments};
 use sylva_rs::scene::range_image::{Cell, RangeImage, RangeImageParams};
-use sylva_rs::scene::scene::{CellPrediction, Class, Element, ElementScan, Form, Information, Scene, SceneError};
+use sylva_rs::scene::query::{CellPrediction, Information};
+use sylva_rs::scene::render::{Class, Element, Form};
+use sylva_rs::scene::scene::{ElementScan, Scene, SceneError};
 use sylva_rs::scene::settings::{Background, Settings};
 
 use crate::xyz_from_py;
@@ -127,7 +129,7 @@ fn alignment_hats<'py>(py: Python<'py>, points: PyReadonlyArray2<f64>, spacing: 
     let n = p.len();
     let (mut keys, mut ws) = (vec![0i64; n * 24], vec![0.0; n * 8]);
     for (i, x) in p.iter().enumerate() {
-        for (j, (k, w)) in sylva_rs::scene::scene::hats(x, spacing).into_iter().enumerate() {
+        for (j, (k, w)) in sylva_rs::scene::alignment::hats(x, spacing).into_iter().enumerate() {
             keys[(i * 8 + j) * 3..(i * 8 + j) * 3 + 3].copy_from_slice(&k);
             ws[i * 8 + j] = w;
         }
@@ -139,7 +141,7 @@ fn alignment_hats<'py>(py: Python<'py>, points: PyReadonlyArray2<f64>, spacing: 
 /// a beam of radius `a` (arrays alike).
 #[pyfunction]
 fn beam_fill<'py>(py: Python<'py>, d: PyReadonlyArray1<f64>, r: f64, a: PyReadonlyArray1<f64>) -> PyResult<(Bound<'py, PyArray1<f64>>, Bound<'py, PyArray1<f64>>)> {
-    let (f, g): (Vec<f64>, Vec<f64>) = d.as_slice()?.iter().zip(a.as_slice()?).map(|(&d, &a)| sylva_rs::scene::scene::beam_fill(d, r, a)).unzip();
+    let (f, g): (Vec<f64>, Vec<f64>) = d.as_slice()?.iter().zip(a.as_slice()?).map(|(&d, &a)| sylva_rs::scene::render::beam_fill(d, r, a)).unzip();
     Ok((f.into_pyarray(py), g.into_pyarray(py)))
 }
 
