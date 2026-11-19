@@ -93,14 +93,14 @@ params! {
         /// one box (0.10 against 0.48) and well in another (0.40 against 0.39), so the share is
         /// `logistic(merge_a + merge_field M + merge_range t + merge_fill f)` at the layer's range t (m) and fill f,
         /// fitted on edges whose pulse merged with a surface within the resolution behind (`reflectance.py site`'s
-        /// `merge_summary`, the field held in; slice 2d: AM's from day-1 scans the held-out checks never hold out).
-        /// Soft attribution (slice-soft) doesn't retire it: about the second box the field's own share behind the
-        /// candidates' edges rises from 0.06 to 0.13 against 0.45 merged (AUC 0.54 → 0.60). These values were fitted
-        /// under the hard cut and margin.
-        pub merge_a: f64 = -0.1104,
-        pub merge_field: f64 = 1.2609,
-        pub merge_range: f64 = -0.1127,
-        pub merge_fill: f64 = 0.1912,
+        /// `merge_summary`, the field held in; slice 2d: AM's from day-1 scans the held-out checks never hold out),
+        /// on the field's own share M as [`super::scene::Scene::predict`] reports it (slice-products; before it, on
+        /// the previous map's output). Soft attribution (slice-soft) doesn't retire it: about the second box M is 0.13
+        /// against 0.46 merged (AUC 0.60), the map 0.46 (AUC 0.68).
+        pub merge_a: f64 = -1.0467,
+        pub merge_field: f64 = 5.7753,
+        pub merge_range: f64 = -0.1205,
+        pub merge_fill: f64 = 1.9335,
         /// Located edges (3dtrees research 130 step 2): an echo's reflectance (dB) is read beside its range. A return's
         /// predicted reflectance is `10 log10` of its members' energy shares (each fill × the beam left × cos^k ι ×
         /// the surface's reflectance, k `refl_incidence`, which sets the detection too; a merged return sums them), so

@@ -727,8 +727,9 @@ fn term_classes(v: &RangeImage, buf: &HashMap<usize, Vec<Layer>>, slot: &[usize]
 /// declared reflectance and its own section radius, without the shape mismatch's blur; NaN where that section
 /// misses the beam), the mean cos ι over the part of the footprint the element meets, its term's surface class,
 /// the observed first echo (NaN for none) and its reflectance (NaN unknown), the [`Outcome`], whether any echo the
-/// likelihood reads of the cell's pulse is on the element (`read`: [`Outcome::of`] for each), its merge share with the
-/// medium behind it (`merge`: [`merges`]), the cell's weight ([`Settings::cell_weight`]), the footprint (m) and where
+/// likelihood reads of the cell's pulse is on the element (`read`: [`Outcome::of`] for each), the foliage field's own
+/// merge share behind it (`merge`: [`merges`]' `1 − exp(−b ∫ σ (1 − p))`, before the site's map, which is fitted on
+/// it: 3dtrees research 130 slice-products), the cell's weight ([`Settings::cell_weight`]), the footprint (m) and where
 /// its ray passes the axis (across, along). From the same pass over the pulse ([`Pulse::read`]): the expected number
 /// of returns the receiver records from the cell's occluders (`returns`: its layers and the ground, merged, detected
 /// and capped; the medium's echoes are the foliage field's), the share of the beam the element leaves behind it
@@ -761,12 +762,14 @@ pub struct CellPrediction {
 
 
 /// What lies behind a layer in the medium (the foliage field; κ outside its box), at unshifted ranges ([`merges`]):
-/// the share of pulses whose return from it merges with a medium surface behind it, that surface's energy share
-/// when it does (the beam the layer leaves, at the medium's mean reflectance), and how far the merge pulls the echo
-/// back ([`Settings::pull`], at the merged surface's mean separation).
+/// the share of pulses whose return from it merges with a medium surface behind it (`share`, the site's map of the
+/// field's own share `field`, [`Settings::merge_share`]), that surface's energy share when it does (the beam the
+/// layer leaves, at the medium's mean reflectance), and how far the merge pulls the echo back ([`Settings::pull`], at
+/// the merged surface's mean separation).
 #[derive(Debug, Clone, Copy)]
 struct Merge<P = f64> {
     share: P,
+    field: f64,
     energy: P,
     pull: P,
 }
@@ -774,7 +777,7 @@ struct Merge<P = f64> {
 impl<P: Real> Merge<P> {
     /// No merge.
     fn none() -> Self {
-        Merge { share: P::c(0.0), energy: P::c(0.0), pull: P::c(0.0) }
+        Merge { share: P::c(0.0), field: 0.0, energy: P::c(0.0), pull: P::c(0.0) }
     }
 }
 
@@ -1029,8 +1032,9 @@ fn merges<P: Real>(occ: &mut [Occluder<P>], m: &Medium, em: &Settings) {
         let d = if near.v() > 0.0 { parts.iter().map(|p| p.0 * p.1).sum::<P>() / near } else { P::c(0.0) };
         // the share fades to none as the beam left does, under 1e-6 of it (it was cut there, a jump of up to the map's
         // intercept, about 0.4: 3dtrees research 130 slice-trim)
-        let share = em.merge_share(P::c(1.0) - (-beam * whole).exp(), ly.t, ly.f) * smooth(beam / 1e-6);
-        occ[i].merge = Merge { share, energy: beam * 10f64.powf(em.refl_background_mean / 10.0), pull: em.pull(d, e) };
+        let field = P::c(1.0) - (-beam * whole).exp();
+        let share = em.merge_share(field, ly.t, ly.f) * smooth(beam / 1e-6);
+        occ[i].merge = Merge { share, field: field.v(), energy: beam * 10f64.powf(em.refl_background_mean / 10.0), pull: em.pull(d, e) };
     }
 }
 
@@ -2358,7 +2362,7 @@ impl Scene {
                 refl: fe.map_or(f64::NAN, |f| if f.db[1] > -200.0 { f.db[1] } else { f64::NAN }), cos: ly.cos, obs: cv.obs,
                 obs_refl: pulse.refls.first().map_or(f64::NAN, |&x| x as f64),
                 outcome: Outcome::of(cv.obs, depth, sd), read: pulse.echoes.iter().any(|&r| Outcome::of(r as f64, depth, sd) == Outcome::On),
-                merge: at.map_or(0.0, |i| pulse.occluders[i].merge.share), weight: cv.wt, footprint: em.footprint(ly.t), across: ly.x, along: ly.s,
+                merge: at.map_or(0.0, |i| pulse.occluders[i].merge.field), weight: cv.wt, footprint: em.footprint(ly.t), across: ly.x, along: ly.s,
                 returns: r.rx.expected(pulse.cap).iter().sum(), beam: at.map_or(f64::NAN, |i| r.rx.members[i].beam), owned: at.map_or(0.0, |i| r.owned(i)),
             }
         }).collect();
@@ -3816,6 +3820,8 @@ mod tests {
         let p = pulse_in(&em, &[], &[], false, &[layer(4.0, 0.3, 1.0)], None, &dense);
         let m = p.occluders[0].merge;
         assert!(m.share > 0.9 && m.share < 1.0, "{m:?}");
+        // the share is the site's map of the field's own share, which `predict` reports (the map is fitted on it)
+        assert!(m.field > 0.0 && m.field < m.share && (m.share - em.merge_share(m.field, 4.0, 0.3)).abs() < 1e-12, "{m:?}");
         assert_eq!(merge(1.0, &dense).share, 0.0);
         assert!(merge(0.3, &Foliage::uniform(0.05)).share < 0.5 * m.share);
         let r = p.receiver(0.0, 0.0, &em).patterns[0].1[0];

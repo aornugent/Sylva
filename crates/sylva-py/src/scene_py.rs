@@ -637,10 +637,11 @@ impl PyScene {
     /// (flat index), elem (which of them, its row), surface, outcome (0 on, 1 empty, 2 in front, 3 behind), fill,
     /// recorded, arrives, depth, sd, refl (the echo's predicted reflectance, dB), cos (the mean cos ι where the element
     /// meets the footprint), obs, obs_refl (the first echo's reflectance, dB), read (any echo the likelihood reads is
-    /// on it), merge (its merge share with the medium behind), weight (the cell weight), footprint (m), across and
-    /// along (where the ray passes the axis); from the same pass over each pulse, returns (the expected number of echoes
-    /// the receiver records from the cell's layers and ground), beam (the share of the beam the element leaves) and
-    /// owned (how many of the pulse's echoes are the element's in expectation).
+    /// on it), merge (the foliage field's own merge share with the medium behind, before the site's map), weight (the
+    /// cell weight), footprint (m), across and along (where the ray passes the axis); from the same pass over each
+    /// pulse, returns (the expected number of echoes the receiver records from the cell's layers and ground), beam (the
+    /// share of the beam the element leaves) and owned (how many of the pulse's echoes are the element's in
+    /// expectation).
     #[pyo3(signature = (elements, scan=0))]
     fn predict<'py>(&self, py: Python<'py>, elements: &Bound<'_, PyDict>, scan: usize) -> PyResult<Bound<'py, PyDict>> {
         self.inner.check_scan(scan).map_err(scene_err)?;
