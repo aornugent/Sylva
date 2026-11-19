@@ -161,3 +161,21 @@ def test_the_collapsed_field_crosses_the_binding():
     rows = sc.rows()
     assert rows['field'].shape == rows['cost'].shape
     assert np.isclose(rows['cost'].sum() + sc.alignment_parts().sum() + sc.field_part(), sc.cost())
+
+
+def test_the_rules_consumers_read_beside_the_cost_cross_the_binding():
+    """The footprint, the detection floor, a fill with its slope in ln r and the field's marginal per voxel, the
+    scene's own rules, under the settings given (the defaults without)."""
+    from math import lgamma, log
+    s = _core.settings_defaults()
+    t = np.array([4.0, 30.0])
+    assert np.allclose(_core.footprint(t), s['beam_exit'] + s['beam_divergence'] * t)
+    assert np.allclose(_core.floor(t, dict(floor_db=-40.0)), -40.0 + s['floor_slope'] * np.log10(np.maximum(t, s['floor_ref']) / s['floor_ref']))
+    f, g = _core.beam_fill(np.array([0.0, 0.03, 0.1]), 0.03, np.full(3, 0.004))
+    assert np.allclose(f, [1.0, 0.5, 0.0]) and g[0] == 0.0 and g[1] > 0.0
+    h = 1e-6
+    up, _ = _core.beam_fill(np.array([0.03]), 0.03 * np.exp(h), np.array([0.004]))
+    assert abs((up[0] - f[1]) / h - g[1]) < 1e-4 * g[1]
+    a0, b0 = 0.05 * 0.4, 0.4
+    nb = _core.field_ln_nb(np.array([2.0, 0.0]), np.array([3.0, 0.0]), 0.05, 0.4)
+    assert np.allclose(nb, [lgamma(a0 + 2) - lgamma(a0) + a0 * log(b0) - (a0 + 2) * log(b0 + 3), 0.0])

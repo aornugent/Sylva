@@ -388,6 +388,15 @@ fn smooth<P: Real>(x: P) -> P {
     x * x * (P::c(3.0) - x * 2.0)
 }
 
+/// The share of the beam (a uniform disc of radius `a`) a section of radius `r` meets whose axis passes `d` from the
+/// beam's centre, and its slope in ln r: a layer's fill at one section radius ([`layer`]'s), for what a consumer reads
+/// beside the cost.
+pub fn beam_fill(d: f64, r: f64, a: f64) -> (f64, f64) {
+    let r = Dual::<1>::var(r.ln(), 0).exp();
+    let f = disc_cdf((r - d) / a) - disc_cdf((-r - d) / a);
+    (f.v(), f.g[0])
+}
+
 /// The share of a uniform disc's energy (radius 1) nearer than a line `z` radii from its centre: the CDF of its 1-D
 /// marginal, a semicircle.
 fn disc_cdf<P: Real>(z: P) -> P {

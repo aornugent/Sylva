@@ -6,7 +6,9 @@
 //! glossary these names follow).
 //!
 //! - **Settings and background:** flat dicts of the records' fields (`Settings`, `Background`), each optional;
-//!   `settings_defaults()` returns the settings' defaults (AM's). An unknown key raises.
+//!   `settings_defaults()` returns the settings' defaults (AM's). An unknown key raises. A few of the scene's rules for
+//!   what consumers read beside the cost: `footprint`, `floor`, `beam_fill` (a fill and its slope in ln r) and
+//!   `field_ln_nb` (the foliage field's marginal per voxel).
 //! - **Elements:** a dict of arrays, one row per element: `a`, `b` (n, 3) and `r` (n,) are required; `opacity` (n,)
 //!   defaults to 1, `mismatch` (n,) to the settings' prior `mismatch_base + mismatch_slope r`, `patch` (n,) bool
 //!   to false, `leaf` (n,) bool, its class (wood or leaf), to `patch`, and `group` (n,) int, its chain's key
@@ -74,6 +76,38 @@ fn settings_defaults<'py>(py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
         d.set_item(k, m.get(k))?;
     }
     Ok(d)
+}
+
+/// The beam's diameter (m) at each range (`Settings::footprint`), under `settings` (the defaults without).
+#[pyfunction]
+#[pyo3(signature = (range, settings=None))]
+fn footprint<'py>(py: Python<'py>, range: PyReadonlyArray1<f64>, settings: Option<&Bound<'_, PyDict>>) -> PyResult<Bound<'py, PyArray1<f64>>> {
+    let em = self::settings(settings)?;
+    Ok(range.as_slice()?.iter().map(|&t| em.footprint(t)).collect::<Vec<_>>().into_pyarray(py))
+}
+
+/// The detection floor (dB) at each range (`Settings::floor`), under `settings` (the defaults without).
+#[pyfunction]
+#[pyo3(signature = (range, settings=None))]
+fn floor<'py>(py: Python<'py>, range: PyReadonlyArray1<f64>, settings: Option<&Bound<'_, PyDict>>) -> PyResult<Bound<'py, PyArray1<f64>>> {
+    let em = self::settings(settings)?;
+    Ok(range.as_slice()?.iter().map(|&t| em.floor(t)).collect::<Vec<_>>().into_pyarray(py))
+}
+
+/// A layer's fill at one section radius `r` and its slope in ln r (`scene::beam_fill`), its axis `d` from the centre of
+/// a beam of radius `a` (arrays alike).
+#[pyfunction]
+fn beam_fill<'py>(py: Python<'py>, d: PyReadonlyArray1<f64>, r: f64, a: PyReadonlyArray1<f64>) -> PyResult<(Bound<'py, PyArray1<f64>>, Bound<'py, PyArray1<f64>>)> {
+    let (f, g): (Vec<f64>, Vec<f64>) = d.as_slice()?.iter().zip(a.as_slice()?).map(|(&d, &a)| sylva_rs::scene::scene::beam_fill(d, r, a)).unzip();
+    Ok((f.into_pyarray(py), g.into_pyarray(py)))
+}
+
+/// Each voxel's `ln NB(hits, path)` under the foliage field's Gamma prior of mean `mean` worth `prior_path` m of
+/// weighted ray (`foliage::ln_nb`; 0 with no counts).
+#[pyfunction]
+fn field_ln_nb<'py>(py: Python<'py>, hits: PyReadonlyArray1<f64>, path: PyReadonlyArray1<f64>, mean: f64, prior_path: f64) -> PyResult<Bound<'py, PyArray1<f64>>> {
+    Ok(hits.as_slice()?.iter().zip(path.as_slice()?).map(|(&h, &l)| sylva_rs::scene::foliage::ln_nb(h, l, mean * prior_path, prior_path))
+        .collect::<Vec<_>>().into_pyarray(py))
 }
 
 fn elements_from_py(d: &Bound<'_, PyDict>, em: &Settings) -> PyResult<Vec<Element>> {
@@ -332,6 +366,10 @@ pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyScene>()?;
     m.add_function(wrap_pyfunction!(candidates, m)?)?;
     m.add_function(wrap_pyfunction!(settings_defaults, m)?)?;
+    m.add_function(wrap_pyfunction!(footprint, m)?)?;
+    m.add_function(wrap_pyfunction!(floor, m)?)?;
+    m.add_function(wrap_pyfunction!(beam_fill, m)?)?;
+    m.add_function(wrap_pyfunction!(field_ln_nb, m)?)?;
     Ok(())
 }
 
