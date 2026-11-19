@@ -206,15 +206,14 @@ def test_the_rules_consumers_read_beside_the_cost_cross_the_binding():
     assert keys.shape == (2, 8, 3) and np.allclose((w ** 2).sum(1), 1.0) and (w[1] > 0).sum() == 1
 
 
-def test_a_chain_added_together_and_a_field_built_to_its_fixed_point():
-    """Research 130 slice-consolidate: `add` of a list is one move (Sylva's add_many), the cost as adding one by one;
-    a scene with a field reports the EM steps its build took."""
+def test_a_chain_added_together():
+    """Research 130 slice-consolidate: `add` of a list is one move (Sylva's add_many), the cost as adding one by one,
+    with a field."""
     v = pole_image()
     box = dict(lo=[-0.5, 2.9, -0.3], hi=[0.5, 8.9, 0.3], voxel=0.1)
     halves = dict(a=np.array([[0.0, 4.0, -0.1], [0.0, 4.0, 0.0]]), b=np.array([[0.0, 4.0, 0.0], [0.0, 4.0, 0.1]]), r=np.array([0.03, 0.03]),
                   group=np.array([4, 4]))
     one, many = _core.Scene([v], pole(), None, None, box), _core.Scene([v], pole(), None, None, box)
-    assert one.em_steps >= 1 and _core.Scene([v], pole()).em_steps == 0
     for k in range(2):
         one.add({key: x[k:k + 1] for key, x in halves.items()})
     ids, _ = many.add(halves)

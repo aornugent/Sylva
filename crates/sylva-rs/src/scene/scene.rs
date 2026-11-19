@@ -75,12 +75,6 @@ pub struct ElementScan {
     pub refl_level_sd: f64,
 }
 
-/// A build with a foliage field runs EM until a step changes the cost by less than this (nats): its fixed point.
-pub const EM_TOL: f64 = 1.0;
-
-/// EM steps at most in a build.
-pub(super) const MAX_EM: usize = 50;
-
 /// What a scene call can't do: an element id that isn't live, a scan index out of range, or an element that can't be
 /// scored ([`Element::invalid`]).
 #[derive(Debug, Clone, PartialEq)]
@@ -105,9 +99,15 @@ impl std::error::Error for SceneError {}
 ///   the cost is the exact Laplace marginal ([`Scene::exact_cost`], the referee); the scene is built refitted.
 /// - With a foliage field, each term's deposit (the hits its elements take from the field, [`Term`]'s `deposit`)
 ///   changes with the term, so a move changes the field's counts by its terms' old deposits less their new ones. A scene
-///   is built by EM from κ to its fixed point: the terms read the background, their deposits make the field, the terms
-///   read it, and so on until a step ([`Scene::refit_foliage`]) changes the cost by less than [`EM_TOL`]
-///   ([`Scene::em_steps`] counts them). So scenes built from the same elements are comparable, however they were reached.
+///   is built by one step of EM from κ: the terms read the background, their deposits make the field, and the terms read
+///   it ([`Scene::refit_foliage`] is another step). The first step carries nearly all of EM's change (3dtrees research
+///   130 rca-em: the stand's 1,893 of 2,028 nats, AM's all but 0.13), so **compare fresh builds with fresh builds**: a
+///   scene refitted further, or reached by moves and refits, sits a few tens of nats from a fresh build of the same
+///   elements on the stand.
+/// - Two approximations make the field's EM a surrogate, not the bound it would be (rca-em): the E-step reads σ's
+///   posterior mean `α / β` where the mean-field bound's own step reads `exp(E ln σ)` (so iterating to a fixed point
+///   drains the voxels the elements hold, without each voxel's Occam term), and the plug-in ([`FieldCounts`]) takes the
+///   empty scene to read every echo the elements take as the medium's.
 /// - Element ids are stable and never reused.
 /// - The reference epoch (the scanning day the alignment error's spread is stated for) is declared: a scan of another epoch adds the other-epoch part
 ///   to its alignment error.
@@ -129,8 +129,6 @@ pub struct Scene {
     pub(super) cells: Vec<HashMap<usize, Vec<Entered>>>,
     /// [image]: its fit.
     pub(super) fits: Vec<Fit>,
-    /// The EM steps its build took ([`EM_TOL`]; 0 without a field).
-    pub(super) em_steps: usize,
 }
 
 /// An element's layer in a cell's index: its id, range and whether it is wholly in the cell ([`Layer::full`]).
@@ -194,7 +192,7 @@ impl Scene {
     pub fn new(views: Vec<Arc<RangeImage>>, elems: &[Element], em: Settings, sc: Background, spec: Option<FoliageBox>, ref_epoch: u32) -> Self {
         let n = views.len();
         let mut c = Scene { views, em, sc, ext: Foliage::uniform(sc.kappa), field: None, ref_epoch, elems: elems.iter().map(|e| Some(*e)).collect(),
-                             groups: HashMap::new(), rendered: Vec::new(), cells: vec![HashMap::new(); n], fits: Vec::new(), em_steps: 0 };
+                             groups: HashMap::new(), rendered: Vec::new(), cells: vec![HashMap::new(); n], fits: Vec::new() };
         for (i, e) in elems.iter().enumerate() {
             c.join(i as u32, e);
         }
@@ -206,18 +204,10 @@ impl Scene {
         }
         c.field = spec.map(|sp| FieldCounts::new(sp, &c.views.iter().map(|v| &**v).collect::<Vec<_>>(), &em));
         c.refit_alignment();
-        while c.field.is_some() && c.em_steps < MAX_EM {
-            c.em_steps += 1;
-            if c.refit_foliage().abs() < EM_TOL {
-                break;
-            }
+        if c.field.is_some() {
+            c.refit_foliage();
         }
         c
-    }
-
-    /// The EM steps the scene's build took to its fixed point ([`EM_TOL`]; 0 without a field).
-    pub fn em_steps(&self) -> usize {
-        self.em_steps
     }
 
     /// The scene's cost against the empty scene: its elements' cells, each against the same cell with the foliage
@@ -730,9 +720,8 @@ mod tests {
 
     /// The foliage field is what the elements leave: the empty scene's field holds the pole's echoes (its voxel is
     /// dense), and promoting the pole takes its share of them out. The cost after a promotion is near a fresh scene's
-    /// (one step of EM from the empty scene's field against EM to the fixed point from κ), its change is that cost, the
-    /// rows, the alignment parts and the field's part sum to it, and demotion restores the empty scene exactly. A
-    /// fresh scene is at its fixed point: another step moves its cost by less than [`EM_TOL`].
+    /// (one step of EM each, from different fields: the empty scene's and κ), its change is that cost, the rows, the
+    /// alignment parts and the field's part sum to it, and demotion restores the empty scene exactly.
     #[test]
     fn the_field_is_what_the_elements_leave() {
         let v = pole_view();
@@ -744,9 +733,8 @@ mod tests {
         let dense = sigma(&c);
         assert!(dense > 1.0, "{dense}");
         let (id, d) = c.promote(pole);
-        let mut fresh = Scene::new(vec![v.clone()], &[pole], em, sc, Some(field_box()), 0);
+        let fresh = Scene::new(vec![v.clone()], &[pole], em, sc, Some(field_box()), 0);
         assert!((c.cost() - fresh.cost()).abs() < 1e-3 * fresh.cost().abs(), "{} vs {}", c.cost(), fresh.cost());
-        assert!(fresh.em_steps() >= 1 && fresh.refit_foliage().abs() < EM_TOL, "{} steps", fresh.em_steps());
         assert!((d - c.cost()).abs() < 1e-9 * d.abs().max(1.0));
         assert!(d < 0.0, "{d}");
         assert!(sigma(&c) < 0.5 * dense, "{} vs {dense}", sigma(&c));
