@@ -408,7 +408,13 @@ impl PyScene {
         Ok(PyScene { inner: py.detach(|| Scene::new(vs, &el, em, bg, spec, ref_epoch)), em })
     }
 
-    /// Re-solve the foliage field from what the elements leave of the rays: the cost change.
+    /// The EM steps the scene's build took to its fixed point (scene::EM_TOL; 0 without a field).
+    #[getter]
+    fn em_steps(&self) -> usize {
+        self.inner.em_steps()
+    }
+
+    /// Re-solve the foliage field from what the elements leave of the rays (one step of EM): the cost change.
     fn refit_foliage(&mut self, py: Python<'_>) -> f64 {
         let c = &mut self.inner;
         py.detach(|| c.refit_foliage())
