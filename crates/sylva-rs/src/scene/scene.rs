@@ -1440,7 +1440,7 @@ impl Term {
 
 /// The scan alignment error's nodes about a place: trilinear hats on a grid of spacing ℓ, normalised so the alignment
 /// error's variance is the same everywhere (`t(x) = Σ w_j z_j / √Σ w_j²`); each node carries the along-beam shift.
-fn hats(x: &Point, l: f64) -> Vec<([i64; 3], f64)> {
+pub fn hats(x: &Point, l: f64) -> Vec<([i64; 3], f64)> {
     let g = x.map(|v| v / l);
     let f = g.map(|v| v.floor());
     let mut out = Vec::with_capacity(8);

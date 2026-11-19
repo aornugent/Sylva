@@ -7,8 +7,9 @@
 //!
 //! - **Settings and background:** flat dicts of the records' fields (`Settings`, `Background`), each optional;
 //!   `settings_defaults()` returns the settings' defaults (AM's). An unknown key raises. A few of the scene's rules for
-//!   what consumers read beside the cost: `footprint`, `floor`, `beam_fill` (a fill and its slope in ln r) and
-//!   `field_ln_nb` (the foliage field's marginal per voxel).
+//!   what consumers read beside the cost: `footprint`, `floor`, `p_detect` (the detection's chance), `mismatch_sd`
+//!   (the shape mismatch's prior), `beam_fill` (a fill and its slope in ln r), `field_ln_nb` (the foliage field's
+//!   marginal per voxel) and `alignment_hats` (the scan alignment error's nodes about points).
 //! - **Elements:** a dict of arrays, one row per element: `a`, `b` (n, 3) and `r` (n,) are required; `opacity` (n,)
 //!   defaults to 1, `mismatch` (n,) to the settings' prior `mismatch_base + mismatch_slope r`, `patch` (n,) bool
 //!   to false, `leaf` (n,) bool, its class (wood or leaf), to `patch`, and `group` (n,) int, its chain's key
@@ -28,7 +29,7 @@
 //!   `promote(element)` and `demote(id)` move mass between the field and the elements; `foliage_voxels()` gives it
 //!   per voxel and `transmission(image, cells)` its optical depth across the box along other images' rays.
 
-use numpy::{IntoPyArray, PyArray1, PyArrayMethods, PyReadonlyArray1, PyReadonlyArray2};
+use numpy::{IntoPyArray, PyArray1, PyArray2, PyArray3, PyArrayMethods, PyReadonlyArray1, PyReadonlyArray2};
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
@@ -93,6 +94,45 @@ fn footprint<'py>(py: Python<'py>, range: PyReadonlyArray1<f64>, settings: Optio
 fn floor<'py>(py: Python<'py>, range: PyReadonlyArray1<f64>, settings: Option<&Bound<'_, PyDict>>) -> PyResult<Bound<'py, PyArray1<f64>>> {
     let em = self::settings(settings)?;
     Ok(range.as_slice()?.iter().map(|&t| em.floor(t)).collect::<Vec<_>>().into_pyarray(py))
+}
+
+/// The chance an echo is recorded (`Settings::p_detect`) off a surface of reflectance `db` (dB, at full fill and face-on)
+/// taking energy share `share` (its fill × cos^k ι) at range `range` (arrays alike), under `settings`.
+#[pyfunction]
+#[pyo3(signature = (db, share, range, settings=None))]
+fn p_detect<'py>(py: Python<'py>, db: PyReadonlyArray1<f64>, share: PyReadonlyArray1<f64>, range: PyReadonlyArray1<f64>,
+                 settings: Option<&Bound<'_, PyDict>>) -> PyResult<Bound<'py, PyArray1<f64>>> {
+    let em = self::settings(settings)?;
+    let (d, e, t) = (db.as_slice()?, share.as_slice()?, range.as_slice()?);
+    if d.len() != e.len() || t.len() != e.len() {
+        return Err(PyValueError::new_err("p_detect: db, share and range need one value each"));
+    }
+    Ok(d.iter().zip(e).zip(t).map(|((&d, &e), &t)| em.p_detect::<f64, f64>(d, e, t)).collect::<Vec<_>>().into_pyarray(py))
+}
+
+/// An element's shape mismatch prior sd (m) at each radius (`Settings::mismatch_sd`), under `settings`.
+#[pyfunction]
+#[pyo3(signature = (r, settings=None))]
+fn mismatch_sd<'py>(py: Python<'py>, r: PyReadonlyArray1<f64>, settings: Option<&Bound<'_, PyDict>>) -> PyResult<Bound<'py, PyArray1<f64>>> {
+    let em = self::settings(settings)?;
+    Ok(r.as_slice()?.iter().map(|&r| em.mismatch_sd(r)).collect::<Vec<_>>().into_pyarray(py))
+}
+
+/// The scan alignment error's nodes about each point (scene::hats: normalised trilinear hats on a grid of `spacing` m):
+/// keys (n, 8, 3) and weights (n, 8), a point's unused slots weight 0.
+#[pyfunction]
+#[pyo3(signature = (points, spacing=sylva_rs::scene::settings::ALIGN_SPACING))]
+fn alignment_hats<'py>(py: Python<'py>, points: PyReadonlyArray2<f64>, spacing: f64) -> PyResult<(Bound<'py, PyArray3<i64>>, Bound<'py, PyArray2<f64>>)> {
+    let p = xyz_from_py(points)?;
+    let n = p.len();
+    let (mut keys, mut ws) = (vec![0i64; n * 24], vec![0.0; n * 8]);
+    for (i, x) in p.iter().enumerate() {
+        for (j, (k, w)) in sylva_rs::scene::scene::hats(x, spacing).into_iter().enumerate() {
+            keys[(i * 8 + j) * 3..(i * 8 + j) * 3 + 3].copy_from_slice(&k);
+            ws[i * 8 + j] = w;
+        }
+    }
+    Ok((keys.into_pyarray(py).reshape([n, 8, 3])?, ws.into_pyarray(py).reshape([n, 8])?))
 }
 
 /// A layer's fill at one section radius `r` and its slope in ln r (`scene::beam_fill`), its axis `d` from the centre of
@@ -370,6 +410,9 @@ pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(footprint, m)?)?;
     m.add_function(wrap_pyfunction!(floor, m)?)?;
     m.add_function(wrap_pyfunction!(beam_fill, m)?)?;
+    m.add_function(wrap_pyfunction!(p_detect, m)?)?;
+    m.add_function(wrap_pyfunction!(mismatch_sd, m)?)?;
+    m.add_function(wrap_pyfunction!(alignment_hats, m)?)?;
     m.add_function(wrap_pyfunction!(field_ln_nb, m)?)?;
     Ok(())
 }
