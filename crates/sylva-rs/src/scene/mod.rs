@@ -13,6 +13,7 @@
 //! - [`dual`]: forward derivatives in any number of variables: second order for the own nodes' Newton, first order
 //!   for the geometry's slope and Fisher information.
 //! - [`render`]: elements and their layers in a view's cells, the k-buffer and its mixture.
+//! - [`pyramid`]: one scan's pulses aggregated over its lattice level by level: carving, arrival.
 //! - [`pulse`]: one cell's pulse against its owners and the one pass over it.
 //! - [`term`]: an element's (or a group's) term per scan: its cells, its own nodes and its deposit.
 //! - [`alignment`]: the scan alignment error, solved with the terms and held between refits.
@@ -38,7 +39,8 @@
 //! | one reading of a pulse that gives every quantity the scene takes from it | the pass | `Pulse::read`: the likelihood with its derivatives, the receiver, the beam each owner leaves (`predict`'s `beam`), each echo's responsibilities (3dtrees research 130 slice-pulse) |
 //! | the posterior over which owner made an echo | responsibility | per echo, over the members, the medium and an outlier, summing to one (`predict`'s `owned`); with a foliage field, what the elements take of each echo the field counts (soft attribution) |
 //! | the most echoes the instrument records per pulse | the target cap | `max_targets`; a pulse at it is capped (`RangeImage::capped`), and says nothing past its last echo |
-//! | the range up to which a pulse shows clear space | free space | `free_to`: the first echo less the receiver's resolution; per voxel, [`foliage::free_space`]'s rays crossing, reaching and clearing it (3dtrees research 130 slice 7) |
+//! | the range up to which a pulse shows clear space | free space | `free_to`: the first echo less the receiver's resolution; what a pulse shows clear along its ray, its echoes and the beam they leave, in one place ([`foliage::walked`]) |
+//! | one scan's pulses aggregated over its lattice, level by level | depth pyramid | [`pyramid::Pyramid`]: per tile its first echoes' nearest and farthest, its pulses, misses, echoes and energy; carving a voxel ([`pyramid::carve`]: every pulse in its cover clear past it) and arrival read off it at the level a query's cover fits (3dtrees research 130 slice-pyramid) |
 //! | a proposed part of the scene | element | a form (a stick, an axis and radius; or a patch, a ball) and a class |
 //! | what an element is made of, wood or leaf | class | `Class`: its reflectance; a mark, not a shape |
 //! | sticks joined end to end, scored as one | chain; group | `Element::group`, a key: a group's members are one term per scan, one set of nuisances (alignment shift, stem front shift, reflectance level) |
@@ -90,6 +92,7 @@ pub mod foliage;
 pub mod lattice;
 pub mod moments;
 pub mod pulse;
+pub mod pyramid;
 pub mod query;
 pub mod range_image;
 pub mod render;

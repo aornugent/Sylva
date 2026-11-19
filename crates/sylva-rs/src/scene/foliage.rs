@@ -33,8 +33,7 @@
 //!   instrument records ([`RangeImage::capped`]): a pulse at its cap says nothing about what lies beyond.
 //! - **One walk per ray** (3dtrees research 130 slice-structure): a cell's ray is traversed through the box once
 //!   ([`Walk`]). The pulse reads its optical depths and hazards as prefix sums over the walk's segments, and its merge
-//!   integrals as sums over them ([`Medium`]); the field's counts lay its path on the same segments, and
-//!   [`free_space`] carves along them.
+//!   integrals as sums over them ([`Medium`]); the field's counts lay its path on the same segments.
 //! - **Energy after an echo.** A pulse's echo energies are bounded by its emitted energy (synthesis §4): an echo's
 //!   reflectance against a full-footprint hit on the dimmest canopy surface ([`Settings::refl_full_hit`]) is the
 //!   share of the beam it took ([`Settings::beam_left`], as the pulse reads it), so a full hit on leaf or wood reads
@@ -201,6 +200,11 @@ impl Walk {
         Walk(segs)
     }
 
+    /// Its segments, in order.
+    pub fn segments(&self) -> &[([i32; 3], f64, f64)] {
+        &self.0
+    }
+
     /// Its segments clipped to the ranges `from` to `to`, in order.
     fn within(&self, from: f64, to: f64) -> impl Iterator<Item = ([i32; 3], f64, f64)> + '_ {
         let i = self.0.partition_point(|s| s.2 <= from);
@@ -309,88 +313,81 @@ fn traverse(sp: &FoliageBox, o: &Point, w: &Point, t_min: f64, t_max: f64, mut f
     }
 }
 
-/// The echoes of image `v`'s cell `k` the field counts as hits, those inside the box: (the echo's index in its
-/// pulse, its voxel, its weight), the weight [`Settings::cell_weight`] at the first echo's range times the beam the
-/// echoes before it left ([`Settings::beam_left`]). The empty scene counts each whole; a scene's elements take their
-/// responsibilities' share (the module docs).
-pub fn hits(v: &RangeImage, sp: &FoliageBox, em: &Settings, k: usize) -> Vec<(usize, [i32; 3], f64)> {
-    if v.cell[k] != Cell::Echoes {
-        return Vec::new();
-    }
-    let w = v.direction((k / v.n_cols) as f64, (k % v.n_cols) as f64);
-    let (echoes, refls) = (v.echoes(k), v.echo_refls(k));
-    let wt = em.cell_weight(echoes[0] as f64, v.step());
-    let mut beam = 1.0;
-    let mut out = Vec::new();
-    for (i, &r) in echoes.iter().enumerate() {
-        let x = [0, 1, 2].map(|a| v.origin[a] + w[a] * r as f64);
-        if inside(sp, &x) {
-            out.push((i, key(sp, &x), wt * beam));
-        }
-        if let Some(&db) = refls.get(i) {
-            beam *= em.beam_left(db as f64);
-        }
-    }
-    out
+/// One pulse as everything that reads its path reads it (3dtrees research 130 slice-pyramid: the restart, beam-left
+/// and miss-weight conventions in one place): its weight ([`Settings::cell_weight`] at its first echo's range, or for
+/// a miss at `exit`, where its ray leaves the box the reader counts in); the stretches of its ray it shows clear, each
+/// with the beam the echoes before it left ([`Settings::beam_left`]): from the origin to its first echo, then from
+/// each echo plus the receiver's resolution to the next (a surface closer behind an echo would have merged with it),
+/// and after the last on, unless the pulse is capped ([`RangeImage::capped`]: it says nothing past its last echo);
+/// each echo's range and the beam the echoes before it left; its clear range ([`Settings::free_to`] of its first echo,
+/// infinite for a miss); and the beam it leaves. None for a cell without a pulse.
+pub struct Walked {
+    pub weight: f64,
+    pub path: Vec<(f64, f64, f64)>,
+    pub echoes: Vec<(f64, f64)>,
+    pub clear: f64,
+    pub beam: f64,
 }
 
-/// One cell's ray through the box, walked once ([`Walk`]), counted whole into `acc` (the empty scene's reading; the
-/// module docs): each echo a hit ([`hits`]) and each stretch of transmission its path, weighted as its hits are. The
-/// path runs from the origin to the first echo, then from each echo plus the receiver's resolution to the next, and
-/// after the last on through the box, unless the pulse is capped.
-fn ray(v: &RangeImage, sp: &FoliageBox, em: &Settings, k: usize, acc: &mut FixedCounts) {
-    let w = v.direction((k / v.n_cols) as f64, (k % v.n_cols) as f64);
-    let Some((_, t1)) = clip(sp, &v.origin, &w) else { return };
+/// Cell `k`'s pulse in image `v` as [`Walked`] reads it.
+pub fn walked(v: &RangeImage, em: &Settings, k: usize, exit: f64) -> Option<Walked> {
     if v.cell[k] == Cell::NoPulse {
-        return; // nothing observed
+        return None;
     }
-    let echoes: &[f32] = if v.cell[k] == Cell::Echoes { v.echoes(k) } else { &[] };
-    let refls = if v.cell[k] == Cell::Echoes { v.echo_refls(k) } else { &[] };
-    let wt = em.cell_weight(echoes.first().map_or(t1, |&r| r as f64), v.step());
+    let (echoes, refls) = (v.echoes(k), v.echo_refls(k));
+    let weight = em.cell_weight(echoes.first().map_or(exit, |&r| r as f64), v.step());
     let known = if v.capped(k) { echoes.last().map_or(f64::INFINITY, |&r| r as f64) } else { f64::INFINITY };
-    let walk = Walk::new(sp, &v.origin, &w);
     let (mut start, mut beam) = (0.0, 1.0);
+    let (mut path, mut out) = (Vec::with_capacity(echoes.len() + 1), Vec::with_capacity(echoes.len()));
     for (i, &r) in echoes.iter().enumerate() {
-        for (key, a, b) in walk.within(start, r as f64) {
-            accumulate(acc, key, 0.0, wt * beam * (b - a));
-        }
+        path.push((start, r as f64, beam));
+        out.push((r as f64, beam));
         if let Some(&db) = refls.get(i) {
             beam *= em.beam_left(db as f64);
         }
         start = r as f64 + em.resolution();
     }
-    for (key, a, b) in walk.within(start, known) {
-        accumulate(acc, key, 0.0, wt * beam * (b - a));
+    path.push((start, known, beam));
+    let clear = echoes.first().map_or(f64::INFINITY, |&r| em.free_to(r as f64));
+    Some(Walked { weight, path, echoes: out, clear, beam })
+}
+
+/// The beam cell `k`'s echoes leave ([`Walked`]'s `beam`, without its stretches).
+pub fn beam_left(v: &RangeImage, em: &Settings, k: usize) -> f64 {
+    v.echo_refls(k).iter().fold(1.0, |b, &db| b * em.beam_left(db as f64))
+}
+
+/// The echoes of image `v`'s cell `k` the field counts as hits, those inside the box: (the echo's index in its
+/// pulse, its voxel, its weight), its pulse's weight times the beam the echoes before it left ([`walked`]). The empty
+/// scene counts each whole; a scene's elements take their responsibilities' share (the module docs).
+pub fn hits(v: &RangeImage, sp: &FoliageBox, em: &Settings, k: usize) -> Vec<(usize, [i32; 3], f64)> {
+    if v.cell[k] != Cell::Echoes {
+        return Vec::new();
+    }
+    let w = v.direction((k / v.n_cols) as f64, (k % v.n_cols) as f64);
+    let p = walked(v, em, k, f64::INFINITY).expect("a pulse");
+    p.echoes.iter().enumerate().filter_map(|(i, &(r, beam))| {
+        let x = [0, 1, 2].map(|a| v.origin[a] + w[a] * r);
+        inside(sp, &x).then(|| (i, key(sp, &x), p.weight * beam))
+    }).collect()
+}
+
+/// One cell's ray through the box, walked once ([`Walk`]), counted whole into `acc` (the empty scene's reading; the
+/// module docs): each echo a hit ([`hits`]) and each stretch it shows clear its path ([`walked`]), weighted as its hits
+/// are.
+fn ray(v: &RangeImage, sp: &FoliageBox, em: &Settings, k: usize, acc: &mut FixedCounts) {
+    let w = v.direction((k / v.n_cols) as f64, (k % v.n_cols) as f64);
+    let Some((_, t1)) = clip(sp, &v.origin, &w) else { return };
+    let Some(p) = walked(v, em, k, t1) else { return }; // nothing observed
+    let walk = Walk::new(sp, &v.origin, &w);
+    for &(from, to, beam) in &p.path {
+        for (key, a, b) in walk.within(from, to) {
+            accumulate(acc, key, 0.0, p.weight * beam * (b - a));
+        }
     }
     for (_, key, h) in hits(v, sp, em, k) {
         accumulate(acc, key, h, 0.0);
     }
-}
-
-/// Free space in one scan, per voxel of a box (3dtrees research 130 slice 7: the wood map's bounds on hidden wood).
-/// Each cell with a pulse traces its ray through the voxels its line crosses, and counts in each: `crossed`, the ray
-/// crosses it; `reached`, it enters it before its first echo; `clear`, it leaves it before its clear range ends,
-/// [`Settings::free_to`] of the first echo (a miss reaches and clears every voxel), so a surface that could have merged
-/// into that echo is never carved. So `crossed − reached` are the voxel's rays in shadow, and `reached − clear` the
-/// ones that end in it or within the receiver's resolution behind it. Counts in voxel order, x slowest:
-/// `(i · ny + j) · nz + l`.
-pub fn free_space(v: &RangeImage, lo: Point, hi: Point, voxel: f64, em: &Settings) -> [Vec<u32>; 3] {
-    use std::sync::atomic::{AtomicU32, Ordering::Relaxed};
-    let sp = FoliageBox { lo, hi, voxel };
-    let n = [0, 1, 2].map(|a| ((hi[a] - lo[a]) / voxel).ceil() as usize);
-    let counts: [Vec<AtomicU32>; 3] = std::array::from_fn(|_| (0..n[0] * n[1] * n[2]).map(|_| AtomicU32::new(0)).collect());
-    (0..v.cell.len()).into_par_iter().filter(|&k| v.cell[k] != Cell::NoPulse).for_each(|k| {
-        let w = v.direction((k / v.n_cols) as f64, (k % v.n_cols) as f64);
-        let first = if v.cell[k] == Cell::Echoes { v.range[k] as f64 } else { f64::INFINITY };
-        let free = em.free_to(first);
-        for &(key, a, b) in &Walk::new(&sp, &v.origin, &w).0 {
-            let i = (key[0] as usize * n[1] + key[1] as usize) * n[2] + key[2] as usize;
-            counts[0][i].fetch_add(1, Relaxed);
-            counts[1][i].fetch_add((a < first) as u32, Relaxed);
-            counts[2][i].fetch_add((b <= free) as u32, Relaxed);
-        }
-    });
-    counts.map(|c| c.into_iter().map(AtomicU32::into_inner).collect())
 }
 
 /// Add (h, l) to a voxel's counts in fixed point; a voxel whose counts come to nothing is dropped.
@@ -530,7 +527,6 @@ impl FieldCounts {
 mod tests {
     use super::*;
     use crate::transform::norm;
-    use super::super::fixtures::pole_image;
 
     /// A ray through a box of 1 m voxels: the segments tile the clipped ray, and a uniform field's optical depth is κ t.
     #[test]
@@ -613,26 +609,5 @@ mod tests {
                 assert!((a - b).abs() < 1e-12 * a.max(1.0), "merge at {t}: {b} vs {a}");
             }
         }
-    }
-
-    /// Free space (slice 7): in front of the pole every ray clears a voxel; within the receiver's resolution in front of
-    /// an echo none does, though the rays reach it; behind the pole its rays are in shadow; a ray crosses the voxels
-    /// its line meets whatever its echo.
-    #[test]
-    fn free_space_carves_only_past_the_resolution() {
-        let v = pole_image();
-        let em = Settings::default();
-        let [crossed, reached, clear] = free_space(&v, [-0.1, 1.0, -0.1], [0.1, 8.6, 0.1], 0.2, &em);
-        assert_eq!(crossed.len(), 38);
-        let at = |y: f64| ((y - 1.0) / 0.2).floor() as usize;
-        let near = at(2.1);
-        assert!(crossed[near] > 100 && clear[near] == crossed[near], "{} {}", crossed[near], clear[near]);
-        let front = at(4.0 - 0.03 - 0.5 * em.resolution()); // within the resolution in front of the pole
-        assert!(reached[front] == crossed[front] && clear[front] < crossed[front], "{} {} {}", crossed[front], reached[front], clear[front]);
-        let behind = at(5.1);
-        assert!(reached[behind] < crossed[behind] && clear[behind] > 0, "{} {} {}", crossed[behind], reached[behind], clear[behind]);
-        let wall = at(8.0 - 0.5 * em.resolution());
-        assert!(clear[wall] == 0 && reached[wall] > 0, "{} {}", reached[wall], clear[wall]);
-        assert!((0..38).all(|i| clear[i] <= reached[i] && reached[i] <= crossed[i]));
     }
 }

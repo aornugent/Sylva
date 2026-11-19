@@ -382,7 +382,7 @@ pub(super) fn elem_data(v: &RangeImage, rendered: &[Vec<(usize, Layer)>], elems:
                 el.on_across = [el.on_across[0].min(z), el.on_across[1].max(z)];
             }
         }
-        let base = cv.pulses[0].1.empty().read(0.0, 0.0, em).ll;
+        let base = cv.empty.read(0.0, 0.0, em).ll;
         let hits = field.map_or(Vec::new(), |sp| foliage::hits(v, sp, em, cell));
         for (d, s) in shares {
             data[d].cells.push(CellData { cell, pulses: cv.pulses.clone(), wt: cv.wt * s, base, outcome, hits: hits.iter().map(|&(i, k, w)| (i, k, w * s)).collect() });

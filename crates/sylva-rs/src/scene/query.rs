@@ -418,7 +418,7 @@ impl Scene {
         let layers: Vec<Layer<P>> = ls.iter().enumerate().map(|(i, l)| if i == j { moved } else { l.lift() }).collect();
         let shares = front_shares(&layers);
         let cv = cell_view(v, cell, layers, em, &self.sc, &self.ext);
-        let base = cv.pulses[0].1.empty().read(P::c(0.0), P::c(0.0), em).ll;
+        let base = cv.empty.read(P::c(0.0), P::c(0.0), em).ll;
         let mut cost = P::c(0.0);
         for &(i, [shift, level]) in owners {
             cost += -((mixture_ll(&cv.pulses, shift, level, em) - base) * cv.wt) * shares[i];

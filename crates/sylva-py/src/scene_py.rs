@@ -37,6 +37,7 @@ use std::sync::Arc;
 use sylva_rs::scene::chain::{Coupling, Grow};
 use sylva_rs::scene::foliage::FoliageBox;
 use sylva_rs::scene::moments::{Candidate, Moments};
+use sylva_rs::scene::pyramid::Pyramid;
 use sylva_rs::scene::range_image::{Cell, RangeImage, RangeImageParams};
 use sylva_rs::scene::query::{CellPrediction, Information};
 use sylva_rs::scene::render::{Class, Element, Form};
@@ -238,6 +239,27 @@ fn elements_from_py(d: &Bound<'_, PyDict>, em: &Settings) -> PyResult<Vec<Elemen
 #[pyclass(name = "RangeImage", frozen)]
 struct PyRangeImage {
     inner: Arc<RangeImage>,
+    /// Its depth pyramid, built on first use under the settings it was asked with (rebuilt for others).
+    pyramid: std::sync::Mutex<Option<(String, Arc<Pyramid>)>>,
+}
+
+impl PyRangeImage {
+    fn of(inner: RangeImage) -> Self {
+        PyRangeImage { inner: Arc::new(inner), pyramid: std::sync::Mutex::new(None) }
+    }
+
+    /// The image's depth pyramid under `em`, built once.
+    fn pyramid_of(&self, py: Python<'_>, em: &Settings) -> Arc<Pyramid> {
+        let key = format!("{:?}", Settings::FIELDS.iter().map(|k| em.get(k)).collect::<Vec<Option<f64>>>());
+        let mut slot = self.pyramid.lock().unwrap();
+        if let Some((_, p)) = slot.as_ref().filter(|(k, _)| *k == key) {
+            return p.clone();
+        }
+        let v = &self.inner;
+        let p = Arc::new(py.detach(|| Pyramid::new(v, em)));
+        *slot = Some((key, p.clone()));
+        p
+    }
 }
 
 #[pymethods]
@@ -258,7 +280,7 @@ impl PyRangeImage {
         if inner.n_lines == 0 {
             return Err(PyValueError::new_err("no lattice: too few pulses"));
         }
-        Ok(PyRangeImage { inner: Arc::new(inner) })
+        Ok(PyRangeImage::of(inner))
     }
 
     #[getter]
@@ -278,7 +300,7 @@ impl PyRangeImage {
     fn from_file(py: Python<'_>, path: std::path::PathBuf, epoch: u32) -> PyResult<Self> {
         let p = RangeImageParams::default();
         let inner = py.detach(|| RangeImage::from_file(&path, epoch, &p)).map_err(|e| PyValueError::new_err(e.to_string()))?;
-        Ok(PyRangeImage { inner: Arc::new(inner) })
+        Ok(PyRangeImage::of(inner))
     }
 
     /// Writes the image to `path`, a cache for `RangeImage.load` on this machine.
@@ -290,7 +312,7 @@ impl PyRangeImage {
     #[staticmethod]
     fn load(py: Python<'_>, path: std::path::PathBuf) -> PyResult<Self> {
         let inner = py.detach(|| RangeImage::load(&path)).map_err(|e| PyValueError::new_err(e.to_string()))?;
-        Ok(PyRangeImage { inner: Arc::new(inner) })
+        Ok(PyRangeImage::of(inner))
     }
 
     /// A hash of the code that builds images: a saved image loads only into a build with the same one.
@@ -323,23 +345,57 @@ impl PyRangeImage {
         Ok(d)
     }
 
-    /// Free space per voxel of the box `lo`-`hi` (m, `voxel` m cubes) under the `settings` (scene::foliage::free_space):
-    /// crossed, reached and clear, each (nx, ny, nz) counts of pulses whose ray crosses the voxel, enters it before its
-    /// first echo, and leaves it before its clear range (`free_to`) ends.
+    /// The depth pyramid (scene::pyramid), built once per image under `settings`: its kept levels' shapes (lines,
+    /// columns) and, over the whole image, pulses, misses, echoes and energy.
+    #[pyo3(signature = (settings=None))]
+    fn pyramid<'py>(&self, py: Python<'py>, settings: Option<&Bound<'_, PyDict>>) -> PyResult<Bound<'py, PyDict>> {
+        let em = self::settings(settings)?;
+        let p = self.pyramid_of(py, &em);
+        let (shapes, t) = (p.shapes(), p.total());
+        let d = PyDict::new(py);
+        d.set_item("levels", shapes)?;
+        d.set_item("pulses", t.pulses)?;
+        d.set_item("misses", t.misses)?;
+        d.set_item("echoes", t.echoes)?;
+        d.set_item("energy", t.energy)?;
+        Ok(d)
+    }
+
+    /// Per voxel of the box `lo`-`hi` (m, `voxel` m cubes; (nx, ny, nz) counts) under `settings`, read off the image's
+    /// depth pyramid (scene::pyramid::carve): `pulses` in its cover (the cells its corners project to, a cell wider),
+    /// those `clear` past its far side by the receiver's resolution (or with no echo), and those `ending` in it or
+    /// within the resolution behind it. A voxel is carved where enough pulses cover it and all are clear.
     #[pyo3(signature = (lo, hi, voxel, settings=None))]
-    fn free_space<'py>(&self, py: Python<'py>, lo: [f64; 3], hi: [f64; 3], voxel: f64, settings: Option<&Bound<'_, PyDict>>) -> PyResult<Bound<'py, PyDict>> {
+    fn carve<'py>(&self, py: Python<'py>, lo: [f64; 3], hi: [f64; 3], voxel: f64, settings: Option<&Bound<'_, PyDict>>) -> PyResult<Bound<'py, PyDict>> {
         if !(voxel > 0.0) || (0..3).any(|a| !(hi[a] > lo[a])) {
-            return Err(PyValueError::new_err("free_space needs voxel > 0 and hi > lo"));
+            return Err(PyValueError::new_err("carve needs voxel > 0 and hi > lo"));
         }
         let em = self::settings(settings)?;
         let n = [0, 1, 2].map(|a| ((hi[a] - lo[a]) / voxel).ceil() as usize);
+        let p = self.pyramid_of(py, &em);
         let v = &self.inner;
-        let counts = py.detach(|| sylva_rs::scene::foliage::free_space(v, lo, hi, voxel, &em));
+        let counts = py.detach(|| sylva_rs::scene::pyramid::carve(v, &p, lo, hi, voxel, &em));
         let d = PyDict::new(py);
-        for (name, c) in ["crossed", "reached", "clear"].into_iter().zip(counts) {
+        for (name, c) in ["pulses", "clear", "ending"].into_iter().zip(counts) {
             d.set_item(name, c.into_pyarray(py).reshape(n)?)?;
         }
         Ok(d)
+    }
+
+    /// Per stick (n, 7: a, b, r), the pulses in its cover and those that reach its middle's range (a first echo beyond
+    /// it, or none), off the depth pyramid (scene::pyramid::arrival): (n, 2).
+    #[pyo3(signature = (sticks, settings=None))]
+    fn arrival<'py>(&self, py: Python<'py>, sticks: PyReadonlyArray2<f64>, settings: Option<&Bound<'_, PyDict>>) -> PyResult<Bound<'py, PyArray2<u64>>> {
+        let em = self::settings(settings)?;
+        let st = sticks.as_array();
+        if st.ncols() != 7 {
+            return Err(PyValueError::new_err("arrival needs sticks (n, 7)"));
+        }
+        let rows: Vec<([f64; 3], [f64; 3], f64)> = st.rows().into_iter().map(|x| ([x[0], x[1], x[2]], [x[3], x[4], x[5]], x[6])).collect();
+        let p = self.pyramid_of(py, &em);
+        let v = &self.inner;
+        let out = py.detach(|| sylva_rs::scene::pyramid::arrival(v, &p, &rows));
+        Ok(out.iter().flat_map(|x| [x.0, x.1]).collect::<Vec<u64>>().into_pyarray(py).reshape([out.len(), 2])?)
     }
 
     /// The fractional (line, col) and range of each world point (NaN outside the lattice), flat (n × 3).

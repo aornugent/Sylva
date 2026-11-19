@@ -106,7 +106,7 @@ def test_the_held_alignment_crosses_the_binding():
     assert list(pairs['i']) == [0] and list(pairs['j']) == [1] and pairs['cells'][0] and pairs['nodes'][0]
 
 
-def test_a_fisher_step_and_free_space_cross_the_binding():
+def test_a_fisher_step_and_the_clear_range_cross_the_binding():
     """Research 130 slice-derivatives: `information`'s slope and expected information make a Fisher-scoring step that
     moves a stick too wide toward the pole's radius; the image gives each cell's free space (its first echo less the
     receiver's resolution, the longest range for a miss) under the settings."""
@@ -123,18 +123,24 @@ def test_a_fisher_step_and_free_space_cross_the_binding():
     assert (A['free_to'][A['cell'] == 1] == 80.0).all()
 
 
-def test_free_space_per_voxel_crosses_the_binding():
-    """Research 130 slice 7: per voxel, the rays crossing it, reaching it and clearing it; in front of the pole every
-    ray clears, behind it some are in shadow; bad boxes raise."""
+def test_the_depth_pyramid_crosses_the_binding():
+    """Research 130 slice-pyramid: the image's depth pyramid counts every pulse; per voxel, the pulses covering it, those
+    clear past it and those ending in it: in front of the pole all are clear, behind it some are stopped; a stick's
+    arrival counts its cover's pulses; bad boxes raise."""
     v = pole_image()
-    fs = v.free_space([-0.1, 1.0, -0.1], [0.1, 8.6, 0.1], 0.2)
-    assert all(fs[k].shape == (1, 38, 1) for k in ('crossed', 'reached', 'clear'))
-    c, r, f = (fs[k][0, :, 0] for k in ('crossed', 'reached', 'clear'))
-    assert (f <= r).all() and (r <= c).all()
-    assert c[5] > 0 and f[5] == c[5]
-    assert r[20] < c[20]
+    p = v.pyramid()
+    A = v.arrays()
+    assert p['pulses'] == int((A['cell'] != 2).sum()) and p['misses'] == int((A['cell'] == 1).sum())
+    fs = v.carve([-0.1, 1.0, -0.1], [0.1, 8.6, 0.1], 0.2)
+    assert all(fs[k].shape == (1, 38, 1) for k in ('pulses', 'clear', 'ending'))
+    n, c, e = (fs[k][0, :, 0] for k in ('pulses', 'clear', 'ending'))
+    assert (c <= n).all() and (e <= n).all()
+    assert n[5] > 0 and c[5] == n[5]
+    assert c[20] < n[20]
+    a = v.arrival(np.array([[0.0, 3.0, -0.1, 0.0, 3.0, 0.1, 0.03], [0.0, 6.0, -0.1, 0.0, 6.0, 0.1, 0.03]]))
+    assert a.shape == (2, 2) and a[0, 1] > 0.9 * a[0, 0] and a[1, 1] < 0.5 * a[1, 0]
     with pytest.raises(ValueError):
-        v.free_space([0.0, 0.0, 0.0], [0.0, 1.0, 1.0], 0.2)
+        v.carve([0.0, 0.0, 0.0], [0.0, 1.0, 1.0], 0.2)
 
 
 def test_a_chain_crosses_the_binding():

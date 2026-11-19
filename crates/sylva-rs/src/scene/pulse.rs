@@ -117,13 +117,14 @@ pub(super) fn obs_ground(v: &RangeImage, cell: usize, sc: &Background) -> (f64, 
 }
 
 /// A cell as the likelihood reads it: its pulse per subset of its mixture with that subset's chance ([`mixture`]; the
-/// one with every layer in first), its first echo (NaN for none) and its weight ([`Settings::cell_weight`], at its
-/// first echo's range or else its layers' ranges weighted by their front shares, [`front_shares`]), in the layers'
-/// numbers `P`.
+/// one with every layer in first), the same pulse in the empty scene (the medium and the ground alone: the same for
+/// every hypothesis), its first echo (NaN for none) and its weight ([`Settings::cell_weight`], at its first echo's
+/// range or else its layers' ranges weighted by their front shares, [`front_shares`]), in the layers' numbers `P`.
 pub(super) struct CellView<P = f64> {
     pub(super) obs: f64,
     pub(super) wt: P,
     pub(super) pulses: Vec<(P, Pulse<P>)>,
+    pub(super) empty: Pulse<P>,
 }
 
 /// Cell `cell` of image `v` with `layers` in front of it (nearest first, [`keep`]), read at the cell's surface class
@@ -135,7 +136,8 @@ pub(super) fn cell_view<P: Real>(v: &RangeImage, cell: usize, layers: Vec<Layer<
     let (m, class) = (ext.medium(&v.origin, &w), cell_class(v, cell, em));
     let pulses = mixture(&layers).into_iter()
         .map(|(p, ls)| (p, Pulse::on(occluders(ls, ground), class, &m, v.echoes(cell), v.echo_refls(cell), v.max_targets, em))).collect();
-    CellView { obs, wt, pulses }
+    let empty = Pulse::on(occluders(Vec::new(), ground), class, &m, v.echoes(cell), v.echo_refls(cell), v.max_targets, em);
+    CellView { obs, wt, pulses, empty }
 }
 
 /// Cell `cell`'s surface class: its echo's surface continuity (the excess, data), mid where it has no surface fit.
@@ -532,10 +534,6 @@ impl<P: Real> Pulse<P> {
         r.rows().map(|row| layers.iter().map(|&o| row[o]).sum()).collect()
     }
 
-    /// The same pulse in the empty scene: the medium and the ground alone, the same for every hypothesis.
-    pub(super) fn empty(&self) -> Self {
-        Pulse { occluders: self.occluders.iter().filter(|o| matches!(o.surface, Surface::Ground(_))).copied().collect(), ..self.clone() }
-    }
 }
 
 /// One pulse's echoes against one way its returns come back ([`Pulse::read`]): the receiver's members, and `owners`

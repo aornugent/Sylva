@@ -51,8 +51,9 @@ branch `3dtrees/125-rebase`.
   site settings (`Settings`: the beam, the per-echo noise, the detection floor rising with range, the receiver's
   resolution, 0.95 m at equal energies on AM's VZ-2000i, the class edges, the reflectances and the declared priors)
   and `Background`, both `params!` records whose defaults are AM's. `scene.foliage` is the foliage field, a residual
-  extinction per voxel in a box that every cell's ray likelihood reads, and each scan's free space per voxel (the rays
-  crossing, reaching and clearing it: bounds on hidden wood). `scene.scene`'s `Scene` holds elements
+  extinction per voxel in a box that every cell's ray likelihood reads; `scene.pyramid` is each scan's depth pyramid
+  (its pulses' first echoes, counts and energy aggregated over the lattice level by level), carving voxels for bounds
+  on hidden wood and reading arrival. `scene.scene`'s `Scene` holds elements
   against range images, each rendered once with a uniform-disc beam (returns within the resolution merge), with a
   per-scan alignment error and a per-(element, scan) stem front shift over which each scan's ray likelihood is
   integrated by a Laplace marginal. It returns its cost, the cost change of a move, rows splitting each (element,
