@@ -109,7 +109,9 @@ impl std::error::Error for SceneError {}
 /// - Two approximations make the field's EM a surrogate, not the bound it would be (rca-em): the E-step reads σ's
 ///   posterior mean `α / β` where the mean-field bound's own step reads `exp(E ln σ)` (so iterating to a fixed point
 ///   drains the voxels the elements hold, without each voxel's Occam term), and the plug-in (each term's, [`Term`]'s
-///   `plug`) takes the empty scene to read every echo the elements take as the medium's.
+///   `plug`) takes the empty scene to read every echo the elements take as the medium's (weighting it by the empty
+///   pulse's medium responsibility moved the stand's build by 962 nats and away from EM's fixed point, no check improving:
+///   3dtrees research 130 slice-review).
 /// - Element ids are stable and never reused.
 /// - The reference epoch (the scanning day the alignment error's spread is stated for) is declared: a scan of another epoch adds the other-epoch part
 ///   to its alignment error.
