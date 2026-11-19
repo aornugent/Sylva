@@ -804,8 +804,10 @@ mod tests {
         assert_eq!(c.field.as_ref().unwrap().counts(), recounted(&c));
         c.change(0, pole);
         assert_eq!(c.cost(), e0);
-        // held against refitted, nats: 0.0004 nudged, 0.4 wrong
-        for (e, tol) in [(nudged, 0.01), (wrong, 1.0)] {
+        // held against refitted, nats: 0.0004 nudged; 2.4 wrong (0.4 before the near-range rule: a pulse meets its
+        // element's own voxel only behind the element's front, so moving it a centimetre moves what of the held σ the
+        // pulses meet; 3dtrees research 130 slice-pyramid)
+        for (e, tol) in [(nudged, 0.01), (wrong, 3.0)] {
             let mut c = Scene::new(vec![v.clone()], &[pole], em, sc, spec, 0);
             c.change(0, e);
             let held = c.cost();
