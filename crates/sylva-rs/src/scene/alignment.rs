@@ -304,8 +304,8 @@ mod tests {
 
     /// A scene's moves hold the alignment (step 3a): each move's cost change stays near the exact marginal's
     /// (re-solved), for an add beside the pole (sharing its alignment node), an alter and a remove; adding then removing
-    /// an element restores the cost exactly (synthesis §18 invariant 7); `costs_to_add` and `costs_to_remove` equal
-    /// the moves; and after `refit_alignment` the cost is a fresh scene's.
+    /// an element restores the cost exactly (synthesis §18 invariant 7); `costs_to_add` equals
+    /// the move; and after `refit_alignment` the cost is a fresh scene's.
     #[test]
     fn held_moves_match_the_exact_marginal() {
         let v = pole_view();
@@ -328,9 +328,7 @@ mod tests {
         let (other, _) = c.add(stick(-0.1, 5.0, 0.01));
         c.remove(other);
         assert_eq!(c.cost(), e1);
-        let r: f64 = c.costs_to_remove(&[id])[0].iter().sum();
         let d_remove = c.remove(id);
-        assert_eq!(r, d_remove);
         assert!(near(d_remove, full(&[wide]) - full(&[wide, side])), "remove {d_remove} exact {}", full(&[wide]) - full(&[wide, side]));
         c.refit_alignment();
         assert!((c.cost() - full(&[wide])).abs() < 1e-9 * c.cost().abs().max(1.0), "{} vs {}", c.cost(), full(&[wide]));

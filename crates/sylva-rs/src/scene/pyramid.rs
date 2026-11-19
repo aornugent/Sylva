@@ -19,8 +19,6 @@
 //!   that end in it or within the resolution behind it. A voxel is carved where the cover holds enough pulses and all
 //!   are clear: never where a pulse that crosses it shows a surface (every such pulse is in the cover), so the bound
 //!   is exact; the cover's corners hold pulses that miss the voxel, so it carves less than a walk of each ray would.
-//! - **Arrival** ([`arrival`]): the share of a cover's pulses that reach a range, for detectability's echo-or-none
-//!   part read off the scan instead of the field.
 //! - **The level information supports:** the cover's rectangle is read at the coarsest tiles that fit wholly inside
 //!   it, so a voxel's query reads its projection's scale, and a bound is reported per voxel at the scan's own
 //!   resolution there.
@@ -201,16 +199,6 @@ impl Pyramid {
         })
     }
 
-    /// Its kept levels' shapes (lines, columns of tiles), finest first.
-    pub fn shapes(&self) -> Vec<(usize, usize)> {
-        self.levels.iter().map(|l| (l.0, l.1)).collect()
-    }
-
-    /// The whole image's aggregates.
-    pub fn total(&self) -> Tile {
-        self.levels.last().map_or(Tile::EMPTY, |l| l.2.iter().fold(Tile::EMPTY, |t, x| t.merge(*x)))
-    }
-
     /// The tiles of the kept level `s` (from [`FIRST`]), row-major, and its shape (for tests and reports).
     pub fn level(&self, s: usize) -> (usize, usize, &[Tile]) {
         let (nl, nc, t) = &self.levels[s - FIRST];
@@ -265,20 +253,6 @@ pub fn carve(v: &RangeImage, pyr: &Pyramid, lo: Point, hi: Point, voxel: f64, em
         [pyr.pulses(v, rect), pyr.beyond(v, rect, far + res), pyr.within(v, rect, near, far + res)].map(|x| x as u32)
     }).collect();
     [0, 1, 2].map(|j| out.iter().map(|x| x[j]).collect())
-}
-
-/// Per stick (a, b, r): the pulses in its cover (its ends' rectangle, wider by its radius and a cell) and those that
-/// reach its middle's range (a first echo beyond it, or none): the share of the scan's pulses that arrive there.
-pub fn arrival(v: &RangeImage, pyr: &Pyramid, sticks: &[(Point, Point, f64)]) -> Vec<(u64, u64)> {
-    sticks.par_iter().map(|&(a, b, r)| {
-        let mid = [0, 1, 2].map(|j| 0.5 * (a[j] + b[j]));
-        let t = norm(&sub(&mid, &v.origin));
-        let pad = 1.0 + r / (t * v.step());
-        match cover(v, &[a, b], pad).map(|r| supported(v, r)) {
-            Some(rect) => (pyr.pulses(v, rect), pyr.beyond(v, rect, t)),
-            None => (0, 0),
-        }
-    }).collect()
 }
 
 #[cfg(test)]

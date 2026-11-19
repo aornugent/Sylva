@@ -21,11 +21,11 @@ use nalgebra::Vector2;
 use rayon::prelude::*;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
-use super::alignment::{hats, Reference, solve_alignment, Fit, Changes};
+use super::alignment::{Reference, solve_alignment, Fit, Changes};
 use super::foliage::{self, FieldCounts, FixedHits, Foliage, FoliageBox};
 use super::range_image::RangeImage;
 use super::render::{Element, Layer, KBuffer, render, render_all, kept, keep, fronting, numbered};
-use super::settings::{Background, Settings, ALIGN_SPACING};
+use super::settings::{Background, Settings};
 use super::term::{Owner, owner, slots, ElemData, Term, elem_data};
 
 /// What one scan says about one element, or one group ([`Owner`]: `group`, and `elem` its first member), its cost
@@ -40,9 +40,9 @@ use super::term::{Owner, owner, slots, ElemData, Term, elem_data};
 ///   `ray_on` (its echoes), `ray_empty` (pulses with no echo), `ray_in_front` (hidden by something nearer) and
 ///   `ray_behind` (pulses that passed through it: evidence against); with a foliage field, each with the plug-in of
 ///   the hits its cells' echoes take from the field ([`Term`]'s `plug`).
-/// - `alignment`: its own nodes' (stem front shift, reflectance level) prior and log-determinant terms. The scan's alignment part is the scan's, not shared out among its
-///   elements ([`Scene::alignment_parts`]), so the rows, those parts and the field's part ([`Scene::field_part`]) sum
-///   to the scene's cost.
+/// - `alignment`: its own nodes' (stem front shift, reflectance level) prior and log-determinant terms. Each scan's
+///   alignment part (its cost less its terms') is the scan's, not shared out among its elements, so the rows, those
+///   parts and the field's part ([`Scene::field_part`]) sum to the scene's cost.
 /// - `field`: beside `cost`, not in it: the change in the foliage field's term (`Σ ln NB`) in its cost to remove,
 ///   were its deposit in this scan given back ([`Term`]'s `deposit`; the field's term is non-linear in the counts, so
 ///   these don't sum over elements or scans).
@@ -93,7 +93,7 @@ impl std::error::Error for SceneError {}
 ///
 /// - Each element is rendered once per image, and re-rendered only when it is added or changed.
 /// - A scan's cost is a term per element it sees, plus the scan alignment error's part. Moves (`add`, `remove`,
-///   `change`) and queries (`costs_to_add`, `costs_to_remove`, `information`) hold the alignment ([`Held`]): its mode
+///   `change`) and queries (`costs_to_add`, `information`) hold the alignment ([`Held`]): its mode
 ///   and precision stay as the last refit left them, and a move's change to them is a rank-k correction on the nodes
 ///   it touches. So a move recomputes only the terms of the elements whose cells it touches, not the scan, and
 ///   removing an element restores the cost exactly (synthesis §18 invariant 7). [`Scene::refit_alignment`] re-solves
@@ -281,29 +281,7 @@ impl Scene {
         (self.ext.spec, out)
     }
 
-    /// For each of image `v`'s `cells`: the optical depth of the foliage field across its box, and the ray's entry and
-    /// exit ranges (NaN where it misses the box).
-    pub fn transmission(&self, v: &RangeImage, cells: &[usize]) -> Vec<(f64, f64, f64)> {
-        let Some(sp) = self.ext.spec else { return vec![(0.0, f64::NAN, f64::NAN); cells.len()] };
-        cells.par_iter().map(|&k| {
-            let w = v.direction((k / v.n_cols) as f64, (k % v.n_cols) as f64);
-            match foliage::clip(&sp, &v.origin, &w) {
-                Some((a, b)) => {
-                    let m = self.ext.medium(&v.origin, &w);
-                    (m.tau(b) - m.tau(a), a, b)
-                }
-                None => (f64::NAN, f64::NAN, f64::NAN),
-            }
-        }).collect()
-    }
-
-    /// Each scan's alignment part ([`Held::part`]): its cost less its elements' terms.
-    pub fn alignment_parts(&self) -> Vec<f64> {
-        self.fits.iter().map(|fit| fit.cost - fit.terms.values().map(Term::cost).sum::<f64>()).collect()
-    }
-
-    /// A row per (term, scan), by element id: an element's term, or a group's under its first member's id (the scan's
-    /// alignment part is [`Scene::alignment_parts`]).
+    /// A row per (term, scan), by element id: an element's term, or a group's under its first member's id.
     pub fn rows(&self) -> Vec<ElementScan> {
         let mut first: HashMap<u32, u32> = HashMap::new();
         for (i, e) in self.elems.iter().enumerate().rev() {
@@ -532,28 +510,16 @@ impl Scene {
     /// elements of one group are one term ([`Owner`]: a chain), joined by the scene's members of that group, which are
     /// rescored with it; its other elements are each alone.
     pub fn costs_to_add(&self, hyps: &[Vec<Element>]) -> Vec<Vec<f64>> {
-        self.costs_replacing(&hyps.iter().map(|h| (h.clone(), Vec::new())).collect::<Vec<_>>())
-    }
-
-    /// Each live element's cost to remove ([`Scene::check_id`]), per scan and then, with a field, the field's part
-    /// (as [`Scene::costs_to_add`]), the scene unchanged. A row sums to removing it then adding it back.
-    pub fn costs_to_remove(&self, ids: &[u32]) -> Vec<Vec<f64>> {
-        self.costs_replacing(&ids.iter().map(|&id| (Vec::new(), vec![id])).collect::<Vec<_>>())
-    }
-
-    /// Per (hypothesis, live elements): the cost of the scene with the elements taken out and the hypothesis put
-    /// in, against the scene, per scan and then the field's part.
-    pub(super) fn costs_replacing(&self, items: &[(Vec<Element>, Vec<u32>)]) -> Vec<Vec<f64>> {
         let first = self.elems.len() as u32;
-        items.par_iter().map(|(h, without)| {
+        hyps.par_iter().map(|h| {
             let layers: Vec<Vec<Vec<(usize, Layer)>>> = self.views.iter().map(|v| h.iter().map(|e| render(v, e, 0, &self.em)).collect()).collect();
             let mut delta = FixedHits::default();
             let mut out: Vec<f64> = layers.iter().enumerate().map(|(s, ls)| {
-                if ls.iter().all(Vec::is_empty) && without.iter().all(|&w| self.entered[s][w as usize].is_none()) {
+                if ls.iter().all(Vec::is_empty) {
                     return 0.0;
                 }
                 let with: Vec<(Element, Vec<(usize, Layer)>)> = h.iter().copied().zip(ls.iter().cloned()).collect();
-                let over: HashMap<Owner, Option<Term>> = self.reterm(s, without, &with, first).into_iter().collect();
+                let over: HashMap<Owner, Option<Term>> = self.reterm(s, &[], &with, first).into_iter().collect();
                 for (o, t) in &over {
                     redeposit(&mut delta, self.fits[s].terms.get(o), t.as_ref());
                 }
@@ -566,53 +532,6 @@ impl Scene {
         }).collect()
     }
 
-    /// Which hypotheses interact in each scan, so that their costs scored together differ from the sum of their costs
-    /// alone: (i, j, scan, `cells`, `nodes`) for i < j, `cells` when they enter a cell in common or cells in which one
-    /// scene term has a front share ([`Owner`]: an element, or any member of a group), or join one group, `nodes` when they share an
-    /// alignment node. With the alignment held, a shared node only couples them through its rank-k correction
-    /// (small); shared cells are evidence they share. A hypothesis is one move, so its own elements (a chain's joints)
-    /// never interact with each other.
-    pub fn interactions(&self, hyps: &[Vec<Element>]) -> Vec<(u32, u32, u32, bool, bool)> {
-        let mut out: BTreeMap<(u32, u32, u32), (bool, bool)> = BTreeMap::new();
-        for (s, v) in self.views.iter().enumerate() {
-            // per key (a cell, or a term its hypotheses front or join), the hypotheses that have it
-            let mut cells: HashMap<(bool, u64), BTreeSet<u32>> = HashMap::new();
-            let mut nodes: HashMap<[i64; 3], BTreeSet<u32>> = HashMap::new();
-            let term = |o: Owner| match o {
-                Owner::Alone(i) => i as u64,
-                Owner::Group(g) => 1 << 32 | g as u64,
-            };
-            let rendered: Vec<Vec<Vec<(usize, Layer)>>> = hyps.par_iter().map(|h| h.iter().map(|e| render(v, e, 0, &self.em)).collect()).collect();
-            for (k, (h, ls)) in hyps.iter().zip(&rendered).enumerate() {
-                for (e, l) in h.iter().zip(ls).filter(|(_, l)| !l.is_empty()) {
-                    for (key, _) in hats(&e.mid(), ALIGN_SPACING) {
-                        nodes.entry(key).or_default().insert(k as u32);
-                    }
-                    if let Some(g) = e.group {
-                        cells.entry((true, term(Owner::Group(g)))).or_default().insert(k as u32);
-                    }
-                    for (c, _) in l.iter().filter(|(_, l)| l.enters()) {
-                        cells.entry((false, *c as u64)).or_default().insert(k as u32);
-                        let ls = kept(self.buffers[s].get(*c));
-                        for o in &ls[..fronting(ls)] {
-                            cells.entry((true, term(owner(o.elem, &self.elems[o.elem as usize].unwrap())))).or_default().insert(k as u32);
-                        }
-                    }
-                }
-            }
-            let mut mark = |set: &BTreeSet<u32>, cell: bool| {
-                for (n, &i) in set.iter().enumerate() {
-                    for &j in set.iter().skip(n + 1) {
-                        let f = out.entry((i, j, s as u32)).or_default();
-                        if cell { f.0 = true } else { f.1 = true }
-                    }
-                }
-            };
-            cells.values().for_each(|set| mark(set, true));
-            nodes.values().for_each(|set| mark(set, false));
-        }
-        out.into_iter().map(|((i, j, s), (c, n))| (i, j, s, c, n)).collect()
-    }
 }
 
 #[cfg(test)]
@@ -644,7 +563,7 @@ mod tests {
         let both = cost(&v, &pair, &em, &sc);
         let delta: f64 = Scene::new(vec![v.clone()], &pair[..1], em, sc, None, 0).costs_to_add(&[vec![pair[1]]])[0].iter().sum();
         assert!((delta - (both.0 - truth)).abs() < 1e-6, "{delta} vs {}", both.0 - truth);
-        let parts: f64 = Scene::new(vec![v.clone()], &pair, em, sc, None, 0).alignment_parts().iter().sum();
+        let parts = alignment_parts(&Scene::new(vec![v.clone()], &pair, em, sc, None, 0));
         let sum: f64 = both.1.iter().map(|r| r.cost).sum::<f64>() + parts;
         assert!((sum - both.0).abs() < 1e-6);
     }
@@ -666,7 +585,7 @@ mod tests {
         let fresh = Scene::new(vec![v.clone()], &[pole], em, sc, Some(field_box()), 0);
         assert!(sigma(&fresh) < 0.5 * dense, "{} vs {dense}", sigma(&fresh));
         // each datum is scored once: the elements' cells and the field's part hold the whole cost
-        let rows = |c: &Scene| c.rows().iter().map(|r| r.cost).sum::<f64>() + c.alignment_parts().iter().sum::<f64>() + c.field_part();
+        let rows = |c: &Scene| c.rows().iter().map(|r| r.cost).sum::<f64>() + alignment_parts(c) + c.field_part();
         assert!((rows(&fresh) - fresh.cost()).abs() < 1e-9 * fresh.cost().abs(), "{} vs {}", rows(&fresh), fresh.cost());
         let (id, d) = c.add(pole);
         assert!((d - c.cost()).abs() < 1e-9 * d.abs().max(1.0) && d < 0.0, "{d}");
@@ -773,6 +692,11 @@ mod tests {
         }
         // a stick outside the box takes nothing from the field
         assert!(all[1][2] != 0.0 && all[2][2] == 0.0, "{all:?}");
+    }
+
+    /// The scans' alignment parts: each scan's cost less its terms'.
+    fn alignment_parts(c: &Scene) -> f64 {
+        c.fits.iter().map(|f| f.cost - f.terms.values().map(Term::cost).sum::<f64>()).sum()
     }
 
     /// The field's counts recomputed from scratch: the empty scene's, less every term's deposit as it now stands.
@@ -903,17 +827,6 @@ mod tests {
         assert_eq!(many.cost(), e0);
     }
 
-    /// Which hypotheses interact: two sticks on the pole's cells share cells and a node; one beside them in the view
-    /// shares no cell, and a node with one of them.
-    #[test]
-    fn interactions_name_shared_cells_and_nodes() {
-        let v = pole_view();
-        let c = Scene::new(vec![v.clone()], &[stick(0.0, 4.0, 0.03)], Settings::default(), Background::default(), None, 0);
-        let pairs = c.interactions(&[vec![stick(0.0, 3.9, 0.03)], vec![stick(0.005, 4.1, 0.03)], vec![stick(-0.15, 7.5, 0.03)]]);
-        assert_eq!(pairs[0], (0, 1, 0, true, true));
-        assert!(pairs[1..].iter().all(|p| p.1 == 2 && !p.3 && p.4), "{pairs:?}");
-    }
-
     /// A move that touches one member rescores its whole group, so its pooled terms never go stale: pieces of the
     /// pole 10 cm apart (no cell in common), added one by one, reach the same cost as the group built at once;
     /// removing a member restores the cost exactly, and `costs_to_add` of a member joining a group equals adding it.
@@ -936,22 +849,5 @@ mod tests {
         by_one.refit_alignment();
         assert!((by_one.cost() - at_once.cost()).abs() < 1e-9 * at_once.cost().abs().max(1.0), "{} vs {}", by_one.cost(), at_once.cost());
         assert_eq!(by_one.rows().len(), 1);
-    }
-
-    /// A chain is one hypothesis, so its own joints (two sticks meeting, sharing cells and a node) never read as
-    /// interacting; a hypothesis fronting cells of a scene group's member, or joining that group, interacts with
-    /// another that joins it.
-    #[test]
-    fn a_chains_joints_are_not_interacting_hypotheses() {
-        let v = pole_view();
-        let c = Scene::new(vec![v.clone()], &[piece_of(-0.2, 0.0, Some(5)), stick(0.4, 6.0, 0.02)], Settings::default(), Background::default(), None, 0);
-        let chain = vec![piece_of(-0.1, 0.05, Some(9)), piece_of(0.05, 0.2, Some(9))];
-        assert!(c.interactions(&[chain.clone()]).is_empty());
-        assert!(c.interactions(&[chain, vec![stick(-0.4, 7.5, 0.02)]]).iter().all(|p| !p.3), "far apart: cells in common only through a node");
-        // one fronts the scene group's member; the other, elsewhere in the view, interacts with it only by joining
-        let beside = stick(0.15, 4.0, 0.02);
-        let pairs = |g: Option<u32>| c.interactions(&[vec![piece_of(-0.15, -0.05, None)], vec![Element { group: g, ..beside }]]);
-        assert!(pairs(Some(5)).iter().any(|p| p.3), "{:?}", pairs(Some(5)));
-        assert!(pairs(None).iter().all(|p| !p.3), "{:?}", pairs(None));
     }
 }

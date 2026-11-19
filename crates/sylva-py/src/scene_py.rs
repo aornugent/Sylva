@@ -17,16 +17,15 @@
 //!   (its extent); its `b` is ignored. An element that can't be scored (a radius that isn't positive, an opacity
 //!   outside (0, 1], a stick of no length) raises.
 //! - **Scenes:** `Scene(images, elements, settings, background, foliage, ref_epoch)` holds elements against range
-//!   images, the alignment error's spread stated for the scans of epoch `ref_epoch` (another epoch's add `align_epoch_*`): `cost()`, `rows()`, each scan's `alignment_parts()` and the foliage field's `field_part()`, the cost change of each move (`add`,
-//!   `remove`, `change`, `costs_to_add`, `costs_to_remove`) with the alignment held, `refit_alignment()` and
-//!   `exact_cost()`, which hypotheses interact (`interactions`), an element's counts (`counts`), cell predictions (`predict`), what one
+//!   images, the alignment error's spread stated for the scans of epoch `ref_epoch` (another epoch's add `align_epoch_*`): `cost()`, `rows()` and the foliage field's `field_part()`, the cost change of each move (`add`,
+//!   `remove`, `change`, `costs_to_add`) with the alignment held, `refit_alignment()`, an element's counts (`counts`), cell predictions (`predict`), what one
 //!   hypothesis is expected to cost against another (`divergence`) and how well the scans pin elements down, one or
 //!   several jointly (`information`). A bad element id or scan index raises.
 //! - **The foliage field:** `foliage` is a dict `lo`, `hi` (the box, 3 each) and `voxel` (m; its prior is the
 //!   settings' `field_prior_*`); the field is then what the elements leave of each echo there (`FoliageBox`; soft
 //!   attribution, 3dtrees research 130 slice-soft), its marginal in
 //!   the cost, exact through moves, and what a pulse meets of it fixed at the build (one step of EM from the
-//!   background) or held from another scene (`hold_foliage`); `foliage_voxels()` gives it per voxel and `transmission(image, cells)` its optical depth across the box along other images' rays.
+//!   background) or held from another scene (`hold_foliage`); `foliage_voxels()` gives it per voxel.
 
 use numpy::{IntoPyArray, PyArray1, PyArray2, PyArray3, PyArrayMethods, PyReadonlyArray1, PyReadonlyArray2};
 use pyo3::exceptions::PyValueError;
@@ -344,22 +343,6 @@ impl PyRangeImage {
         Ok(d)
     }
 
-    /// The depth pyramid (scene::pyramid), built once per image under `settings`: its kept levels' shapes (lines,
-    /// columns) and, over the whole image, pulses, misses, echoes and energy.
-    #[pyo3(signature = (settings=None))]
-    fn pyramid<'py>(&self, py: Python<'py>, settings: Option<&Bound<'_, PyDict>>) -> PyResult<Bound<'py, PyDict>> {
-        let em = self::settings(settings)?;
-        let p = self.pyramid_of(py, &em);
-        let (shapes, t) = (p.shapes(), p.total());
-        let d = PyDict::new(py);
-        d.set_item("levels", shapes)?;
-        d.set_item("pulses", t.pulses)?;
-        d.set_item("misses", t.misses)?;
-        d.set_item("echoes", t.echoes)?;
-        d.set_item("energy", t.energy)?;
-        Ok(d)
-    }
-
     /// Per voxel of the box `lo`-`hi` (m, `voxel` m cubes; (nx, ny, nz) counts) under `settings`, read off the image's
     /// depth pyramid (scene::pyramid::carve): `pulses` in its cover (the cells its corners project to, a cell wider),
     /// those `clear` past its far side by the receiver's resolution (or with no echo), and those `ending` in it or
@@ -379,22 +362,6 @@ impl PyRangeImage {
             d.set_item(name, c.into_pyarray(py).reshape(n)?)?;
         }
         Ok(d)
-    }
-
-    /// Per stick (n, 7: a, b, r), the pulses in its cover and those that reach its middle's range (a first echo beyond
-    /// it, or none), off the depth pyramid (scene::pyramid::arrival): (n, 2).
-    #[pyo3(signature = (sticks, settings=None))]
-    fn arrival<'py>(&self, py: Python<'py>, sticks: PyReadonlyArray2<f64>, settings: Option<&Bound<'_, PyDict>>) -> PyResult<Bound<'py, PyArray2<u64>>> {
-        let em = self::settings(settings)?;
-        let st = sticks.as_array();
-        if st.ncols() != 7 {
-            return Err(PyValueError::new_err("arrival needs sticks (n, 7)"));
-        }
-        let rows: Vec<([f64; 3], [f64; 3], f64)> = st.rows().into_iter().map(|x| ([x[0], x[1], x[2]], [x[3], x[4], x[5]], x[6])).collect();
-        let p = self.pyramid_of(py, &em);
-        let v = &self.inner;
-        let out = py.detach(|| sylva_rs::scene::pyramid::arrival(v, &p, &rows));
-        Ok(out.iter().flat_map(|x| [x.0, x.1]).collect::<Vec<u64>>().into_pyarray(py).reshape([out.len(), 2])?)
     }
 
     /// The fractional (line, col) and range of each world point (NaN outside the lattice), flat (n × 3).
@@ -561,38 +528,13 @@ impl PyScene {
         Ok(d)
     }
 
-    /// For flat `cells` of another image: the foliage field's optical depth across its box along each cell's ray
-    /// (tau), and the ray's entry and exit ranges (t_in, t_out); NaN where the ray misses the box.
-    fn transmission<'py>(&self, py: Python<'py>, image: PyRef<'py, PyRangeImage>, cells: PyReadonlyArray1<i64>) -> PyResult<Bound<'py, PyDict>> {
-        let v = image.inner.clone();
-        let n = (v.n_lines * v.n_cols) as i64;
-        if let Some(k) = cells.as_array().iter().find(|&&k| k < 0 || k >= n) {
-            return Err(PyValueError::new_err(format!("no cell {k}")));
-        }
-        let cs: Vec<usize> = cells.as_array().iter().map(|&k| k as usize).collect();
-        let c = &self.inner;
-        let t = py.detach(|| c.transmission(&v, &cs));
-        let d = PyDict::new(py);
-        d.set_item("tau", t.iter().map(|x| x.0).collect::<Vec<f64>>().into_pyarray(py))?;
-        d.set_item("t_in", t.iter().map(|x| x.1).collect::<Vec<f64>>().into_pyarray(py))?;
-        d.set_item("t_out", t.iter().map(|x| x.2).collect::<Vec<f64>>().into_pyarray(py))?;
-        Ok(d)
-    }
-
     /// The scene's cost: −log of its likelihood ratio against the empty scene, the alignment held.
     fn cost(&self) -> f64 {
         self.inner.cost()
     }
 
-    /// The scene's exact cost: the alignment re-solved for the elements as they are (the referee for `cost`; the scene
-    /// unchanged).
-    fn exact_cost(&self, py: Python<'_>) -> f64 {
-        let c = &self.inner;
-        py.detach(|| c.exact_cost())
-    }
-
-    /// Re-solve the scan alignment error for the elements as they are: the cost change (after it, `cost` is
-    /// `exact_cost`).
+    /// Re-solve the scan alignment error for the elements as they are: the cost change (after it, `cost` is the
+    /// exact Laplace marginal, as a fresh scene's).
     fn refit_alignment(&mut self, py: Python<'_>) -> f64 {
         let c = &mut self.inner;
         py.detach(|| c.refit_alignment())
@@ -600,17 +542,13 @@ impl PyScene {
 
     /// Per (term, scan) (scene::ElementScan): elem (a group's first member), group (-1 alone), scan, cells, cells_on, arc (rad), footprints_across, surface; its cost
     /// and the parts it sums (ray_on, ray_empty, ray_in_front, ray_behind, and alignment: its own nodes' prior and
-    /// log-determinant; each scan's alignment part is `alignment_parts()`, the field's `field_part()`); beside it, not
+    /// log-determinant; with each scan's alignment part, its cost less its rows', and the field's `field_part()`, they sum
+    /// to `cost()`); beside it, not
     /// in it, field: the change in the foliage field's term in its cost to remove in this scan (the plug-in of the hits it takes is in its ray_* parts); the evidence discount (discount); the
     /// posterior along the beam at it, the alignment held: align_shift, align_sd, front_shift, front_shift_sd (m); and
     /// its reflectance level's: refl_level, refl_level_sd (dB).
     fn rows<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
         rows_dict(py, &self.inner.rows())
-    }
-
-    /// Each scan's alignment part (its cost less its rows'), so the rows, these and `field_part()` sum to `cost()`.
-    fn alignment_parts<'py>(&self, py: Python<'py>) -> Bound<'py, PyArray1<f64>> {
-        self.inner.alignment_parts().into_pyarray(py)
     }
 
     /// The foliage field's part of the cost: its marginal against the empty scene's (0 without a field, or with one
@@ -687,34 +625,6 @@ impl PyScene {
             d.set_item("steps", g.steps)?;
             Ok(d)
         }).collect()
-    }
-
-    /// Each element's cost to remove, per scan and then, with a field, the field's part (as `costs_to_add`): `ids`
-    /// live element ids; returns (ids, scans) or (ids, scans + 1), the scene unchanged.
-    fn costs_to_remove<'py>(&self, py: Python<'py>, ids: Vec<u32>) -> PyResult<Bound<'py, numpy::PyArray2<f64>>> {
-        for &id in &ids {
-            self.inner.check_id(id).map_err(scene_err)?;
-        }
-        let c = &self.inner;
-        let out = py.detach(|| c.costs_to_remove(&ids));
-        let (n, m) = (out.len(), out.first().map_or(self.inner.n_scans(), Vec::len));
-        Ok(out.into_iter().flatten().collect::<Vec<f64>>().into_pyarray(py).reshape([n, m])?)
-    }
-
-    /// Which hypotheses interact per scan (scene::Scene::interactions), each pair once: i, j (i < j), scan, cells
-    /// (they front a cell, or cells one scene term owns, in common, or join one group) and nodes (they share an
-    /// alignment node).
-    fn interactions<'py>(&self, py: Python<'py>, hypotheses: Vec<Bound<'py, PyDict>>) -> PyResult<Bound<'py, PyDict>> {
-        let hs: Vec<Vec<Element>> = hypotheses.iter().map(|d| elements_from_py(d, &self.em)).collect::<PyResult<_>>()?;
-        let c = &self.inner;
-        let out = py.detach(|| c.interactions(&hs));
-        let d = PyDict::new(py);
-        d.set_item("i", out.iter().map(|x| x.0).collect::<Vec<u32>>().into_pyarray(py))?;
-        d.set_item("j", out.iter().map(|x| x.1).collect::<Vec<u32>>().into_pyarray(py))?;
-        d.set_item("scan", out.iter().map(|x| x.2).collect::<Vec<u32>>().into_pyarray(py))?;
-        d.set_item("cells", out.iter().map(|x| x.3).collect::<Vec<bool>>().into_pyarray(py))?;
-        d.set_item("nodes", out.iter().map(|x| x.4).collect::<Vec<bool>>().into_pyarray(py))?;
-        Ok(d)
     }
 
     /// How well the scans pin elements `ids` down, one or several jointly (scene::Scene::information), from one forward

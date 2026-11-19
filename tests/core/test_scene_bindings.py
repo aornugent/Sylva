@@ -90,20 +90,16 @@ def test_located_edges_cross_the_binding():
 
 
 def test_the_held_alignment_crosses_the_binding():
-    """Moves hold the alignment: `exact_cost` re-solves it without changing the scene, `refit_alignment` makes `cost`
-    the exact one, `costs_to_remove` equals removing, and `interactions` names hypotheses sharing cells and nodes."""
+    """Moves hold the alignment: a move's cost is near the exact one, and `refit_alignment` re-solves it, after which
+    the cost is a fresh scene's of the same elements."""
     v = pole_image()
     sc = _core.Scene([v], pole())
-    assert sc.cost() == sc.exact_cost()
-    ids, _ = sc.add(pole(r=0.02))
-    held = sc.cost()
-    assert np.isclose(held, sc.exact_cost(), rtol=0.01, atol=0.05) and sc.cost() == held
+    _, d = sc.add(pole(r=0.02))
+    both = {k: np.concatenate([pole()[k], pole(r=0.02)[k]]) for k in pole()}
+    fresh = _core.Scene([v], both).cost()
+    assert np.isclose(sc.cost(), fresh, rtol=0.01, atol=0.05)
     sc.refit_alignment()
-    assert sc.cost() == sc.exact_cost()
-    out = sc.costs_to_remove(ids)
-    assert out.shape == (1, 1) and np.isclose(out[0, 0], sc.remove(ids))
-    pairs = sc.interactions([pole(), pole(r=0.02)])
-    assert list(pairs['i']) == [0] and list(pairs['j']) == [1] and pairs['cells'][0] and pairs['nodes'][0]
+    assert np.isclose(sc.cost(), fresh, rtol=1e-12)
 
 
 def test_a_fisher_step_and_the_clear_range_cross_the_binding():
@@ -124,21 +120,15 @@ def test_a_fisher_step_and_the_clear_range_cross_the_binding():
 
 
 def test_the_depth_pyramid_crosses_the_binding():
-    """Research 130 slice-pyramid: the image's depth pyramid counts every pulse; per voxel, the pulses covering it, those
-    clear past it and those ending in it: in front of the pole all are clear, behind it some are stopped; a stick's
-    arrival counts its cover's pulses; bad boxes raise."""
+    """Research 130 slice-pyramid: per voxel, off the image's depth pyramid, the pulses covering it, those clear past it
+    and those ending in it: in front of the pole all are clear, behind it some are stopped; bad boxes raise."""
     v = pole_image()
-    p = v.pyramid()
-    A = v.arrays()
-    assert p['pulses'] == int((A['cell'] != 2).sum()) and p['misses'] == int((A['cell'] == 1).sum())
     fs = v.carve([-0.1, 1.0, -0.1], [0.1, 8.6, 0.1], 0.2)
     assert all(fs[k].shape == (1, 38, 1) for k in ('pulses', 'clear', 'ending'))
     n, c, e = (fs[k][0, :, 0] for k in ('pulses', 'clear', 'ending'))
     assert (c <= n).all() and (e <= n).all()
     assert n[5] > 0 and c[5] == n[5]
     assert c[20] < n[20]
-    a = v.arrival(np.array([[0.0, 3.0, -0.1, 0.0, 3.0, 0.1, 0.03], [0.0, 6.0, -0.1, 0.0, 6.0, 0.1, 0.03]]))
-    assert a.shape == (2, 2) and a[0, 1] > 0.9 * a[0, 0] and a[1, 1] < 0.5 * a[1, 0]
     with pytest.raises(ValueError):
         v.carve([0.0, 0.0, 0.0], [0.0, 1.0, 1.0], 0.2)
 
@@ -166,8 +156,8 @@ def test_the_grower_and_the_coupling_cross_the_binding():
 
 def test_the_collapsed_field_crosses_the_binding():
     """With a foliage field (its prior the settings'), `costs_to_add` carries the field's part last and sums to the
-    move, the rows carry a `field` part beside the cost, and the rows, the alignment parts and `field_part()` sum to
-    the cost."""
+    move, the rows carry a `field` part beside the cost, and each row's parts (the plug-in of the hits it takes in its
+    ray parts) sum to its cost."""
     v = pole_image()
     box = dict(lo=[-0.5, 2.9, -0.3], hi=[0.5, 8.9, 0.3], voxel=0.1)
     side = dict(a=np.array([[0.2, 4.0, -0.1]]), b=np.array([[0.2, 4.0, 0.1]]), r=np.array([0.02]))
@@ -178,7 +168,8 @@ def test_the_collapsed_field_crosses_the_binding():
     assert np.isclose(c.sum(), d)
     rows = sc.rows()
     assert rows['field'].shape == rows['cost'].shape
-    assert np.isclose(rows['cost'].sum() + sc.alignment_parts().sum() + sc.field_part(), sc.cost())
+    parts = sum(rows[k] for k in ('ray_on', 'ray_empty', 'ray_in_front', 'ray_behind', 'alignment'))
+    assert np.allclose(parts, rows['cost'])
 
 
 def test_the_rules_consumers_read_beside_the_cost_cross_the_binding():

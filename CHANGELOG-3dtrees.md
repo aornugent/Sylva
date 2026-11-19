@@ -53,7 +53,7 @@ branch `3dtrees/125-rebase`.
   and `Background`, both `params!` records whose defaults are AM's. `scene.foliage` is the foliage field, a residual
   extinction per voxel in a box that every cell's ray likelihood reads; `scene.pyramid` is each scan's depth pyramid
   (its pulses' first echoes, counts and energy aggregated over the lattice level by level), carving voxels for bounds
-  on hidden wood and reading arrival. `scene.scene`'s `Scene` holds elements
+  on hidden wood. `scene.scene`'s `Scene` holds elements
   against range images, each rendered once with a uniform-disc beam (returns within the resolution merge), with a
   per-scan alignment error and a per-(element, scan) stem front shift over which each scan's ray likelihood is
   integrated by a Laplace marginal. It returns its cost, the cost change of a move, rows splitting each (element,

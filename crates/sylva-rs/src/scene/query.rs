@@ -547,7 +547,6 @@ mod tests {
         let r = c.rows()[0];
         let parts = r.ray_on + r.ray_empty + r.ray_in_front + r.ray_behind + r.alignment;
         assert!((parts - r.cost).abs() < 1e-9, "{parts} vs {}", r.cost);
-        assert!((r.cost + c.alignment_parts()[0] - c.cost()).abs() < 1e-9);
         assert_eq!(r.discount, em.discount);
     }
 

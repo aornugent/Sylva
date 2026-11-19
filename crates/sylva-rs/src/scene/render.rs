@@ -378,7 +378,8 @@ pub(super) fn render_all(v: &RangeImage, elems: &[Element], em: &Settings) -> Ve
 pub(super) struct KBuffer(HashMap<usize, Vec<Layer>>);
 
 impl KBuffer {
-    /// The k-buffer of elements' layers, `per[i]` element i's.
+    /// The k-buffer of elements' layers, `per[i]` element i's (the tests' referee).
+    #[cfg(test)]
     pub(super) fn of(per: &[Vec<(usize, Layer)>]) -> KBuffer {
         let mut b = KBuffer::default();
         for (i, ls) in per.iter().enumerate() {

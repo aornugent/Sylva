@@ -13,7 +13,7 @@
 //! - [`dual`]: forward derivatives in any number of variables: second order for the own nodes' Newton, first order
 //!   for the geometry's slope and Fisher information.
 //! - [`render`]: elements and their layers in a view's cells, the k-buffer and its mixture.
-//! - [`pyramid`]: one scan's pulses aggregated over its lattice level by level: carving, arrival.
+//! - [`pyramid`]: one scan's pulses aggregated over its lattice level by level: carving.
 //! - [`pulse`]: one cell's pulse against its owners and the one pass over it.
 //! - [`term`]: an element's (or a group's) term per scan: its cells, its own nodes and its deposit.
 //! - [`alignment`]: the scan alignment error, solved with the terms and held between refits.
@@ -40,14 +40,14 @@
 //! | the posterior over which owner made an echo | responsibility | per echo, over the members, the medium and an outlier, summing to one (`predict`'s `owned`); with a foliage field, what the elements take of each echo the field counts (soft attribution) |
 //! | the most echoes the instrument records per pulse | the target cap | `max_targets`; a pulse at it is capped (`RangeImage::capped`), and says nothing past its last echo |
 //! | the range up to which a pulse shows clear space | free space | `free_to`: the first echo less the receiver's resolution; what a pulse shows clear along its ray, its echoes and the beam they leave, in one place ([`foliage::walked`]) |
-//! | one scan's pulses aggregated over its lattice, level by level | depth pyramid | [`pyramid::Pyramid`]: per tile its first echoes' nearest and farthest, its pulses, misses, echoes and energy; carving a voxel ([`pyramid::carve`]: every pulse in its cover clear past it) and arrival read off it at the level a query's cover fits (3dtrees research 130 slice-pyramid) |
+//! | one scan's pulses aggregated over its lattice, level by level | depth pyramid | [`pyramid::Pyramid`]: per tile its first echoes' nearest and farthest, its pulses, misses, echoes and energy; carving a voxel ([`pyramid::carve`]: every pulse in its cover clear past it) read off it at the level its cover fits (3dtrees research 130 slice-pyramid) |
 //! | a proposed part of the scene | element | a form (a stick, an axis and radius; or a patch, a ball) and a class |
 //! | what an element is made of, wood or leaf | class | `Class`: its reflectance; a mark, not a shape |
 //! | sticks joined end to end, scored as one | chain; group | `Element::group`, a key: a group's members are one term per scan, one set of nuisances (alignment shift, stem front shift, reflectance level) |
 //! | a declared term over a chain's geometry alone | coupling | [`chain::Coupling`]: taper, form departures and bends (the bend sd by radius) as a Gaussian Markov process along the chain; it proposes and ranks the grower's continuations and gives a chain's row, beside the cost, never in it |
 //! | a chain grown piece by piece by the likelihood | grower; a chain's state | [`scene::Scene::grow`]; [`chain::Chain`]: its term in information form, updated by each piece's cells alone (3dtrees research 130 slice-grower) |
 //! | elements held against scans | scene | `Scene` |
-//! | `−log` likelihood ratio against the empty scene | cost | also of a move: `add`, `remove`, `change`, `costs_to_add`, `costs_to_remove` |
+//! | `−log` likelihood ratio against the empty scene | cost | also of a move: `add`, `remove`, `change`, `costs_to_add` |
 //! | a cell's likelihood of its pulse | ray likelihood | the scene's data term |
 //! | an element's coverage of a cell's beam | fill | the beam (a uniform disc) convolved with the section |
 //! | what a cell's first echo says about an element | outcome | on it, empty (none), in front, behind (passed through) |
@@ -70,7 +70,7 @@
 //! | what elements don't explain: extinction σ per voxel | foliage field | `Foliage`, `foliage()`; its counts are kept live through moves (`FieldCounts`) |
 //! | what of a ray the foliage field counts | soft attribution | every ray's whole path; each echo a hit less what the elements take of it by their responsibilities, at each term's nodes and front share (a term's `deposit`; 3dtrees research 130 slice-soft): each echo's mass sums to one between the field and the elements |
 //! | the foliage field's prior per voxel | the field's prior | a Gamma, `field_prior_mean` worth `field_prior_path` m of weighted ray; measured per site (the empty scene's type-II maximum) |
-//! | the field's counts scored with σ integrated out | the field's term | `Σ ln NB` over the voxels (a Gamma-mixed Poisson marginal), live and exact through moves; its change against the empty scene's is the cost's `field_part`, the last column of `costs_to_add` and `costs_to_remove` in a scene with a field, and each row's `field`; the plug-in the cells' ratios already read of the hits the elements take is each term's own (its `plug`, in its rows' `ray_*`) (3dtrees research 130 formulation.md) |
+//! | the field's counts scored with σ integrated out | the field's term | `Σ ln NB` over the voxels (a Gamma-mixed Poisson marginal), live and exact through moves; its change against the empty scene's is the cost's `field_part`, the last column of `costs_to_add` in a scene with a field, and each row's `field`; the plug-in the cells' ratios already read of the hits the elements take is each term's own (its `plug`, in its rows' `ray_*`) (3dtrees research 130 formulation.md) |
 //! | what a pulse meets of the field | the held field | σ's posterior mean, read by the ray likelihood (τ, the medium's echoes, the merge) and so by the responsibilities, fixed at the scene's build (one step of EM from κ) or held from another scene (`hold_foliage`) |
 //! | κ outside the field, and a ground plane | background | `Background` |
 //! | the chance the pulse meets no foliage before a return | chance a pulse arrives | `arrives`; `predict`'s `read`: an echo of the pulse on the element |
@@ -81,7 +81,6 @@
 //! | the instrument and site values | settings | `Settings`; a site's settings file in research 130 |
 //! | the epoch (scanning day) the alignment error's spread is stated for | reference epoch | `ref_epoch`; a scan of another epoch adds `align_epoch_*` |
 //! | elements read off the moments | candidates | `candidates` |
-//! | hypotheses whose cost together isn't the sum of their costs alone | interacting hypotheses | `interactions`: a shared cell or front element, or a shared alignment node |
 
 pub mod alignment;
 pub mod chain;
