@@ -38,13 +38,14 @@ use super::term::{Owner, owner, slots, ElemData, Term, elem_data};
 ///   where the scan sees its whole near side, less where it is hidden or seen past the edge only.
 /// - The ray likelihood's cost at the alignment's mode, by what each cell's first echo says about the element:
 ///   `ray_on` (its echoes), `ray_empty` (pulses with no echo), `ray_in_front` (hidden by something nearer) and
-///   `ray_behind` (pulses that passed through it: evidence against).
+///   `ray_behind` (pulses that passed through it: evidence against); with a foliage field, each with the plug-in of
+///   the hits its cells' echoes take from the field ([`Term`]'s `plug`).
 /// - `alignment`: its own nodes' (stem front shift, reflectance level) prior and log-determinant terms. The scan's alignment part is the scan's, not shared out among its
 ///   elements ([`Scene::alignment_parts`]), so the rows, those parts and the field's part ([`Scene::field_part`]) sum
 ///   to the scene's cost.
-/// - `field`: beside `cost`, not in it: the foliage field's part of its cost to remove, were its deposit in this scan
-///   given back ([`Term`]'s `deposit`; the field's term is non-linear in the counts, so these don't sum over elements
-///   or scans).
+/// - `field`: beside `cost`, not in it: the change in the foliage field's term (`Σ ln NB`) in its cost to remove,
+///   were its deposit in this scan given back ([`Term`]'s `deposit`; the field's term is non-linear in the counts, so
+///   these don't sum over elements or scans).
 /// - `discount`: the evidence discount φ every cell's evidence was divided by.
 /// - The posterior at the element in this scan, along the beam (m): the scan alignment error's shift and sd, and the
 ///   stem front shift's (0 when it is off); and its reflectance level's (dB; 0 while reflectance isn't read). Shifts
@@ -106,8 +107,8 @@ impl std::error::Error for SceneError {}
 ///   elements on the stand.
 /// - Two approximations make the field's EM a surrogate, not the bound it would be (rca-em): the E-step reads σ's
 ///   posterior mean `α / β` where the mean-field bound's own step reads `exp(E ln σ)` (so iterating to a fixed point
-///   drains the voxels the elements hold, without each voxel's Occam term), and the plug-in ([`FieldCounts`]) takes the
-///   empty scene to read every echo the elements take as the medium's.
+///   drains the voxels the elements hold, without each voxel's Occam term), and the plug-in (each term's, [`Term`]'s
+///   `plug`) takes the empty scene to read every echo the elements take as the medium's.
 /// - Element ids are stable and never reused.
 /// - The reference epoch (the scanning day the alignment error's spread is stated for) is declared: a scan of another epoch adds the other-epoch part
 ///   to its alignment error.
@@ -187,8 +188,8 @@ impl Scene {
         self.fits.iter().map(|f| f.cost).sum::<f64>() + self.field_part()
     }
 
-    /// The foliage field's part of the cost: its marginal's change against the empty scene's, less the plug-in the
-    /// cells' ratios already read ([`FieldCounts`]); 0 without a box or with the field held from elsewhere.
+    /// The foliage field's part of the cost: its marginal's change against the empty scene's ([`FieldCounts`]); 0
+    /// without a box or with the field held from elsewhere.
     pub fn field_part(&self) -> f64 {
         self.field.as_ref().map_or(0.0, FieldCounts::cost)
     }
@@ -198,7 +199,7 @@ impl Scene {
     /// scene unchanged).
     pub fn exact_cost(&self) -> f64 {
         let fits: Vec<Fit> = (0..self.views.len()).into_par_iter().map(|s| self.solve(s)).collect();
-        let field = self.field.as_ref().map_or(0.0, |f| f.change(&redeposits(&self.fits, &fits), &self.ext));
+        let field = self.field.as_ref().map_or(0.0, |f| f.change(&redeposits(&self.fits, &fits)));
         fits.iter().map(|f| f.cost).sum::<f64>() + self.field_part() + field
     }
 
@@ -220,7 +221,6 @@ impl Scene {
         let before = self.cost();
         let Some(f) = &mut self.field else { return 0.0 };
         self.ext = f.field(self.sc.kappa);
-        f.reread(&self.ext);
         self.refit_alignment();
         self.cost() - before
     }
@@ -253,7 +253,7 @@ impl Scene {
     /// Change the field's counts by `delta` (deposits given back and taken): the change in its part of the cost.
     pub(super) fn give(&mut self, delta: FixedHits) -> f64 {
         match &mut self.field {
-            Some(f) => f.apply(delta, &self.ext),
+            Some(f) => f.apply(delta),
             None => 0.0,
         }
     }
@@ -336,7 +336,7 @@ impl Scene {
         let field = |t: &Term| self.field.as_ref().map_or(0.0, |f| {
             let mut back = FixedHits::default();
             redeposit(&mut back, Some(t), None);
-            -f.change(&back, &self.ext)
+            -f.change(&back)
         });
         let mut rows = Vec::new();
         for (s, fit) in self.fits.iter().enumerate() {
@@ -351,7 +351,7 @@ impl Scene {
                 rows.push(ElementScan {
                     elem: i, group, scan: s as u32, cells: t.cells, cells_on: t.cells_on, arc: t.arc, footprints_across: t.across, surface: t.surface,
                     cost: t.cost(), ray_on: t.ray[0], ray_empty: t.ray[1], ray_in_front: t.ray[2], ray_behind: t.ray[3],
-                    alignment: t.fit - t.ray.iter().sum::<f64>() + t.logdet, field: field(t),
+                    alignment: t.cost() - t.ray.iter().sum::<f64>(), field: field(t),
                     discount: self.em.discount,
                     align_shift: fit.held.shift(&t.align), align_sd: var.max(0.0).sqrt(), front_shift: t.own_sd[0] * t.own[0], front_shift_sd: own_sd(0),
                     refl_level: t.own_sd[1] * t.own[1], refl_level_sd: own_sd(1),
@@ -581,7 +581,7 @@ impl Scene {
                 self.fits[s].total(&over) - self.fits[s].cost
             }).collect();
             if let Some(f) = &self.field {
-                out.push(f.change(&delta, &self.ext));
+                out.push(f.change(&delta));
             }
             out
         }).collect()
@@ -640,7 +640,7 @@ impl Scene {
 mod tests {
     use super::*;
     use std::collections::{BTreeMap, HashMap};
-    use crate::scene::foliage::{self, Deposit, FieldCounts};
+    use crate::scene::foliage::{self, Deposit, FieldCounts, Foliage};
     use crate::scene::render::{Form, Element};
     use crate::scene::settings::{Background, Settings};
     use crate::scene::term::Owner;
@@ -802,7 +802,7 @@ mod tests {
     fn recounted(c: &Scene) -> foliage::Counts {
         let f = c.field.as_ref().unwrap();
         let mut fresh = FieldCounts::new(f.spec, &c.views.iter().map(|v| &**v).collect::<Vec<_>>(), &c.em);
-        fresh.apply(redeposits(&[], &c.fits), &c.ext);
+        fresh.apply(redeposits(&[], &c.fits));
         fresh.counts()
     }
 
@@ -837,19 +837,25 @@ mod tests {
     }
 
     /// With the field collapsed, the pole's cost to add hardly depends on whether the field it is scored against was
-    /// fitted with it in, where the scans' parts alone, the plug-in reading before the collapse, differ by far more:
-    /// the field's term is a function of the scene alone.
+    /// fitted with it in, where the plug-in reading before the collapse (each field held fixed: the cells' ratios
+    /// alone) differs by far more: the field's term is a function of the scene alone.
     #[test]
     fn a_hypothesiss_cost_does_not_depend_on_the_last_refit() {
         let v = pole_view();
         let (em, sc) = (Settings::default(), Background::default());
         let pole = stick(0.0, 4.0, 0.03);
-        let out = Scene::new(vec![v.clone()], &[], em, sc, Some(field_box()), 0).costs_to_add(&[vec![pole]])[0].clone();
-        let mut c = Scene::new(vec![v.clone()], &[pole], em, sc, Some(field_box()), 0);
-        let inn: Vec<f64> = c.costs_to_remove(&[0])[0].iter().map(|x| -x).collect();
-        let (collapsed, today) = ((out[0] + out[1]) - (inn[0] + inn[1]), out[0] - inn[0]);
+        let scene = |els: &[Element], spec| Scene::new(vec![v.clone()], els, em, sc, spec, 0);
+        let held = |els: &[Element], ext: &Foliage| {
+            let mut c = scene(els, None);
+            c.hold_foliage(ext);
+            c
+        };
+        // the pole's cost to add, from the scene without it; and to remove, from the scene with it
+        let (without, mut with) = (scene(&[], Some(field_box())), scene(&[pole], Some(field_box())));
+        let (out_held, mut in_held) = (held(&[], without.foliage_field()), held(&[pole], with.foliage_field()));
+        let add = |c: &Scene| -> f64 { c.costs_to_add(&[vec![pole]])[0].iter().sum() };
+        let (collapsed, today) = (add(&without) + with.remove(0), add(&out_held) + in_held.remove(0));
         assert!(collapsed.abs() < 0.1 * today.abs(), "collapsed {collapsed} vs today {today}");
-        c.remove(0);
     }
 
     /// A move's change is a full recompute's (3dtrees research 130 slice-structure, slice-soft): each cell read at its

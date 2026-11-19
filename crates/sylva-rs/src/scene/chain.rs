@@ -171,12 +171,13 @@ impl Quadratic {
 }
 
 /// One cell's last read: its quadratic, its vote for the term's class, and what the term took of the field's hits
-/// there.
+/// there, and their plug-in ([`Term`]'s `plug`).
 #[derive(Debug, Clone)]
 struct Read {
     q: Quadratic,
     vote: Option<u8>,
     deposit: Deposit,
+    plug: f64,
 }
 
 /// A chain's state in one scan (the module's docs).
@@ -216,7 +217,7 @@ pub struct Chain {
 struct ScanTrial {
     layers: Vec<(usize, Layer)>,
     gone: Vec<usize>,
-    fresh: Vec<(CellData, Option<u8>, Deposit)>,
+    fresh: Vec<(CellData, Option<u8>, Deposit, f64)>,
     term: Option<Term>,
     ctx: Vec<(Owner, Option<Term>)>,
     cost: f64,
@@ -353,7 +354,7 @@ impl Scene {
                     redeposit(&mut delta, old, new.as_ref());
                 }
             }
-            cost += f.change(&delta, &self.ext);
+            cost += f.change(&delta);
         }
         Trial { piece: e, scans, delta, cost }
     }
@@ -405,7 +406,7 @@ impl Scene {
         } else {
             Vec::new()
         };
-        let term = (!members.is_empty()).then(|| {
+        let mut term = (!members.is_empty()).then(|| {
             let es: Vec<&Element> = members.iter().collect();
             let class = median_class(&tally);
             let (hs, front) = term_nodes(&es, em);
@@ -418,25 +419,29 @@ impl Scene {
                 let x = Vector2::new(a + own_sd[0] * y[0], own_sd[1] * y[1]);
                 let lv = if own_sd[1] > 0.0 { Dual2::var(x[1], 1) } else { Dual2::c(x[1]) };
                 let total = fresh_cells.iter().fold(sum.ll(x), |t, f| t + f.read(Dual2::var(x[0], 0), lv, em));
-                super::term::Local { ll: total.v, parts: [0.0; 4], g: -total.g, hess: clipped(-total.h), deposit: Vec::new() }
+                super::term::Local { ll: total.v, parts: [0.0; 4], g: -total.g, hess: clipped(-total.h), deposit: Vec::new(), plug: 0.0 }
             });
             let el = eliminate(own_sd, &at, y);
             Term {
                 align, fit: -at.ll + 0.5 * (y[0] * y[0] + y[1] * y[1]), logdet: 0.5 * el.det.ln(), slope: el.slope, curv: el.curv, own: y, start, own_sd,
                 own_cov: el.pi, own_link: el.pl, ray: [0.0; 4], cells: (cs.cells.len() - gone.len() + fresh_cells.len()) as u32, cells_on: 0, arc: 0.0,
-                across: mean_of(&es, |x| 2.0 * x.r / em.footprint(norm(&sub(&x.mid(), &v.origin)))), surface: class, deposit: Vec::new(),
+                across: mean_of(&es, |x| 2.0 * x.r / em.footprint(norm(&sub(&x.mid(), &v.origin)))), surface: class, deposit: Vec::new(), plug: 0.0,
             }
         });
-        // the deposits of the cells it reads, at the term's mode
+        // the deposits of the cells it reads, at the term's mode, and the term's plug-in: the chain's less the cells
+        // re-read, and those read now
         let x = term.as_ref().map_or(Vector2::zeros(), |t| Vector2::new(fit.held.shift(&t.align) + t.own_sd[0] * t.own[0], t.own_sd[1] * t.own[1]));
-        let fresh: Vec<(CellData, Option<u8>, Deposit)> = fresh_cells.into_iter().map(|f| {
-            let dep = if f.hits.is_empty() { Vec::new() } else {
-                let taken = mixture_taken(&f.pulses, x[0], x[1], em).1;
-                foliage::deposit(f.hits.iter().map(|&(i, k, w)| (k, w * taken[i])))
+        let fresh: Vec<(CellData, Option<u8>, Deposit, f64)> = fresh_cells.into_iter().map(|f| {
+            let (dep, plug) = if f.hits.is_empty() { (Vec::new(), 0.0) } else {
+                let (hits, p) = f.take(&mixture_taken(&f.pulses, x[0], x[1], em).1);
+                (foliage::deposit(hits.into_iter()), -p)
             };
             let vote = votes.get(&f.cell).copied();
-            (f, vote, dep)
+            (f, vote, dep, plug)
         }).collect();
+        if let Some(t) = &mut term {
+            t.plug = cs.term.as_ref().map_or(0.0, |t| t.plug) - gone.iter().map(|k| cs.cells[k].plug).sum::<f64>() + fresh.iter().map(|x| x.3).sum::<f64>();
+        }
         let mut over: HashMap<Owner, Option<Term>> = cs.ctx.clone();
         over.extend(ctx.iter().cloned());
         over.insert(g, term.clone());
@@ -469,13 +474,13 @@ impl Scene {
             if let Some(term) = &st.term {
                 let x = Vector2::new(self.fits[s].held.shift(&term.align) + term.own_sd[0] * term.own[0], term.own_sd[1] * term.own[1]);
                 let lv = if term.own_sd[1] > 0.0 { Dual2::var(x[1], 1) } else { Dual2::c(x[1]) };
-                for (f, vote, deposit) in st.fresh {
+                for (f, vote, deposit, plug) in st.fresh {
                     let q = Quadratic::of(&f.read(Dual2::var(x[0], 0), lv, &self.em), x);
                     sum.add(&q, 1.0);
                     if let Some(v) = vote {
                         cs.votes[v as usize] += 1;
                     }
-                    cs.cells.insert(f.cell, Read { q, vote, deposit });
+                    cs.cells.insert(f.cell, Read { q, vote, deposit, plug });
                 }
             }
             cs.sum = Some(sum);

@@ -622,7 +622,7 @@ impl PyScene {
     /// Per (term, scan) (scene::ElementScan): elem (a group's first member), group (-1 alone), scan, cells, cells_on, arc (rad), footprints_across, surface; its cost
     /// and the parts it sums (ray_on, ray_empty, ray_in_front, ray_behind, and alignment: its own nodes' prior and
     /// log-determinant; each scan's alignment part is `alignment_parts()`, the field's `field_part()`); beside it, not
-    /// in it, field: the foliage field's part of its cost to remove in this scan; the evidence discount (discount); the
+    /// in it, field: the change in the foliage field's term in its cost to remove in this scan (the plug-in of the hits it takes is in its ray_* parts); the evidence discount (discount); the
     /// posterior along the beam at it, the alignment held: align_shift, align_sd, front_shift, front_shift_sd (m); and
     /// its reflectance level's: refl_level, refl_level_sd (dB).
     fn rows<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
@@ -634,8 +634,8 @@ impl PyScene {
         self.inner.alignment_parts().into_pyarray(py)
     }
 
-    /// The foliage field's part of the cost: its marginal against the empty scene's, less the plug-in the cells'
-    /// ratios already read (0 without a field, or with one held from elsewhere).
+    /// The foliage field's part of the cost: its marginal against the empty scene's (0 without a field, or with one
+    /// held from elsewhere).
     fn field_part(&self) -> f64 {
         self.inner.field_part()
     }
