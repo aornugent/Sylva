@@ -94,6 +94,9 @@ params! {
         /// `logistic(merge_a + merge_field M + merge_range t + merge_fill f)` at the layer's range t (m) and fill f,
         /// fitted on edges whose pulse merged with a surface within the resolution behind (`reflectance.py site`'s
         /// `merge_summary`, the field held in; slice 2d: AM's from day-1 scans the held-out checks never hold out).
+        /// Soft attribution (slice-soft) doesn't retire it: about the second box the field's own share behind the
+        /// candidates' edges rises from 0.06 to 0.13 against 0.45 merged (AUC 0.54 → 0.60). These values were fitted
+        /// under the hard cut and margin.
         pub merge_a: f64 = -0.1104,
         pub merge_field: f64 = 1.2609,
         pub merge_range: f64 = -0.1127,
