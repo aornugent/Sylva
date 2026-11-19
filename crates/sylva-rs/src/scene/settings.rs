@@ -88,15 +88,13 @@ params! {
         /// fitted by least absolute deviations, `reflectance.py site`'s `merge_summary`; slice 9).
         pub pull_a: f64 = 2.529,
         pub pull_b: f64 = 0.062,
-        /// The merge share behind a layer, calibrated per site (3dtrees research 130 slice 2c): the foliage field's
-        /// share M (`1 − exp(−b ∫ σ (1 − p))`, [`super::scene`]'s merges) predicts AM's merges beside wood poorly in
-        /// one box (0.10 against 0.48) and well in another (0.40 against 0.39), so the share is
-        /// `logistic(merge_a + merge_field M + merge_range t + merge_fill f)` at the layer's range t (m) and fill f,
-        /// fitted on edges whose pulse merged with a surface within the resolution behind (`reflectance.py site`'s
-        /// `merge_summary`, the field held in; slice 2d: AM's from day-1 scans the held-out checks never hold out),
-        /// on the field's own share M as [`super::scene::Scene::predict`] reports it (slice-products; before it, on
-        /// the previous map's output). Soft attribution (slice-soft) doesn't retire it: about the second box M is 0.13
-        /// against 0.46 merged (AUC 0.60), the map 0.46 (AUC 0.68).
+        /// The merge share behind a layer, calibrated per site (3dtrees research 130 slice 2c): the foliage field's own
+        /// share M (`1 − exp(−b ∫ σ (1 − p))`, [`super::scene`]'s merges) predicts a site's merges beside wood too
+        /// poorly to stand alone (slice-soft), so the share is `logistic(merge_a + merge_field M + merge_range t +
+        /// merge_fill f)` at the layer's range t (m) and fill f, fitted on the field's own share M as
+        /// [`super::scene::Scene::predict`] reports it, on edges whose pulse merged with a surface within the
+        /// resolution behind (`reflectance.py site`'s `merge_summary`, the field held in; AM's from day-1 scans the
+        /// held-out checks never hold out: slices 2d, products).
         pub merge_a: f64 = -1.0467,
         pub merge_field: f64 = 5.7753,
         pub merge_range: f64 = -0.1205,

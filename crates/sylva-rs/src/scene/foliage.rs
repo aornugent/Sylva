@@ -51,9 +51,7 @@
 //!   hit, less the share the scene's elements take of it: their responsibilities for it, the posterior over who made
 //!   it from the pass over its pulse at its term's nodes, shared among a cell's terms by their front shares (a
 //!   term's [`Deposit`]). So each echo's mass sums to one between the field and the elements, and nothing about an
-//!   element is set aside: no cut along its rays, no margin about it. With responsibilities 0 or 1 the hits are the
-//!   old hard cut's (an echo at or behind the element's front surface the element's); the path is not split, as the
-//!   cut split it. The empty scene's counts read every echo as the medium's.
+//!   element is set aside. The empty scene's counts read every echo as the medium's.
 //! - **Held during moves** ([`FieldCounts`]), as the scan alignment is: a move changes the deposits of the terms it
 //!   recomputes (each term's old deposit back, its new one out), and the field's term with them, exactly; what a pulse
 //!   meets stays the field of the last refit (the responsibilities read it), so the cost is a function of the scene
@@ -86,6 +84,10 @@ pub const FIXED: f64 = (1u64 << 40) as f64;
 /// Weighted counts per voxel in fixed point ([`FIXED`]): [hits, path].
 pub type FixedCounts = HashMap<[i32; 3], [i64; 2], std::hash::BuildHasherDefault<VoxelHasher>>;
 
+/// Weighted hits per voxel in fixed point: what the elements take, and a move's change to it (the path is never
+/// taken).
+pub type FixedHits = HashMap<[i32; 3], i64, std::hash::BuildHasherDefault<VoxelHasher>>;
+
 /// The hits a term's elements take from the field (the module docs: soft attribution), per voxel in fixed point, in
 /// voxel order: a function of the term alone, so a move's change to the counts is its terms' old deposits less
 /// their new ones, exactly.
@@ -101,13 +103,18 @@ pub fn deposit(hits: impl Iterator<Item = ([i32; 3], f64)>) -> Deposit {
 }
 
 /// Add a deposit's hits to `acc` with `sign` (+1 back to the field, −1 out of it).
-pub fn give(acc: &mut FixedCounts, d: &Deposit, sign: i64) {
+pub fn give(acc: &mut FixedHits, d: &Deposit, sign: i64) {
     for &(k, h) in d {
-        let e = acc.entry(k).or_insert([0, 0]);
-        e[0] += sign * h;
-        if *e == [0, 0] {
-            acc.remove(&k);
-        }
+        add_hits(acc, k, sign * h);
+    }
+}
+
+/// Add `h` to voxel `k`'s hits in `acc`; a voxel that comes to nothing is dropped.
+fn add_hits(acc: &mut FixedHits, k: [i32; 3], h: i64) {
+    let e = acc.entry(k).or_insert(0);
+    *e += h;
+    if *e == 0 {
+        acc.remove(&k);
     }
 }
 
@@ -424,7 +431,7 @@ pub struct FieldCounts {
     /// Per voxel, the weighted counts the field explains: the empty scene's less the hits the elements take
     /// (`taken`, the scene's deposits).
     counts: FixedCounts,
-    taken: FixedCounts,
+    taken: FixedHits,
     /// In fixed point: the field's term `Σ ln NB`, the empty scene's, and the plug-in of `taken`.
     term: i128,
     empty: i128,
@@ -446,7 +453,7 @@ impl FieldCounts {
                 acc
             }).reduce(FixedCounts::default, merged)
         }).fold(FixedCounts::default(), merged);
-        let mut f = FieldCounts { spec, prior, counts, taken: FixedCounts::default(), term: 0, empty: 0, plug: 0 };
+        let mut f = FieldCounts { spec, prior, counts, taken: FixedHits::default(), term: 0, empty: 0, plug: 0 };
         f.term = f.counts.values().map(|&c| f.fixed_term(c)).sum();
         f.empty = f.term;
         f
@@ -457,45 +464,45 @@ impl FieldCounts {
         fixed(ln_nb(h as f64 / FIXED, l as f64 / FIXED, self.prior.0, self.prior.1))
     }
 
-    /// The plug-in of counts `taken` in voxel `k` at the field `ext`, in fixed point.
-    fn fixed_plug(k: &[i32; 3], [h, l]: [i64; 2], ext: &Foliage) -> i128 {
-        if h == 0 && l == 0 {
-            return 0;
-        }
-        let s = ext.sigma(k);
-        fixed((h as f64 * s.ln() - s * l as f64) / FIXED)
+    /// The plug-in of hits `h` taken in voxel `k` at the field `ext`, in fixed point.
+    fn fixed_plug(k: &[i32; 3], h: i64, ext: &Foliage) -> i128 {
+        fixed(h as f64 * ext.sigma(k).ln() / FIXED)
     }
 
-    /// The change in the term and in the plug-in were the counts changed by `delta`.
-    fn fixed_change(&self, delta: &FixedCounts, ext: &Foliage) -> (i128, i128) {
-        delta.iter().fold((0, 0), |(t, p), (k, d)| {
+    /// The change in the term and in the plug-in were the hits changed by `delta`.
+    fn fixed_change(&self, delta: &FixedHits, ext: &Foliage) -> (i128, i128) {
+        delta.iter().fold((0, 0), |(t, p), (k, &d)| {
             let c = self.counts.get(k).copied().unwrap_or([0, 0]);
-            let b = self.taken.get(k).copied().unwrap_or([0, 0]);
-            (t + self.fixed_term([c[0] + d[0], c[1] + d[1]]) - self.fixed_term(c),
-             p + Self::fixed_plug(k, [b[0] - d[0], b[1] - d[1]], ext) - Self::fixed_plug(k, b, ext))
+            let b = self.taken.get(k).copied().unwrap_or(0);
+            (t + self.fixed_term([c[0] + d, c[1]]) - self.fixed_term(c), p + Self::fixed_plug(k, b - d, ext) - Self::fixed_plug(k, b, ext))
         })
     }
 
-    /// The change in the field's part of the cost were the counts changed by `delta` (deposits given back or taken:
+    /// The change in the field's part of the cost were the hits changed by `delta` (deposits given back or taken:
     /// [`give`]), its plug-in read at `ext`; the counts stay as they are.
-    pub fn change(&self, delta: &FixedCounts, ext: &Foliage) -> f64 {
+    pub fn change(&self, delta: &FixedHits, ext: &Foliage) -> f64 {
         let (t, p) = self.fixed_change(delta, ext);
         -(t + p) as f64 / FIXED
     }
 
-    /// Change the counts by `delta`, the plug-in read at `ext`: the change in the field's part of the cost.
-    pub fn apply(&mut self, delta: FixedCounts, ext: &Foliage) -> f64 {
+    /// Change the hits by `delta`, the plug-in read at `ext`: the change in the field's part of the cost.
+    pub fn apply(&mut self, delta: FixedHits, ext: &Foliage) -> f64 {
         let (t, p) = self.fixed_change(&delta, ext);
         (self.term, self.plug) = (self.term + t, self.plug + p);
-        let neg: FixedCounts = delta.iter().map(|(&k, &[h, l])| (k, [-h, -l])).collect();
-        self.taken = merged(std::mem::take(&mut self.taken), neg);
-        self.counts = merged(std::mem::take(&mut self.counts), delta);
+        for (k, d) in delta {
+            add_hits(&mut self.taken, k, -d);
+            let e = self.counts.entry(k).or_insert([0, 0]);
+            e[0] += d;
+            if *e == [0, 0] {
+                self.counts.remove(&k);
+            }
+        }
         -(t + p) as f64 / FIXED
     }
 
     /// Read the plug-in at the field `ext` (the field a pulse now meets, after a refit).
     pub fn reread(&mut self, ext: &Foliage) {
-        self.plug = self.taken.iter().map(|(k, &b)| Self::fixed_plug(k, b, ext)).sum();
+        self.plug = self.taken.iter().map(|(k, &h)| Self::fixed_plug(k, h, ext)).sum();
     }
 
     /// The field's part of the scene's cost (above).

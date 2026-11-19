@@ -44,7 +44,6 @@
 //! | what a cell's first echo says about an element | outcome | on it, empty (none), in front, behind (passed through) |
 //! | the element's predicted echo in a cell | the element's echo | `front_echo`; [`scene::Outcome::of`] against it |
 //! | the cost from pulses that passed through | evidence against | `ray_behind` (and `ray_empty`, pulses with no echo) |
-//! | cells the element mostly fills but whose first echo isn't its | expected hits with no echo | |
 //! | the weight a cell's evidence counts with | cell weight | `1 / (φ m)`, [`settings::Settings::cell_weight`] |
 //! | the chance a layer is part of its cell | entry weight | a smooth step in its widest fill from `MIN_FILL` (0.2 %) to `FULL_FILL` (1 %); a layer at 1 % or more is wholly in its cell, one below partial; a cell's likelihood is the mixture over which partial layers are in it (3dtrees research 130 slice-trim) |
 //! | the chance a layer is its cell's nearest | front share | how a cell's evidence is shared among its layers' terms; all the front layer's where that is wholly in it |
@@ -73,9 +72,7 @@
 //! | the instrument and site values | settings | `Settings`; a site's settings file in research 130 |
 //! | the epoch (scanning day) the alignment error's spread is stated for | reference epoch | `ref_epoch`; a scan of another epoch adds `align_epoch_*` |
 //! | elements read off the moments | candidates | `candidates` |
-//! | sticks and paths not seen, scored per scan | hidden links | |
 //! | hypotheses whose cost together isn't the sum of their costs alone | interacting hypotheses | `interactions`: a shared cell or front element, or a shared alignment node |
-//! | a measurement against the stand's truth or AM's held-out scans | check | |
 
 pub mod dual;
 pub mod foliage;
