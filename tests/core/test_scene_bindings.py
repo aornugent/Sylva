@@ -179,3 +179,25 @@ def test_the_rules_consumers_read_beside_the_cost_cross_the_binding():
     a0, b0 = 0.05 * 0.4, 0.4
     nb = _core.field_ln_nb(np.array([2.0, 0.0]), np.array([3.0, 0.0]), 0.05, 0.4)
     assert np.allclose(nb, [lgamma(a0 + 2) - lgamma(a0) + a0 * log(b0) - (a0 + 2) * log(b0 + 3), 0.0])
+    from math import erfc, sqrt
+    floor = _core.floor(np.array([4.0]))[0]
+    p = _core.p_detect(np.array([-15.0]), np.array([0.5]), np.array([4.0]))
+    assert np.isclose(p[0], 0.5 * erfc(-((-15.0 + 10 * np.log10(0.5) - floor) / s['detect_sd']) / sqrt(2)))
+    assert np.allclose(_core.mismatch_sd(np.array([0.01, 0.1])), s['mismatch_base'] + s['mismatch_slope'] * np.array([0.01, 0.1]))
+    keys, w = _core.alignment_hats(np.array([[0.3, 4.1, -0.7], [2.0, 2.0, 2.0]]))
+    assert keys.shape == (2, 8, 3) and np.allclose((w ** 2).sum(1), 1.0) and (w[1] > 0).sum() == 1
+
+
+def test_a_chain_added_together_and_a_field_built_to_its_fixed_point():
+    """Research 130 slice-consolidate: `add` of a list is one move (Sylva's add_many), the cost as adding one by one;
+    a scene with a field reports the EM steps its build took."""
+    v = pole_image()
+    box = dict(lo=[-0.5, 2.9, -0.3], hi=[0.5, 8.9, 0.3], voxel=0.1)
+    halves = dict(a=np.array([[0.0, 4.0, -0.1], [0.0, 4.0, 0.0]]), b=np.array([[0.0, 4.0, 0.0], [0.0, 4.0, 0.1]]), r=np.array([0.03, 0.03]),
+                  group=np.array([4, 4]))
+    one, many = _core.Scene([v], pole(), None, None, box), _core.Scene([v], pole(), None, None, box)
+    assert one.em_steps >= 1 and _core.Scene([v], pole()).em_steps == 0
+    for k in range(2):
+        one.add({key: x[k:k + 1] for key, x in halves.items()})
+    ids, _ = many.add(halves)
+    assert list(ids) == [1, 2] and one.cost() == many.cost()
