@@ -29,7 +29,7 @@
 //!     curvature in the own nodes ([`Dual2`]; with the geometry, its slope in [`Scene::information`]: [`Dual`]), the element's echo ([`front_echo`]), each owner's beam left and
 //!     expected echoes, and each echo's responsibilities over the owners. With a foliage field, the responsibilities
 //!     at each term's nodes share each echo between the field and the elements (soft attribution: the term's deposit,
-//!     [`ElemData::deposit`]; 3dtrees research 130 slice-soft).
+//!     [`Term`]'s `deposit`; 3dtrees research 130 slice-soft).
 //!   - The beam reaches layer i with energy `e_i = f_i Π_{j<i} (1 − op_j f_j)`, and its echo is recorded with
 //!     `op_i det_i`, where `det_i` is the chance it clears the detection floor ([`Settings::p_detect`]):
 //!     `Φ((ρ_dB + 10 log10(e_i cos ι_i) − floor(t_i)) / σ)`.
@@ -337,7 +337,7 @@ impl Layer {
 ///   elements ([`Scene::alignment_parts`]), so the rows, those parts and the field's part ([`Scene::field_part`]) sum
 ///   to the scene's cost.
 /// - `field`: beside `cost`, not in it: the foliage field's part of its cost to remove, were its deposit in this scan
-///   given back ([`ElemData::deposit`]; the field's term is non-linear in the counts, so these don't sum over elements
+///   given back ([`Term`]'s `deposit`; the field's term is non-linear in the counts, so these don't sum over elements
 ///   or scans).
 /// - `discount`: the evidence discount φ every cell's evidence was divided by.
 /// - The posterior at the element in this scan, along the beam (m): the scan alignment error's shift and sd, and the
@@ -901,6 +901,11 @@ struct Receiver<P = f64, T = P> {
 }
 
 impl<P: Real, T: Over<P>> Receiver<P, T> {
+    /// The width of a pulse's responsibility row: each member, then the medium and an outlier.
+    fn owners(&self) -> usize {
+        self.members.len() + 2
+    }
+
     /// The first return of the most likely pattern (none without an occluder).
     fn front(&self) -> Option<Return<P, T>> {
         self.patterns.iter().max_by(|a, b| a.0.v().total_cmp(&b.0.v())).and_then(|p| p.1.first().copied())
@@ -1068,11 +1073,15 @@ struct Reading<P, T> {
     resp: Vec<f64>,
 }
 
-impl<P, T> Reading<P, T> {
+impl<P: Real, T: Over<P>> Reading<P, T> {
+    /// Its responsibilities, a row per echo ([`Receiver::owners`] wide).
+    fn rows(&self) -> std::slice::Chunks<'_, f64> {
+        self.resp.chunks(self.rx.owners())
+    }
+
     /// Occluder `o`'s responsibilities summed over the echoes: how many of the pulse's echoes are its in expectation.
     fn owned(&self, o: usize) -> f64 {
-        let n = self.rx.members.len() + 2;
-        self.resp.chunks(n).map(|r| r[o]).sum()
+        self.rows().map(|r| r[o]).sum()
     }
 }
 
@@ -1108,7 +1117,7 @@ impl<P: Real> Pulse<P> {
     /// patterns of [`Pass::lik`]'s recursion over the echoes; the responsibilities are each branch's share of it.
     fn read<T: Over<P>>(&self, shift: T, level: T, em: &Settings) -> Reading<P, T> {
         let rx = self.receiver(shift, level, em);
-        let owners = rx.members.len() + 2;
+        let owners = rx.owners();
         let mut resp = vec![0.0; self.echoes.len() * owners];
         let pass = Pass { pulse: self, rx: &rx, em, t_end: Self::end(&self.occluders), capped: self.capped(), owners };
         let total = rx.patterns.iter().map(|(p, rets)| *p * pass.lik(rets, 0, 0, P::c(1.0), 1.0, 1.0, 0.0, p.v(), &mut resp)).sum::<T>();
@@ -1120,9 +1129,9 @@ impl<P: Real> Pulse<P> {
 
     /// Per echo, the share of it its elements' layers take in `r` (their responsibilities summed; the ground, the medium
     /// and an outlier take the rest).
-    fn taken<T>(&self, r: &Reading<P, T>) -> Vec<f64> {
+    fn taken<T: Over<P>>(&self, r: &Reading<P, T>) -> Vec<f64> {
         let layers: Vec<usize> = (0..self.occluders.len()).filter(|&o| matches!(self.occluders[o].surface, Surface::Layer(_))).collect();
-        r.resp.chunks(self.occluders.len() + 2).map(|row| layers.iter().map(|&o| row[o]).sum()).collect()
+        r.rows().map(|row| layers.iter().map(|&o| row[o]).sum()).collect()
     }
 
     /// The same pulse in the empty scene: the medium and the ground alone, the same for every hypothesis.
@@ -1226,12 +1235,13 @@ struct CellData {
     hits: Vec<(usize, [i32; 3], f64)>,
 }
 
-/// Per echo of a cell's pulse (`pulses`, per subset of its mixture), the share its elements' layers take at shift and
-/// reflectance level `x`: each subset's ([`Pulse::taken`]) by the subset's posterior.
-fn taken(pulses: &[(f64, Pulse)], x: (f64, f64), em: &Settings) -> Vec<f64> {
-    let reads: Vec<_> = pulses.iter().map(|(w, p)| (*w, p, p.read(x.0, x.1, em))).collect();
-    let m = reads.iter().map(|r| r.2.ll).fold(f64::NEG_INFINITY, f64::max);
-    let post: Vec<f64> = reads.iter().map(|(w, _, r)| w * (r.ll - m).exp()).collect();
+/// A cell's log-likelihood at shift `shift` and reflectance level `level` ([`mixture_ll`]) and, per echo, the share
+/// its elements' layers take ([`Pulse::taken`]): each subset's by the subset's posterior, from the same reads.
+fn mixture_taken<T: Over<f64>>(pulses: &[(f64, Pulse)], shift: T, level: T, em: &Settings) -> (T, Vec<f64>) {
+    let reads: Vec<_> = pulses.iter().map(|(w, p)| (*w, p, p.read(shift, level, em))).collect();
+    let m = reads.iter().map(|r| r.2.ll.v()).fold(f64::NEG_INFINITY, f64::max);
+    let ll = if let [(_, _, r)] = &reads[..] { r.ll } else { reads.iter().map(|(w, _, r)| (r.ll - m).exp() * *w).sum::<T>().ln() + m };
+    let post: Vec<f64> = reads.iter().map(|(w, _, r)| w * (r.ll.v() - m).exp()).collect();
     let total: f64 = post.iter().sum();
     let mut out = vec![0.0; pulses[0].1.echoes.len()];
     for ((_, p, r), q) in reads.iter().zip(&post) {
@@ -1239,7 +1249,7 @@ fn taken(pulses: &[(f64, Pulse)], x: (f64, f64), em: &Settings) -> Vec<f64> {
             *o += q / total * t;
         }
     }
-    out
+    (ll, out)
 }
 
 /// One term's data in one scan (an element's, or a group's: [`Owner`]): the cells its members own (its evidence:
@@ -1268,12 +1278,20 @@ impl ElemData {
 
     /// Its ray likelihood at `x` = (δ, reflectance level), in total and by [`Outcome`] (in its order), and −ll's slope
     /// and curvature in (δ, level) there, in closed form, one pass over its cells ([`Dual2`]; the value is the `f64`
-    /// one), the curvature's negative eigenvalues set to 0. Without a level node only δ's are filled.
-    fn quad(&self, x: (f64, f64), em: &Settings) -> Local {
+    /// one), the curvature's negative eigenvalues set to 0. Without a level node only δ's are filled. With `deposit`,
+    /// from the same pass, what its elements take of the foliage field's hits there ([`Local`]'s `deposit`).
+    fn quad(&self, x: (f64, f64), em: &Settings, deposit: bool) -> Local {
         let level = if self.own_sd[1] > 0.0 { Dual2::var(x.1, 1) } else { Dual2::c(x.1) };
-        let (mut total, mut parts) = (Dual2::<2>::c(0.0), [0.0; 4]);
+        let (mut total, mut parts, mut hits) = (Dual2::<2>::c(0.0), [0.0; 4], Vec::new());
         for c in &self.cells {
-            let l = (mixture_ll(&c.pulses, Dual2::var(x.0, 0), level, em) - c.base) * c.wt;
+            let ll = if deposit && !c.hits.is_empty() {
+                let (ll, taken) = mixture_taken(&c.pulses, Dual2::var(x.0, 0), level, em);
+                hits.extend(c.hits.iter().map(|&(i, k, w)| (k, w * taken[i])));
+                ll
+            } else {
+                mixture_ll(&c.pulses, Dual2::var(x.0, 0), level, em)
+            };
+            let l = (ll - c.base) * c.wt;
             total += l;
             parts[c.outcome as usize] += l.v;
         }
@@ -1285,7 +1303,7 @@ impl ElemData {
             eig.eigenvalues = eig.eigenvalues.map(|l| l.max(0.0));
             eig.recompose()
         };
-        Local { ll: total.v, parts, g: -total.g, hess }
+        Local { ll: total.v, parts, g: -total.g, hess, deposit: foliage::deposit(hits.into_iter()) }
     }
 
     /// Its curvature over (a, y) at own nodes `y` given its likelihood there (`at`), with y eliminated: over (a, y),
@@ -1308,7 +1326,7 @@ impl ElemData {
         let s = self.own_sd;
         let prior = |y: Vector2<f64>| 0.5 * (y[0] * y[0] + y[1] * y[1]);
         let mut y = if s == Vector2::zeros() { Vector2::zeros() } else { start };
-        let mut at = self.quad(self.at(a, y), em);
+        let mut at = self.quad(self.at(a, y), em, true);
         if s != Vector2::zeros() {
             let mut f_now = -at.ll + prior(y);
             for _ in 0..MAX_NEWTON {
@@ -1317,7 +1335,7 @@ impl ElemData {
                 let (mut t, mut fall) = (1.0, None);
                 while t >= 1e-3 {
                     let yn = y - step * t;
-                    let next = self.quad(self.at(a, yn), em);
+                    let next = self.quad(self.at(a, yn), em, true);
                     let f_new = -next.ll + prior(yn);
                     if f_new <= f_now {
                         fall = Some(f_now - f_new);
@@ -1352,18 +1370,8 @@ impl ElemData {
             },
             across: self.across,
             surface: self.surface,
-            deposit: self.deposit(|c| taken(&c.pulses, self.at(a, y), em)),
+            deposit: at.deposit,
         }
-    }
-
-    /// What its elements take of the foliage field's hits in its cells (soft attribution; [`foliage`]'s module docs):
-    /// per hit, its weight (front share included) times `taken`'s share of its echo, per cell. At its term's nodes
-    /// (`term`), `taken` is the share the cell's layers take by their responsibilities ([`taken`]).
-    fn deposit(&self, taken: impl Fn(&CellData) -> Vec<f64>) -> Deposit {
-        foliage::deposit(self.cells.iter().filter(|c| !c.hits.is_empty()).flat_map(|c| {
-            let t = taken(c);
-            c.hits.iter().map(move |&(i, k, w)| (k, w * t[i])).collect::<Vec<_>>()
-        }))
     }
 }
 
@@ -1385,12 +1393,15 @@ fn cap(step: Vector2<f64>) -> Vector2<f64> {
 }
 
 /// One term's ray likelihood at a point (δ, reflectance level), by outcome, and −ll's slope and curvature there
-/// ([`ElemData::quad`]).
+/// ([`ElemData::quad`]); and, asked for, what its elements take of the foliage field's hits there (soft attribution;
+/// [`foliage`]'s module docs): per hit, its weight (front share included) times the share of its echo the cell's
+/// layers take by their responsibilities ([`mixture_taken`]).
 struct Local {
     ll: f64,
     parts: [f64; 4],
     g: Vector2<f64>,
     hess: Matrix2<f64>,
+    deposit: Deposit,
 }
 
 /// One (element, scan)'s part of its scan's cost at an alignment shift, `fit + logdet`: `fit` its ray likelihood's
@@ -1399,7 +1410,7 @@ struct Local {
 /// eliminated), where its own nodes' Newton began (`start`: a move recomputes a held term from its reference's, so an
 /// unchanged term comes out the same), and what its row reports: ŷ, its own nodes' covariance given the shift P⁻¹ and how they follow it
 /// (`own_link`: ŷ moves by −`own_link` per unit of shift), the ray likelihood's cost by outcome, and its cells; and,
-/// with a foliage field, the hits its elements take from it at its nodes ([`ElemData::deposit`]).
+/// with a foliage field, the hits its elements take from it at its nodes (`deposit`, from its last read: [`ElemData::quad`]).
 #[derive(Debug, Clone)]
 struct Term {
     align: Vec<([i64; 3], f64)>,
@@ -1424,11 +1435,6 @@ struct Term {
 impl Term {
     fn cost(&self) -> f64 {
         self.fit + self.logdet
-    }
-
-    /// Whether it enters the scan alignment error as `other` does (the same nodes, slope and curvature).
-    fn same_alignment(&self, other: &Term) -> bool {
-        self.align == other.align && self.slope == other.slope && self.curv == other.curv
     }
 }
 
@@ -1528,7 +1534,8 @@ fn elem_data(v: &RangeImage, rendered: &[Vec<(usize, Layer)>], elems: &[Element]
 
 /// The scan alignment error held at its mode (research 130 offset-field-design.md §3, step 3a): the nodes' mode ẑ
 /// and covariance Σ₀ = Λ₀⁻¹ at the last refit, `m` = Σ₀ G₀ (the step Newton would still take, G₀ the cost's slope in
-/// the nodes there) and `gm` = G₀ᵀ Σ₀ G₀, and the terms the refit was taken with (`reference`, by [`Owner`]).
+/// the nodes there) and `gm` = G₀ᵀ Σ₀ G₀, and what it reads of the terms the refit was taken with (`reference`, by
+/// [`Owner`]: [`Reference`]).
 ///
 /// With its own nodes eliminated, each term (an element's or a group's) meets the nodes through its alignment shift alone: slope γ and
 /// curvature h along its weights r. For the elements now in the scan, `Λ = I + Σ h r rᵀ` and `G = ẑ + Σ γ r`, and the
@@ -1543,7 +1550,28 @@ struct Held {
     m: Vec<f64>,
     gm: f64,
     logdet: f64,
-    reference: BTreeMap<Owner, Term>,
+    reference: BTreeMap<Owner, Reference>,
+}
+
+/// What the held alignment keeps of a term at its refit: how it meets the nodes (its weights, its cost's slope and
+/// curvature in its shift) and where its own nodes' Newton began, so a move recomputes an unchanged term exactly.
+#[derive(Debug, Clone)]
+struct Reference {
+    align: Vec<([i64; 3], f64)>,
+    slope: f64,
+    curv: f64,
+    start: Vector2<f64>,
+}
+
+impl Reference {
+    fn of(t: &Term) -> Reference {
+        Reference { align: t.align.clone(), slope: t.slope, curv: t.curv, start: t.start }
+    }
+
+    /// Whether term `t` enters the scan alignment error as this did (the same nodes, slope and curvature).
+    fn same_alignment(&self, t: &Term) -> bool {
+        self.align == t.align && self.slope == t.slope && self.curv == t.curv
+    }
 }
 
 impl Held {
@@ -1640,7 +1668,7 @@ fn solve_alignment(data: &[ElemData], em: &Settings) -> (Held, Vec<Term>) {
     let index = alignment_nodes(data);
     let n = index.len();
     let shift = |el: &ElemData, z: &[f64]| -> f64 { el.align.iter().map(|(k, w)| w * z[index[k]]).sum() };
-    let read = |z: &[f64], ys: &[Vector2<f64>]| -> Vec<Local> { data.par_iter().zip(ys).map(|(el, y)| el.quad(el.at(shift(el, z), *y), em)).collect() };
+    let read = |z: &[f64], ys: &[Vector2<f64>]| -> Vec<Local> { data.par_iter().zip(ys).map(|(el, y)| el.quad(el.at(shift(el, z), *y), em, false)).collect() };
     let objective = |z: &[f64], ys: &[Vector2<f64>], ls: &[Local]| {
         0.5 * z.iter().map(|x| x * x).sum::<f64>() + ls.iter().zip(ys).map(|(l, y)| -l.ll + 0.5 * (y[0] * y[0] + y[1] * y[1])).sum::<f64>()
     };
@@ -1774,7 +1802,7 @@ impl std::error::Error for SceneError {}
 ///   it touches. So a move recomputes only the terms of the elements whose cells it touches, not the scan, and
 ///   removing an element restores the cost exactly (synthesis §18 invariant 7). [`Scene::refit_alignment`] re-solves the alignment (a move like `refit_foliage`), after which
 ///   the cost is the exact Laplace marginal ([`Scene::exact_cost`], the referee); the scene is built refitted.
-/// - With a foliage field, each term's deposit (the hits its elements take from the field, [`ElemData::deposit`])
+/// - With a foliage field, each term's deposit (the hits its elements take from the field, [`Term`]'s `deposit`)
 ///   changes with the term, so a move changes the field's counts by its terms' old deposits less their new ones. A scene
 ///   is built by EM from κ to its fixed point: the terms read the background, their deposits make the field, the terms
 ///   read it, and so on until a step ([`Scene::refit_foliage`]) changes the cost by less than [`EM_TOL`]
@@ -1839,7 +1867,7 @@ fn index(cells: &mut HashMap<usize, Vec<Entered>>, id: u32, layers: &[(usize, La
 }
 
 /// The change to the foliage field's counts were a term `old` replaced by `new` (none: no term), added to `acc`: its
-/// old deposit given back, its new one taken ([`ElemData::deposit`]).
+/// old deposit given back, its new one taken ([`Term`]'s `deposit`).
 fn redeposit(acc: &mut FixedHits, old: Option<&Term>, new: Option<&Term>) {
     if let Some(t) = old {
         foliage::give(acc, &t.deposit, 1);
@@ -2291,7 +2319,7 @@ impl Scene {
         let (owners, data): (Vec<Owner>, Vec<ElemData>) = self.data(s).into_iter().unzip();
         let (mut held, terms) = solve_alignment(&data, &self.em);
         let fit_terms: BTreeMap<Owner, Term> = owners.into_iter().zip(terms).collect();
-        held.reference = fit_terms.clone();
+        held.reference = fit_terms.iter().map(|(o, t)| (*o, Reference::of(t))).collect();
         let mut fit = Fit { terms: fit_terms, held, cost: 0.0 };
         fit.cost = fit.total(&HashMap::new());
         fit
@@ -2993,13 +3021,16 @@ mod tests {
         assert_eq!(d.cells.len(), order.len());
         let front = |c: &CellData| buf[&order[d.cells.iter().position(|x| std::ptr::eq(x, c)).unwrap()]][0];
         let interior = |c: &CellData| front(c).f > 0.99;
-        let behind = |c: &CellData| {
+        let behind = |c: &CellData| -> Vec<f64> {
             let l = front(c);
             c.pulses[0].1.echoes.iter().map(|&r| (interior(c) && r as f64 >= l.t - 3.0 * em.depth_sd(2, l.spread) - 0.03) as u8 as f64).collect()
         };
-        let soft = |c: &CellData| if interior(c) { taken(&c.pulses, (0.0, 0.0), &em) } else { vec![0.0; c.pulses[0].1.echoes.len()] };
-        let total = |d: &Deposit| d.iter().map(|x| x.1 as f64).sum::<f64>();
-        let (whole, soft) = (total(&d.deposit(behind)), total(&d.deposit(soft)));
+        let soft = |c: &CellData| if interior(c) { mixture_taken(&c.pulses, 0.0, 0.0, &em).1 } else { vec![0.0; c.pulses[0].1.echoes.len()] };
+        let total = |taken: &dyn Fn(&CellData) -> Vec<f64>| -> f64 {
+            foliage::deposit(d.cells.iter().flat_map(|c| { let t = taken(c); c.hits.iter().map(move |&(i, k, w)| (k, w * t[i])).collect::<Vec<_>>() }))
+                .iter().map(|x| x.1 as f64).sum()
+        };
+        let (whole, soft) = (total(&behind), total(&soft));
         assert!(whole > 0.0 && (soft / whole - 1.0).abs() < 0.01, "{soft} vs {whole}");
     }
 
@@ -3168,8 +3199,8 @@ mod tests {
             let d = &elem_data(&v, &rendered, &[e], &[0], &[0], 0, &em, &sc, &Foliage::uniform(sc.kappa), None)[0];
             assert!(d.own_sd[0] > 0.0 && d.own_sd[1] > 0.0);
             for x in [(0.0, 0.0), (0.002, -0.4)] {
-                let q = d.quad(x, &em);
-                let f = |dx: f64, db: f64| -d.quad((x.0 + dx, x.1 + db), &em).ll;
+                let q = d.quad(x, &em, false);
+                let f = |dx: f64, db: f64| -d.quad((x.0 + dx, x.1 + db), &em, false).ll;
                 let (h, hb) = (1e-5, 2e-3);
                 let g = [(f(h, 0.0) - f(-h, 0.0)) / (2.0 * h), (f(0.0, hb) - f(0.0, -hb)) / (2.0 * hb)];
                 let hess = [(f(h, 0.0) - 2.0 * f(0.0, 0.0) + f(-h, 0.0)) / (h * h), (f(h, hb) - f(h, -hb) - f(-h, hb) + f(-h, -hb)) / (4.0 * h * hb),
@@ -3186,7 +3217,7 @@ mod tests {
             let (cold, warm) = (d.term(0.0, Vector2::zeros(), &em), d.term(0.0, Vector2::new(0.5, -0.5), &em));
             assert!((cold.own[0] - warm.own[0]).abs() < 1e-3 && (cold.own[1] - warm.own[1]).abs() < 1e-3, "{:?} vs {:?}", cold.own, warm.own);
             assert!((cold.cost() - warm.cost()).abs() < 1e-5, "{} vs {}", cold.cost(), warm.cost());
-            let at = d.quad(d.at(0.0, cold.own), &em);
+            let at = d.quad(d.at(0.0, cold.own), &em, false);
             for i in 0..2 {
                 assert!((d.own_sd[i] * at.g[i] + cold.own[i]).abs() < 0.01, "slope in y {:?} at {:?}", at.g, cold.own);
             }
@@ -3946,9 +3977,8 @@ mod tests {
         let em = Settings::default();
         for p in test_pulses() {
             let r = p.read(0.0, 0.0, &em);
-            let n = r.rx.members.len() + 2;
-            assert_eq!(r.resp.len(), p.echoes.len() * n);
-            for row in r.resp.chunks(n) {
+            assert_eq!(r.resp.len(), p.echoes.len() * r.rx.owners());
+            for row in r.rows() {
                 assert!((row.iter().sum::<f64>() - 1.0).abs() < 1e-9 && row.iter().all(|&x| x >= 0.0), "{row:?}");
             }
         }
