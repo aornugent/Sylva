@@ -46,6 +46,8 @@
 //! | the cost from pulses that passed through | evidence against | `ray_behind` (and `ray_empty`, pulses with no echo) |
 //! | cells the element mostly fills but whose first echo isn't its | expected hits with no echo | |
 //! | the weight a cell's evidence counts with | cell weight | `1 / (φ m)`, [`settings::Settings::cell_weight`] |
+//! | the chance a layer is part of its cell | entry weight | a smooth step in its widest fill from `MIN_FILL` (0.2 %) to `FULL_FILL` (1 %); a layer at 1 % or more is wholly in its cell, one below partial; a cell's likelihood is the mixture over which partial layers are in it (3dtrees research 130 slice-trim) |
+//! | the chance a layer is its cell's nearest | front share | how a cell's evidence is shared among its layers' terms; all the front layer's where that is wholly in it |
 //! | φ, for correlation the model leaves out | evidence discount | `discount` |
 //! | beams overlapping a spot | footprints per cell | `m`, `multiplicity` |
 //! | an along-beam error per (scan, place) | scan alignment error | `align_*`; its value at an element, `align_shift` |
