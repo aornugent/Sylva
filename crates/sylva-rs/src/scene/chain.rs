@@ -31,12 +31,11 @@ use crate::transform::{add, cross, dot, norm, normalize, scale, sub};
 use nalgebra::{Matrix2, Vector2};
 use rayon::prelude::*;
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::sync::Arc;
 use super::dual::{Dual2, Real};
 use super::foliage::{self, Deposit, FixedHits};
 use super::pulse::mixture_taken;
-use super::render::{Element, Form, Layer, kbuffer, render};
-use super::scene::{Entered, Scene, redeposit};
+use super::render::{Element, Form, Layer, KBuffer, keep, numbered, render};
+use super::scene::{Scene, redeposit};
 use super::term::{CellData, Owner, Term, eliminate, elem_data, median_class, owner, settle, slots, term_nodes, vote, clipped, mean_of};
 
 /// The coupling's declared row (3dtrees research 128: taper and form departures; research 130 slice 7: the bend sd
@@ -183,9 +182,8 @@ struct Read {
 /// A chain's state in one scan (the module's docs).
 #[derive(Clone, Default)]
 struct ChainScan {
-    /// Its pieces' entered layers by cell, and each piece's layers (by piece; empty where the scan doesn't see it).
-    index: HashMap<usize, Vec<Entered>>,
-    layers: Vec<Arc<Vec<(usize, Layer)>>>,
+    /// Its pieces' layers by cell.
+    buffer: KBuffer,
     /// The pieces the scan sees: its term's members.
     members: Vec<usize>,
     /// Per cell its term has a front share in, its last read; their sum; the class votes.
@@ -216,7 +214,7 @@ pub struct Chain {
 /// A piece tried on a chain in one scan: its layers, the chain's cells it re-reads (`gone`) and those it reads now
 /// with their votes and deposits, the term, the scene's terms it changes (beyond the chain's), and the scan's cost.
 struct ScanTrial {
-    layers: Arc<Vec<(usize, Layer)>>,
+    layers: Vec<(usize, Layer)>,
     gone: Vec<usize>,
     fresh: Vec<(CellData, Option<u8>, Deposit)>,
     term: Option<Term>,
@@ -251,11 +249,6 @@ impl Chain {
     fn end(&self) -> usize {
         if self.done[self.turn] { 1 - self.turn } else { self.turn }
     }
-}
-
-/// A piece's layer in a cell (`ls` sorted by cell, as [`render`] gives them).
-fn layer_at(ls: &[(usize, Layer)], cell: usize) -> Option<Layer> {
-    ls.binary_search_by_key(&cell, |x| x.0).ok().map(|i| ls[i].1)
 }
 
 impl Scene {
@@ -370,36 +363,21 @@ impl Scene {
         let (v, em, fit) = (&*self.views[s], &self.em, &self.fits[s]);
         let first = self.elems.len() as u32;
         let g = Owner::Group(e.group.expect("a chain's piece has its group"));
-        let layers = Arc::new(render(v, &e, id, em));
-        let touched: Vec<usize> = layers.iter().filter(|(_, l)| l.enters()).map(|(k, _)| *k).collect();
+        let layers = render(v, &e, id, em);
+        let mut own = KBuffer::default();
+        let touched = own.enter(id, &layers);
         let piece = |i: u32| if i == id { e } else { c.pieces[(i - first) as usize] };
-        // every layer entered in the cells it enters, numbered from 0: the scene's, the chain's and its own
-        let (mut ids, mut rendered): (Vec<u32>, Vec<Vec<(usize, Layer)>>) = (Vec::new(), Vec::new());
-        let mut at: HashMap<u32, usize> = HashMap::new();
-        let mut put = |i: u32, cell: usize, l: Layer| {
-            let k = *at.entry(i).or_insert_with(|| {
-                ids.push(i);
-                rendered.push(Vec::new());
-                ids.len() - 1
-            });
-            rendered[k].push((cell, Layer { elem: k as u32, ..l }));
-        };
-        for (cell, l) in layers.iter().filter(|(_, l)| l.enters()) {
-            for x in self.cells[s].get(cell).into_iter().flatten() {
-                put(x.id, *cell, layer_at(&self.rendered[s][x.id as usize], *cell).expect("an entered layer"));
-            }
-            for x in cs.index.get(cell).into_iter().flatten() {
-                put(x.id, *cell, layer_at(&cs.layers[(x.id - first) as usize], *cell).expect("an entered layer"));
-            }
-            put(id, *cell, *l);
-        }
+        // the k-buffers of the cells it enters, the scene's layers, the chain's and its own, numbered from 0
+        let in_cell = |cell: usize| keep(self.buffers[s].get(cell).iter().chain(cs.buffer.get(cell)).chain(own.get(cell)).copied().collect());
+        let mut ids = Vec::new();
+        let cells = numbered(touched.iter().map(|&cell| (cell, in_cell(cell))).collect(), &mut ids);
         let elems: Vec<Element> = ids.iter().map(|&i| if i >= first { piece(i) } else { self.elems[i as usize].unwrap() }).collect();
         let owners: Vec<Owner> = ids.iter().zip(&elems).map(|(&i, x)| if i >= first { g } else { owner(i, x) }).collect();
         let mine: Vec<usize> = (0..ids.len()).filter(|&k| ids[k] >= first).collect();
-        let fresh_cells = elem_data(v, &rendered, &elems, &slots(&owners), &mine, self.ref_epoch, em, &self.sc, &self.ext, self.field.as_ref().map(|f| &f.spec))
+        let fresh_cells = elem_data(v, &cells, &elems, &slots(&owners), &mine, self.ref_epoch, em, &self.sc, &self.ext, self.field.as_ref().map(|f| &f.spec))
             .into_iter().next().map_or(Vec::new(), |d| d.cells);
-        let votes: HashMap<usize, u8> = kbuffer(&rendered).iter()
-            .filter_map(|(&cell, ls)| vote(v, cell, ls, em).filter(|x| ids[x.0 as usize] >= first).map(|x| (cell, x.1))).collect();
+        let votes: HashMap<usize, u8> = cells.iter()
+            .filter_map(|(cell, ls)| vote(v, *cell, ls, em).filter(|x| ids[x.0 as usize] >= first).map(|x| (*cell, x.1))).collect();
         let gone: Vec<usize> = touched.iter().copied().filter(|k| cs.cells.contains_key(k)).collect();
         // the term: the chain's sum less the cells re-read, those read exactly, its own nodes warm from its mode
         let mut sum = cs.sum.unwrap_or(Quadratic::ZERO);
@@ -419,13 +397,10 @@ impl Scene {
         if !layers.is_empty() {
             members.push(e);
         }
-        let ctx = if touched.iter().any(|k| self.cells[s].get(k).is_some_and(|x| !x.is_empty())) {
-            let with: Vec<(Element, &[(usize, Layer)])> = c.pieces.iter().zip(&cs.layers).map(|(p, l)| (*p, &l[..])).chain([(e, &layers[..])]).collect();
-            let fresh = |cell: usize| -> Vec<Entered> {
-                let mut x = cs.index.get(&cell).cloned().unwrap_or_default();
-                x.extend(layer_at(&layers, cell).filter(Layer::enters).map(|l| Entered::of(id, &l)));
-                x
-            };
+        let ctx = if touched.iter().any(|&k| !self.buffers[s].get(k).is_empty()) {
+            // the chain's own term is skipped, so its pieces' cells aren't read
+            let with: Vec<(Element, Option<&[usize]>)> = c.pieces.iter().chain([&e]).map(|p| (*p, None)).collect();
+            let fresh = |cell: usize| -> Vec<Layer> { cs.buffer.get(cell).iter().chain(own.get(cell)).copied().collect() };
             self.terms_after(s, &[], &with, first, &fresh, &touched.iter().copied().collect::<HashSet<usize>>(), &[], Some(g))
         } else {
             Vec::new()
@@ -478,13 +453,10 @@ impl Scene {
         n.pieces.push(t.piece);
         if end == 1 { n.order.push_back(k) } else { n.order.push_front(k) }
         for (s, (cs, st)) in n.scans.iter_mut().zip(t.scans).enumerate() {
-            for (cell, l) in st.layers.iter().filter(|(_, l)| l.enters()) {
-                cs.index.entry(*cell).or_default().push(Entered::of(id, l));
-            }
+            cs.buffer.enter(id, &st.layers);
             if !st.layers.is_empty() {
                 cs.members.push(k);
             }
-            cs.layers.push(st.layers);
             let mut sum = cs.sum.unwrap_or(Quadratic::ZERO);
             for cell in st.gone {
                 let r = cs.cells.remove(&cell).unwrap();
@@ -554,7 +526,7 @@ mod tests {
                 let whole = scene.costs_to_add(&[sticks.clone()]).remove(0).iter().sum::<f64>();
                 assert!((c.cost - whole).abs() < 1e-3 * whole.abs().max(1.0), "{k} pieces: {} against {whole}", c.cost);
                 let rendered = render_all(&v, &sticks, &em);
-                let d = &elem_data(&v, &rendered, &sticks, &vec![0; sticks.len()], &(0..sticks.len()).collect::<Vec<_>>(), 0, &em, &sc, &scene.ext,
+                let d = &elem_data(&v, &KBuffer::of(&rendered).cells(), &sticks, &vec![0; sticks.len()], &(0..sticks.len()).collect::<Vec<_>>(), 0, &em, &sc, &scene.ext,
                                    spec.as_ref())[0];
                 let mut cells: Vec<usize> = c.scans[0].cells.keys().copied().collect();
                 cells.sort_unstable();

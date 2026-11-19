@@ -23,7 +23,7 @@ use super::dual::{Dual2, Real};
 use super::foliage::{self, Deposit, Foliage, FoliageBox};
 use super::pulse::{Outcome, mixture_ll, cell_view, front_echo, depth_sd, Pulse, mixture_taken};
 use super::range_image::{Cell, RangeImage};
-use super::render::{MOSTLY, Form, Element, Layer, kbuffer, front_shares};
+use super::render::{MOSTLY, Form, Element, Layer, front_shares};
 use super::settings::{Background, Settings, ALIGN_SPACING};
 
 /// Whose term a cell's evidence enters, per scan: an element alone (by id), or a group (by its key). A group's members
@@ -70,10 +70,10 @@ pub(super) fn term_nodes(es: &[&Element], em: &Settings) -> (Vec<([i64; 3], f64)
 /// Each element's term's surface class in one view (`slot`, per element: [`slots`]), which sets the term's alignment
 /// spread: the median class of the cells its members mostly fill ([`MOSTLY`]) that hold an echo with a surface fit (mid
 /// where none). The echoes themselves read their own cells' class ([`cell_class`]).
-pub(super) fn term_classes(v: &RangeImage, buf: &HashMap<usize, Vec<Layer>>, slot: &[usize], em: &Settings) -> Vec<u8> {
+pub(super) fn term_classes(v: &RangeImage, cells: &[(usize, Vec<Layer>)], slot: &[usize], em: &Settings) -> Vec<u8> {
     let mut ks: Vec<[u32; 3]> = vec![[0; 3]; slot.iter().max().map_or(0, |m| m + 1)];
-    for (&cell, ls) in buf {
-        if let Some((e, k)) = vote(v, cell, ls, em) {
+    for (cell, ls) in cells {
+        if let Some((e, k)) = vote(v, *cell, ls, em) {
             ks[slot[e as usize]][k as usize] += 1;
         }
     }
@@ -324,16 +324,16 @@ impl Term {
 /// Newton steps at most per mode.
 pub(super) const MAX_NEWTON: usize = 40;
 
-/// One scan's data for the elements `score` (indices into `elems`, each with its layers in `rendered`), one per term
-/// (`slot`, per element: [`slots`]), against the k-buffer of every element's layers. A cell's evidence belongs to its
+/// One scan's data for the elements `score` (indices into `elems`), one per term (`slot`, per element: [`slots`]),
+/// from the cells they may front: `cells`, in index order, each with its k-buffer as its pulse reads it
+/// ([`super::render::kept`]), its layers' `elem` indices into `elems`. A cell's evidence belongs to its
 /// layers' terms by their front shares ([`front_shares`]: wholly its front element's where that is wholly in it); its echoes read the cell's own surface class ([`cell_class`]) and its shift the term's
 /// alignment spread ([`term_classes`]), so a term depends on no other term's class. With the foliage field's box
 /// `field`, each cell holds the hits the field counts of its echoes, for the terms' deposits.
 #[allow(clippy::too_many_arguments)]
-pub(super) fn elem_data(v: &RangeImage, rendered: &[Vec<(usize, Layer)>], elems: &[Element], slot: &[usize], score: &[usize], ref_epoch: u32,
+pub(super) fn elem_data(v: &RangeImage, cells: &[(usize, Vec<Layer>)], elems: &[Element], slot: &[usize], score: &[usize], ref_epoch: u32,
              em: &Settings, sc: &Background, ext: &Foliage, field: Option<&FoliageBox>) -> Vec<ElemData> {
-    let buf = kbuffer(rendered);
-    let cls = term_classes(v, &buf, slot, em);
+    let cls = term_classes(v, cells, slot, em);
     let other = v.epoch != ref_epoch;
     let level = if em.refl_noise > 0.0 && !v.echo_refl.is_empty() { em.refl_level_sd } else { 0.0 };
     let (mut members, mut at, mut by_elem): (Vec<Vec<usize>>, HashMap<usize, usize>, HashMap<u32, usize>) = Default::default();
@@ -353,11 +353,9 @@ pub(super) fn elem_data(v: &RangeImage, rendered: &[Vec<(usize, Layer)>], elems:
                    across: mean_of(&es, |e| 2.0 * e.r / em.footprint(norm(&sub(&e.mid(), &v.origin)))),
                    align: hs.into_iter().map(|(key, w)| (key, w * s_along)).collect(), own_sd: Vector2::new(front, level), members: ms }
     }).collect();
-    // cells in index order, so an element's sums run in the same order in every run (the k-buffer is a hash map)
-    let mut order: Vec<usize> = buf.keys().copied().collect();
-    order.sort_unstable();
-    for cell in order {
-        let ls = &buf[&cell];
+    // cells in index order, so an element's sums run in the same order in every run
+    for (cell, ls) in cells {
+        let cell = *cell;
         // the scored terms with a front share in the cell, in the order their layers come
         let mut shares: Vec<(usize, f64)> = Vec::new();
         for (l, s) in ls.iter().zip(front_shares(ls)).filter(|x| x.1 > 0.0) {
@@ -399,7 +397,7 @@ mod tests {
     use crate::scene::foliage::{self, Foliage};
     use crate::scene::pulse::mixture_taken;
     use crate::scene::range_image::Cell;
-    use crate::scene::render::{Form, Class, Element, render_all, kbuffer};
+    use crate::scene::render::{Form, Class, Element, KBuffer, render_all};
     use crate::scene::settings::{Background, Settings};
     use super::super::fixtures::{cost, field_box, piece_of, pole_scan_of, pole_view, stick, thin_pole_view};
 
@@ -412,13 +410,12 @@ mod tests {
         let (em, sc, sp) = (Settings::default(), Background::default(), field_box());
         let e = stick(0.0, 4.0, 0.03);
         let rendered = render_all(&v, &[e], &em);
-        let buf = kbuffer(&rendered);
-        let d = &elem_data(&v, &rendered, &[e], &[0], &[0], 0, &em, &sc, &Foliage::uniform(sc.kappa), Some(&sp))[0];
+        let cells = KBuffer::of(&rendered).cells();
+        let d = &elem_data(&v, &cells, &[e], &[0], &[0], 0, &em, &sc, &Foliage::uniform(sc.kappa), Some(&sp))[0];
         // each cell's front layer, in elem_data's order
-        let mut order: Vec<usize> = buf.keys().copied().filter(|&c| v.cell[c] != Cell::NoPulse).collect();
-        order.sort_unstable();
+        let order: Vec<&(usize, Vec<Layer>)> = cells.iter().filter(|x| v.cell[x.0] != Cell::NoPulse).collect();
         assert_eq!(d.cells.len(), order.len());
-        let front = |c: &CellData| buf[&order[d.cells.iter().position(|x| std::ptr::eq(x, c)).unwrap()]][0];
+        let front = |c: &CellData| order[d.cells.iter().position(|x| std::ptr::eq(x, c)).unwrap()].1[0];
         let interior = |c: &CellData| front(c).f > 0.99;
         let behind = |c: &CellData| -> Vec<f64> {
             let l = front(c);
@@ -442,7 +439,7 @@ mod tests {
         let (em, sc) = (Settings::default(), Background::default());
         for e in [stick(0.0, 4.0, 0.03), stick(0.004, 4.0, 0.025)] {
             let rendered = render_all(&v, &[e], &em);
-            let d = &elem_data(&v, &rendered, &[e], &[0], &[0], 0, &em, &sc, &Foliage::uniform(sc.kappa), None)[0];
+            let d = &elem_data(&v, &KBuffer::of(&rendered).cells(), &[e], &[0], &[0], 0, &em, &sc, &Foliage::uniform(sc.kappa), None)[0];
             assert!(d.own_sd[0] > 0.0 && d.own_sd[1] > 0.0);
             for x in [(0.0, 0.0), (0.002, -0.4)] {
                 let q = d.quad(x, &em, false);

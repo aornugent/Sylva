@@ -271,7 +271,7 @@ mod tests {
     use crate::scene::foliage::Foliage;
     use crate::scene::pulse::{cell_class, occluders, Pulse};
     use crate::scene::range_image::Cell;
-    use crate::scene::render::{Element, Layer, render_all, kbuffer, mixture};
+    use crate::scene::render::{Element, Layer, KBuffer, render_all, mixture};
     use crate::scene::scene::Scene;
     use crate::scene::settings::{Background, Settings};
     use crate::scene::term::{term_classes, ElemData};
@@ -370,10 +370,10 @@ mod tests {
         // the element sits on one node set: its alignment shift has prior sd s_along (√Σŵ² = 1)
         let (gh_x, gh_w) = ([-2.0201828704560856, -0.9585724646138185, 0.0, 0.9585724646138185, 2.0201828704560856],
                             [0.019953242059045913, 0.39361932315224116, 0.9453087204829419, 0.39361932315224116, 0.019953242059045913]);
-        let buf = kbuffer(&rendered);
+        let buf = KBuffer::of(&rendered).cells();
         let s_along = em.align_sd(term_classes(&v, &buf, &[0], &em)[0], false).hypot(em.front_shift_sd(el.r));
         let ed = |shift: f64, level: f64| -> f64 {
-            buf.iter().map(|(&cell, ls)| {
+            buf.iter().map(|&(cell, ref ls)| {
                 let echoes = v.echoes(cell);
                 let wt = em.cell_weight(echoes.first().map_or(ls[0].t, |&r| r as f64), v.step());
                 let w = v.direction((cell / v.n_cols) as f64, (cell % v.n_cols) as f64);

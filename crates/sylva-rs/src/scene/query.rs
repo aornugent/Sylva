@@ -6,11 +6,11 @@
 //! information and the divergence.
 
 use rayon::prelude::*;
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use super::dual::{Dual, Real};
 use super::pulse::{Outcome, mixture_ll, cell_view, front_echo, depth_sd, Surface, Pulse};
 use super::range_image::Cell;
-use super::render::{MOSTLY, Form, Element, Layer, placed, render, kbuffer, keep, front_shares, layer};
+use super::render::{MOSTLY, Form, Element, Layer, placed, render, keep, kept, front_shares, layer};
 use super::scene::Scene;
 use super::settings::Settings;
 use super::term::{Owner, owner, slots, term_nodes, term_classes, Term};
@@ -196,26 +196,27 @@ impl Scene {
     /// ([`Layer::full`]): a partial layer's evidence is the cost's, its prediction too faint to report.
     pub fn predict(&self, es: &[Element], s: usize) -> Vec<CellPrediction> {
         let (v, em) = (&*self.views[s], &self.em);
-        let full = |ls: Vec<(usize, Layer)>| ls.into_iter().filter(|(_, l)| l.full()).collect::<Vec<_>>();
-        let mut per: Vec<Vec<(usize, Layer)>> = es.iter().enumerate().map(|(k, e)| full(render(v, e, k as u32, em))).collect();
-        let cells: HashSet<usize> = per.iter().flatten().map(|&(c, _)| c).collect();
-        let mut els = es.to_vec();
-        let n = self.elems.len() as u32;
-        let mut owners: Vec<Owner> = es.iter().enumerate().map(|(k, e)| owner(n + k as u32, e)).collect();
-        for (i, el) in self.elems.iter().enumerate() {
-            let Some(el) = el.as_ref() else { continue };
-            let k = per.len() as u32;
-            let l: Vec<(usize, Layer)> = self.rendered[s][i].iter().filter(|(c, l)| cells.contains(c) && l.full()).map(|&(c, ly)| (c, Layer { elem: k, ..ly })).collect();
-            if !l.is_empty() {
-                els.push(*el);
-                per.push(l);
-                owners.push(owner(i as u32, el));
+        // per cell they enter wholly, their layers and the scene's (numbered after them, in id order), kept
+        let mut cells: BTreeMap<usize, Vec<Layer>> = BTreeMap::new();
+        for (k, e) in es.iter().enumerate() {
+            for (c, l) in render(v, e, k as u32, em).into_iter().filter(|(_, l)| l.full()) {
+                cells.entry(c).or_default().push(l);
             }
         }
-        let buf = kbuffer(&per);
+        let buf = &self.buffers[s];
+        let ids: BTreeSet<u32> = cells.keys().flat_map(|&c| buf.get(c).iter().filter(|l| l.full()).map(|l| l.elem)).collect();
+        let at: HashMap<u32, u32> = ids.iter().enumerate().map(|(k, &i)| (i, (es.len() + k) as u32)).collect();
+        let cells: Vec<(usize, Vec<Layer>)> = cells.into_iter().map(|(c, mut ls)| {
+            ls.extend(buf.get(c).iter().filter(|l| l.full()).map(|l| Layer { elem: at[&l.elem], ..*l }));
+            (c, keep(ls))
+        }).collect();
+        let n = self.elems.len() as u32;
+        let els: Vec<Element> = es.iter().copied().chain(ids.iter().map(|&i| self.elems[i as usize].unwrap())).collect();
+        let owners: Vec<Owner> = es.iter().enumerate().map(|(k, e)| owner(n + k as u32, e)).chain(ids.iter().zip(&els[es.len()..]).map(|(&i, e)| owner(i, e))).collect();
         let other = v.epoch != self.ref_epoch;
-        let cls = term_classes(v, &buf, &slots(&owners), em);
-        let mut out: Vec<CellPrediction> = buf.iter().filter(|(&cell, ls)| (ls[0].elem as usize) < es.len() && v.cell[cell] != Cell::NoPulse).map(|(&cell, ls)| {
+        let cls = term_classes(v, &cells, &slots(&owners), em);
+        let mut out: Vec<CellPrediction> = cells.iter().filter(|(cell, ls)| (ls[0].elem as usize) < es.len() && v.cell[*cell] != Cell::NoPulse).map(|(cell, ls)| {
+            let cell = *cell;
             let ly = ls[0];
             let k = ly.elem as usize;
             let cv = cell_view(v, cell, ls.clone(), em, &self.sc, &self.ext);
@@ -389,14 +390,12 @@ impl Scene {
     /// nodes as the fit holds them: the shift along the beam (the held alignment's and the stem front shift's) and the
     /// reflectance level.
     pub(super) fn cells_of(&self, s: usize, ids: &[u32]) -> Vec<(usize, Vec<Layer>, Vec<(usize, &Term, [f64; 2])>)> {
-        let (v, fit, rendered) = (&*self.views[s], &self.fits[s], &self.rendered[s]);
-        let mut cells: Vec<usize> = ids.iter().flat_map(|&id| rendered[id as usize].iter().filter(|(_, l)| l.enters()).map(|(c, _)| *c)).collect();
+        let (v, fit) = (&*self.views[s], &self.fits[s]);
+        let mut cells: Vec<usize> = ids.iter().flat_map(|&id| self.entered[s][id as usize].iter().flatten().copied()).collect();
         cells.sort_unstable();
         cells.dedup();
         cells.into_iter().filter(|&c| v.cell[c] != Cell::NoPulse).filter_map(|cell| {
-            let mut ls: Vec<Layer> = self.cells[s][&cell].iter().map(|x| x.id).collect::<BTreeSet<u32>>().into_iter()
-                .map(|id| rendered[id as usize][rendered[id as usize].binary_search_by_key(&cell, |x| x.0).expect("an indexed layer")].1).collect();
-            keep(&mut ls, |l| l.t, |l| l.full());
+            let ls = kept(self.buffers[s].get(cell)).to_vec();
             let owners: Vec<(usize, &Term, [f64; 2])> = front_shares(&ls).iter().enumerate().filter(|(_, &w)| w > 0.0).filter_map(|(i, _)| {
                 let id = ls[i].elem;
                 let term = fit.terms.get(&owner(id, &self.elems[id as usize]?))?;
@@ -479,7 +478,7 @@ mod tests {
     use crate::scene::dual::Real;
     use crate::scene::foliage::Foliage;
     use crate::scene::pulse::Outcome;
-    use crate::scene::render::{Form, Class, Element, Layer, placed, render, render_all, layer};
+    use crate::scene::render::{Form, Class, Element, Layer, placed, render, render_all, layer, KBuffer};
     use crate::scene::settings::{Background, Settings};
     use crate::scene::term::elem_data;
     use super::super::fixtures::{cost, piece_of, pole_view, stick, thin_pole_view};
@@ -725,7 +724,7 @@ mod tests {
         let (em, sc) = (Settings::default(), Background::default());
         let es = [Element { r: 0.03, ..piece_of(-0.2, 0.0, Some(3)) }, Element { r: 0.015, ..piece_of(0.0, 0.2, Some(3)) }];
         let rendered = render_all(&v, &es, &em);
-        let d = elem_data(&v, &rendered, &es, &[0, 0], &[0, 1], 0, &em, &sc, &Foliage::uniform(sc.kappa), None);
+        let d = elem_data(&v, &KBuffer::of(&rendered).cells(), &es, &[0, 0], &[0, 1], 0, &em, &sc, &Foliage::uniform(sc.kappa), None);
         assert_eq!(d.len(), 1);
         let shared = Shared::new(1, &es, &em);
         for (k, e) in es.iter().enumerate() {

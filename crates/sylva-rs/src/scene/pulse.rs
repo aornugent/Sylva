@@ -127,7 +127,7 @@ pub(super) struct CellView<P = f64> {
     pub(super) empty: Pulse<P>,
 }
 
-/// Cell `cell` of image `v` with `layers` in front of it (nearest first, [`keep`]), read at the cell's surface class
+/// Cell `cell` of image `v` with `layers` in front of it (nearest first, [`kept`]), read at the cell's surface class
 /// ([`cell_class`]), against the foliage field `ext` and the background's ground.
 pub(super) fn cell_view<P: Real>(v: &RangeImage, cell: usize, layers: Vec<Layer<P>>, em: &Settings, sc: &Background, ext: &Foliage) -> CellView<P> {
     let (obs, ground, w) = obs_ground(v, cell, sc);
@@ -641,8 +641,7 @@ mod tests {
     use std::collections::HashMap;
     use std::sync::Arc;
     use crate::scene::foliage::{Foliage, FoliageBox};
-    use crate::scene::range_image::Cell;
-    use crate::scene::render::{Form, Class, Element, Layer, render_all, kbuffer};
+    use crate::scene::render::{Form, Class, Element, Layer, KBuffer, render_all};
     use crate::scene::settings::{Background, Settings};
     use crate::scene::term::elem_data;
     use super::super::fixtures::{cost, pole_scan, pole_view, stick};
@@ -746,9 +745,8 @@ mod tests {
         let ext = Foliage::uniform(sc.kappa);
         let bases = |e: Element| -> HashMap<usize, f64> {
             let rendered = render_all(&v, &[e], &em);
-            let d = elem_data(&v, &rendered, &[e], &[0], &[0], 0, &em, &sc, &ext, None);
-            let cells: Vec<usize> = { let mut c: Vec<usize> = kbuffer(&rendered).keys().copied().collect(); c.sort_unstable(); c.retain(|&k| v.cell[k] != Cell::NoPulse); c };
-            cells.into_iter().zip(d[0].cells.iter().map(|c| c.base)).collect()
+            let d = elem_data(&v, &KBuffer::of(&rendered).cells(), &[e], &[0], &[0], 0, &em, &sc, &ext, None);
+            d[0].cells.iter().map(|c| (c.cell, c.base)).collect()
         };
         let (a, b) = (bases(stick(0.0, 4.0, 0.03)), bases(Element { opacity: 0.4, ..stick(0.005, 4.05, 0.045) }));
         let common: Vec<&usize> = a.keys().filter(|k| b.contains_key(k)).collect();
@@ -785,7 +783,7 @@ mod tests {
         let (em, sc) = (Settings::default(), Background::default());
         let es = [stick(0.0, 4.0, 0.03), Element { opacity: 0.4, ..stick(0.03, 3.9, 0.045) }];
         let rendered = render_all(&v, &es, &em);
-        let data = elem_data(&v, &rendered, &es, &[0, 1], &[0, 1], 0, &em, &sc, &Foliage::uniform(sc.kappa), None);
+        let data = elem_data(&v, &KBuffer::of(&rendered).cells(), &es, &[0, 1], &[0, 1], 0, &em, &sc, &Foliage::uniform(sc.kappa), None);
         let mut out: Vec<Pulse> = data.into_iter().flat_map(|d| d.cells.into_iter().flat_map(|c| c.pulses.into_iter().map(|p| p.1))).collect();
         let spec = FoliageBox { lo: [-0.5, 4.0, -0.5], hi: [0.5, 5.0, 0.5], voxel: 1.0 };
         let dense = Foliage { kappa: 0.05, spec: Some(spec), post: HashMap::from([([0, 0, 0], (5.0, 1.0))]) };

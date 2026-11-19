@@ -24,7 +24,7 @@ use std::sync::Arc;
 use super::alignment::{hats, Reference, solve_alignment, Fit, Changes};
 use super::foliage::{self, FieldCounts, FixedHits, Foliage, FoliageBox};
 use super::range_image::RangeImage;
-use super::render::{Element, Layer, render, render_all, keep};
+use super::render::{Element, Layer, KBuffer, render, render_all, kept, keep, fronting, numbered};
 use super::settings::{Background, Settings, ALIGN_SPACING};
 use super::term::{Owner, owner, slots, ElemData, Term, elem_data};
 
@@ -123,46 +123,19 @@ pub struct Scene {
     pub(super) elems: Vec<Option<Element>>,
     /// Per group key, its live members' ids.
     pub(super) groups: HashMap<u32, BTreeSet<u32>>,
-    /// [image][id]: the element's layers (empty when removed or unseen).
-    pub(super) rendered: Vec<Vec<Vec<(usize, Layer)>>>,
-    /// [image]: per cell, the elements whose layers enter it ([`Entered`]).
-    pub(super) cells: Vec<HashMap<usize, Vec<Entered>>>,
+    /// [image]: its k-buffer, every element's layers by cell.
+    pub(super) buffers: Vec<KBuffer>,
+    /// [image][id]: the cells the element's layers enter ([`entered`]; none where the image renders none of it, or it
+    /// was removed).
+    pub(super) entered: Vec<Vec<Option<Vec<usize>>>>,
     /// [image]: its fit.
     pub(super) fits: Vec<Fit>,
 }
 
-/// An element's layer in a cell's index: its id, range and whether it is wholly in the cell ([`Layer::full`]).
-#[derive(Debug, Clone, Copy)]
-pub(super) struct Entered {
-    pub(super) id: u32,
-    pub(super) t: f64,
-    pub(super) full: bool,
-}
-
-impl Entered {
-    pub(super) fn of(id: u32, l: &Layer) -> Entered {
-        Entered { id, t: l.t, full: l.full() }
-    }
-}
-
-/// A cell's entered layers' elements, nearest first as its k-buffer keeps them ([`keep`]), and how many of the first
-/// have a front share ([`front_shares`]): those up to the first wholly in it.
-pub(super) fn kept(mut e: Vec<Entered>) -> (Vec<u32>, usize) {
-    keep(&mut e, |x| x.t, |x| x.full);
-    let owners = e.iter().position(|x| x.full).map_or(e.len(), |i| i + 1);
-    (e.into_iter().map(|x| x.id).collect(), owners)
-}
-
-/// Enter an element's layers in one image's cell index ([`Layer::enters`]), or take them out.
-pub(super) fn index(cells: &mut HashMap<usize, Vec<Entered>>, id: u32, layers: &[(usize, Layer)], enter: bool) {
-    for (c, l) in layers.iter().filter(|(_, l)| l.enters()) {
-        let e = cells.entry(*c).or_default();
-        if enter {
-            e.push(Entered::of(id, l));
-        } else {
-            e.retain(|x| x.id != id);
-        }
-    }
+/// Element `id`'s layers `ls` entered in a k-buffer: the cells they enter, none where the image renders none of it (an
+/// element rendered there is in its scan's terms even where no layer enters a cell).
+pub(super) fn entered(buf: &mut KBuffer, id: u32, ls: &[(usize, Layer)]) -> Option<Vec<usize>> {
+    (!ls.is_empty()).then(|| buf.enter(id, ls))
 }
 
 /// The change to the foliage field's counts were a term `old` replaced by `new` (none: no term), added to `acc`: its
@@ -190,18 +163,16 @@ impl Scene {
     /// A scene of `elems` against `views`, the alignment error's spread stated for the scans of epoch `ref_epoch`; with `spec`, the foliage
     /// field is estimated in its box as the residual of the elements, otherwise it is the background's κ.
     pub fn new(views: Vec<Arc<RangeImage>>, elems: &[Element], em: Settings, sc: Background, spec: Option<FoliageBox>, ref_epoch: u32) -> Self {
-        let n = views.len();
         let mut c = Scene { views, em, sc, ext: Foliage::uniform(sc.kappa), field: None, ref_epoch, elems: elems.iter().map(|e| Some(*e)).collect(),
-                             groups: HashMap::new(), rendered: Vec::new(), cells: vec![HashMap::new(); n], fits: Vec::new() };
+                             groups: HashMap::new(), buffers: Vec::new(), entered: Vec::new(), fits: Vec::new() };
         for (i, e) in elems.iter().enumerate() {
             c.join(i as u32, e);
         }
-        c.rendered = c.views.par_iter().map(|v| render_all(v, elems, &c.em)).collect();
-        for (cells, rendered) in c.cells.iter_mut().zip(&c.rendered) {
-            for (i, ls) in rendered.iter().enumerate() {
-                index(cells, i as u32, ls, true);
-            }
-        }
+        (c.buffers, c.entered) = c.views.par_iter().map(|v| {
+            let mut b = KBuffer::default();
+            let cells = render_all(v, elems, &c.em).iter().enumerate().map(|(i, ls)| entered(&mut b, i as u32, ls)).collect();
+            (b, cells)
+        }).unzip();
         c.field = spec.map(|sp| FieldCounts::new(sp, &c.views.iter().map(|v| &**v).collect::<Vec<_>>(), &em));
         c.refit_alignment();
         if c.field.is_some() {
@@ -277,12 +248,6 @@ impl Scene {
                 self.groups.remove(&e.group.unwrap());
             }
         }
-    }
-
-    /// Image `s`'s cell index after element `id`'s layers `old` give way to `new`.
-    pub(super) fn reindex(&mut self, s: usize, id: u32, old: &[(usize, Layer)], new: &[(usize, Layer)]) {
-        index(&mut self.cells[s], id, old, false);
-        index(&mut self.cells[s], id, new, true);
     }
 
     /// Change the field's counts by `delta` (deposits given back and taken): the change in its part of the cost.
@@ -424,9 +389,9 @@ impl Scene {
         }
         let (mut d, mut delta) = (0.0, FixedHits::default());
         for (s, (ls, ch)) in layers.into_iter().zip(changes).enumerate() {
-            for (k, l) in ls.into_iter().enumerate() {
-                self.reindex(s, first + k as u32, &[], &l);
-                self.rendered[s].push(l);
+            for (k, l) in ls.iter().enumerate() {
+                let cells = entered(&mut self.buffers[s], first + k as u32, l);
+                self.entered[s].push(cells);
             }
             d += self.apply(s, ch, &mut delta);
         }
@@ -437,13 +402,14 @@ impl Scene {
     pub fn remove(&mut self, id: u32) -> f64 {
         let first = self.elems.len() as u32;
         let changes: Vec<Changes> = (0..self.views.len()).into_par_iter()
-            .map(|s| if self.rendered[s][id as usize].is_empty() { Changes::default() } else { self.reterm(s, &[id], &[], first) }).collect();
+            .map(|s| if self.entered[s][id as usize].is_none() { Changes::default() } else { self.reterm(s, &[id], &[], first) }).collect();
         let gone = self.elems[id as usize].take().expect("a live element");
         self.leave(id, &gone);
         let (mut d, mut delta) = (0.0, FixedHits::default());
         for (s, ch) in changes.into_iter().enumerate() {
-            let old = std::mem::take(&mut self.rendered[s][id as usize]);
-            self.reindex(s, id, &old, &[]);
+            if let Some(old) = self.entered[s][id as usize].take() {
+                self.buffers[s].leave(id, &old);
+            }
             d += self.apply(s, ch, &mut delta);
         }
         d + self.give(delta)
@@ -454,16 +420,17 @@ impl Scene {
         let em = self.em;
         let layers: Vec<Vec<(usize, Layer)>> = self.views.par_iter().map(|v| render(v, &e, id, &em)).collect();
         let changes: Vec<Changes> = (0..self.views.len()).into_par_iter().map(|s| {
-            if layers[s].is_empty() && self.rendered[s][id as usize].is_empty() { Changes::default() } else { self.reterm(s, &[id], &[(e, layers[s].clone())], id) }
+            if layers[s].is_empty() && self.entered[s][id as usize].is_none() { Changes::default() } else { self.reterm(s, &[id], &[(e, layers[s].clone())], id) }
         }).collect();
         let old = self.elems[id as usize].replace(e).expect("a live element");
         self.leave(id, &old);
         self.join(id, &e);
         let (mut d, mut delta) = (0.0, FixedHits::default());
         for (s, (l, ch)) in layers.into_iter().zip(changes).enumerate() {
-            let old = std::mem::take(&mut self.rendered[s][id as usize]);
-            self.reindex(s, id, &old, &l);
-            self.rendered[s][id as usize] = l;
+            if let Some(old) = self.entered[s][id as usize].take() {
+                self.buffers[s].leave(id, &old);
+            }
+            self.entered[s][id as usize] = entered(&mut self.buffers[s], id, &l);
             d += self.apply(s, ch, &mut delta);
         }
         d + self.give(delta)
@@ -487,14 +454,13 @@ impl Scene {
         fit.cost - before
     }
 
-    /// Scan `s`'s data for every live element it sees ([`elem_data`]), each term with its owner.
+    /// Scan `s`'s data for every live element whose layers enter its cells ([`elem_data`]), each term with its owner.
     pub(super) fn data(&self, s: usize) -> Vec<(Owner, ElemData)> {
-        let ids: Vec<u32> = (0..self.elems.len() as u32).filter(|&i| self.elems[i as usize].is_some() && !self.rendered[s][i as usize].is_empty()).collect();
+        let mut ids: Vec<u32> = (0..self.elems.len() as u32).filter(|&i| self.entered[s][i as usize].is_some()).collect();
+        let cells = numbered(self.buffers[s].cells(), &mut ids);
         let elems: Vec<Element> = ids.iter().map(|&i| self.elems[i as usize].unwrap()).collect();
-        let rendered: Vec<Vec<(usize, Layer)>> = ids.iter().enumerate()
-            .map(|(k, &i)| self.rendered[s][i as usize].iter().map(|&(c, l)| (c, Layer { elem: k as u32, ..l })).collect()).collect();
         let owners: Vec<Owner> = ids.iter().zip(&elems).map(|(&i, e)| owner(i, e)).collect();
-        let data = elem_data(&self.views[s], &rendered, &elems, &slots(&owners), &(0..ids.len()).collect::<Vec<_>>(), self.ref_epoch, &self.em, &self.sc, &self.ext,
+        let data = elem_data(&self.views[s], &cells, &elems, &slots(&owners), &(0..ids.len()).collect::<Vec<_>>(), self.ref_epoch, &self.em, &self.sc, &self.ext,
                              self.field.as_ref().map(|f| &f.spec));
         data.into_iter().map(|d| (owners[d.members[0]], d)).collect()
     }
@@ -518,35 +484,27 @@ impl Scene {
     /// together, so every present member of a group one of those (or an element taken out) belongs to is rescored with
     /// it, and its pooled evidence never goes stale.
     pub(super) fn reterm(&self, s: usize, without: &[u32], with: &[(Element, Vec<(usize, Layer)>)], first: u32) -> Changes {
-        let mut fresh: HashMap<usize, Vec<Entered>> = HashMap::new();
-        for (k, (_, ls)) in with.iter().enumerate() {
-            for (c, l) in ls.iter().filter(|(_, l)| l.enters()) {
-                fresh.entry(*c).or_default().push(Entered::of(first + k as u32, l));
-            }
-        }
-        let touched: HashSet<usize> = without.iter().flat_map(|&w| self.rendered[s][w as usize].iter()).filter(|(_, l)| l.enters()).map(|(c, _)| *c)
-            .chain(fresh.keys().copied()).collect();
-        let with: Vec<(Element, &[(usize, Layer)])> = with.iter().map(|(e, ls)| (*e, &ls[..])).collect();
+        let mut fresh = KBuffer::default();
+        let cells: Vec<Option<Vec<usize>>> = with.iter().enumerate().map(|(k, (_, ls))| entered(&mut fresh, first + k as u32, ls)).collect();
+        let touched: HashSet<usize> = without.iter().flat_map(|&w| self.entered[s][w as usize].iter().flatten()).chain(cells.iter().flatten().flatten()).copied().collect();
+        let with: Vec<(Element, Option<&[usize]>)> = with.iter().zip(&cells).map(|((e, _), c)| (*e, c.as_deref())).collect();
         let start: Vec<u32> = (0..with.len() as u32).map(|k| first + k).collect();
-        self.terms_after(s, without, &with, first, &|c| fresh.get(&c).cloned().unwrap_or_default(), &touched, &start, None)
+        self.terms_after(s, without, &with, first, &|c| fresh.get(c).to_vec(), &touched, &start, None)
     }
 
     /// [`Scene::reterm`]'s rule, for a move that touches the cells `touched` and adds the elements `start` (its
-    /// elements `with` put in from `first`, their entered layers in a cell `fresh`), leaving out the term of `skip`
-    /// (a chain grown beside the scene: [`super::chain`], which keeps its own term).
+    /// elements `with` put in from `first`, each with the cells it enters ([`entered`]); their layers in a cell `fresh`), leaving out
+    /// the term of `skip` (a chain grown beside the scene: [`super::chain`], which keeps its own term).
     #[allow(clippy::too_many_arguments)]
-    pub(super) fn terms_after(&self, s: usize, without: &[u32], with: &[(Element, &[(usize, Layer)])], first: u32, fresh: &dyn Fn(usize) -> Vec<Entered>,
+    pub(super) fn terms_after(&self, s: usize, without: &[u32], with: &[(Element, Option<&[usize]>)], first: u32, fresh: &dyn Fn(usize) -> Vec<Layer>,
                               touched: &HashSet<usize>, start: &[u32], skip: Option<Owner>) -> Changes {
-        let (v, em, fit, index) = (&*self.views[s], &self.em, &self.fits[s], &self.cells[s]);
+        let (v, em, fit, buf) = (&*self.views[s], &self.em, &self.fits[s], &self.buffers[s]);
         let added = |i: u32| i >= first && ((i - first) as usize) < with.len();
-        let layers = |i: u32| -> &[(usize, Layer)] { if added(i) { with[(i - first) as usize].1 } else { &self.rendered[s][i as usize] } };
+        let entered = |i: u32| -> Option<&[usize]> { if added(i) { with[(i - first) as usize].1 } else { self.entered[s][i as usize].as_deref() } };
         let element = |i: u32| if added(i) { with[(i - first) as usize].0 } else { self.elems[i as usize].unwrap() };
-        let present = |i: u32| !layers(i).is_empty() && (added(i) || !without.contains(&i)) && Some(owner(i, &element(i))) != skip;
-        let fronting = |i: u32| layers(i).iter().filter(|(_, l)| l.enters()).map(|(c, _)| *c);
-        // a cell's k-buffer, before the move and after it: its elements, nearest first, and how many have a front share
-        let before = |c: usize| kept(index.get(&c).cloned().unwrap_or_default());
-        let after = |c: usize| kept(index.get(&c).into_iter().flatten().filter(|x| !without.contains(&x.id) && !added(x.id))
-            .copied().chain(fresh(c)).collect());
+        let present = |i: u32| entered(i).is_some() && (added(i) || !without.contains(&i)) && Some(owner(i, &element(i))) != skip;
+        // a cell's k-buffer after the move
+        let after = |c: usize| keep(buf.get(c).iter().filter(|l| !without.contains(&l.elem) && !added(l.elem)).copied().chain(fresh(c)).collect());
         let owner_of = |i: u32| owner(i, &element(i));
         // every present member of the groups of `ids` and of the elements taken out
         let whole = |ids: &mut BTreeSet<u32>| {
@@ -558,30 +516,24 @@ impl Scene {
             ids.extend((0..with.len() as u32).filter(|&k| with[k as usize].0.group.is_some_and(|g| groups.contains(&g))).map(|k| first + k));
             ids.retain(|&i| present(i));
         };
-        // the terms with a front share in the cells the move touches, and the elements it adds
+        // the terms with a front share in the cells the move touches, before it and after, and the elements it adds
         let mut near: BTreeSet<u32> = start.iter().copied().collect();
         for &c in touched {
-            for (ids, n) in [before(c), after(c)] {
-                near.extend(&ids[..n]);
-            }
+            let (before, after) = (kept(buf.get(c)), after(c));
+            near.extend(before[..fronting(before)].iter().chain(&after[..fronting(&after)]).map(|l| l.elem));
         }
         near.retain(|&i| present(i));
         whole(&mut near);
-        // those terms' elements and every layer in the cells they front, numbered from 0 (the context after them)
-        let mut cells: Vec<usize> = near.iter().flat_map(|&i| fronting(i)).collect();
+        // the cells those terms enter, with their k-buffers after the move, numbered from 0: those terms' elements, then
+        // the context as it comes
+        let mut cells: Vec<usize> = near.iter().flat_map(|&i| entered(i).into_iter().flatten()).copied().collect();
         cells.sort_unstable();
         cells.dedup();
         let mut ids: Vec<u32> = near.iter().copied().collect();
-        let mut seen: HashSet<u32> = near.iter().copied().collect();
-        for &c in &cells {
-            ids.extend(after(c).0.into_iter().filter(|&i| seen.insert(i)));
-        }
-        let cells: HashSet<usize> = cells.into_iter().collect();
-        let r: Vec<Vec<(usize, Layer)>> = ids.iter().enumerate()
-            .map(|(k, &i)| layers(i).iter().filter(|(c, _)| cells.contains(c)).map(|&(c, l)| (c, Layer { elem: k as u32, ..l })).collect()).collect();
+        let cells = numbered(cells.into_iter().map(|c| (c, after(c))).collect(), &mut ids);
         let el: Vec<Element> = ids.iter().map(|&i| element(i)).collect();
         let owners: Vec<Owner> = ids.iter().map(|&i| owner_of(i)).collect();
-        let data = elem_data(v, &r, &el, &slots(&owners), &(0..near.len()).collect::<Vec<_>>(), self.ref_epoch, em, &self.sc, &self.ext,
+        let data = elem_data(v, &cells, &el, &slots(&owners), &(0..near.len()).collect::<Vec<_>>(), self.ref_epoch, em, &self.sc, &self.ext,
                              self.field.as_ref().map(|f| &f.spec));
         // a held term's own nodes start where its reference's did, so an unchanged term is recomputed exactly
         let mut terms: Vec<(Owner, Option<Term>)> = data.par_iter().map(|d| {
@@ -618,7 +570,7 @@ impl Scene {
             let layers: Vec<Vec<Vec<(usize, Layer)>>> = self.views.iter().map(|v| h.iter().map(|e| render(v, e, 0, &self.em)).collect()).collect();
             let mut delta = FixedHits::default();
             let mut out: Vec<f64> = layers.iter().enumerate().map(|(s, ls)| {
-                if ls.iter().all(Vec::is_empty) && without.iter().all(|&w| self.rendered[s][w as usize].is_empty()) {
+                if ls.iter().all(Vec::is_empty) && without.iter().all(|&w| self.entered[s][w as usize].is_none()) {
                     return 0.0;
                 }
                 let with: Vec<(Element, Vec<(usize, Layer)>)> = h.iter().copied().zip(ls.iter().cloned()).collect();
@@ -662,9 +614,9 @@ impl Scene {
                     }
                     for (c, _) in l.iter().filter(|(_, l)| l.enters()) {
                         cells.entry((false, *c as u64)).or_default().insert(k as u32);
-                        let (ids, n) = kept(self.cells[s].get(c).cloned().unwrap_or_default());
-                        for &o in &ids[..n] {
-                            cells.entry((true, term(owner(o, &self.elems[o as usize].unwrap())))).or_default().insert(k as u32);
+                        let ls = kept(self.buffers[s].get(*c));
+                        for o in &ls[..fronting(ls)] {
+                            cells.entry((true, term(owner(o.elem, &self.elems[o.elem as usize].unwrap())))).or_default().insert(k as u32);
                         }
                     }
                 }

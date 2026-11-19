@@ -13,8 +13,8 @@
 //!   Opacity is the chance a pulse the section fills meets solid there, its gaps wider than the footprint (synthesis
 //!   §1's "extent, opacity"). The mismatch is the sd of the section's and axis's
 //!   departure from the form, which blurs the fill and spreads the depth.
-//! - **The k-buffer:** each element renders into each view's cells. A cell keeps its layers, nearest first, up to the
-//!   [`K`]th wholly in it ([`keep`]), each with a depth, a depth spread, a fill and a cosine. Fill is the beam (a uniform disc of the
+//! - **The k-buffer** ([`KBuffer`]): each element renders into each view's cells. A cell keeps its layers, nearest first, up to the
+//!   [`K`]th wholly in it ([`kept`]), each with a depth, a depth spread, a fill and a cosine. Fill is the beam (a uniform disc of the
 //!   footprint's diameter, as AM's raw edges measure it) convolved with the section, at three section radii over
 //!   the mismatch; an echo's chance is the detection's mean over them. Along a stick's axis it is cut square, so a
 //!   chain of sticks joins without seams.
@@ -371,31 +371,98 @@ pub(super) fn render_all(v: &RangeImage, elems: &[Element], em: &Settings) -> Ve
     elems.par_iter().enumerate().map(|(i, e)| render(v, e, i as u32, em)).collect()
 }
 
-/// The k-buffer of one view: per touched cell, the layers that enter it ([`Layer::enters`]), nearest first ([`keep`]).
-pub(super) fn kbuffer(per: &[Vec<(usize, Layer)>]) -> HashMap<usize, Vec<Layer>> {
-    let mut buf: HashMap<usize, Vec<Layer>> = HashMap::new();
-    for &(cell, ly) in per.iter().flatten() {
-        if ly.enters() {
-            buf.entry(cell).or_default().push(ly);
+/// One view's k-buffer, kept as its elements move: per cell, every layer that enters it ([`Layer::enters`]), its
+/// element's id in `elem`, nearest first (ties by id: [`order`]). A cell's pulse reads them up to the [`K`]th wholly
+/// in it ([`kept`]); a move takes an element's layers out by the cells [`KBuffer::enter`] gave for it.
+#[derive(Debug, Clone, Default)]
+pub(super) struct KBuffer(HashMap<usize, Vec<Layer>>);
+
+impl KBuffer {
+    /// The k-buffer of elements' layers, `per[i]` element i's.
+    pub(super) fn of(per: &[Vec<(usize, Layer)>]) -> KBuffer {
+        let mut b = KBuffer::default();
+        for (i, ls) in per.iter().enumerate() {
+            b.enter(i as u32, ls);
+        }
+        b
+    }
+
+    /// Enter element `id`'s layers: the cells they enter, in the layers' order.
+    pub(super) fn enter(&mut self, id: u32, layers: &[(usize, Layer)]) -> Vec<usize> {
+        layers.iter().filter(|(_, l)| l.enters()).map(|&(c, l)| {
+            let l = Layer { elem: id, ..l };
+            let ls = self.0.entry(c).or_default();
+            ls.insert(ls.partition_point(|x| order(x, &l).is_lt()), l);
+            c
+        }).collect()
+    }
+
+    /// Take element `id`'s layers out of `cells`, those [`KBuffer::enter`] gave for it.
+    pub(super) fn leave(&mut self, id: u32, cells: &[usize]) {
+        for c in cells {
+            let ls = self.0.get_mut(c).expect("a cell the element entered");
+            ls.retain(|l| l.elem != id);
+            if ls.is_empty() {
+                self.0.remove(c);
+            }
         }
     }
-    for ls in buf.values_mut() {
-        keep(ls, |l| l.t, |l| l.full());
+
+    /// Cell `cell`'s layers, nearest first (none where no layer enters it).
+    pub(super) fn get(&self, cell: usize) -> &[Layer] {
+        self.0.get(&cell).map_or(&[], Vec::as_slice)
     }
-    buf
+
+    /// Every cell, in index order, with its layers as its pulse reads them ([`kept`]).
+    pub(super) fn cells(&self) -> Vec<(usize, Vec<Layer>)> {
+        let mut out: Vec<(usize, Vec<Layer>)> = self.0.iter().map(|(&c, ls)| (c, kept(ls).to_vec())).collect();
+        out.sort_unstable_by_key(|x| x.0);
+        out
+    }
 }
 
-/// A cell's layers `xs` (range `t`; wholly in it or not, `full`) sorted nearest first, ties in their given order, up
-/// to the [`K`]th wholly in it: every subset of its mixture ([`mixture`]) reads its K nearest from these.
-pub(super) fn keep<X>(xs: &mut Vec<X>, t: impl Fn(&X) -> f64, full: impl Fn(&X) -> bool) {
-    xs.sort_by(|a, b| t(a).total_cmp(&t(b)));
+/// Cells' layers numbered from 0 by their elements: those of `ids` first, in its order, then the rest as they come
+/// (pushed onto `ids`), so each layer's `elem` indexes `ids`.
+pub(super) fn numbered(cells: Vec<(usize, Vec<Layer>)>, ids: &mut Vec<u32>) -> Vec<(usize, Vec<Layer>)> {
+    let mut at: HashMap<u32, u32> = ids.iter().enumerate().map(|(k, &i)| (i, k as u32)).collect();
+    cells.into_iter().map(|(c, ls)| (c, ls.into_iter().map(|l| {
+        let k = *at.entry(l.elem).or_insert_with(|| {
+            ids.push(l.elem);
+            ids.len() as u32 - 1
+        });
+        Layer { elem: k, ..l }
+    }).collect())).collect()
+}
+
+/// The k-buffer's order: nearer first, ties by element.
+pub(super) fn order(a: &Layer, b: &Layer) -> std::cmp::Ordering {
+    a.t.total_cmp(&b.t).then(a.elem.cmp(&b.elem))
+}
+
+/// A cell's layers (nearest first) up to the [`K`]th wholly in it: every subset of its mixture ([`mixture`]) reads
+/// its K nearest from these.
+pub(super) fn kept(ls: &[Layer]) -> &[Layer] {
     let mut n = 0;
-    if let Some(i) = xs.iter().position(|x| {
-        n += full(x) as usize;
+    match ls.iter().position(|l| {
+        n += l.full() as usize;
         n == K
     }) {
-        xs.truncate(i + 1);
+        Some(i) => &ls[..=i],
+        None => ls,
     }
+}
+
+/// A cell's layers gathered from several k-buffers, put in [`order`] and [`kept`].
+pub(super) fn keep(mut ls: Vec<Layer>) -> Vec<Layer> {
+    ls.sort_by(order);
+    let n = kept(&ls).len();
+    ls.truncate(n);
+    ls
+}
+
+/// How many of a cell's kept layers have a front share ([`front_shares`]): those up to its first wholly in it.
+pub(super) fn fronting(ls: &[Layer]) -> usize {
+    ls.iter().position(Layer::full).map_or(ls.len(), |i| i + 1)
 }
 
 /// A cell's likelihood as a mixture (3dtrees research 130 slice-trim): per subset of its partial layers
@@ -476,7 +543,7 @@ mod tests {
         let fills = |x: f64| -> HashMap<usize, f64> { render(&v, &at(x), 0, &em).into_iter().map(|(k, l)| (k, l.fq[2])).collect() };
         let xs: Vec<f64> = (0..=40).map(|i| 0.026 + 5e-5 * i as f64).collect();
         let (mut worst, mut n, mut shared) = (0.0f64, 0, false);
-        let both = |x: f64| kbuffer(&render_all(&v, &[stick(0.0, 4.0, 0.03), at(x)], &em));
+        let both = |x: f64| KBuffer::of(&render_all(&v, &[stick(0.0, 4.0, 0.03), at(x)], &em)).cells();
         for w in xs.windows(2) {
             let (f0, f1) = (fills(w[0]), fills(w[1]));
             for threshold in [MIN_FILL, FULL_FILL] {
@@ -490,7 +557,7 @@ mod tests {
                 }
                 worst = worst.max((cost(hi + 1e-12) - cost(lo - 1e-12)).abs());
                 n += 1;
-                shared |= [lo, hi].iter().any(|&x| both(x).values().any(|ls| !ls[0].full() && front_shares(ls).iter().filter(|&&s| s > 0.0).count() == 2));
+                shared |= [lo, hi].iter().any(|&x| both(x).iter().any(|(_, ls)| !ls[0].full() && front_shares(ls).iter().filter(|&&s| s > 0.0).count() == 2));
             }
         }
         assert!(n >= 4 && shared, "{n} crossings");
