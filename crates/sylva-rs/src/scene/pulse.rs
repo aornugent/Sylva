@@ -128,18 +128,14 @@ pub(super) struct CellView<P = f64> {
 }
 
 /// Cell `cell` of image `v` with `layers` in front of it (nearest first, [`keep`]), read at the cell's surface class
-/// ([`cell_class`]), against the foliage field `ext` and the background's ground. Each subset's pulse reads the medium
-/// behind its layers' fronts in their own voxels ([`Medium::behind`]: 3dtrees research 130 slice-pyramid's near-range
-/// rule); the empty scene's reads it whole.
+/// ([`cell_class`]), against the foliage field `ext` and the background's ground.
 pub(super) fn cell_view<P: Real>(v: &RangeImage, cell: usize, layers: Vec<Layer<P>>, em: &Settings, sc: &Background, ext: &Foliage) -> CellView<P> {
     let (obs, ground, w) = obs_ground(v, cell, sc);
     let at = if obs.is_finite() { P::c(obs) } else { front_shares(&layers).iter().zip(&layers).map(|(&s, l)| s * l.t).sum() };
     let wt = em.cell_weight(at, v.step());
     let (m, class) = (ext.medium(&v.origin, &w), cell_class(v, cell, em));
-    let pulses = mixture(&layers).into_iter().map(|(p, ls)| {
-        let mb = m.behind(&ls.iter().map(|l| l.t.v()).collect::<Vec<f64>>());
-        (p, Pulse::on(occluders(ls, ground), class, &mb, v.echoes(cell), v.echo_refls(cell), v.max_targets, em))
-    }).collect();
+    let pulses = mixture(&layers).into_iter()
+        .map(|(p, ls)| (p, Pulse::on(occluders(ls, ground), class, &m, v.echoes(cell), v.echo_refls(cell), v.max_targets, em))).collect();
     let empty = Pulse::on(occluders(Vec::new(), ground), class, &m, v.echoes(cell), v.echo_refls(cell), v.max_targets, em);
     CellView { obs, wt, pulses, empty }
 }

@@ -792,16 +792,30 @@ mod tests {
         assert_eq!(c.field.as_ref().unwrap().counts(), recounted(&c));
         c.change(0, pole);
         assert_eq!(c.cost(), e0);
-        // held against refitted, nats: 0.0004 nudged; 2.4 wrong (0.4 before the near-range rule: a pulse meets its
-        // element's own voxel only behind the element's front, so moving it a centimetre moves what of the held σ the
-        // pulses meet; 3dtrees research 130 slice-pyramid)
-        for (e, tol) in [(nudged, 0.01), (wrong, 3.0)] {
+        // held against refitted, nats: 0.0004 nudged, 0.4 wrong
+        for (e, tol) in [(nudged, 0.01), (wrong, 1.0)] {
             let mut c = Scene::new(vec![v.clone()], &[pole], em, sc, spec, 0);
             c.change(0, e);
             let held = c.cost();
             c.refit_foliage();
             assert!((held - c.cost()).abs() < tol, "held {held} vs refitted {}", c.cost());
         }
+    }
+
+    /// With a field held, the cost is smooth where an element's front crosses a voxel face (3dtrees research 130
+    /// slice-review: a rule that read the medium differently in front of an element in its own voxel stepped the cost
+    /// by about 0.28 nats there). The pole slid 1 cm along the beam in 25 µm steps, its front crossing the face at
+    /// y = 4.0 m against the empty scene's field (dense in the pole's voxels): its cost to add has no second
+    /// difference over 1e-3 nats.
+    #[test]
+    fn the_cost_is_continuous_across_a_voxel_face_with_a_field_held() {
+        let v = pole_view();
+        let (em, sc) = (Settings::default(), Background::default());
+        let c = Scene::new(vec![v.clone()], &[], em, sc, Some(field_box()), 0);
+        let hyps: Vec<Vec<Element>> = (0..=400).map(|i| vec![stick(0.0, 4.025 + 2.5e-5 * i as f64, 0.03)]).collect();
+        let costs: Vec<f64> = c.costs_to_add(&hyps).iter().map(|r| r.iter().sum()).collect();
+        let worst = costs.windows(3).map(|w| (w[0] - 2.0 * w[1] + w[2]).abs()).fold(0.0, f64::max);
+        assert!(worst < 1e-3, "a second difference of {worst} nats");
     }
 
     /// Many hypotheses at once: each one's cost per scan, and the foliage field's part, sum to adding then removing

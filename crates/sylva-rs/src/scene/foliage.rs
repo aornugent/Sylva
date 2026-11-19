@@ -26,9 +26,6 @@
 //!   alike (3dtrees research 130 slice 2c: one medium, read the same at every point of a pulse; the Gamma–Poisson
 //!   predictive it replaces read each cell as a draw of its own). That part isn't conjugate (the merge share is a
 //!   calibrated map, not a likelihood in σ), so it stays this first-order reading, held between refits (below).
-//!   In an element's own voxel the pulse meets σ only behind the element's front, κ in front of it (the near-range
-//!   rule, 3dtrees research 130 slice-pyramid: σ is the voxel's mean, and what of it the element's voxel holds, the
-//!   rest of its branch and its foliage, lies about it, not in front of it; [`Medium::behind`]).
 //! - **A pulse's echo sequence:** every echo is a hit, and the path up to it is transmission, from the origin for the
 //!   first and from the previous echo plus the receiver's resolution after that (a surface closer behind an echo would
 //!   have merged with it: [`Settings::resolution`]). The report is the first K returns in time (research 130 slice
@@ -229,25 +226,6 @@ impl Medium {
         let i = self.segs.partition_point(|s| s[0] < t.v());
         let past = if i == 0 { P::c(0.0) } else { let s = self.segs[i - 1]; (t.min(s[1]) - s[0]) * (s[2] - self.kappa) + s[3] };
         t * self.kappa + past
-    }
-
-    /// The medium read only behind the nearest of `fronts` (ranges) in the voxel each lies in (3dtrees research 130
-    /// slice-pyramid: the field's σ is a voxel's mean, and the part of it an element's own voxel holds lies about the
-    /// element, not in front of it): that voxel's stretch in front of the front reads κ, the rest its σ.
-    pub fn behind(&self, fronts: &[f64]) -> Medium {
-        let mut segs = Vec::with_capacity(self.segs.len() + fronts.len());
-        let mut before = 0.0;
-        for s in &self.segs {
-            let cut = fronts.iter().copied().filter(|&t| t > s[0] && t < s[1]).fold(f64::INFINITY, f64::min);
-            if cut.is_finite() {
-                segs.push([s[0], cut, self.kappa, before]);
-                segs.push([cut, s[1], s[2], before]);
-            } else {
-                segs.push([s[0], s[1], s[2], before]);
-            }
-            before += (s[2] - self.kappa) * (s[1] - if cut.is_finite() { cut } else { s[0] });
-        }
-        Medium { kappa: self.kappa, segs }
     }
 
     /// The hazard of an echo at range `t`: σ in the voxel the ray is in there (κ outside the box).
