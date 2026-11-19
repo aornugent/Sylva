@@ -51,12 +51,11 @@
 //!   it from the pass over its pulse at its term's nodes, shared among a cell's terms by their front shares (a
 //!   term's [`Deposit`]). So each echo's mass sums to one between the field and the elements, and nothing about an
 //!   element is set aside. The empty scene's counts read every echo as the medium's.
-//! - **Held during moves** ([`FieldCounts`]), as the scan alignment is: a move changes the deposits of the terms it
-//!   recomputes (each term's old deposit back, its new one out), and the field's term with them, exactly; what a pulse
-//!   meets stays the field of the last refit (the responsibilities read it), so the cost is a function of the scene
-//!   and that reference, not of the moves that led to it. `refit_foliage` re-reads it from the counts: one step of EM
-//!   (the responsibilities given the field, then the field given them). The field's own term is never stale; only
-//!   that reading is held.
+//! - **Through moves** ([`FieldCounts`]): a move changes the deposits of the terms it recomputes (each term's old
+//!   deposit back, its new one out), and the field's term with them, exactly; what a pulse meets is the field fixed at
+//!   the scene's build (one step of EM: the responsibilities given κ, then the field given them), so the cost is a
+//!   function of the scene and that field, not of the moves that led to it. The field's own term is never stale; only
+//!   that reading is fixed.
 //! - **Counts and the term are fixed point** ([`FIXED`]): integer sums are exact in any order, so a move and its undo
 //!   restore them exactly and a count over threads is reproducible.
 use super::dual::Real;

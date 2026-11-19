@@ -25,9 +25,8 @@
 //! - **The foliage field:** `foliage` is a dict `lo`, `hi` (the box, 3 each) and `voxel` (m; its prior is the
 //!   settings' `field_prior_*`); the field is then what the elements leave of each echo there (`FoliageBox`; soft
 //!   attribution, 3dtrees research 130 slice-soft), its marginal in
-//!   the cost and what a pulse meets of it held through moves. `refit_foliage()`,
-//!   `promote(element)` and `demote(id)` move mass between the field and the elements; `foliage_voxels()` gives it
-//!   per voxel and `transmission(image, cells)` its optical depth across the box along other images' rays.
+//!   the cost, exact through moves, and what a pulse meets of it fixed at the build (one step of EM from the
+//!   background) or held from another scene (`hold_foliage`); `foliage_voxels()` gives it per voxel and `transmission(image, cells)` its optical depth across the box along other images' rays.
 
 use numpy::{IntoPyArray, PyArray1, PyArray2, PyArray3, PyArrayMethods, PyReadonlyArray1, PyReadonlyArray2};
 use pyo3::exceptions::PyValueError;
@@ -537,31 +536,11 @@ impl PyScene {
         Ok(PyScene { inner: py.detach(|| Scene::new(vs, &el, em, bg, spec, ref_epoch)), em })
     }
 
-    /// Re-solve the foliage field from what the elements leave of the rays (one step of EM): the cost change.
-    fn refit_foliage(&mut self, py: Python<'_>) -> f64 {
-        let c = &mut self.inner;
-        py.detach(|| c.refit_foliage())
-    }
-
     /// Hold `other`'s foliage field fixed (estimated from its scans, e.g. the training scans): the cost change.
     fn hold_foliage(&mut self, py: Python<'_>, other: PyRef<'_, PyScene>) -> f64 {
         let ext = other.inner.foliage_field().clone();
         let c = &mut self.inner;
         py.detach(|| c.hold_foliage(&ext))
-    }
-
-    /// Add one element and take the mass it explains out of the foliage field: its id and the cost change.
-    fn promote(&mut self, py: Python<'_>, element: &Bound<'_, PyDict>) -> PyResult<(u32, f64)> {
-        let e = self.one(element)?;
-        let c = &mut self.inner;
-        Ok(py.detach(|| c.promote(e)))
-    }
-
-    /// Remove an element and give its mass back to the foliage field: the cost change.
-    fn demote(&mut self, py: Python<'_>, id: u32) -> PyResult<f64> {
-        self.inner.check_id(id).map_err(scene_err)?;
-        let c = &mut self.inner;
-        Ok(py.detach(|| c.demote(id)))
     }
 
     /// The foliage field per voxel with counts: voxel (n, 3, its index in the box), centre (n, 3), sigma (1/m, as

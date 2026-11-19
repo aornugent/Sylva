@@ -96,15 +96,16 @@ impl std::error::Error for SceneError {}
 ///   `change`) and queries (`costs_to_add`, `costs_to_remove`, `information`) hold the alignment ([`Held`]): its mode
 ///   and precision stay as the last refit left them, and a move's change to them is a rank-k correction on the nodes
 ///   it touches. So a move recomputes only the terms of the elements whose cells it touches, not the scan, and
-///   removing an element restores the cost exactly (synthesis §18 invariant 7). [`Scene::refit_alignment`] re-solves the alignment (a move like `refit_foliage`), after which
-///   the cost is the exact Laplace marginal ([`Scene::exact_cost`], the referee); the scene is built refitted.
+///   removing an element restores the cost exactly (synthesis §18 invariant 7). [`Scene::refit_alignment`] re-solves
+///   the alignment (a move), after which the cost is the exact Laplace marginal ([`Scene::exact_cost`], the referee);
+///   the scene is built refitted.
 /// - With a foliage field, each term's deposit (the hits its elements take from the field, [`Term`]'s `deposit`)
-///   changes with the term, so a move changes the field's counts by its terms' old deposits less their new ones. A scene
-///   is built by one step of EM from κ: the terms read the background, their deposits make the field, and the terms read
-///   it ([`Scene::refit_foliage`] is another step). The first step carries nearly all of EM's change (3dtrees research
-///   130 rca-em: the stand's 1,893 of 2,028 nats, AM's all but 0.13), so **compare fresh builds with fresh builds**: a
-///   scene refitted further, or reached by moves and refits, sits a few tens of nats from a fresh build of the same
-///   elements on the stand.
+///   changes with the term, so a move changes the field's counts by its terms' old deposits less their new ones, and
+///   the field's term with them, exactly. What a pulse meets of the field is fixed at the build: one step of EM from κ
+///   (the terms read the background, their deposits make the field, and the terms read it), or a field held from
+///   another scene ([`Scene::hold_foliage`]). The first step carries nearly all of EM's change (3dtrees research 130
+///   rca-em: the stand's 1,893 of 2,028 nats, AM's all but 0.13), so a scene reached by moves is compared with a fresh
+///   build of the same elements.
 /// - Two approximations make the field's EM a surrogate, not the bound it would be (rca-em): the E-step reads σ's
 ///   posterior mean `α / β` where the mean-field bound's own step reads `exp(E ln σ)` (so iterating to a fixed point
 ///   drains the voxels the elements hold, without each voxel's Occam term), and the plug-in (each term's, [`Term`]'s
@@ -176,8 +177,9 @@ impl Scene {
         }).unzip();
         c.field = spec.map(|sp| FieldCounts::new(sp, &c.views.iter().map(|v| &**v).collect::<Vec<_>>(), &em));
         c.refit_alignment();
-        if c.field.is_some() {
-            c.refit_foliage();
+        if let Some(f) = &c.field {
+            c.ext = f.field(c.sc.kappa);
+            c.refit_alignment();
         }
         c
     }
@@ -214,19 +216,8 @@ impl Scene {
         self.cost() - before
     }
 
-    /// Re-read the foliage field a pulse meets from the counts the moves since the last refit kept, and refit the
-    /// alignment, the terms' responsibilities and so their deposits with it (a move: its cost change; one step of EM).
-    /// Moves hold that field.
-    pub fn refit_foliage(&mut self) -> f64 {
-        let before = self.cost();
-        let Some(f) = &mut self.field else { return 0.0 };
-        self.ext = f.field(self.sc.kappa);
-        self.refit_alignment();
-        self.cost() - before
-    }
-
-    /// Hold a foliage field estimated elsewhere (another scene's, from other scans) fixed: `refit_foliage` then
-    /// leaves it. The cost change.
+    /// Hold a foliage field estimated elsewhere (another scene's, from other scans) in place of the scene's own, which
+    /// it drops with its counts. The cost change.
     pub fn hold_foliage(&mut self, ext: &Foliage) -> f64 {
         self.ext = ext.clone();
         self.field = None;
@@ -279,18 +270,6 @@ impl Scene {
     /// An error unless `s` is one of the scene's scans.
     pub fn check_scan(&self, s: usize) -> Result<(), SceneError> {
         if s < self.views.len() { Ok(()) } else { Err(SceneError(format!("no scan {s}: the scene holds {}", self.views.len()))) }
-    }
-
-    /// Promote: add an element and take the mass it explains out of the foliage field. Its id and the cost change.
-    pub fn promote(&mut self, e: Element) -> (u32, f64) {
-        let (id, d) = self.add(e);
-        (id, d + self.refit_foliage())
-    }
-
-    /// Demote: remove an element and give the mass back to the foliage field. The cost change.
-    pub fn demote(&mut self, id: u32) -> f64 {
-        let d = self.remove(id);
-        d + self.refit_foliage()
     }
 
     /// The foliage field and its counts: per voxel with counts, (voxel, σ as held, the counts as the scene now is).
@@ -671,9 +650,9 @@ mod tests {
     }
 
     /// The foliage field is what the elements leave: the empty scene's field holds the pole's echoes (its voxel is
-    /// dense), and promoting the pole takes its share of them out. The cost after a promotion is near a fresh scene's
-    /// (one step of EM each, from different fields: the empty scene's and κ), its change is that cost, the rows, the
-    /// alignment parts and the field's part sum to it, and demotion restores the empty scene exactly.
+    /// dense), and a scene built with the pole takes its share of them out. Added to the empty scene, its field fixed,
+    /// the pole costs less than nothing, that change is the cost, the rows, the alignment parts and the field's part sum
+    /// to it, and removing it restores the empty scene exactly; built with the pole, the rows sum to the cost too.
     #[test]
     fn the_field_is_what_the_elements_leave() {
         let v = pole_view();
@@ -684,16 +663,15 @@ mod tests {
         assert_eq!(c.cost(), 0.0);
         let dense = sigma(&c);
         assert!(dense > 1.0, "{dense}");
-        let (id, d) = c.promote(pole);
         let fresh = Scene::new(vec![v.clone()], &[pole], em, sc, Some(field_box()), 0);
-        assert!((c.cost() - fresh.cost()).abs() < 1e-3 * fresh.cost().abs(), "{} vs {}", c.cost(), fresh.cost());
-        assert!((d - c.cost()).abs() < 1e-9 * d.abs().max(1.0));
-        assert!(d < 0.0, "{d}");
-        assert!(sigma(&c) < 0.5 * dense, "{} vs {dense}", sigma(&c));
+        assert!(sigma(&fresh) < 0.5 * dense, "{} vs {dense}", sigma(&fresh));
         // each datum is scored once: the elements' cells and the field's part hold the whole cost
-        let rows: f64 = c.rows().iter().map(|r| r.cost).sum::<f64>() + c.alignment_parts().iter().sum::<f64>() + c.field_part();
-        assert!((rows - c.cost()).abs() < 1e-9 * c.cost().abs().max(1.0), "{rows} vs {}", c.cost());
-        c.demote(id);
+        let rows = |c: &Scene| c.rows().iter().map(|r| r.cost).sum::<f64>() + c.alignment_parts().iter().sum::<f64>() + c.field_part();
+        assert!((rows(&fresh) - fresh.cost()).abs() < 1e-9 * fresh.cost().abs(), "{} vs {}", rows(&fresh), fresh.cost());
+        let (id, d) = c.add(pole);
+        assert!((d - c.cost()).abs() < 1e-9 * d.abs().max(1.0) && d < 0.0, "{d}");
+        assert!((rows(&c) - c.cost()).abs() < 1e-9 * c.cost().abs().max(1.0), "{} vs {}", rows(&c), c.cost());
+        c.remove(id);
         assert_eq!(c.cost(), 0.0);
     }
 
@@ -725,10 +703,10 @@ mod tests {
         assert!(pole[&surface].0 < 0.2 * empty[&surface].0, "{:?} vs {:?}", pole[&surface], empty[&surface]);
     }
 
-    /// The field is held through moves (research 130 slice 2b), as the alignment is: moves keep its counts exactly (the
-    /// empty scene's less every term's deposit, recomputed from scratch), adding then removing an element and moving
-    /// one there and back restore the cost exactly, and after a small move, or one to a wrong, wider stick, the held
-    /// cost is near the refitted one.
+    /// The field is fixed through moves (research 130 slice 2b), as the alignment is held: moves keep its counts
+    /// exactly (the empty scene's less every term's deposit, recomputed from scratch), adding then removing an element
+    /// and moving one there and back restore the cost exactly, and after a small move, or one to a wrong, wider stick,
+    /// the cost is near a fresh build's of the moved scene.
     #[test]
     fn held_moves_keep_the_fields_counts() {
         let v = pole_view();
@@ -744,13 +722,12 @@ mod tests {
         assert_eq!(c.field.as_ref().unwrap().counts(), recounted(&c));
         c.change(0, pole);
         assert_eq!(c.cost(), e0);
-        // held against refitted, nats: 0.0004 nudged, 0.4 wrong
+        // moved against a fresh build, nats: 0.001 nudged, 0.8 wrong
         for (e, tol) in [(nudged, 0.01), (wrong, 1.0)] {
             let mut c = Scene::new(vec![v.clone()], &[pole], em, sc, spec, 0);
             c.change(0, e);
-            let held = c.cost();
-            c.refit_foliage();
-            assert!((held - c.cost()).abs() < tol, "held {held} vs refitted {}", c.cost());
+            let fresh = Scene::new(vec![v.clone()], &[e], em, sc, spec, 0).cost();
+            assert!((c.cost() - fresh).abs() < tol, "moved {} vs fresh {fresh}", c.cost());
         }
     }
 
@@ -828,7 +805,7 @@ mod tests {
         let (a0, b0) = field(&c).prior;
         let recomputed: f64 = field(&c).counts().values().map(|&(h, l)| foliage::ln_nb(h, l, a0, b0)).sum();
         assert!((recomputed - field(&c).marginal()).abs() < 1e-9 * recomputed.abs(), "{recomputed} vs {}", field(&c).marginal());
-        c.refit_foliage();
+        c.refit_alignment();
         assert_eq!(field(&c).counts(), recounted(&c));
         let before = c.field_part();
         let per = c.costs_to_add(&[vec![side]]);
