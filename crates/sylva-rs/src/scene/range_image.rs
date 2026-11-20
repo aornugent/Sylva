@@ -86,8 +86,11 @@ pub struct RangeImage {
     pub echo_range: Vec<f32>,
     /// Each echo's reflectance (dB), beside `echo_range`; empty where the source has none.
     pub echo_refl: Vec<f32>,
-    /// The most echoes any pulse recorded: the instrument's cap on targets per pulse, read from the data (AM's
-    /// VZ-2000i at 1.2 MHz records 4; the stand's simulator 3). A pulse at its cap says nothing past its last echo ([`RangeImage::capped`]).
+    /// The instrument's cap on targets per pulse, read from the data: the most echoes at least a share [`CAP_SHARE`]
+    /// of the pulses with echoes returned (AM's VZ-2000i at 1.2 MHz records 4; the stand's simulator 3). Not the most
+    /// any pulse returned: two of AM 016's 40 M pulses carry 5, which read every 4-echo pulse there as uncapped and
+    /// counted its path past the fourth echo as clear (3dtrees research 130 rca-field-range). A pulse at its cap, or
+    /// past it, says nothing past its last echo ([`RangeImage::capped`]).
     pub max_targets: usize,
     /// Unit normal toward the scanner (world), `cos ι` and excess; NaN where no fit.
     pub normal: Vec<[f32; 3]>,
@@ -101,6 +104,25 @@ fn rot_t(r: &[[f64; 3]; 3], d: &Point) -> Point {
 
 fn rot_mul(r: &[[f64; 3]; 3], d: &Point) -> Point {
     [0, 1, 2].map(|k| r[k][0] * d[0] + r[k][1] * d[1] + r[k][2] * d[2])
+}
+
+/// The share of a scan's pulses with echoes that must reach a count of echoes for it to be the instrument's cap
+/// ([`RangeImage::max_targets`]).
+pub const CAP_SHARE: f64 = 1e-4;
+
+/// The cap on targets per pulse from the pulses' echo spans (`echo_start`): the most echoes at least [`CAP_SHARE`] of
+/// the pulses with echoes returned.
+fn cap(echo_start: &[u32]) -> usize {
+    let mut count: Vec<usize> = Vec::new();
+    for w in echo_start.windows(2) {
+        let n = (w[1] - w[0]) as usize;
+        if count.len() <= n {
+            count.resize(n + 1, 0);
+        }
+        count[n] += 1;
+    }
+    let returned: usize = count.iter().skip(1).sum();
+    (1..count.len()).rev().find(|&n| count[n] as f64 >= CAP_SHARE * returned as f64).unwrap_or(0)
 }
 
 impl RangeImage {
@@ -228,7 +250,7 @@ impl RangeImage {
                 cell[k] = Cell::Miss;
             }
         }
-        let max_targets = echo_start.windows(2).map(|w| (w[1] - w[0]) as usize).max().unwrap_or(0);
+        let max_targets = cap(&echo_start);
         let mut v = RangeImage {
             lat, c0, n_lines: nl, n_cols: nc, rot, origin, epoch, cell, range: rng, pulse, echo_start, echo_range, echo_refl: Vec::new(), max_targets,
             normal: Vec::new(), cos_inc: Vec::new(), excess: Vec::new(),
@@ -523,6 +545,20 @@ fn get<T: Plain>(r: &mut impl Read) -> std::io::Result<Vec<T>> {
 mod tests {
     use super::*;
     use crate::shots::reconstruct::dir;
+
+    /// The cap is the most echoes a share of the pulses reaches, not the most any pulse carries (3dtrees research 130
+    /// rca-field-range): 40,000 pulses of 0 to 4 echoes and two of 5 are capped at 4; a scan whose pulses carry at
+    /// most one echo at 1.
+    #[test]
+    fn a_few_pulses_past_the_cap_dont_move_it() {
+        let spans = |counts: &[u32]| std::iter::once(0).chain(counts.iter().scan(0, |a, &n| { *a += n; Some(*a) })).collect::<Vec<u32>>();
+        let mut counts: Vec<u32> = (0..40_000).map(|i| (i % 5) as u32).collect();
+        assert_eq!(cap(&spans(&counts)), 4);
+        counts[7] = 5;
+        counts[11] = 5;
+        assert_eq!(cap(&spans(&counts)), 4);
+        assert_eq!(cap(&spans(&[0, 1, 1, 0, 1])), 1);
+    }
 
     /// A scan of a vertical wall 5 m away (the y = 5 plane), lines 0.03° apart in azimuth, a hole of unrecorded
     /// pulses in it, and a pole 1 m in front of part of it: normals face the scanner, the hole reads as misses, and

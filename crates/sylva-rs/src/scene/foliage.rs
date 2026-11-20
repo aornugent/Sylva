@@ -37,8 +37,13 @@
 //! - **Energy after an echo.** A pulse's echo energies are bounded by its emitted energy (synthesis §4): an echo's
 //!   reflectance against a full-footprint hit on the dimmest canopy surface ([`Settings::refl_full_hit`]) is the
 //!   share of the beam it took ([`Settings::beam_left`], as the pulse reads it), so a full hit on leaf or wood reads
-//!   as the whole beam, and only the rest goes on. So each stretch after an echo counts as transmission in proportion to the beam left: none past an opaque hit, most
-//!   past a sliver. Where echoes carry no reflectance, the beam is taken to go on whole. (On held-out transmission
+//!   as the whole beam, and only the rest goes on. So each stretch after an echo counts as transmission in proportion
+//!   to the beam left: none past an opaque hit, most past a sliver. Where echoes carry no reflectance, the beam is
+//!   taken to go on whole. The beam left is read as the chance the pulse goes on (the pulse reads the medium past an
+//!   echo thinned by it: [`super::pulse`]), so a stretch's path is exposure in proportion to it and each echo is one
+//!   hit, whatever came before it. Counting a later echo at the beam its predecessors left as well read σ times that
+//!   beam on every stretch after an echo: AM's far scans, whose path in a box is mostly such stretches, saw half the
+//!   hits the other scans' field predicts (3dtrees research 130 rca-field-range). (On held-out transmission
 //!   this reading is as good as the first echo's alone or better: research 130 slices 12c, 13b. A clumping factor Ω
 //!   on the optical depth wasn't supported: slice 12c.) Each echo and each voxel's piece of a ray counts
 //!   [`Settings::cell_weight`] at its own range: how many neighbouring beams overlap there (slice-path). φ there is a
@@ -315,11 +320,11 @@ fn traverse(sp: &FoliageBox, o: &Point, w: &Point, t_min: f64, t_max: f64, mut f
 /// beam-left conventions in one place): the stretches of its ray it shows clear, each with the beam the echoes before it left ([`Settings::beam_left`]): from the origin to its first echo, then from
 /// each echo plus the receiver's resolution to the next (a surface closer behind an echo would have merged with it),
 /// and after the last on, unless the pulse is capped ([`RangeImage::capped`]: it says nothing past its last echo);
-/// each echo's range and the beam the echoes before it left; its clear range ([`Settings::free_to`] of its first echo,
+/// each echo's range; its clear range ([`Settings::free_to`] of its first echo,
 /// infinite for a miss); and the beam it leaves. None for a cell without a pulse.
 pub struct Walked {
     pub path: Vec<(f64, f64, f64)>,
-    pub echoes: Vec<(f64, f64)>,
+    pub echoes: Vec<f64>,
     pub clear: f64,
     pub beam: f64,
 }
@@ -335,7 +340,7 @@ pub fn walked(v: &RangeImage, em: &Settings, k: usize) -> Option<Walked> {
     let (mut path, mut out) = (Vec::with_capacity(echoes.len() + 1), Vec::with_capacity(echoes.len()));
     for (i, &r) in echoes.iter().enumerate() {
         path.push((start, r as f64, beam));
-        out.push((r as f64, beam));
+        out.push(r as f64);
         if let Some(&db) = refls.get(i) {
             beam *= em.beam_left(db as f64);
         }
@@ -352,9 +357,9 @@ pub fn beam_left(v: &RangeImage, em: &Settings, k: usize) -> f64 {
 }
 
 /// The echoes of image `v`'s cell `k` the field counts as hits, those inside the box: (the echo's index in its
-/// pulse, its voxel, its weight), [`Settings::cell_weight`] at the echo's range times the beam the echoes before it
-/// left ([`walked`]). The empty scene counts each whole; a scene's elements explain their responsibilities' share (the
-/// module docs).
+/// pulse, its voxel, its weight), [`Settings::cell_weight`] at the echo's range: one hit, whatever the echoes before it
+/// left, since the beam left is the chance the pulse got there and its path counts it (the module docs). The empty
+/// scene counts each whole; a scene's elements explain their responsibilities' share (the module docs).
 pub fn hits(v: &RangeImage, sp: &FoliageBox, em: &Settings, k: usize) -> Vec<(usize, [i32; 3], f64)> {
     if v.cell[k] != Cell::Echoes {
         return Vec::new();
@@ -362,9 +367,9 @@ pub fn hits(v: &RangeImage, sp: &FoliageBox, em: &Settings, k: usize) -> Vec<(us
     let w = v.direction((k / v.n_cols) as f64, (k % v.n_cols) as f64);
     let p = walked(v, em, k).expect("a pulse");
     let steps = v.steps(k);
-    p.echoes.iter().enumerate().filter_map(|(i, &(r, beam))| {
+    p.echoes.iter().enumerate().filter_map(|(i, &r)| {
         let x = [0, 1, 2].map(|a| v.origin[a] + w[a] * r);
-        inside(sp, &x).then(|| (i, key(sp, &x), em.cell_weight(r, steps) * beam))
+        inside(sp, &x).then(|| (i, key(sp, &x), em.cell_weight(r, steps)))
     }).collect()
 }
 
@@ -570,6 +575,42 @@ mod tests {
         };
         let (a, b) = (per_metre(pole), per_metre(wall));
         assert!((a / b - 1.0).abs() < 0.01, "{a} against {b}");
+    }
+
+    /// The field recovers the medium past an echo as the pulse reads it (3dtrees research 130 rca-field-range): every
+    /// pulse first meets a sliver at 3 m whose reflectance leaves half the beam ([`Settings::beam_left`]), then a
+    /// medium of σ = 1/m, which past the sliver the pulse reads thinned by the beam left (`pulse`'s `seen`): its
+    /// second echo where an exponential free path of rate σ/2 from the receiver's resolution ends. The empty scene's
+    /// counts over the box behind read σ: each later echo one hit, its stretch's path at the beam left. Counting the
+    /// echo at the beam left too read σ/2.
+    #[test]
+    fn the_field_reads_the_medium_past_an_echo() {
+        use crate::shots::reconstruct::dir;
+        let em = Settings::default();
+        let (sigma, left) = (1.0, 0.5);
+        let sliver = em.refl_full_hit() + 10.0 * (1.0 - left).log10();
+        assert!((em.beam_left(sliver) - left).abs() < 1e-9);
+        let u = |s: u64| ((s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407) >> 11) as f64 + 0.5) / (1u64 << 53) as f64;
+        let (mut t, mut d, mut start, mut range, mut refl) = (Vec::new(), Vec::new(), vec![0u32], Vec::new(), Vec::new());
+        for l in 0..200usize {
+            for k in 0..400usize {
+                let s = (l * 400 + k) as u64 * 2 + 1;
+                t.push(l as f64 * 6.6e-3 + k as f64 * 0.825e-6);
+                d.push(dir(84.0 + 0.03 * k as f64, -3.0 + 0.03 * l as f64));
+                range.push(3.0f32);
+                refl.push(sliver as f32);
+                range.push((3.0 + em.resolution() - u(s).ln() / (left * sigma)) as f32);
+                refl.push(-30.0);
+                start.push(range.len() as u32);
+            }
+        }
+        let id = [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]];
+        let mut v = RangeImage::new(&t, &d, start, range, (84.0, 96.0), id, [0.0; 3], 0, &super::super::range_image::RangeImageParams::default());
+        v.echo_refl = refl;
+        assert_eq!(v.max_targets, 2);
+        let sp = FoliageBox { lo: [-1.0, 4.0, -1.0], hi: [1.0, 6.0, 1.0], voxel: 0.25 };
+        let (h, l) = FieldCounts::new(sp, &[&v], &em).counts().values().fold((0.0, 0.0), |(h, l), &(a, b)| (h + a, l + b));
+        assert!((h / l / sigma - 1.0).abs() < 0.03, "the field reads {} against σ = {sigma}", h / l);
     }
 
     /// One walk per ray (3dtrees research 130 slice-structure): the medium's optical depths, hazards and merge
