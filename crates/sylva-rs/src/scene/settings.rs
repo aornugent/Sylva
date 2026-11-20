@@ -144,7 +144,9 @@ params! {
         /// by √φ times their per-view sd (`discount.py`, slice 7d: 10.5 on raw). Not settled: about the second box it
         /// reads 2.3, but 30 between the two near scans and 1 with the far one, because what one view adds is not a
         /// scale on its sd: each view's radius is off by about 13 % whatever its sd, and the far view's reads small
-        /// (research 130 slice-grid).
+        /// (research 130 slice-grid). With that error split out, what φ leaves on the radius is 0.12 on AM and 0.77 on
+        /// the stand (whose views add none); but the stand's alignment needs φ near 4 (at 1 its shifts cover 0.45 /
+        /// 0.60 / 0.75 of 50 / 80 / 95 %), which a stem front shift doesn't replace (slice-radius).
         pub discount: f64 = 10.0,
         /// The stem front shift (research 130 slice 14): a section's departure from round, as each view sees it, is
         /// an along-beam shift of its front per (element, scan), with prior sd
