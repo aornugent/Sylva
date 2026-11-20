@@ -90,8 +90,8 @@ params! {
         /// a fitted peak follows the nearer unless the farther outweighs it, far less than their energy-weighted range
         /// says (3dtrees research 130 slice 2c: AM's edges with one echo and a surface within the resolution behind,
         /// fitted by least absolute deviations, `reflectance.py site`'s `merge_summary`; slices 9, consolidate, grid).
-        pub pull_a: f64 = 2.177,
-        pub pull_b: f64 = 0.043,
+        pub pull_a: f64 = 2.21,
+        pub pull_b: f64 = 0.042,
         /// The merge share behind a layer, calibrated per site (3dtrees research 130 slice 2c): the foliage field's own
         /// share M (`1 − exp(−b ∫ σ (1 − p))`, [`super::scene`]'s merges) predicts a site's merges beside wood too
         /// poorly to stand alone (slice-soft), so the share is `logistic(merge_a + merge_field M + merge_range t +
@@ -99,10 +99,10 @@ params! {
         /// [`super::scene::Scene::predict`] reports it, on edges whose pulse merged with a surface within the
         /// resolution behind (`reflectance.py site`'s `merge_summary`, the field held in; AM's from day-1 scans the
         /// held-out checks never hold out: slices 2d, products).
-        pub merge_a: f64 = -1.0684,
-        pub merge_field: f64 = 5.731,
-        pub merge_range: f64 = -0.1177,
-        pub merge_fill: f64 = 1.9239,
+        pub merge_a: f64 = -1.2785,
+        pub merge_field: f64 = 5.8611,
+        pub merge_range: f64 = -0.1234,
+        pub merge_fill: f64 = 2.1153,
         /// Located edges (3dtrees research 130 step 2): an echo's reflectance (dB) is read beside its range. A return's
         /// predicted reflectance is `10 log10` of its members' energy shares (each fill × the beam left × cos^k ι ×
         /// the surface's reflectance, k `refl_incidence`, which sets the detection too; a merged return sums them), so
@@ -116,10 +116,10 @@ params! {
         /// (`reflectance.py site`, slice 9; re-measured with the field fixed at the build and the cell weight's
         /// zenith factor, slice-grid).
         pub refl_noise: f64 = 0.37,
-        pub refl_dof: f64 = 3.7,
-        pub refl_edge: f64 = 11.12,
+        pub refl_dof: f64 = 3.8,
+        pub refl_edge: f64 = 11.15,
         pub refl_incidence: f64 = 0.3,
-        pub refl_level_sd: f64 = 0.77,
+        pub refl_level_sd: f64 = 0.75,
         pub refl_background_mean: f64 = -21.29,
         pub refl_background_sd: f64 = 6.28,
         /// The scan alignment error (research 130 offset-field-design.md): an along-beam shift per (scan, place),
@@ -159,9 +159,13 @@ params! {
         /// `field_prior_path` (m of weighted ray), measured as the type-II maximum of the empty scene's counts on
         /// 0.125 m voxels (`collapsed.py prior`, 3dtrees research 130: AM's about the second box no held-out check
         /// holds out, from its three day-1 scans there). The field's term in the cost is its marginal, so the prior is
-        /// in the evidence and is measured, not declared.
-        pub field_prior_mean: f64 = 0.08994,
-        pub field_prior_path: f64 = 0.8038,
+        /// in the evidence and is measured, not declared. `field_prior_voxel` (m) is the voxel it was measured on: a
+        /// prior doesn't carry to another voxel (pooled voxels aren't Gamma of the same shape), and the field's part of
+        /// the cost moves by thousands of nats between 0.125 and 0.25 m (research 130 field-closed-form), so a field
+        /// on another voxel reads a prior not measured for it.
+        pub field_prior_mean: f64 = 0.10103,
+        pub field_prior_path: f64 = 0.6647,
+        pub field_prior_voxel: f64 = 0.125,
     }
 }
 

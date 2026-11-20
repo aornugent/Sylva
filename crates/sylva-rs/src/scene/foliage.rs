@@ -40,9 +40,10 @@
 //!   as the whole beam, and only the rest goes on. So each stretch after an echo counts as transmission in proportion to the beam left: none past an opaque hit, most
 //!   past a sliver. Where echoes carry no reflectance, the beam is taken to go on whole. (On held-out transmission
 //!   this reading is as good as the first echo's alone or better: research 130 slices 12c, 13b. A clumping factor Ω
-//!   on the optical depth wasn't supported: slice 12c.) Each ray counts [`Settings::cell_weight`] at its first echo's
-//!   range, or where it leaves the box. φ there is a compound Poisson's clump size: mulga's leaf hits are clumped,
-//!   and their dispersion is flat in cell size (synthesis §2).
+//!   on the optical depth wasn't supported: slice 12c.) Each echo and each voxel's piece of a ray counts
+//!   [`Settings::cell_weight`] at its own range: how many neighbouring beams overlap there (slice-path). φ there is a
+//!   compound Poisson's clump size: mulga's leaf hits are clumped, and their dispersion is flat in cell size
+//!   (synthesis §2).
 //! - **Soft attribution: what the field counts** (3dtrees research 130 slice-soft; formulation.md "Soft attribution
 //!   and the representation under it"). Every ray counts its whole path, in the beam its echoes left: the ray
 //!   likelihood reads the medium's path in every way it explains a pulse (an echo is the medium's, an element's or an
@@ -166,7 +167,9 @@ impl Foliage {
         Foliage { kappa, spec: Some(spec), post }
     }
 
-    /// σ's posterior mean in voxel `k` (κ where it has no data).
+    /// σ's posterior mean in voxel `k` (κ where it has no data). The geometric mean `exp ψ(α) / β`, the bound's own
+    /// first-order value, was tried in its place and read far worse: with AM's and the stand's prior shapes far below 1
+    /// it is near 0 wherever a voxel holds no echo (3dtrees research 130 slice-path).
     pub fn sigma(&self, k: &[i32; 3]) -> f64 {
         self.post.get(k).map_or(self.kappa, |&(a, b)| a / b)
     }
@@ -308,16 +311,13 @@ fn traverse(sp: &FoliageBox, o: &Point, w: &Point, t_min: f64, t_max: f64, mut f
     }
 }
 
-/// One pulse as everything that reads its path reads it (3dtrees research 130 slice-pyramid: the restart, beam-left
-/// and miss-weight conventions in one place): its weight ([`Settings::cell_weight`] at its first echo's range, or for
-/// a miss at `exit`, where its ray leaves the box the reader counts in); the stretches of its ray it shows clear, each
-/// with the beam the echoes before it left ([`Settings::beam_left`]): from the origin to its first echo, then from
+/// One pulse as everything that reads its path reads it (3dtrees research 130 slice-pyramid: the restart and
+/// beam-left conventions in one place): the stretches of its ray it shows clear, each with the beam the echoes before it left ([`Settings::beam_left`]): from the origin to its first echo, then from
 /// each echo plus the receiver's resolution to the next (a surface closer behind an echo would have merged with it),
 /// and after the last on, unless the pulse is capped ([`RangeImage::capped`]: it says nothing past its last echo);
 /// each echo's range and the beam the echoes before it left; its clear range ([`Settings::free_to`] of its first echo,
 /// infinite for a miss); and the beam it leaves. None for a cell without a pulse.
 pub struct Walked {
-    pub weight: f64,
     pub path: Vec<(f64, f64, f64)>,
     pub echoes: Vec<(f64, f64)>,
     pub clear: f64,
@@ -325,12 +325,11 @@ pub struct Walked {
 }
 
 /// Cell `k`'s pulse in image `v` as [`Walked`] reads it.
-pub fn walked(v: &RangeImage, em: &Settings, k: usize, exit: f64) -> Option<Walked> {
+pub fn walked(v: &RangeImage, em: &Settings, k: usize) -> Option<Walked> {
     if v.cell[k] == Cell::NoPulse {
         return None;
     }
     let (echoes, refls) = (v.echoes(k), v.echo_refls(k));
-    let weight = em.cell_weight(echoes.first().map_or(exit, |&r| r as f64), v.steps(k));
     let known = if v.capped(k) { echoes.last().map_or(f64::INFINITY, |&r| r as f64) } else { f64::INFINITY };
     let (mut start, mut beam) = (0.0, 1.0);
     let (mut path, mut out) = (Vec::with_capacity(echoes.len() + 1), Vec::with_capacity(echoes.len()));
@@ -344,7 +343,7 @@ pub fn walked(v: &RangeImage, em: &Settings, k: usize, exit: f64) -> Option<Walk
     }
     path.push((start, known, beam));
     let clear = echoes.first().map_or(f64::INFINITY, |&r| em.free_to(r as f64));
-    Some(Walked { weight, path, echoes: out, clear, beam })
+    Some(Walked { path, echoes: out, clear, beam })
 }
 
 /// The beam cell `k`'s echoes leave ([`Walked`]'s `beam`, without its stretches).
@@ -353,31 +352,37 @@ pub fn beam_left(v: &RangeImage, em: &Settings, k: usize) -> f64 {
 }
 
 /// The echoes of image `v`'s cell `k` the field counts as hits, those inside the box: (the echo's index in its
-/// pulse, its voxel, its weight), its pulse's weight times the beam the echoes before it left ([`walked`]). The empty
-/// scene counts each whole; a scene's elements take their responsibilities' share (the module docs).
+/// pulse, its voxel, its weight), [`Settings::cell_weight`] at the echo's range times the beam the echoes before it
+/// left ([`walked`]). The empty scene counts each whole; a scene's elements explain their responsibilities' share (the
+/// module docs).
 pub fn hits(v: &RangeImage, sp: &FoliageBox, em: &Settings, k: usize) -> Vec<(usize, [i32; 3], f64)> {
     if v.cell[k] != Cell::Echoes {
         return Vec::new();
     }
     let w = v.direction((k / v.n_cols) as f64, (k % v.n_cols) as f64);
-    let p = walked(v, em, k, f64::INFINITY).expect("a pulse");
+    let p = walked(v, em, k).expect("a pulse");
+    let steps = v.steps(k);
     p.echoes.iter().enumerate().filter_map(|(i, &(r, beam))| {
         let x = [0, 1, 2].map(|a| v.origin[a] + w[a] * r);
-        inside(sp, &x).then(|| (i, key(sp, &x), p.weight * beam))
+        inside(sp, &x).then(|| (i, key(sp, &x), em.cell_weight(r, steps) * beam))
     }).collect()
 }
 
 /// One cell's ray through the box, walked once ([`Walk`]), counted whole into `acc` (the empty scene's reading; the
-/// module docs): each echo a hit ([`hits`]) and each stretch it shows clear its path ([`walked`]), weighted as its hits
-/// are.
+/// module docs): each echo a hit ([`hits`]) and each stretch it shows clear its path ([`walked`]), each voxel's piece of
+/// it weighted at its own range, as an echo there would be (3dtrees research 130 slice-path: the overlap of
+/// neighbouring beams is the voxel's, for its hits and its path alike).
 fn ray(v: &RangeImage, sp: &FoliageBox, em: &Settings, k: usize, acc: &mut FixedCounts) {
     let w = v.direction((k / v.n_cols) as f64, (k % v.n_cols) as f64);
-    let Some((_, t1)) = clip(sp, &v.origin, &w) else { return };
-    let Some(p) = walked(v, em, k, t1) else { return }; // nothing observed
+    if clip(sp, &v.origin, &w).is_none() {
+        return;
+    }
+    let Some(p) = walked(v, em, k) else { return }; // nothing observed
+    let steps = v.steps(k);
     let walk = Walk::new(sp, &v.origin, &w);
     for &(from, to, beam) in &p.path {
         for (key, a, b) in walk.within(from, to) {
-            accumulate(acc, key, 0.0, p.weight * beam * (b - a));
+            accumulate(acc, key, 0.0, em.cell_weight(0.5 * (a + b), steps) * beam * (b - a));
         }
     }
     for (_, key, h) in hits(v, sp, em, k) {
@@ -538,6 +543,33 @@ mod tests {
         let numeric: f64 = (0..20000).map(|i| 0.05 * 0.005 / (1.0 + (z0 + slope * (i as f64 + 0.5) * 0.005).exp())).sum();
         assert!((m - numeric).abs() < 1e-6, "{m} vs {numeric}");
         assert!(flat.merge_integral(10.0, 20.0, 30.0, z0, slope) < 1e-10);
+    }
+
+    /// A voxel's path counts with the weight of its own range, wherever the ray ends (3dtrees research 130 slice-path):
+    /// two neighbouring rays of the test scan, one stopping on the pole at 4 m, one passing on to the wall at 8 m, count
+    /// the same weighted path per metre in the voxels before the pole. Read at each ray's first echo, the wall's ray
+    /// counted about three times the pole's there, so a near voxel read thin.
+    #[test]
+    fn a_voxels_path_counts_at_its_own_range() {
+        let v = super::super::fixtures::pole_image();
+        let em = Settings::default();
+        let sp = super::super::fixtures::field_box();
+        let cell = |x: &Point| {
+            let (l, c, _) = v.cell_of(x).unwrap();
+            l.round() as usize * v.n_cols + c.round() as usize
+        };
+        let (pole, wall) = (cell(&[0.0, 3.97, 0.0]), cell(&[0.28, 8.0, 0.0]));
+        assert!(v.echoes(pole)[0] < 4.1 && v.echoes(wall)[0] > 7.9);
+        let per_metre = |k: usize| {
+            let mut acc = FixedCounts::default();
+            ray(&v, &sp, &em, k, &mut acc);
+            let w = v.direction((k / v.n_cols) as f64, (k % v.n_cols) as f64);
+            // the voxels from the box's face at 2.9 m to 3.8 m (rows 0..9 across the beam), over that length of ray
+            let path: i64 = acc.iter().filter(|(key, _)| key[1] < 9).map(|(_, c)| c[1]).sum();
+            path as f64 / FIXED / (0.9 / w[1])
+        };
+        let (a, b) = (per_metre(pole), per_metre(wall));
+        assert!((a / b - 1.0).abs() < 0.01, "{a} against {b}");
     }
 
     /// One walk per ray (3dtrees research 130 slice-structure): the medium's optical depths, hazards and merge

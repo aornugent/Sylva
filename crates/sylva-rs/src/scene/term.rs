@@ -206,12 +206,15 @@ impl CellData {
         (mixture_ll(&self.pulses, shift, level, em) - self.base) * self.wt
     }
 
-    /// What its term takes of the field's hits at the shares `taken` of its echoes (its layers' responsibilities): per
-    /// hit its voxel and weight, and their plug-in `Σ h ln σ̂`, how the empty scene's pulse already reads them in the
-    /// cell's ratio, as a log-likelihood (the field's term reads them by its marginal instead: [`Term`]'s `plug`).
+    /// What its term explains of the field's hits at the shares `taken` of its echoes (its layers' responsibilities):
+    /// per hit its voxel and weight (the field's count of it: [`foliage::hits`]), and their plug-in `Σ w t ln σ̂`, how
+    /// the empty scene's pulse already reads them in the cell's ratio, as a log-likelihood (the field's term reads them
+    /// by its marginal instead: [`Term`]'s `plug`). The plug-in weighs each echo as the cell's ratio does (`wt`), not as
+    /// the field counts it, so σ̂ cancels from the cost but through the responsibilities (3dtrees research 130
+    /// field-closed-form, slice-path).
     pub(super) fn take(&self, taken: &[f64]) -> (Vec<([i32; 3], f64)>, f64) {
         let hits: Vec<([i32; 3], f64)> = self.hits.iter().map(|&(i, k, w, _)| (k, w * taken[i])).collect();
-        (hits, self.hits.iter().map(|&(i, _, w, ln_sigma)| w * taken[i] * ln_sigma).sum())
+        (hits, self.hits.iter().map(|&(i, _, _, ln_sigma)| self.wt * taken[i] * ln_sigma).sum())
     }
 }
 
