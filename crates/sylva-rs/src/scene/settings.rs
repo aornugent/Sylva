@@ -141,8 +141,10 @@ params! {
         /// The evidence discount per cell φ: each cell's log-likelihood ratio counts `1/φ` (with the footprints'
         /// `1/m`), for what the model leaves correlated between cells (departures every cell of a section shares, in
         /// one view or all). Declared at 10 from AM's cross-scan residuals: per-view radii of one element disagree
-        /// by √φ times their per-view sd (`discount.py`, slice 7d: 10.5 on raw). Re-read under the current refit it is
-        /// 2.8 overall but 37 at 6-12 m and 2.0 beyond, on the box's own scans: not settled (slice-consolidate).
+        /// by √φ times their per-view sd (`discount.py`, slice 7d: 10.5 on raw). Not settled: about the second box it
+        /// reads 2.3, but 30 between the two near scans and 1 with the far one, because what one view adds is not a
+        /// scale on its sd: each view's radius is off by about 13 % whatever its sd, and the far view's reads small
+        /// (research 130 slice-grid).
         pub discount: f64 = 10.0,
         /// The stem front shift (research 130 slice 14): a section's departure from round, as each view sees it, is
         /// an along-beam shift of its front per (element, scan), with prior sd
