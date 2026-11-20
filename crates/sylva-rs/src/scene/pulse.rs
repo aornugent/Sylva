@@ -132,7 +132,7 @@ pub(super) struct CellView<P = f64> {
 pub(super) fn cell_view<P: Real>(v: &RangeImage, cell: usize, layers: Vec<Layer<P>>, em: &Settings, sc: &Background, ext: &Foliage) -> CellView<P> {
     let (obs, ground, w) = obs_ground(v, cell, sc);
     let at = if obs.is_finite() { P::c(obs) } else { front_shares(&layers).iter().zip(&layers).map(|(&s, l)| s * l.t).sum() };
-    let wt = em.cell_weight(at, v.step());
+    let wt = em.cell_weight(at, v.steps(cell));
     let (m, class) = (ext.medium(&v.origin, &w), cell_class(v, cell, em));
     let pulses = mixture(&layers).into_iter()
         .map(|(p, ls)| (p, Pulse::on(occluders(ls, ground), class, &m, v.echoes(cell), v.echo_refls(cell), v.max_targets, em))).collect();

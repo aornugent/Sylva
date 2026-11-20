@@ -9,8 +9,8 @@
 //! the 3dtrees research 130 driver that measures it, and a site's values live in its settings file (research 130
 //! `settings/<site>.json`, written by those drivers), so another scanner or plot is a file, not code. What stays
 //! constant here is method, not calibration: the alignment error's node spacing, the depth bias's reference range,
-//! the outlier share and the longest range. The lattice step is each image's own
-//! ([`super::range_image::RangeImage::step`]). The values measured against the scene's own predictions
+//! the outlier share and the longest range. The lattice steps are each image's own
+//! ([`super::range_image::RangeImage::steps`]). The values measured against the scene's own predictions
 //! (`reflectance.py site`: the reflectance model, the wood, the pull, the merge map) move as the model does, and are
 //! re-measured together (research 130 slice-consolidate). Of the drivers named here, `constants.py`, `pulses.py` and
 //! `ground.py` are at 3dtrees' tag `archive/l0-drivers-2026-11-19`, `edges.py` and `leaf.py` in its history before
@@ -69,7 +69,7 @@ params! {
         /// is declared: `leaf.py` am's single-echo peak in rank-3 voxels plus the stand's partial-fill offset (1.9 dB);
         /// not measured (leaf-reflectance.md). AM's ground is measured on its ground echoes (`ground.py am`, slice 2d).
         /// AM's measured values come from day-1 scans about a second box that no held-out check holds out.
-        pub refl_wood: f64 = -15.2,
+        pub refl_wood: f64 = -15.1,
         pub refl_leaf: f64 = -15.6,
         pub refl_ground: f64 = -16.9,
         /// The ground plane ([`Background`]'s `ground_z`), as AM's ground echoes measure it (3dtrees research 130 slice
@@ -89,9 +89,9 @@ params! {
         /// `d / (1 + 10^(pull_a + pull_b e))` (m), e the nearer's energy over the farther's (dB), with an sd as large:
         /// a fitted peak follows the nearer unless the farther outweighs it, far less than their energy-weighted range
         /// says (3dtrees research 130 slice 2c: AM's edges with one echo and a surface within the resolution behind,
-        /// fitted by least absolute deviations, `reflectance.py site`'s `merge_summary`; slices 9, consolidate).
-        pub pull_a: f64 = 2.26,
-        pub pull_b: f64 = 0.047,
+        /// fitted by least absolute deviations, `reflectance.py site`'s `merge_summary`; slices 9, consolidate, grid).
+        pub pull_a: f64 = 2.177,
+        pub pull_b: f64 = 0.043,
         /// The merge share behind a layer, calibrated per site (3dtrees research 130 slice 2c): the foliage field's own
         /// share M (`1 − exp(−b ∫ σ (1 − p))`, [`super::scene`]'s merges) predicts a site's merges beside wood too
         /// poorly to stand alone (slice-soft), so the share is `logistic(merge_a + merge_field M + merge_range t +
@@ -99,10 +99,10 @@ params! {
         /// [`super::scene::Scene::predict`] reports it, on edges whose pulse merged with a surface within the
         /// resolution behind (`reflectance.py site`'s `merge_summary`, the field held in; AM's from day-1 scans the
         /// held-out checks never hold out: slices 2d, products).
-        pub merge_a: f64 = -1.2105,
-        pub merge_field: f64 = 5.659,
-        pub merge_range: f64 = -0.109,
-        pub merge_fill: f64 = 1.9792,
+        pub merge_a: f64 = -1.0684,
+        pub merge_field: f64 = 5.731,
+        pub merge_range: f64 = -0.1177,
+        pub merge_fill: f64 = 1.9239,
         /// Located edges (3dtrees research 130 step 2): an echo's reflectance (dB) is read beside its range. A return's
         /// predicted reflectance is `10 log10` of its members' energy shares (each fill × the beam left × cos^k ι ×
         /// the surface's reflectance, k `refl_incidence`, which sets the detection too; a merged return sums them), so
@@ -113,12 +113,13 @@ params! {
         /// its surface's reflectance with prior sd `refl_level_sd` (dB), marginalised with the alignment error. An echo
         /// nothing in the scene explains (the foliage field's, an outlier) reads `refl_background_mean` ±
         /// `refl_background_sd` (dB). All are measured on single echoes against the scene's own predictions
-        /// (`reflectance.py site`, slice 9; re-measured at the field's EM fixed point, slice-consolidate).
+        /// (`reflectance.py site`, slice 9; re-measured with the field fixed at the build and the cell weight's
+        /// zenith factor, slice-grid).
         pub refl_noise: f64 = 0.37,
-        pub refl_dof: f64 = 3.9,
-        pub refl_edge: f64 = 10.39,
-        pub refl_incidence: f64 = 0.25,
-        pub refl_level_sd: f64 = 0.78,
+        pub refl_dof: f64 = 3.7,
+        pub refl_edge: f64 = 11.12,
+        pub refl_incidence: f64 = 0.3,
+        pub refl_level_sd: f64 = 0.77,
         pub refl_background_mean: f64 = -21.29,
         pub refl_background_sd: f64 = 6.28,
         /// The scan alignment error (research 130 offset-field-design.md): an along-beam shift per (scan, place),
@@ -155,8 +156,8 @@ params! {
         /// 0.125 m voxels (`collapsed.py prior`, 3dtrees research 130: AM's about the second box no held-out check
         /// holds out, from its three day-1 scans there). The field's term in the cost is its marginal, so the prior is
         /// in the evidence and is measured, not declared.
-        pub field_prior_mean: f64 = 0.09056,
-        pub field_prior_path: f64 = 0.7234,
+        pub field_prior_mean: f64 = 0.08994,
+        pub field_prior_path: f64 = 0.8038,
     }
 }
 
@@ -196,16 +197,20 @@ impl Settings {
         range * self.beam_divergence + self.beam_exit
     }
 
-    /// Footprints per cell, `(footprint / cell)²`, at least 1, on a lattice of step `step` (rad): how many cells see
-    /// the same spot.
-    pub fn multiplicity<P: Real>(&self, range: P, step: f64) -> P {
-        (self.footprint(range) / (range * step)).sq().max(1.0)
+    /// Footprints per cell: how many cells see the same spot, on a lattice whose cells are `steps` (rad) apart along
+    /// the line and across lines ([`super::range_image::RangeImage::steps`]). On each axis the footprint spans
+    /// `footprint / (range × step)` cells, at least 1 (a footprint narrower than the spacing overlaps no neighbour on
+    /// that axis), and m is their product. So a cell's weight is its share of a footprint's area, and an element's
+    /// total weight is its projected area in footprints, `A / (φ f²)`, wherever it sits in the scan (slice-grid).
+    pub fn multiplicity<P: Real>(&self, range: P, steps: (f64, f64)) -> P {
+        let f = self.footprint(range) / range;
+        (f / steps.0).max(1.0) * (f / steps.1).max(1.0)
     }
 
     /// The one weight a cell's evidence counts with everywhere (the ray likelihood, the foliage field, predictions):
     /// `1 / (φ m(ρ))`, at ρ the cell's first echo's range, or its predicted range where it has none.
-    pub fn cell_weight<P: Real>(&self, range: P, step: f64) -> P {
-        P::c(1.0) / (self.multiplicity(range, step) * self.discount)
+    pub fn cell_weight<P: Real>(&self, range: P, steps: (f64, f64)) -> P {
+        P::c(1.0) / (self.multiplicity(range, steps) * self.discount)
     }
 
     /// The per-echo noise sd (m) of class `k`.

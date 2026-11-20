@@ -378,6 +378,14 @@ impl RangeImage {
         self.lat.zenith_step.abs().to_radians()
     }
 
+    /// Cell `k`'s spacing to its neighbours (rad): along its line, the zenith step; across lines, the head's turn
+    /// per line times the sine of the cell's zenith in the scanner's frame, since a line is a vertical sweep and lines
+    /// converge toward the zenith (3dtrees research 130 slice-grid).
+    pub fn steps(&self, k: usize) -> (f64, f64) {
+        let (zenith, _) = self.lat.cell_angles((k / self.n_cols) as f64, (k % self.n_cols + self.c0) as f64);
+        (self.step(), self.lat.azimuth_step.abs().to_radians() * zenith.to_radians().sin())
+    }
+
     /// The surfels of this scan's echo cells with a normal whose echo lies inside the box `lo`-`hi` (world positions
     /// along the cell centre's ray, and normals), for the moments. Silhouette cells are left out: those with a
     /// 4-neighbour that is empty or more than 5 cm behind. Their echoes are partial hits, often merged with the
@@ -568,5 +576,43 @@ mod tests {
         std::fs::write(&b, f).unwrap();
         assert!(RangeImage::load(&b).is_err());
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// The scan's one exact invariant (3dtrees research 130 slice-grid): a disc's cells' weights sum to its area in
+    /// footprints, `A / (φ f²)`, wherever it sits in the scan. Lines are vertical sweeps 0.15° apart in azimuth with
+    /// slots 0.1° apart, so a cell looking 40° from the zenith is 0.64 of one at the horizon across lines; a weight
+    /// on the zenith step alone would count the disc there 1.56 times.
+    #[test]
+    fn a_discs_weight_is_its_area_in_footprints_wherever_it_sits() {
+        let (period, interval, zstep, astep) = (6.6e-3, 0.825e-6, 0.1, 0.15);
+        let (mut t, mut d, mut r) = (Vec::new(), Vec::new(), Vec::new());
+        for l in 0..140usize {
+            for k in 0..960usize {
+                t.push(l as f64 * period + k as f64 * interval);
+                d.push(dir(34.0 + zstep * k as f64, -10.5 + astep * l as f64));
+                r.push(1.5);
+            }
+        }
+        let id = [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]];
+        let v = RangeImage::from_first_echoes(&t, &d, &r, id, [0.0; 3], 0, &RangeImageParams::default());
+        let em = super::super::settings::Settings::default();
+        let (range, a) = (1.5, 0.15);
+        let f = em.footprint(range);
+        for zenith in [40.0, 90.0, 120.0] {
+            let u = dir(zenith, 0.0);
+            let (mut total, mut cells) = (0.0, 0);
+            for k in 0..v.n_lines * v.n_cols {
+                let w = v.direction((k / v.n_cols) as f64, (k % v.n_cols) as f64);
+                // the disc, a m across at `range`, face-on: the cells whose rays pass through it
+                if dot(&w, &u) > range / (range * range + a * a).sqrt() {
+                    total += em.cell_weight(range, v.steps(k));
+                    cells += 1;
+                }
+            }
+            // its area as the cone of rays sees it, at `range`
+            let area = 2.0 * std::f64::consts::PI * range * range * (1.0 - range / (range * range + a * a).sqrt());
+            let want = area / (em.discount * f * f);
+            assert!((total / want - 1.0).abs() < 0.02, "zenith {zenith}: {total} against {want} over {cells} cells");
+        }
     }
 }

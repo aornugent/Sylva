@@ -6,7 +6,7 @@
 //! what it deposits in the foliage field.
 //!
 //! - **Weights:** each cell counts [`Settings::cell_weight`], `1 / (φ m(ρ))`, with m the footprints per cell
-//!   (overlapping footprints, on the image's own lattice step) and φ the evidence discount per cell: one constant
+//!   (overlapping footprints, on the cell's own lattice steps) and φ the evidence discount per cell: one constant
 //!   for every cell and every hypothesis, so it widens posteriors without favouring any hypothesis (a
 //!   quasi-likelihood). It replaced slice 7's ρ_res, `1 + (n − 1) ρ` with n an element's own footprints, which
 //!   differed between hypotheses and, once every fronted cell counted, favoured the thinner (slice 7c).

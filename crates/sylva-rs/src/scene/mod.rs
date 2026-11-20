@@ -57,7 +57,7 @@
 //! | the chance a layer is part of its cell | entry weight | a smooth step in its widest fill from `MIN_FILL` (0.2 %) to `FULL_FILL` (1 %); a layer at 1 % or more is wholly in its cell, one below partial; a cell's likelihood is the mixture over which partial layers are in it (3dtrees research 130 slice-trim) |
 //! | the chance a layer is its cell's nearest | front share | how a cell's evidence is shared among its layers' terms; all the front layer's where that is wholly in it |
 //! | φ, for correlation the model leaves out | evidence discount | `discount` |
-//! | beams overlapping a spot | footprints per cell | `m`, `multiplicity` |
+//! | beams overlapping a spot | footprints per cell | `m`, `multiplicity`: per axis of the cell's lattice steps (`RangeImage::steps`: the zenith step along a line, the head's step × sin θ across lines), so an element's total weight is its area in footprints |
 //! | an along-beam error per (scan, place) | scan alignment error | `align_*`; its value at an element, `align_shift` |
 //! | the scan alignment error's mode and precision kept between refits, a move's change to them a rank-k correction | held alignment | `refit_alignment` re-solves it; `exact_cost` is the exact marginal |
 //! | a section's departure from round, per (element, scan) | stem front shift | `front_shift_*` |

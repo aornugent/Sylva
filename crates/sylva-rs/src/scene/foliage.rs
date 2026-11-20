@@ -330,7 +330,7 @@ pub fn walked(v: &RangeImage, em: &Settings, k: usize, exit: f64) -> Option<Walk
         return None;
     }
     let (echoes, refls) = (v.echoes(k), v.echo_refls(k));
-    let weight = em.cell_weight(echoes.first().map_or(exit, |&r| r as f64), v.step());
+    let weight = em.cell_weight(echoes.first().map_or(exit, |&r| r as f64), v.steps(k));
     let known = if v.capped(k) { echoes.last().map_or(f64::INFINITY, |&r| r as f64) } else { f64::INFINITY };
     let (mut start, mut beam) = (0.0, 1.0);
     let (mut path, mut out) = (Vec::with_capacity(echoes.len() + 1), Vec::with_capacity(echoes.len()));

@@ -399,7 +399,7 @@ mod tests {
         let ed = |shift: f64, level: f64| -> f64 {
             buf.iter().map(|&(cell, ref ls)| {
                 let echoes = v.echoes(cell);
-                let wt = em.cell_weight(echoes.first().map_or(ls[0].t, |&r| r as f64), v.step());
+                let wt = em.cell_weight(echoes.first().map_or(ls[0].t, |&r| r as f64), v.steps(cell));
                 let w = v.direction((cell / v.n_cols) as f64, (cell % v.n_cols) as f64);
                 let pulse = |ls: Vec<Layer>| Pulse::on(occluders(ls, None), cell_class(&v, cell, &em), &Foliage::uniform(sc.kappa).medium(&v.origin, &w), echoes, v.echo_refls(cell), v.max_targets, &em);
                 // a partial layer is in the cell with its entry weight

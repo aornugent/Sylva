@@ -253,11 +253,10 @@ pub(super) fn render(v: &RangeImage, e: &Element, id: u32, em: &Settings) -> Vec
     let dist = norm(&c);
     let Some((l0, k0, _)) = v.cell_of(&mid) else { return out };
     let alpha = (half * half + (e.r + em.footprint(dist)).powi(2)).sqrt() / dist;
-    let sin_z = ((c[0] * c[0] + c[1] * c[1]).sqrt() / dist).max(0.05);
-    let (zs, az) = (v.lat.zenith_step.abs().to_radians(), v.lat.azimuth_step.abs().to_radians());
-    let dl = (alpha / (az * sin_z)).min(4000.0).ceil() as i64 + 1;
-    let dc = (alpha / zs).min(4000.0).ceil() as i64 + 1;
-    let (li, ki) = (l0.round() as i64, k0.round() as i64);
+    let (li, ki) = (l0.round().clamp(0.0, (v.n_lines - 1) as f64) as i64, k0.round().clamp(0.0, (v.n_cols - 1) as f64) as i64);
+    let (along, across) = v.steps(li as usize * v.n_cols + ki as usize);
+    let dl = (alpha / across).min(4000.0).ceil() as i64 + 1;
+    let dc = (alpha / along).min(4000.0).ceil() as i64 + 1;
     let p = placed(e, &v.origin, None);
     for l in (li - dl).max(0)..=(li + dl).min(v.n_lines as i64 - 1) {
         for k in (ki - dc).max(0)..=(ki + dc).min(v.n_cols as i64 - 1) {
