@@ -142,16 +142,22 @@ def test_a_chain_crosses_the_binding():
     assert list(_core.Scene([v], halves).rows()['group']) == [-1, -1]
 
 
-def test_the_grower_and_the_coupling_cross_the_binding():
-    """Research 130 slice-grower: a seed on the pole grows into a chain along it inside the region a Python test
-    gives, read exactly; the coupling row of its sticks is pure geometry."""
+def test_the_grower_and_the_axis_prior_cross_the_binding():
+    """Research 130 slice-grower and slice-s8: a seed on the pole grows into a chain along it inside the region a
+    Python test gives, read exactly, its axis prior row apart from its cost; the row of its sticks, read alone, is the
+    grower's, and a fork's insertion row reads the settings' γ."""
     v = pole_image()
     seed = dict(a=np.array([[0.0, 4.0, -0.02]]), b=np.array([[0.0, 4.0, 0.02]]), r=np.array([0.03]))
     (g,) = _core.Scene([v], dict(a=np.zeros((0, 3)), b=np.zeros((0, 3)), r=np.zeros(0))).grow(seed, lambda p: np.abs(p[:, 2]) < 0.2)
     assert g['sticks'].shape[1] == 7 and g['length'] > 0.2 and g['cost'] < g['seed_cost'] < 0
     assert np.isclose(g['scan'].sum(), g['cost']) and np.allclose(g['sticks'][:, 1], 4.0)
-    row = _core.coupling(g['sticks'])
+    row = _core.axis_prior(g['sticks'])
     assert np.isclose(row['length'], g['length']) and row['gap'] < 1e-9
+    assert np.isclose(row['radius'] + row['bend'], g['prior']) and np.isclose(row['polarity'], g['polarity'])
+    before, after = np.r_[0, 0, -0.05, 0, 0, 0, 0.01], np.r_[0, 0, 0, 0, 0, 0.05, 0.008]
+    lateral = np.r_[0, 0, 0, 0.03, 0, 0.04, 0.006]
+    at = lambda g: _core.insertion(before, after, lateral, dict(fork_gamma=g, axis_taper=0.0))['departure']
+    assert abs(at(2.0)) < 1e-12 and abs(at(3.0)) > 1e-3
 
 
 def test_the_collapsed_field_crosses_the_binding():

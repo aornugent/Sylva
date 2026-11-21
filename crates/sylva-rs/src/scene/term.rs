@@ -12,7 +12,7 @@
 //!   differed between hypotheses and, once every fronted cell counted, favoured the thinner (slice 7c).
 //! - **Chains** (3dtrees research 130 slice 6): elements of one group ([`Element`]'s `group`) are one term per scan
 //!   ([`Owner`]), so a chain of short sticks shares its nuisances. A declared term over
-//!   its geometry alone (its coupling: taper, bends) is the consumer's, beside the cost, never in it.
+//!   its geometry alone (the axis prior, `chain::axis_row`) is the consumer's, beside the cost, never in it.
 
 use crate::Point;
 use crate::transform::{norm, sub};

@@ -32,7 +32,7 @@ use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
 use std::sync::Arc;
-use sylva_rs::scene::chain::{Coupling, Grow};
+use sylva_rs::scene::chain::{Grow, axis_row, insertion_row};
 use sylva_rs::scene::foliage::FoliageBox;
 use sylva_rs::scene::moments::{Candidate, Moments};
 use sylva_rs::scene::pyramid::Pyramid;
@@ -153,18 +153,47 @@ fn field_ln_nb<'py>(py: Python<'py>, hits: PyReadonlyArray1<f64>, path: PyReadon
         .collect::<Vec<_>>().into_pyarray(py))
 }
 
-/// The coupling row (scene::chain::Coupling::row) along sticks (n, 7: a, b, r) joined end to end in order: length and
-/// gap (m), and the declared coupling's cost of their radii and bends (nats), beside the cost, never in it.
-#[pyfunction]
-fn coupling<'py>(py: Python<'py>, sticks: PyReadonlyArray2<f64>) -> PyResult<Bound<'py, PyDict>> {
+/// Sticks (n, 7: a, b, r) as (a, b, r) triples.
+fn triples_of(sticks: &PyReadonlyArray2<f64>, what: &str) -> PyResult<Vec<([f64; 3], [f64; 3], f64)>> {
     let st = sticks.as_array();
     if st.ncols() != 7 || st.nrows() == 0 {
-        return Err(PyValueError::new_err("coupling needs sticks (n, 7), n > 0"));
+        return Err(PyValueError::new_err(format!("{what} needs sticks (n, 7), n > 0")));
     }
-    let rows: Vec<([f64; 3], [f64; 3], f64)> = st.rows().into_iter().map(|x| ([x[0], x[1], x[2]], [x[3], x[4], x[5]], x[6])).collect();
-    let c = Coupling::default().row(&rows);
+    Ok(st.rows().into_iter().map(|x| ([x[0], x[1], x[2]], [x[3], x[4], x[5]], x[6])).collect())
+}
+
+/// The axis prior's row (scene::chain::axis_row) along sticks (n, 7: a, b, r) joined end to end in order, one axis,
+/// under `settings` (its `axis_*` fields; the defaults without): length and gap (m), tau (its length in τ), and the
+/// departures of its radii and bends (nats) with polarity (the other polarity's radius departure less this one's,
+/// positive when the root is at the first stick's start). Beside the cost, never in it.
+#[pyfunction]
+#[pyo3(signature = (sticks, settings=None))]
+fn axis_prior<'py>(py: Python<'py>, sticks: PyReadonlyArray2<f64>, settings: Option<&Bound<'_, PyDict>>) -> PyResult<Bound<'py, PyDict>> {
+    let c = axis_row(&self::settings(settings)?, &triples_of(&sticks, "axis_prior")?);
     let d = PyDict::new(py);
-    for (k, v) in [("length", c.length), ("gap", c.gap), ("radius", c.radius), ("bend", c.bend)] {
+    for (k, v) in [("length", c.length), ("tau", c.tau), ("gap", c.gap), ("radius", c.radius), ("bend", c.bend), ("polarity", c.polarity)] {
+        d.set_item(k, v)?;
+    }
+    Ok(d)
+}
+
+/// The fork insertion's row (scene::chain::insertion_row) of a lateral on its parent, each a stick (7: a, b, r): the
+/// parent before the insertion (its end the insertion point), after it, and the lateral, under `settings` (its
+/// `fork_*` and `axis_*` fields): conservation and angle (nats) and departure (in ln r).
+#[pyfunction]
+#[pyo3(signature = (before, after, lateral, settings=None))]
+fn insertion<'py>(py: Python<'py>, before: PyReadonlyArray1<f64>, after: PyReadonlyArray1<f64>, lateral: PyReadonlyArray1<f64>,
+                  settings: Option<&Bound<'_, PyDict>>) -> PyResult<Bound<'py, PyDict>> {
+    let one = |x: &PyReadonlyArray1<f64>| -> PyResult<([f64; 3], [f64; 3], f64)> {
+        let x = x.as_slice()?;
+        if x.len() != 7 {
+            return Err(PyValueError::new_err("insertion needs sticks of 7: a, b, r"));
+        }
+        Ok(([x[0], x[1], x[2]], [x[3], x[4], x[5]], x[6]))
+    };
+    let c = insertion_row(&self::settings(settings)?, one(&before)?, one(&after)?, one(&lateral)?);
+    let d = PyDict::new(py);
+    for (k, v) in [("conservation", c.conservation), ("angle", c.angle), ("departure", c.departure)] {
         d.set_item(k, v)?;
     }
     Ok(d)
@@ -465,7 +494,8 @@ pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(mismatch_sd, m)?)?;
     m.add_function(wrap_pyfunction!(alignment_hats, m)?)?;
     m.add_function(wrap_pyfunction!(field_ln_nb, m)?)?;
-    m.add_function(wrap_pyfunction!(coupling, m)?)?;
+    m.add_function(wrap_pyfunction!(axis_prior, m)?)?;
+    m.add_function(wrap_pyfunction!(insertion, m)?)?;
     Ok(())
 }
 
@@ -600,7 +630,8 @@ impl PyScene {
     /// `beam` continuations, pieces 4 r long within `step` m, up to `max_length` m, inside the region: `inside` takes
     /// points (n, 3) and returns a bool per point), the scene unchanged. Per seed a dict: sticks (k, 7) in order along
     /// the chain; cost and scan (per scan, then with a field the field's part), its cost to add read exactly; kalman
-    /// (the chain state's own cost); seed_cost; steps; coupling (the departures' ½ Σ z²); length (m).
+    /// (the chain state's own cost); seed_cost; steps; prior, prior_radius, prior_bend and polarity (its axis prior row
+    /// under the scene's settings, apart from the cost; the beam ranked by cost plus prior); length (m).
     #[pyo3(signature = (seeds, inside, beam=3, max_length=1.5, step=(0.03, 0.10)))]
     fn grow<'py>(&self, py: Python<'py>, seeds: &Bound<'py, PyDict>, inside: Py<PyAny>, beam: usize, max_length: f64, step: (f64, f64))
         -> PyResult<Vec<Bound<'py, PyDict>>> {
@@ -619,7 +650,8 @@ impl PyScene {
             let d = PyDict::new(py);
             d.set_item("sticks", sticks_of(py, &g.sticks)?)?;
             d.set_item("scan", g.scan.clone().into_pyarray(py))?;
-            for (k, v) in [("cost", g.cost), ("kalman", g.kalman), ("seed_cost", g.seed_cost), ("coupling", g.coupling), ("length", g.length)] {
+            for (k, v) in [("cost", g.cost), ("kalman", g.kalman), ("seed_cost", g.seed_cost), ("prior", g.prior.total()), ("prior_radius", g.prior.radius),
+                           ("prior_bend", g.prior.bend), ("polarity", g.prior.polarity), ("length", g.length)] {
                 d.set_item(k, v)?;
             }
             d.set_item("steps", g.steps)?;
