@@ -25,6 +25,7 @@
 //!   scan alignment error's spread.
 
 use super::instrument::Instrument;
+use super::settings::T_MAX;
 use super::lattice::{scan_lattice, Lattice};
 use std::sync::Arc;
 use crate::error::{Error, Result};
@@ -417,6 +418,31 @@ impl RangeImage {
     /// The lattice step (rad), the zenith step between a line's slots, as this scan's timing measures it.
     pub fn step(&self) -> f64 {
         self.lat.zenith_step.abs().to_radians()
+    }
+
+    /// The range cell `k`'s weight is read at ([`super::settings::Settings::cell_weight`]), from the data alone, the
+    /// same for every hypothesis, and the one weight its pulse counts everywhere, in the ray likelihood and in the
+    /// foliage field's counts alike: its first echo's; for a pulse with no echo, the nearest first echo among its eight
+    /// neighbouring cells (where its footprint overlaps theirs on the surface beside it), else [`T_MAX`]. A stand-in
+    /// until a shared misfit per element replaces per-cell weights (3dtrees research 130 slice-miss-weight; slice-defects
+    /// D2: the field counted each echo at its own range, so a later echo weighed m(first) / m(echo) as much in the
+    /// field's part as in the pulse's, and the read field no longer cancelled).
+    pub fn weight_range(&self, k: usize) -> f64 {
+        if self.cell[k] == Cell::Echoes {
+            return self.range[k] as f64;
+        }
+        let (l, c, nl, nc) = ((k / self.n_cols) as i64, (k % self.n_cols) as i64, self.n_lines as i64, self.n_cols as i64);
+        let mut near = f64::INFINITY;
+        for (dl, dc) in [(-1, -1), (-1, 0), (-1, 1), (0, -1), (0, 1), (1, -1), (1, 0), (1, 1)] {
+            let (ll, cc) = (l + dl, c + dc);
+            if ll >= 0 && cc >= 0 && ll < nl && cc < nc {
+                let j = (ll * nc + cc) as usize;
+                if self.cell[j] == Cell::Echoes {
+                    near = near.min(self.range[j] as f64);
+                }
+            }
+        }
+        if near.is_finite() { near } else { T_MAX }
     }
 
     /// Cell `k`'s spacing to its neighbours (rad): along its line, the zenith step; across lines, the head's turn

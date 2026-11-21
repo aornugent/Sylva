@@ -51,8 +51,8 @@
 //!   hits the other scans' field predicts (3dtrees research 130 rca-field-range). (On held-out transmission
 //!   this reading is as good as the first echo's alone or better: research 130 slices 12c, 13b. A clumping factor Ω
 //!   on the optical depth wasn't supported: slice 12c.) Each echo and each voxel's piece of a ray counts
-//!   [`field_weight`] at its own range: without grains the cell's weight, how many neighbouring beams overlap there
-//!   (slice-path); with them, the cell's share of a grain.
+//!   [`field_weight`]: without grains the cell's weight, the one its pulse counts in the ray likelihood (slice-defects
+//!   D2; slice-path read it at each echo's and stretch's own range); with them, the cell's share of a grain.
 //! - **Soft attribution: what the field counts** (3dtrees research 130 slice-soft; formulation.md "Soft attribution
 //!   and the representation under it"). Every ray counts its whole path, in the beam its echoes left: the ray
 //!   likelihood reads the medium's path in every way it explains a pulse (an echo is the medium's, an element's or an
@@ -138,17 +138,21 @@ pub fn grain_factor(em: &Settings, range: f64) -> f64 {
     if s > 0.0 { (1.0 + 0.5 * em.footprint(range) / s).powi(2) } else { 1.0 }
 }
 
-/// The weight the field counts an echo, and a stretch of path, with at range `range` on a lattice of `steps`: with
-/// grains, one grain stops every cell its grown shadow covers, so each echo counts the cell's share of a grain,
-/// `min(1, cell / (π (s + w/2)²))` (3dtrees research 130 grain-field: φ's part in the field); without, the cell's own
-/// weight ([`Settings::cell_weight`]).
-pub fn field_weight(em: &Settings, range: f64, steps: (f64, f64)) -> f64 {
-    let s = em.grain_radius;
+/// The weight the field counts cell `k`'s echo, or stretch of path, at range `range` with: without grains the cell's
+/// weight, the one its pulse counts in the ray likelihood ([`Settings::cell_weight`] at
+/// [`RangeImage::weight_range`]), so the read field cancels from the cost (3dtrees research 130 slice-defects D2: at
+/// each echo's own range, a later echo weighed m(first) / m(echo) as much here as in the pulse; one weight a pulse also
+/// keeps each pulse's hits and path in proportion, so σ's estimate stays unbiased). With grains, one grain stops every
+/// cell its grown shadow covers, so each counts the cell's share of a grain at its own range,
+/// `min(1, cell / (π (s + w/2)²))` (3dtrees research 130 grain-field: φ's part in the field; the pulse doesn't read it
+/// yet).
+pub fn field_weight(em: &Settings, v: &RangeImage, k: usize, range: f64) -> f64 {
+    let (s, steps) = (em.grain_radius, v.steps(k));
     if s > 0.0 {
         let grown = std::f64::consts::PI * (s + 0.5 * em.footprint(range)).powi(2);
         (range * range * steps.0 * steps.1 / grown).min(1.0)
     } else {
-        em.cell_weight(range, steps)
+        em.cell_weight(v.weight_range(k), steps)
     }
 }
 
@@ -405,8 +409,7 @@ pub fn beam_left(v: &RangeImage, em: &Settings, k: usize) -> f64 {
 }
 
 /// The echoes of image `v`'s cell `k` the field counts as hits, those inside the box: (the echo's index in its
-/// pulse, its voxel, its weight), [`Settings::cell_weight`] at the echo's range: one hit, whatever the echoes before it
-/// left, since the beam left is the chance the pulse got there and its path counts it (the module docs). The empty
+/// pulse, its voxel, its weight), [`field_weight`]: one hit, whatever the echoes before it left, since the beam left is the chance the pulse got there and its path counts it (the module docs). The empty
 /// scene counts each whole; a scene's elements explain their responsibilities' share (the module docs).
 pub fn hits(v: &RangeImage, sp: &FoliageBox, em: &Settings, k: usize) -> Vec<(usize, [i32; 3], f64, f64)> {
     if v.cell[k] != Cell::Echoes {
@@ -414,29 +417,27 @@ pub fn hits(v: &RangeImage, sp: &FoliageBox, em: &Settings, k: usize) -> Vec<(us
     }
     let w = v.direction((k / v.n_cols) as f64, (k % v.n_cols) as f64);
     let p = walked(v, em, k).expect("a pulse");
-    let steps = v.steps(k);
     p.echoes.iter().enumerate().filter_map(|(i, &r)| {
         let x = [0, 1, 2].map(|a| v.origin[a] + w[a] * r);
-        inside(sp, &x).then(|| (i, key(sp, &x), field_weight(em, r, steps), r))
+        inside(sp, &x).then(|| (i, key(sp, &x), field_weight(em, v, k, r), r))
     }).collect()
 }
 
 /// One cell's ray through the box, walked once ([`Walk`]), counted whole into `acc` (the empty scene's reading; the
-/// module docs): each echo a hit ([`hits`]) and each stretch it shows clear its path ([`walked`]), each voxel's piece of
-/// it weighted at its own range, as an echo there would be (3dtrees research 130 slice-path: the overlap of
-/// neighbouring beams is the voxel's, for its hits and its path alike).
+/// module docs): each echo a hit ([`hits`]) and each stretch it shows clear its path ([`walked`]), each at
+/// [`field_weight`]: the cell's weight, its hits and its path alike (slice-defects D2; slice-path weighed each voxel's
+/// piece at its own range).
 fn ray(v: &RangeImage, sp: &FoliageBox, em: &Settings, k: usize, acc: &mut FixedCounts) {
     let w = v.direction((k / v.n_cols) as f64, (k % v.n_cols) as f64);
     if clip(sp, &v.origin, &w).is_none() {
         return;
     }
     let Some(p) = walked(v, em, k) else { return }; // nothing observed
-    let steps = v.steps(k);
     let walk = Walk::new(sp, &v.origin, &w);
     for &(from, to, beam) in &p.path {
         for (key, a, b) in walk.within(from, to) {
             let mid = 0.5 * (a + b);
-            accumulate(acc, key, 0.0, field_weight(em, mid, steps) * grain_factor(em, mid) * beam * (b - a));
+            accumulate(acc, key, 0.0, field_weight(em, v, k, mid) * grain_factor(em, mid) * beam * (b - a));
         }
     }
     for (_, key, h, _) in hits(v, sp, em, k) {
@@ -754,12 +755,13 @@ mod tests {
         assert!(flat.merge_integral(10.0, 20.0, 30.0, z0, slope) < 1e-10);
     }
 
-    /// A voxel's path counts with the weight of its own range, wherever the ray ends (3dtrees research 130 slice-path):
-    /// two neighbouring rays of the test scan, one stopping on the pole at 4 m, one passing on to the wall at 8 m, count
-    /// the same weighted path per metre in the voxels before the pole. Read at each ray's first echo, the wall's ray
-    /// counted about three times the pole's there, so a near voxel read thin.
+    /// A ray's path counts with its cell's weight, wherever the voxel (slice-defects D2; slice-path read each voxel's
+    /// piece at its own range): two neighbouring rays of the test scan, one stopping on the pole at 4 m, one passing on
+    /// to the wall at 8 m, count weighted path per metre before the pole in the ratio of their cells' weights, about
+    /// three times as much for the wall's ray. slice-path found this reads a near voxel thin, since the rays that end
+    /// in it weigh less than those that pass; one weight a pulse is what lets the read field cancel from the cost.
     #[test]
-    fn a_voxels_path_counts_at_its_own_range() {
+    fn a_rays_path_counts_at_its_cells_weight() {
         let v = super::super::fixtures::pole_image();
         let em = Settings::default();
         let sp = super::super::fixtures::field_box();
@@ -778,7 +780,8 @@ mod tests {
             path as f64 / FIXED / (0.9 / w[1])
         };
         let (a, b) = (per_metre(pole), per_metre(wall));
-        assert!((a / b - 1.0).abs() < 0.01, "{a} against {b}");
+        let wt = |k: usize| em.cell_weight(v.weight_range(k), v.steps(k));
+        assert!((a / b / (wt(pole) / wt(wall)) - 1.0).abs() < 0.01 && b > 2.0 * a, "{a} against {b}");
     }
 
     /// The field recovers the medium past an echo as the pulse reads it (3dtrees research 130 rca-field-range): every
@@ -816,6 +819,36 @@ mod tests {
         let sp = FoliageBox { lo: [-1.0, 4.0, -1.0], hi: [1.0, 6.0, 1.0], voxel: 0.25 };
         let (h, l) = FieldCounts::new(sp, &[&v], &em).counts().values().fold((0.0, 0.0), |(h, l), &(a, b)| (h + a, l + b));
         assert!((h / l / sigma - 1.0).abs() < 0.03, "the field reads {} against σ = {sigma}", h / l);
+    }
+
+    /// Slice-defects D2: every echo of a pulse, the later one too, counts in the field at the weight its pulse counts
+    /// with in the ray likelihood (the cell's: [`RangeImage::weight_range`]), so the read field cancels from the cost.
+    #[test]
+    fn a_later_echo_counts_at_its_pulses_weight() {
+        use crate::shots::reconstruct::dir;
+        let em = Settings::default();
+        let (mut t, mut d, mut start, mut range) = (Vec::new(), Vec::new(), vec![0u32], Vec::new());
+        for l in 0..200usize {
+            for k in 0..400usize {
+                t.push(l as f64 * 6.6e-3 + k as f64 * 0.825e-6);
+                d.push(dir(84.0 + 0.03 * k as f64, -3.0 + 0.03 * l as f64));
+                range.extend([3.0f32, 8.0]);
+                start.push(range.len() as u32);
+            }
+        }
+        let id = [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]];
+        let v = RangeImage::new(&t, &d, start, range, (84.0, 96.0), id, [0.0; 3], 0, &super::super::range_image::RangeImageParams::default());
+        let sp = FoliageBox { lo: [-2.0, 2.0, -2.0], hi: [2.0, 9.0, 2.0], voxel: 0.5 };
+        let mut n = 0;
+        for k in 0..v.n_lines * v.n_cols {
+            let h = hits(&v, &sp, &em, k);
+            if h.len() == 2 {
+                let wt = em.cell_weight(v.weight_range(k), v.steps(k));
+                assert!(h.iter().all(|x| (x.2 - wt).abs() < 1e-12 * wt), "{h:?} against {wt}");
+                n += 1;
+            }
+        }
+        assert!(n > 100, "{n}");
     }
 
     /// An echo's reflectance is its share of the emitted beam, so two echoes taking 40 % each leave 20 %, not 36 %, and
