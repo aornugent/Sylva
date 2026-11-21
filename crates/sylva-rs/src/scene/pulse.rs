@@ -641,7 +641,7 @@ impl<P: Real, T: Over<P>> Pass<'_, P, T> {
             let d = none * (seen * sig_o * (-seen * (tau_o - tau0).max(0.0)).exp()) * em.refl_background(P::c(x) - (scene * taken).max(1e-6).log10() * 10.0);
             if d.v() > 0.0 {
                 let f = d * (1.0 - P_OUTLIER);
-                let rest = self.lik(rets, i + 1, jn, scene, em.beam_after(taken, x), em.beam_after(seen, x), tau_after, prefix * f.v(), resp);
+                let rest = self.lik(rets, i + 1, jn, scene, taken_after(scene.v(), taken, x, em), em.beam_after(seen, x), tau_after, prefix * f.v(), resp);
                 resp[row + self.owners - 2] += prefix * f.v() * rest.v();
                 total += f * rest;
             }
@@ -652,6 +652,14 @@ impl<P: Real, T: Over<P>> Pass<'_, P, T> {
         resp[row + self.owners - 1] += prefix * f * rest.v();
         total + rest * f
     }
+}
+
+/// `taken` after a medium echo of reflectance `x` (dB), where the scene left `scene` of the emitted beam: the echo takes
+/// its share of the emitted beam ([`Settings::beam_after`]) from the beam there, `scene × taken`, as `seen` subtracts
+/// it, and what's left is read against `scene` again (3dtrees research 130 slice-defects D3: subtracted from `taken`
+/// alone, behind a return that left 0.6 a leaf echo of share 0.3 left 0.42 of the emitted beam, not 0.30).
+pub(super) fn taken_after(scene: f64, taken: f64, x: f64, em: &Settings) -> f64 {
+    if scene > 0.0 { em.beam_after(scene * taken, x) / scene } else { taken }
 }
 
 /// A cell's log-likelihood at shift `shift` and reflectance level `level` ([`mixture_ll`]) and, per echo, the share
@@ -681,6 +689,17 @@ mod tests {
     use crate::scene::settings::{Background, Settings};
     use crate::scene::term::elem_data;
     use super::super::fixtures::{cost, pole_scan, pole_view, stick};
+
+    #[test]
+    fn a_medium_echo_takes_its_share_of_the_emitted_beam() {
+        // slice-defects D3: behind a return that left 0.6, a leaf echo of share 0.3 leaves 0.30 of the emitted beam,
+        // half of what the return left; in front of every return it leaves 0.7, as `seen` reads it
+        let em = Settings::default();
+        let x = em.refl_full_hit() + 10.0 * 0.3f64.log10();
+        assert!((taken_after(0.6, 1.0, x, &em) * 0.6 - 0.3).abs() < 1e-9);
+        assert!((taken_after(1.0, 1.0, x, &em) - em.beam_after(1.0, x)).abs() < 1e-12);
+        assert_eq!(taken_after(0.6, 1.0, f64::NAN, &em), 1.0);
+    }
 
     #[test]
     fn a_miss_is_weighted_at_the_nearest_echo_beside_it() {
