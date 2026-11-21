@@ -66,6 +66,8 @@ branch `3dtrees/125-rebase`.
   (`information`), what one hypothesis is expected to cost against another (`divergence`), and elements' counts and
   cell predictions. Elements of one group (a chain) are one term per scan; `scene.chain` grows chains by the
   likelihood beside a scene (`Scene::grow`, each chain's term held in information form and updated by a piece's
-  cells alone) under a declared coupling. Bound as `_core.RangeImage`, `_core.Scene`,
+  cells alone) under the declared prior over a plant's wood (`chain::axis_row`, an axis in length in radii scored by
+  departures only, the same however the wood is cut; `chain::insertion_row`, a fork conserving r^γ), its values in
+  `Settings`, its rows beside the cost, never in it. Bound as `_core.axis_prior`, `_core.insertion`, `_core.RangeImage`, `_core.Scene`,
   `_core.candidates` and `_core.settings_defaults` in `scene_py.rs`, with `ShotsFile::read_echo_f64` for per-echo
   attributes. 3dtrees needs them to score geometry and class hypotheses from the rays. Additive.

@@ -12,7 +12,7 @@
 //!   differed between hypotheses and, once every fronted cell counted, favoured the thinner (slice 7c).
 //! - **Chains** (3dtrees research 130 slice 6): elements of one group ([`Element`]'s `group`) are one term per scan
 //!   ([`Owner`]), so a chain of short sticks shares its nuisances. A declared term over
-//!   its geometry alone (its coupling: taper, bends) is the consumer's, beside the cost, never in it.
+//!   its geometry alone (the axis prior, `chain::axis_row`) is the consumer's, beside the cost, never in it.
 
 use crate::Point;
 use crate::transform::{norm, sub};
@@ -506,7 +506,7 @@ mod tests {
             assert_eq!(a, b);
         }
         assert_eq!(w.cost, l.cost);
-        let patch = Element { form: Form::Patch { centre: [0.0, 4.0, 0.0] }, class: Class::Leaf, r: 0.03, opacity: 1.0, mismatch: 0.002, group: None };
+        let patch = Element { form: Form::Patch { centre: [0.0, 4.0, 0.0] }, class: Class::Leaf, r: 0.03, opacity: 1.0, mismatch: 0.002, group: None, key: None };
         assert_eq!(rows(patch).front_shift_sd, 0.0);
     }
 

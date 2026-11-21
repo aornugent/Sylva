@@ -301,7 +301,7 @@ mod tests {
     use crate::scene::scene::Scene;
     use crate::scene::settings::{Background, Settings};
     use crate::scene::term::{term_classes, ElemData};
-    use super::super::fixtures::{cost, pole_image, pole_view, stick};
+    use super::super::fixtures::{add, cost, costs, pole_image, pole_view, remove, stick, swap};
 
     /// The joint arrowhead Newton ([`solve_alignment`]) ends at the scan's minimum: on the pole alone and with a stick
     /// beside it (sharing its node), moving any alignment node by ±0.2 prior sd, each term's own nodes re-solved
@@ -330,8 +330,8 @@ mod tests {
 
     /// A scene's moves hold the alignment (step 3a): each move's cost change stays near the exact marginal's
     /// (re-solved), for an add beside the pole (sharing its alignment node), an alter and a remove; adding then removing
-    /// an element restores the cost exactly (synthesis §18 invariant 7); `costs_to_add` equals
-    /// the move; and after `refit_alignment` the cost is a fresh scene's.
+    /// an element restores the cost exactly (synthesis §18 invariant 7); the score equals keeping
+    /// it; and after `refit_alignment` the cost is a fresh scene's.
     #[test]
     fn held_moves_match_the_exact_marginal() {
         let v = pole_view();
@@ -343,18 +343,18 @@ mod tests {
         let e0 = c.cost();
         assert_eq!(e0, c.exact_cost());
         assert!((e0 - full(&[pole])).abs() < 1e-9 * e0.abs().max(1.0));
-        let t: f64 = c.costs_to_add(&[vec![side]])[0].iter().sum();
-        let (id, d_add) = c.add(side);
+        let t: f64 = costs(&c, &[vec![side]])[0].iter().sum();
+        let (id, d_add) = add(&mut c, side);
         assert_eq!(t, d_add);
         assert!(near(d_add, full(&[pole, side]) - e0), "add {d_add} exact {}", full(&[pole, side]) - e0);
-        let d_alter = c.change(0, wide);
+        let (_, d_alter) = swap(&mut c, 0, wide);
         assert!(near(d_alter, full(&[wide, side]) - full(&[pole, side])), "alter {d_alter} exact {}", full(&[wide, side]) - full(&[pole, side]));
         assert!(near(c.cost(), c.exact_cost()), "{} vs {}", c.cost(), c.exact_cost());
         let e1 = c.cost();
-        let (other, _) = c.add(stick(-0.1, 5.0, 0.01));
-        c.remove(other);
+        let (other, _) = add(&mut c, stick(-0.1, 5.0, 0.01));
+        remove(&mut c, other);
         assert_eq!(c.cost(), e1);
-        let d_remove = c.remove(id);
+        let d_remove = remove(&mut c, id);
         assert!(near(d_remove, full(&[wide]) - full(&[wide, side])), "remove {d_remove} exact {}", full(&[wide]) - full(&[wide, side]));
         c.refit_alignment();
         assert!((c.cost() - full(&[wide])).abs() < 1e-9 * c.cost().abs().max(1.0), "{} vs {}", c.cost(), full(&[wide]));
@@ -428,7 +428,7 @@ mod tests {
         let ab = Scene::new(vec![a.clone(), b.clone()], &el, em, sc, None, 0);
         let ba = Scene::new(vec![b.clone(), a.clone()], &el, em, sc, None, 0);
         assert!((ab.cost() - ba.cost()).abs() < 1e-9, "{} vs {}", ab.cost(), ba.cost());
-        let rows = ab.rows();
+        let rows = ab.rows(&crate::scene::scene::Proposal::default());
         assert!(rows[1].align_sd > rows[0].align_sd, "{:?}", rows);
     }
 }

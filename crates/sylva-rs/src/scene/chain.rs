@@ -2,14 +2,22 @@
 // Copyright (C) 2026 Tim Devereux, The University of Queensland.
 // Free software under the GNU General Public License v3.0 or later;
 // see the LICENSE file. There is no warranty, to the extent permitted by law.
-//! Chains grown by the likelihood (3dtrees research 130 slice-grower): the coupling along a chain, a chain's state as
-//! it grows beside a scene, and the grower.
+//! Chains grown by the likelihood (3dtrees research 130 slice-grower), and the declared prior over a plant's wood
+//! (research 130 plant-prior, slice-s8): the axis prior and the fork as an insertion, a chain's state as it grows
+//! beside a scene, and the grower.
 //!
-//! - **The coupling** ([`Coupling`]; research 130 slices 6 and 7): a declared prior over a chain's geometry alone, a
-//!   Gaussian Markov process along its length. Its ln r drifts (the taper) with stationary form departures about the
-//!   drift (an Ornstein–Uhlenbeck process), and its axis's direction walks with a bend sd by radius, measured on the
-//!   stand's true axes. It is the consumer's: it proposes and ranks the grower's continuations and gives a chain's
-//!   coupling row ([`Coupling::row`]), never enters the cost.
+//! - **The axis prior** ([`axis_row`]; research 130 lens-tree T1–T2): a declared prior over one axis's geometry alone,
+//!   never in a cost. Its clock is length in radii, dτ = ds / r (more generally ds / r^β, `Settings::axis_clock`), so
+//!   the taper, the form departures and the bend are each one constant per unit τ from twig to stem. ln r drifts by
+//!   `axis_taper` per τ (at β = 1 a linear taper, dr/ds constant) with Ornstein–Uhlenbeck departures about a level the
+//!   row profiles out; the direction walks at `axis_bend` per √τ. The row samples the sticks' radius and direction
+//!   every `axis_step` of τ about the axis's middle and charges only departures (½ z², no normalisers), so the same
+//!   wood cut into more sticks gives the same row (the invariant `the_axis_row_is_the_same_however_the_wood_is_cut`).
+//!   Which end is the root isn't known for a chain alone: the radius departure is the cheaper polarity's, with the two
+//!   polarities' difference beside it.
+//! - **The fork** ([`insertion_row`]; lens-tree T3): a lateral inserted on its parent axis, scored by conservation,
+//!   r_before^γ = r_after^γ + r_lat^γ (`fork_gamma`, spread `fork_sd` in ln r), the radii carried by the taper to the
+//!   insertion point, and by the lateral's angle to its parent. A crossing is two axes and no insertion.
 //! - **A chain's state** ([`Chain`]), per scan: its group's term's evidence in information form (each cell's
 //!   −log-likelihood a quadratic in (δ, reflectance level) about the point of its last read, and their sum), its own
 //!   nodes' mode and precision and its alignment shift's slope and curvature (its [`Term`]), the context terms it
@@ -17,14 +25,15 @@
 //!   exactly, through the own nodes' Newton warm from the chain's mode, the rest from the sum less the quadratics of
 //!   the cells it enters. So growing a chain takes time linear in its length, and scoring an extension costs the
 //!   piece's cells. The quadratics are the Laplace step the term already takes, each about its own last read; a grown
-//!   chain's cost is read again exactly (`costs_to_add`) when it is handed over.
+//!   chain's cost is read again exactly (`score`) when it is handed over.
 //! - **The grower** ([`Scene::grow`]): from a seed stick, a beam of a few chains grows one piece at a time, the ends
-//!   taking turns. A piece leaves the end along its axis, 4 r long within [`Grow`]'s `step`; its options are the
-//!   coupling's: straight at the radius or e^(±2 sd) of it, or turned one or two bend sds either way in two planes.
-//!   Each option's cost to add is conditioned on its chain (one group, the scene unchanged). A chain extends by the
-//!   options whose cost to add is negative, inside the region and within the longest length; an end with none stops.
-//!   The beam keeps the chains least in cost plus the coupling's departures (½ Σ z²), and the least of them is handed
-//!   over. A seed that doesn't beat nothing isn't grown.
+//!   taking turns. A piece leaves the end along its axis, 4 r long within [`Grow`]'s `step`; its options are the axis
+//!   prior's spread over the piece's τ: straight at the radius or e^(±2 sd) of it, or turned one or two bend sds
+//!   either way in two planes. Each option's cost to add is conditioned on its chain (one group, the scene
+//!   unchanged). A chain extends by the options whose cost to add is negative, inside the region and within the
+//!   longest length; an end with none stops. The beam keeps the chains least in cost plus the axis row (a proposer
+//!   ranks as it likes), and the least of them is handed over with its cost and its row apart. A seed that doesn't
+//!   beat nothing isn't grown.
 
 use crate::Point;
 use crate::transform::{add, cross, dot, norm, normalize, scale, sub};
@@ -35,101 +44,144 @@ use super::dual::{Dual2, Real};
 use super::foliage::{self, Deposit, FixedHits};
 use super::pulse::mixture_taken;
 use super::render::{Element, Form, Layer, KBuffer, keep, numbered, render};
-use super::scene::{Scene, redeposit};
+use super::scene::{Proposal, Scene, redeposit};
+use super::settings::Settings;
 use super::term::{CellData, Owner, Term, eliminate, elem_data, median_class, owner, settle, slots, term_nodes, vote, clipped, mean_of};
 
-/// The coupling's declared row (3dtrees research 128: taper and form departures; research 130 slice 7: the bend sd
-/// by radius, measured on the stand's true axes at the median: twigs 1.3, branches 0.48, scaffolds 0.19 rad per √m).
-#[derive(Debug, Clone, Copy)]
-pub struct Coupling {
-    /// The taper: ln r's drift per metre along the chain.
-    pub drift: f64,
-    /// The form departures about the drift: their sd, and the length (m) over which they decorrelate.
-    pub form_sd: f64,
-    pub form_range: f64,
-    /// The bend sd (rad per √m) under [`BEND_BANDS`]' first radius (twigs), between them (branches) and over
-    /// (scaffolds and stems).
-    pub bend_sd: [f64; 3],
+/// The clock's reference radius (m): dτ = ds / r · (r / R_CLOCK)^(1 − β), so β = 1 is length in radii and β = 0 is
+/// length in units of R_CLOCK, whatever the radius (`Settings::axis_clock`).
+pub const R_CLOCK: f64 = 0.01;
+
+/// τ per metre along wood of radius r (the clock, `Settings::axis_clock`).
+pub fn tau_rate(em: &Settings, r: f64) -> f64 {
+    (r / R_CLOCK).powf(1.0 - em.axis_clock) / r
 }
 
-impl Default for Coupling {
-    fn default() -> Self {
-        Coupling { drift: -0.15, form_sd: 0.2, form_range: 1.0, bend_sd: [1.3, 0.48, 0.19] }
-    }
-}
-
-/// The radii (m) between the bend sd's bands.
-pub const BEND_BANDS: [f64; 2] = [0.005, 0.01];
-
-/// A chain's coupling row: its length and widest end-to-start gap (m), and the coupling's cost of its radii and its
-/// bends (nats).
+/// An axis's prior row: its length (m), its length in τ, its widest end-to-start gap (m, reported, not charged), and
+/// the departures (nats) of its radii and its direction from the declared process. `radius` is the departure in the
+/// cheaper of the two polarities (which end is the root); `polarity` is the other's less this one's, positive when the
+/// root is at the first stick's start. The marginal over a fair polarity bit is
+/// `radius + ln 2 − ln(1 + e^(−|polarity|))`.
 #[derive(Debug, Clone, Copy, PartialEq)]
-pub struct CouplingRow {
+pub struct AxisRow {
     pub length: f64,
+    pub tau: f64,
     pub gap: f64,
     pub radius: f64,
     pub bend: f64,
+    pub polarity: f64,
 }
 
-impl Coupling {
-    /// The bend sd (rad per √m) at radius r.
-    pub fn bend_sd(&self, r: f64) -> f64 {
-        self.bend_sd[BEND_BANDS.iter().filter(|&&b| r >= b).count()]
+impl AxisRow {
+    /// The row's departures together (nats).
+    pub fn total(&self) -> f64 {
+        self.radius + self.bend
     }
+}
 
-    /// The form departures' sd over a step of `s` m along the chain (the OU's transition).
-    pub fn form_step(&self, s: f64) -> f64 {
-        self.form_sd * (1.0 - (-2.0 * s / self.form_range).exp()).sqrt()
+/// The prior row of sticks (a, b, r) joined end to end in order along one axis (the module's docs, "the axis prior").
+pub fn axis_row(em: &Settings, sticks: &[(Point, Point, f64)]) -> AxisRow {
+    let mut out = AxisRow { length: 0.0, tau: 0.0, gap: 0.0, radius: 0.0, bend: 0.0, polarity: 0.0 };
+    if sticks.is_empty() {
+        return out;
     }
-
-    /// The row along sticks (a, b, r) joined end to end in order: ln r about the drift from the first stick, an OU
-    /// anchored on it, and per joint the turn between the axes over s, the distance between the sticks' middles, at
-    /// the bend sd of their mean ln r.
-    pub fn row(&self, sticks: &[(Point, Point, f64)]) -> CouplingRow {
-        let mut out = CouplingRow { length: 0.0, gap: 0.0, radius: 0.0, bend: 0.0 };
-        let Some(&(a0, b0, r0)) = sticks.first() else { return out };
-        let mut pos = 0.5 * norm(&sub(&b0, &a0));
-        let x0 = r0.ln() - self.drift * pos;
-        let (mut x, mut prev) = (x0, (a0, b0, r0));
-        out.length = 2.0 * pos;
-        for &(a, b, r) in &sticks[1..] {
-            let (ln, ln_prev) = (norm(&sub(&b, &a)), norm(&sub(&prev.1, &prev.0)));
-            let s = 0.5 * (ln + ln_prev);
-            pos += s;
-            let xn = r.ln() - self.drift * pos;
-            let var = self.form_step(s).powi(2);
-            let e = (xn - x0) - (-s / self.form_range).exp() * (x - x0);
-            out.radius += 0.5 * e * e / var + 0.5 * (2.0 * std::f64::consts::PI * var).ln();
-            let turn = dot(&normalize(&sub(&b, &a)), &normalize(&sub(&prev.1, &prev.0))).clamp(-1.0, 1.0).acos();
-            let vb = self.bend_sd((r * prev.2).sqrt()).powi(2) * s;
-            out.bend += 0.5 * turn * turn / vb + (2.0 * std::f64::consts::PI * vb).ln();
-            out.gap = out.gap.max(norm(&sub(&a, &prev.1)));
-            out.length += ln;
-            (x, prev) = (xn, (a, b, r));
+    // each stick's end in τ
+    let mut ends = Vec::with_capacity(sticks.len());
+    for (j, &(a, b, r)) in sticks.iter().enumerate() {
+        let len = norm(&sub(&b, &a));
+        out.length += len;
+        out.tau += len * tau_rate(em, r);
+        ends.push(out.tau);
+        if j > 0 {
+            out.gap = out.gap.max(norm(&sub(&a, &sticks[j - 1].1)));
         }
-        out
+    }
+    // the samples: every `axis_step` of τ about the axis's middle, so a cut that changes nothing adds nothing
+    let step = em.axis_step;
+    let k = (0.5 * out.tau / step).floor() as i64;
+    let samples: Vec<(f64, f64, Point)> = (-k..=k).map(|i| {
+        let t = 0.5 * out.tau + i as f64 * step;
+        let (a, b, r) = sticks[ends.partition_point(|&e| e <= t).min(sticks.len() - 1)];
+        (t, r.ln(), normalize(&sub(&b, &a)))
+    }).collect();
+    // bends: the direction walks with variance axis_bend² per unit τ in each of two directions
+    let q = em.axis_bend.powi(2) * step;
+    out.bend = samples.windows(2).map(|w| {
+        let turn = dot(&w[0].2, &w[1].2).clamp(-1.0, 1.0).acos();
+        0.5 * turn * turn / q
+    }).sum();
+    // radii: ln r less the taper, an OU about a level the row profiles out, in each polarity
+    let rho = (-step / em.axis_form_range).exp();
+    let (sd0, sd1) = (em.axis_form_sd, em.axis_form_sd * (1.0 - rho * rho).sqrt());
+    let ou = |y: &[f64]| -> f64 {
+        // residuals (c − a L) / s, the level L by least squares
+        let mut terms = vec![(y[0], 1.0, sd0)];
+        terms.extend(y.windows(2).map(|w| (w[1] - rho * w[0], 1.0 - rho, sd1)));
+        let (num, den) = terms.iter().fold((0.0, 0.0), |(n, d), &(c, a, s)| (n + a * c / (s * s), d + a * a / (s * s)));
+        let l = num / den;
+        terms.iter().map(|&(c, a, s)| 0.5 * ((c - a * l) / s).powi(2)).sum()
+    };
+    let forward: Vec<f64> = samples.iter().map(|&(t, lr, _)| lr - em.axis_taper * t).collect();
+    let backward: Vec<f64> = samples.iter().map(|&(t, lr, _)| lr - em.axis_taper * (out.tau - t)).collect();
+    let (f, b) = (ou(&forward), ou(&backward));
+    out.radius = f.min(b);
+    out.polarity = b - f;
+    out
+}
+
+/// A fork as an insertion (the module's docs, "the fork"): the departures (nats) of conservation and of the lateral's
+/// angle, and conservation's departure itself in ln r, `(1/γ) ln(r_after^γ + r_lat^γ) − ln r_before`, each radius
+/// carried by the taper from its stick's middle to the insertion point.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct InsertionRow {
+    pub conservation: f64,
+    pub angle: f64,
+    pub departure: f64,
+}
+
+impl InsertionRow {
+    /// The row's departures together (nats).
+    pub fn total(&self) -> f64 {
+        self.conservation + self.angle
     }
 }
 
-/// The grower's settings: the chains a seed's beam keeps, the longest chain (m), a piece's length bounds (m; 4 r
-/// within them), and the coupling.
+/// The insertion row of a lateral stick on its parent: the parent's stick before the insertion (the root on its
+/// start's side, its end at the insertion point), the parent's stick after it, and the lateral, each (a, b, r) with
+/// the after and lateral sticks starting at the insertion.
+pub fn insertion_row(em: &Settings, before: (Point, Point, f64), after: (Point, Point, f64), lateral: (Point, Point, f64)) -> InsertionRow {
+    // a stick's ln r carried from its middle by half its length in τ, toward the tips (+) or toward the root (−)
+    let carried = |(a, b, r): (Point, Point, f64), out: f64| r.ln() + out * em.axis_taper * 0.5 * norm(&sub(&b, &a)) * tau_rate(em, r);
+    let (pb, pa, pl) = (carried(before, 1.0), carried(after, -1.0), carried(lateral, -1.0));
+    let g = em.fork_gamma;
+    let departure = ((g * pa).exp() + (g * pl).exp()).ln() / g - pb;
+    let theta = dot(&normalize(&sub(&before.1, &before.0)), &normalize(&sub(&lateral.1, &lateral.0))).clamp(-1.0, 1.0).acos();
+    InsertionRow {
+        conservation: 0.5 * (departure / em.fork_sd).powi(2),
+        angle: 0.5 * ((theta - em.fork_angle_mean) / em.fork_angle_sd).powi(2),
+        departure,
+    }
+}
+
+/// The grower's settings: the chains a seed's beam keeps, the longest chain (m), and a piece's length bounds (m; 4 r
+/// within them). It proposes under the scene's settings' axis prior.
 #[derive(Debug, Clone, Copy)]
 pub struct Grow {
     pub beam: usize,
     pub max_length: f64,
     pub step: (f64, f64),
-    pub coupling: Coupling,
 }
 
 impl Default for Grow {
     fn default() -> Self {
-        Grow { beam: 3, max_length: 1.5, step: (0.03, 0.10), coupling: Coupling::default() }
+        Grow { beam: 3, max_length: 1.5, step: (0.03, 0.10) }
     }
 }
 
 /// A grown chain as handed over: its sticks in order along it, its cost to add per scan read exactly (then, with a
 /// foliage field, the field's part) and in total, the state's own cost (`kalman`, from the quadratics), the seed's
-/// cost, the pieces it added, the coupling's departures (½ Σ z²) and its length (m).
+/// cost, the pieces it added, its axis prior row (apart from the cost: the beam ranked by their sum) and its length
+/// (m).
 #[derive(Debug, Clone)]
 pub struct Grown {
     pub sticks: Vec<Element>,
@@ -138,7 +190,7 @@ pub struct Grown {
     pub kalman: f64,
     pub seed_cost: f64,
     pub steps: usize,
-    pub coupling: f64,
+    pub prior: AxisRow,
     pub length: f64,
 }
 
@@ -205,7 +257,7 @@ pub struct Chain {
     scans: Vec<ChainScan>,
     delta: FixedHits,
     cost: f64,
-    coupling: f64,
+    prior: f64,
     length: f64,
     steps: usize,
     done: [bool; 2],
@@ -233,7 +285,7 @@ struct Trial {
 
 impl Chain {
     fn empty(n: usize) -> Chain {
-        Chain { pieces: Vec::new(), order: VecDeque::new(), scans: vec![ChainScan::default(); n], delta: FixedHits::default(), cost: 0.0, coupling: 0.0,
+        Chain { pieces: Vec::new(), order: VecDeque::new(), scans: vec![ChainScan::default(); n], delta: FixedHits::default(), cost: 0.0, prior: 0.0,
                 length: 0.0, steps: 0, done: [false; 2], turn: 1 }
     }
 
@@ -243,7 +295,7 @@ impl Chain {
     }
 
     fn score(&self) -> f64 {
-        self.cost + self.coupling
+        self.cost + self.prior
     }
 
     /// The end that grows next: its turn's, unless that one has stopped.
@@ -270,7 +322,8 @@ impl Scene {
             if live.is_empty() {
                 break;
             }
-            // each live chain's options at its growing end, inside the region and within the longest length
+            // each live chain's options at its growing end, with the chain's prior row were it taken, inside the region
+            // and within the longest length
             let props: Vec<(usize, usize, Element, f64)> = live.iter().flat_map(|&i| {
                 let end = beam[i].end();
                 self.options(&beam[i], end, opts).into_iter().map(move |(e, z)| (i, end, e, z))
@@ -291,7 +344,7 @@ impl Scene {
                 if ext.is_empty() {
                     pool.push((m.score(), i, None));
                 }
-                pool.extend(ext.into_iter().map(|k| (trials[k].as_ref().unwrap().cost + m.coupling + props[k].3, i, Some(k))));
+                pool.extend(ext.into_iter().map(|k| (trials[k].as_ref().unwrap().cost + props[k].3, i, Some(k))));
             }
             pool.sort_by(|a, b| a.0.total_cmp(&b.0));
             pool.truncate(opts.beam.max(1));
@@ -307,33 +360,39 @@ impl Scene {
         }
         let best = beam.into_iter().min_by(|a, b| a.score().total_cmp(&b.score())).unwrap();
         let sticks = best.sticks();
-        let scan = self.costs_to_add(&[sticks.clone()]).remove(0);
-        Grown { cost: scan.iter().sum(), scan, sticks, kalman: best.cost, seed_cost, steps: best.steps, coupling: best.coupling, length: best.length }
+        let scan = self.score(&[Proposal::put(&sticks)]).remove(0);
+        let prior = axis_row(&self.em, &triples(&sticks));
+        Grown { cost: scan.iter().sum(), scan, sticks, kalman: best.cost, seed_cost, steps: best.steps, prior, length: best.length }
     }
 
     /// The next piece's options from chain `m`'s end `end` (0 its first stick's start, 1 its last's end), each with
-    /// the coupling's departure ½ z² (the module's docs).
+    /// the chain's axis prior row (its total) were the piece taken (the module's docs).
     fn options(&self, m: &Chain, end: usize, opts: &Grow) -> Vec<(Element, f64)> {
         let tip = m.pieces[if end == 1 { *m.order.back().unwrap() } else { *m.order.front().unwrap() }];
         let Form::Stick { a, b } = tip.form else { return Vec::new() };
         let (p, u) = if end == 1 { (b, normalize(&sub(&b, &a))) } else { (a, normalize(&sub(&a, &b))) };
         let ln = (4.0 * tip.r).clamp(opts.step.0, opts.step.1);
-        let (sd, th) = (opts.coupling.form_step(ln), opts.coupling.bend_sd(tip.r) * ln.sqrt());
+        // the axis prior's spread over the piece's length in τ: the form departures' and the bend's
+        let dt = ln * tau_rate(&self.em, tip.r);
+        let rho = (-dt / self.em.axis_form_range).exp();
+        let (sd, th) = (self.em.axis_form_sd * (1.0 - rho * rho).sqrt(), self.em.axis_bend * dt.sqrt());
         let p1 = normalize(&cross(&u, &if u[2].abs() < 0.9 { [0.0, 0.0, 1.0] } else { [1.0, 0.0, 0.0] }));
         let p2 = cross(&u, &p1);
-        let mut dirs: Vec<(Point, f64, f64)> = [0.0, -2.0, 2.0].iter().map(|&k| (u, k, 0.5 * k * k)).collect();
+        let mut dirs: Vec<(Point, f64)> = [0.0, -2.0, 2.0].iter().map(|&k| (u, k)).collect();
         for j in [1.0, 2.0] {
             for q in [p1, p2] {
                 for s in [1.0, -1.0] {
-                    dirs.push((add(&scale(&u, (j * th).cos()), &scale(&q, s * (j * th).sin())), 0.0, 0.5 * j * j));
+                    dirs.push((add(&scale(&u, (j * th).cos()), &scale(&q, s * (j * th).sin())), 0.0));
                 }
             }
         }
-        dirs.into_iter().map(|(d, k, z)| {
+        let sticks = triples(&m.sticks());
+        dirs.into_iter().map(|(d, k)| {
             let q = add(&p, &scale(&d, ln));
             let r = tip.r * (k * sd).exp();
-            let form = if end == 1 { Form::Stick { a: p, b: q } } else { Form::Stick { a: q, b: p } };
-            (Element { form, r, mismatch: self.em.mismatch_sd(r), ..tip }, z)
+            let (form, piece) = if end == 1 { (Form::Stick { a: p, b: q }, (p, q, r)) } else { (Form::Stick { a: q, b: p }, (q, p, r)) };
+            let with: Vec<_> = if end == 1 { sticks.iter().copied().chain([piece]).collect() } else { [piece].into_iter().chain(sticks.iter().copied()).collect() };
+            (Element { form, r, mismatch: self.em.mismatch_sd(r), ..tip }, axis_row(&self.em, &with).total())
         }).collect()
     }
 
@@ -449,8 +508,8 @@ impl Scene {
         ScanTrial { layers, gone, fresh, term, ctx, cost }
     }
 
-    /// Chain `c` with trial `t` taken at its end `end`, the coupling's departure `z` added.
-    fn take(&self, c: &Chain, t: Trial, end: usize, z: f64) -> Chain {
+    /// Chain `c` with trial `t` taken at its end `end`, its axis prior row's total then `prior`.
+    fn take(&self, c: &Chain, t: Trial, end: usize, prior: f64) -> Chain {
         let first = self.elems.len() as u32;
         let id = first + c.pieces.len() as u32;
         let mut n = c.clone();
@@ -489,12 +548,20 @@ impl Scene {
         }
         n.delta = t.delta;
         n.cost = t.cost;
-        n.coupling += z;
+        n.prior = prior;
         n.length += t.piece.length();
         n.steps += !c.pieces.is_empty() as usize;
         n.turn = 1 - end;
         n
     }
+}
+
+/// Sticks as (a, b, r), patches left out.
+pub fn triples(es: &[Element]) -> Vec<(Point, Point, f64)> {
+    es.iter().filter_map(|e| match e.form {
+        Form::Stick { a, b } => Some((a, b, e.r)),
+        Form::Patch { .. } => None,
+    }).collect()
 }
 
 impl Element {
@@ -515,7 +582,7 @@ mod tests {
     use super::super::fixtures::{field_box, piece_of, pole_view};
 
     /// The chain's state grown piece by piece is its full rebuild: after each piece its cells are those the group's
-    /// term reads when the chain is scored whole, and its cost to add is `costs_to_add`'s for the whole chain within
+    /// term reads when the chain is scored whole, and its cost to add is `score`'s for the whole chain within
     /// the Laplace step's error (each cell a quadratic about its last read), with a foliage field and without.
     #[test]
     fn the_chains_state_is_its_full_rebuild() {
@@ -528,7 +595,7 @@ mod tests {
                 let z = -0.15 + 0.03 * k as f64;
                 c = scene.take(&c, scene.try_piece(&c, piece_of(z, z + 0.03, Some(7))), 1, 0.0);
                 let sticks = c.sticks();
-                let whole = scene.costs_to_add(&[sticks.clone()]).remove(0).iter().sum::<f64>();
+                let whole = scene.score(&[Proposal::put(&sticks)]).remove(0).iter().sum::<f64>();
                 assert!((c.cost - whole).abs() < 1e-3 * whole.abs().max(1.0), "{k} pieces: {} against {whole}", c.cost);
                 let rendered = render_all(&v, &sticks, &em);
                 let d = &elem_data(&v, &KBuffer::of(&rendered).cells(), &sticks, &vec![0; sticks.len()], &(0..sticks.len()).collect::<Vec<_>>(), 0, &em, &sc, &scene.ext,
@@ -540,30 +607,84 @@ mod tests {
         }
     }
 
-    /// The coupling row is pure geometry: radii scaled together cost what they did (the OU's anchor moves with
-    /// them), a bend and a jump in radius cost, the gap is the widest; and a twig bends more freely than a scaffold.
+    /// The axis row is the same however the wood is cut (research 130 lens-tree check C): a kinked, tapering axis
+    /// whose sticks are each cut into 2 and 4 collinear pieces of the same radius gives the same row to rounding.
     #[test]
-    fn the_coupling_row_is_pure_geometry() {
-        let cp = Coupling::default();
-        let straight: Vec<(Point, Point, f64)> = (0..5).map(|k| ([0.0, 0.0, 0.05 * k as f64], [0.0, 0.0, 0.05 * (k + 1) as f64], 0.004)).collect();
-        let base = cp.row(&straight);
-        assert!((base.length - 0.25).abs() < 1e-12 && base.gap == 0.0);
-        let scaled: Vec<_> = straight.iter().map(|&(a, b, r)| (a, b, 2.0 * r)).collect();
-        assert!((cp.row(&scaled).radius - base.radius).abs() < 1e-9);
+    fn the_axis_row_is_the_same_however_the_wood_is_cut() {
+        let em = Settings::default();
+        let (mut at, mut dir) = ([0.0, 0.0, 0.0], [0.0, 0.0, 1.0]);
+        let mut axis = Vec::new();
+        for k in 0..7 {
+            let (len, r) = (0.031 + 0.017 * ((k * 5 % 7) as f64), 0.006 * (1.0 - 0.09 * k as f64) * (1.0 + 0.05 * ((k % 3) as f64 - 1.0)));
+            let b = add(&at, &scale(&dir, len));
+            axis.push((at, b, r));
+            at = b;
+            let turn = 0.06 * (k as f64 - 3.0);
+            dir = normalize(&add(&scale(&dir, turn.cos()), &[turn.sin(), 0.3 * turn.sin(), 0.0]));
+        }
+        let cut = |n: usize| -> Vec<(Point, Point, f64)> {
+            axis.iter().flat_map(|&(a, b, r)| (0..n).map(move |i| {
+                let (f0, f1) = (i as f64 / n as f64, (i + 1) as f64 / n as f64);
+                (add(&a, &scale(&sub(&b, &a), f0)), add(&a, &scale(&sub(&b, &a), f1)), r)
+            })).collect()
+        };
+        let one = axis_row(&em, &cut(1));
+        assert!(one.bend > 1.0 && one.radius > 0.1, "{one:?}");
+        for n in [2, 4] {
+            let x = axis_row(&em, &cut(n));
+            for (p, q) in [(x.length, one.length), (x.tau, one.tau), (x.radius, one.radius), (x.bend, one.bend), (x.polarity, one.polarity)] {
+                assert!((p - q).abs() < 1e-9 * q.abs().max(1.0), "×{n}: {x:?} against {one:?}");
+            }
+        }
+    }
+
+    /// The axis row charges departures only: a straight, untapered axis costs nothing; a kink costs bend and a jump in
+    /// radius costs radius; the gap is the widest, reported; an arc of the same shape costs a twig less than a
+    /// scaffold (in τ a twig is long); and an axis that thins along its order puts the root at its start.
+    #[test]
+    fn the_axis_row_charges_departures_only() {
+        let em = Settings { axis_taper: 0.0, ..Settings::default() };
+        let straight: Vec<(Point, Point, f64)> = (0..10).map(|k| ([0.0, 0.0, 0.05 * k as f64], [0.0, 0.0, 0.05 * (k + 1) as f64], 0.004)).collect();
+        let base = axis_row(&em, &straight);
+        assert!((base.length - 0.5).abs() < 1e-12 && base.gap == 0.0 && base.radius.abs() < 1e-12 && base.bend == 0.0, "{base:?}");
         let mut bent = straight.clone();
-        bent[3] = ([0.0, 0.0, 0.15], [0.03, 0.0, 0.19], 0.004);
-        assert!(cp.row(&bent).bend > base.bend + 1.0);
+        for s in &mut bent[5..] {
+            *s = (add(&s.0, &[0.02 * (s.0[2] - 0.25) / 0.05, 0.0, 0.0]), add(&s.1, &[0.02 * (s.1[2] - 0.25) / 0.05, 0.0, 0.0]), s.2);
+        }
+        assert!(axis_row(&em, &bent).bend > 1.0);
         let mut jump = straight.clone();
-        jump[2].2 = 0.008;
-        assert!(cp.row(&jump).radius > base.radius + 1.0);
+        for s in &mut jump[5..] {
+            s.2 = 0.006;
+        }
+        assert!(axis_row(&em, &jump).radius > 1.0);
         let mut gap = straight.clone();
         gap[4].0[2] += 0.02;
-        assert!((cp.row(&gap).gap - 0.02).abs() < 1e-12);
-        let excess = |r: f64| {
-            let with = |s: &[(Point, Point, f64)]| cp.row(&s.iter().map(|&(a, b, _)| (a, b, r)).collect::<Vec<_>>()).bend;
-            with(&bent) - with(&straight)
+        assert!((axis_row(&em, &gap).gap - 0.02).abs() < 1e-12);
+        let arc = |r: f64| -> f64 {
+            let pts: Vec<Point> = (0..=20).map(|k| { let t = 0.05 * k as f64; [0.5 * (1.0 - t.cos()), 0.0, 0.5 * t.sin()] }).collect();
+            axis_row(&em, &pts.windows(2).map(|w| (w[0], w[1], r)).collect::<Vec<_>>()).bend
         };
-        assert!(excess(0.003) < excess(0.02));
+        assert!(arc(0.002) < arc(0.02), "{} against {}", arc(0.002), arc(0.02));
+        let thinning: Vec<_> = straight.iter().enumerate().map(|(k, &(a, b, _))| (a, b, 0.006 - 0.0004 * k as f64)).collect();
+        assert!(axis_row(&Settings::default(), &thinning).polarity > 0.0);
+    }
+
+    /// The fork as an insertion: radii that conserve r^γ at the declared γ depart by nothing, and by something at
+    /// another γ; a lateral at the declared angle costs nothing for its angle.
+    #[test]
+    fn the_insertion_conserves_r_to_the_gamma() {
+        let em = Settings { axis_taper: 0.0, ..Settings::default() };
+        let g = em.fork_gamma;
+        let (rb, ra) = (0.01, 0.008);
+        let rl = (rb.powf(g) - ra.powf(g)).powf(1.0 / g);
+        let th = em.fork_angle_mean;
+        let before = ([0.0, 0.0, -0.05], [0.0, 0.0, 0.0], rb);
+        let after = ([0.0, 0.0, 0.0], [0.0, 0.0, 0.05], ra);
+        let lateral = ([0.0, 0.0, 0.0], [0.05 * th.sin(), 0.0, 0.05 * th.cos()], rl);
+        let x = insertion_row(&em, before, after, lateral);
+        assert!(x.departure.abs() < 1e-12 && x.conservation < 1e-12 && x.angle < 1e-12, "{x:?}");
+        let other = insertion_row(&Settings { fork_gamma: g + 1.0, ..em }, before, after, lateral);
+        assert!(other.departure.abs() > 1e-3 && other.conservation > 0.0);
     }
 
     /// From a short piece of the pole, the grower runs along the pole to the region's ends: a chain on its axis,

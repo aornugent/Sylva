@@ -166,6 +166,28 @@ params! {
         pub field_prior_mean: f64 = 0.11938,
         pub field_prior_path: f64 = 0.5177,
         pub field_prior_voxel: f64 = 0.125,
+        /// The declared prior over a plant's wood ([`super::chain::axis_row`], [`super::chain::insertion_row`]; 3dtrees
+        /// research 130 slice-s8): a consumer's rows beside the cost, never in it, and never read by the evidence.
+        /// The clock: dτ = ds / r · (r / 1 cm)^(1 − β), β = `axis_clock` (1: length in radii). The axis prior samples
+        /// an axis every `axis_step` of τ; along it ln r drifts by `axis_taper` per τ with Ornstein–Uhlenbeck form
+        /// departures of sd `axis_form_sd` decorrelating over `axis_form_range` τ, and the direction walks at
+        /// `axis_bend` rad per √τ. The fork conserves r^γ, γ = `fork_gamma`, to `fork_sd` in ln r, its lateral at
+        /// `fork_angle_mean` ± `fork_angle_sd` rad from its parent. Taper, form sd and bend are fitted by maximum
+        /// likelihood on 3,000 of the simulated stand's true axes by `prior.py fit` (research 130 slice-s8), which is
+        /// the stand generator's own rule, not mulga's: in τ the bend is 0.048 to 0.038 from 2 mm to 40 mm wood, where
+        /// per metre it is 3.4× apart. The form departures' range is research 128's 1 m read at 2 cm; the step is the
+        /// grower's 4 r; γ, its spread and the angle are declared (the generator draws γ 2.0–2.5 and laterals at
+        /// 20–45°; AM's γ is unresolved against the radius floor, research 128 synthesis §6).
+        pub axis_clock: f64 = 1.0,
+        pub axis_step: f64 = 4.0,
+        pub axis_taper: f64 = -0.0104,
+        pub axis_form_sd: f64 = 0.207,
+        pub axis_form_range: f64 = 50.0,
+        pub axis_bend: f64 = 0.0419,
+        pub fork_gamma: f64 = 2.0,
+        pub fork_sd: f64 = 0.1,
+        pub fork_angle_mean: f64 = 0.57,
+        pub fork_angle_sd: f64 = 0.13,
     }
 }
 

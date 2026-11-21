@@ -658,7 +658,7 @@ mod tests {
     fn a_stick_just_before_a_wall_merges_its_edges() {
         let (em, sc) = (Settings::default(), Background::default());
         let v = Arc::new(pole_scan(0.02, 4.0, 0.5));
-        let wall = Element { form: Form::Patch { centre: [0.0, 6.5, 0.0] }, class: Class::Leaf, r: 2.0, opacity: 1.0, mismatch: 0.002, group: None };
+        let wall = Element { form: Form::Patch { centre: [0.0, 6.5, 0.0] }, class: Class::Leaf, r: 2.0, opacity: 1.0, mismatch: 0.002, group: None, key: None };
         let e = |r: f64| cost(&v, &[wall, stick(0.0, 4.0, r)], &em, &sc).0;
         let truth = e(0.02);
         for r in [0.014, 0.028] {

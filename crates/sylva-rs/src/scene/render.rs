@@ -61,9 +61,11 @@ pub enum Class {
 }
 
 /// An element hypothesis: its form, its class, its section's radius (a stick's a₀; a patch's extent), its opacity
-/// (1 solid), its shape mismatch sd (m) and its group. The caller supplies opacity and mismatch (each with a declared
-/// default). Elements of one `group` (a chain: research 130 slice 6) are one term per scan ([`Owner`]); none, the
-/// element is alone.
+/// (1 solid), its shape mismatch sd (m), its group and the caller's key. The caller supplies opacity and mismatch
+/// (each with a declared default). Elements of one `group` (a chain: research 130 slice 6) are one term per scan
+/// ([`Owner`]); none, the element is alone. `key` is the caller's name for the element in its candidate graph (which
+/// end it continues, which axis it inserts on and at which s*, in the caller's encoding): carried with the element and
+/// read back with it ([`super::scene::Scene::element`]), never read by the scene (research 130 core.md §4.3, item 4).
 #[derive(Debug, Clone, Copy)]
 pub struct Element {
     pub form: Form,
@@ -72,6 +74,7 @@ pub struct Element {
     pub opacity: f64,
     pub mismatch: f64,
     pub group: Option<u32>,
+    pub key: Option<u64>,
 }
 
 impl Element {
@@ -511,7 +514,7 @@ mod tests {
     use super::*;
     use crate::scene::scene::Scene;
     use crate::scene::settings::{Background, Settings};
-    use super::super::fixtures::{cost, pole_view, stick, thin_pole_view};
+    use super::super::fixtures::{cost, costs, pole_view, stick, thin_pole_view};
 
     /// A stick barely wider than the footprint, under the measured (disc) beam: the true radius beats a thinner and a
     /// thicker one (research 130 slice 11: a Gaussian beam's tails expected edge echoes the disc doesn't return, so
@@ -539,7 +542,7 @@ mod tests {
         let (em, sc) = (Settings::default(), Background::default());
         let c = Scene::new(vec![v.clone()], &[stick(0.0, 4.0, 0.03)], em, sc, None, 0);
         let at = |x: f64| stick(x, 3.9, 0.008);
-        let cost = |x: f64| c.costs_to_add(&[vec![at(x)]])[0][0];
+        let cost = |x: f64| costs(&c, &[vec![at(x)]])[0][0];
         let fills = |x: f64| -> HashMap<usize, f64> { render(&v, &at(x), 0, &em).into_iter().map(|(k, l)| (k, l.fq[2])).collect() };
         let xs: Vec<f64> = (0..=40).map(|i| 0.026 + 5e-5 * i as f64).collect();
         let (mut worst, mut n, mut shared) = (0.0f64, 0, false);

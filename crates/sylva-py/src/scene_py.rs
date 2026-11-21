@@ -13,14 +13,18 @@
 //! - **Elements:** a dict of arrays, one row per element: `a`, `b` (n, 3) and `r` (n,) are required; `opacity` (n,)
 //!   defaults to 1, `mismatch` (n,) to the settings' prior `mismatch_base + mismatch_slope r`, `patch` (n,) bool
 //!   to false, `leaf` (n,) bool, its class (wood or leaf), to `patch`, and `group` (n,) int, its chain's key
-//!   (elements of one key are one term per scan: one set of nuisances), to -1, alone. A patch is a ball about `a` of radius `r`
+//!   (elements of one key are one term per scan: one set of nuisances), to -1, alone, and `key` (n,) int, the caller's
+//!   name for the element in its candidate graph (carried, never read), to -1, none. A patch is a ball about `a` of radius `r`
 //!   (its extent); its `b` is ignored. An element that can't be scored (a radius that isn't positive, an opacity
 //!   outside (0, 1], a stick of no length) raises.
 //! - **Scenes:** `Scene(images, elements, settings, background, foliage, ref_epoch)` holds elements against range
-//!   images, the alignment error's spread stated for the scans of epoch `ref_epoch` (another epoch's add `align_epoch_*`): `cost()`, `rows()` and the foliage field's `field_part()`, the cost change of each move (`add`,
-//!   `remove`, `change`, `costs_to_add`) with the alignment held, `refit_alignment()`, an element's counts (`counts`), cell predictions (`predict`), what one
-//!   hypothesis is expected to cost against another (`divergence`) and how well the scans pin elements down, one or
-//!   several jointly (`information`). A bad element id or scan index raises.
+//!   images, the alignment error's spread stated for the scans of epoch `ref_epoch` (another epoch's add `align_epoch_*`): `cost()`, `rows()` and the foliage field's `field_part()`.
+//!   A **proposal** is elements to put in (an element dict, `put_in`, numbered from `next_id()`) and live ids to take
+//!   out (`take_out`): `score` gives proposals' cost changes, nothing kept, and `keep` applies one, both with the
+//!   alignment held; the reads (`rows`, `information`, `foliage_voxels`; `counts` and `predict` with `take_out`) answer
+//!   for the scene as a proposal would leave it. Also `refit_alignment()`, what one hypothesis is expected to cost
+//!   against another (`divergence`) and the live elements with their keys (`elements`). A bad element id or scan index
+//!   raises.
 //! - **The foliage field:** `foliage` is a dict `lo`, `hi` (the box, 3 each) and `voxel` (m; its prior is the
 //!   settings' `field_prior_*`); the field is then what the elements leave of each echo there (`FoliageBox`; soft
 //!   attribution, 3dtrees research 130 slice-soft), its marginal in
@@ -32,14 +36,14 @@ use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
 use std::sync::Arc;
-use sylva_rs::scene::chain::{Coupling, Grow};
+use sylva_rs::scene::chain::{Grow, axis_row, insertion_row};
 use sylva_rs::scene::foliage::FoliageBox;
 use sylva_rs::scene::moments::{Candidate, Moments};
 use sylva_rs::scene::pyramid::Pyramid;
 use sylva_rs::scene::range_image::{Cell, RangeImage, RangeImageParams};
 use sylva_rs::scene::query::{CellPrediction, Information};
 use sylva_rs::scene::render::{Class, Element, Form};
-use sylva_rs::scene::scene::{ElementScan, Scene, SceneError};
+use sylva_rs::scene::scene::{ElementScan, Proposal, Scene, SceneError};
 use sylva_rs::scene::settings::{Background, Settings};
 
 use crate::xyz_from_py;
@@ -146,18 +150,47 @@ fn field_ln_nb<'py>(py: Python<'py>, hits: PyReadonlyArray1<f64>, path: PyReadon
         .collect::<Vec<_>>().into_pyarray(py))
 }
 
-/// The coupling row (scene::chain::Coupling::row) along sticks (n, 7: a, b, r) joined end to end in order: length and
-/// gap (m), and the declared coupling's cost of their radii and bends (nats), beside the cost, never in it.
-#[pyfunction]
-fn coupling<'py>(py: Python<'py>, sticks: PyReadonlyArray2<f64>) -> PyResult<Bound<'py, PyDict>> {
+/// Sticks (n, 7: a, b, r) as (a, b, r) triples.
+fn triples_of(sticks: &PyReadonlyArray2<f64>, what: &str) -> PyResult<Vec<([f64; 3], [f64; 3], f64)>> {
     let st = sticks.as_array();
     if st.ncols() != 7 || st.nrows() == 0 {
-        return Err(PyValueError::new_err("coupling needs sticks (n, 7), n > 0"));
+        return Err(PyValueError::new_err(format!("{what} needs sticks (n, 7), n > 0")));
     }
-    let rows: Vec<([f64; 3], [f64; 3], f64)> = st.rows().into_iter().map(|x| ([x[0], x[1], x[2]], [x[3], x[4], x[5]], x[6])).collect();
-    let c = Coupling::default().row(&rows);
+    Ok(st.rows().into_iter().map(|x| ([x[0], x[1], x[2]], [x[3], x[4], x[5]], x[6])).collect())
+}
+
+/// The axis prior's row (scene::chain::axis_row) along sticks (n, 7: a, b, r) joined end to end in order, one axis,
+/// under `settings` (its `axis_*` fields; the defaults without): length and gap (m), tau (its length in τ), and the
+/// departures of its radii and bends (nats) with polarity (the other polarity's radius departure less this one's,
+/// positive when the root is at the first stick's start). Beside the cost, never in it.
+#[pyfunction]
+#[pyo3(signature = (sticks, settings=None))]
+fn axis_prior<'py>(py: Python<'py>, sticks: PyReadonlyArray2<f64>, settings: Option<&Bound<'_, PyDict>>) -> PyResult<Bound<'py, PyDict>> {
+    let c = axis_row(&self::settings(settings)?, &triples_of(&sticks, "axis_prior")?);
     let d = PyDict::new(py);
-    for (k, v) in [("length", c.length), ("gap", c.gap), ("radius", c.radius), ("bend", c.bend)] {
+    for (k, v) in [("length", c.length), ("tau", c.tau), ("gap", c.gap), ("radius", c.radius), ("bend", c.bend), ("polarity", c.polarity)] {
+        d.set_item(k, v)?;
+    }
+    Ok(d)
+}
+
+/// The fork insertion's row (scene::chain::insertion_row) of a lateral on its parent, each a stick (7: a, b, r): the
+/// parent before the insertion (its end the insertion point), after it, and the lateral, under `settings` (its
+/// `fork_*` and `axis_*` fields): conservation and angle (nats) and departure (in ln r).
+#[pyfunction]
+#[pyo3(signature = (before, after, lateral, settings=None))]
+fn insertion<'py>(py: Python<'py>, before: PyReadonlyArray1<f64>, after: PyReadonlyArray1<f64>, lateral: PyReadonlyArray1<f64>,
+                  settings: Option<&Bound<'_, PyDict>>) -> PyResult<Bound<'py, PyDict>> {
+    let one = |x: &PyReadonlyArray1<f64>| -> PyResult<([f64; 3], [f64; 3], f64)> {
+        let x = x.as_slice()?;
+        if x.len() != 7 {
+            return Err(PyValueError::new_err("insertion needs sticks of 7: a, b, r"));
+        }
+        Ok(([x[0], x[1], x[2]], [x[3], x[4], x[5]], x[6]))
+    };
+    let c = insertion_row(&self::settings(settings)?, one(&before)?, one(&after)?, one(&lateral)?);
+    let d = PyDict::new(py);
+    for (k, v) in [("conservation", c.conservation), ("angle", c.angle), ("departure", c.departure)] {
         d.set_item(k, v)?;
     }
     Ok(d)
@@ -177,7 +210,7 @@ fn elements_from_py(d: &Bound<'_, PyDict>, em: &Settings) -> PyResult<Vec<Elemen
     let req = |k: &str| get(k)?.ok_or_else(|| PyValueError::new_err(format!("elements need {k:?}")));
     for k in d.keys() {
         let k: String = k.extract()?;
-        if !["a", "b", "r", "opacity", "mismatch", "patch", "leaf", "group"].contains(&k.as_str()) {
+        if !["a", "b", "r", "opacity", "mismatch", "patch", "leaf", "group", "key"].contains(&k.as_str()) {
             return Err(bad(&k));
         }
     }
@@ -200,12 +233,15 @@ fn elements_from_py(d: &Bound<'_, PyDict>, em: &Settings) -> PyResult<Vec<Elemen
     };
     let patch = flag("patch", vec![false; r.len()])?;
     let leaf = flag("leaf", patch.clone())?;
-    let group: Vec<i64> = match get("group")? {
-        Some(v) => v.extract::<PyReadonlyArray1<i64>>()?.as_array().to_vec(),
-        None => vec![-1; r.len()],
+    let ints = |k: &str| -> PyResult<Vec<i64>> {
+        Ok(match get(k)? {
+            Some(v) => v.extract::<PyReadonlyArray1<i64>>()?.as_array().to_vec(),
+            None => vec![-1; r.len()],
+        })
     };
+    let (group, key) = (ints("group")?, ints("key")?);
     let n = r.len();
-    if [a.len(), b.len(), opacity.len(), mismatch.len(), patch.len(), leaf.len(), group.len()].iter().any(|&m| m != n) {
+    if [a.len(), b.len(), opacity.len(), mismatch.len(), patch.len(), leaf.len(), group.len(), key.len()].iter().any(|&m| m != n) {
         return Err(PyValueError::new_err("elements: every array needs one row per element"));
     }
     (0..n)
@@ -213,7 +249,7 @@ fn elements_from_py(d: &Bound<'_, PyDict>, em: &Settings) -> PyResult<Vec<Elemen
             let e = Element {
                 form: if patch[i] { Form::Patch { centre: a[i] } } else { Form::Stick { a: a[i], b: b[i] } },
                 class: if leaf[i] { Class::Leaf } else { Class::Wood },
-                r: r[i], opacity: opacity[i], mismatch: mismatch[i], group: u32::try_from(group[i]).ok(),
+                r: r[i], opacity: opacity[i], mismatch: mismatch[i], group: u32::try_from(group[i]).ok(), key: u64::try_from(key[i]).ok(),
             };
             match e.invalid() {
                 Some(why) => Err(PyValueError::new_err(format!("element {i}: {why}"))),
@@ -500,7 +536,8 @@ pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(mismatch_sd, m)?)?;
     m.add_function(wrap_pyfunction!(alignment_hats, m)?)?;
     m.add_function(wrap_pyfunction!(field_ln_nb, m)?)?;
-    m.add_function(wrap_pyfunction!(coupling, m)?)?;
+    m.add_function(wrap_pyfunction!(axis_prior, m)?)?;
+    m.add_function(wrap_pyfunction!(insertion, m)?)?;
     Ok(())
 }
 
@@ -519,6 +556,14 @@ impl PyScene {
             [e] => Ok(*e),
             _ => Err(PyValueError::new_err("expected one element")),
         }
+    }
+
+    /// A proposal from an element dict to put in (none: nothing) and ids to take out, checked against the scene.
+    fn proposal(&self, put_in: Option<&Bound<'_, PyDict>>, take_out: Option<Vec<u32>>) -> PyResult<Proposal> {
+        let put_in = put_in.map(|d| elements_from_py(d, &self.em)).transpose()?.unwrap_or_default();
+        let p = Proposal { put_in, take_out: take_out.unwrap_or_default() };
+        self.inner.check_proposal(&p).map_err(scene_err)?;
+        Ok(p)
     }
 }
 
@@ -546,10 +591,14 @@ impl PyScene {
     }
 
     /// The foliage field per voxel with counts: voxel (n, 3, its index in the box), centre (n, 3), sigma (1/m, as
-    /// held), the weighted counts it is fitted from as the scene now is, hits (less what the elements take of them) and
-    /// path (m). Empty when the field is held from elsewhere.
-    fn foliage_voxels<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
-        let (spec, rows) = self.inner.foliage();
+    /// held), the weighted counts it is fitted from, hits (less what the elements take of them) and path (m), as the
+    /// scene is or, given a proposal (`put_in` an element dict, `take_out` ids), as it would leave them. Empty when the
+    /// field is held from elsewhere.
+    #[pyo3(signature = (put_in=None, take_out=None))]
+    fn foliage_voxels<'py>(&self, py: Python<'py>, put_in: Option<&Bound<'_, PyDict>>, take_out: Option<Vec<u32>>) -> PyResult<Bound<'py, PyDict>> {
+        let p = self.proposal(put_in, take_out)?;
+        let c = &self.inner;
+        let (spec, rows) = py.detach(|| c.foliage(&p));
         let d = PyDict::new(py);
         let n = rows.len();
         d.set_item("voxel", rows.iter().flat_map(|r| r.0).collect::<Vec<i32>>().into_pyarray(py).reshape([n, 3])?)?;
@@ -581,9 +630,14 @@ impl PyScene {
     /// to `cost()`); beside it, not
     /// in it, field: the change in the foliage field's term in its cost to remove in this scan (the plug-in of the hits it takes is in its ray_* parts); the evidence discount (discount); the
     /// posterior along the beam at it, the alignment held: align_shift, align_sd, front_shift, front_shift_sd (m); and
-    /// its reflectance level's: refl_level, refl_level_sd (dB).
-    fn rows<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
-        rows_dict(py, &self.inner.rows())
+    /// its reflectance level's: refl_level, refl_level_sd (dB). Given a proposal (`put_in` an element dict, its
+    /// elements numbered from `next_id()`; `take_out` ids), the rows of the scene as it would leave it, nothing kept.
+    #[pyo3(signature = (put_in=None, take_out=None))]
+    fn rows<'py>(&self, py: Python<'py>, put_in: Option<&Bound<'_, PyDict>>, take_out: Option<Vec<u32>>) -> PyResult<Bound<'py, PyDict>> {
+        let p = self.proposal(put_in, take_out)?;
+        let c = &self.inner;
+        let rows = py.detach(|| c.rows(&p));
+        rows_dict(py, &rows)
     }
 
     /// The foliage field's part of the cost: its marginal against the empty scene's (0 without a field, or with one
@@ -592,41 +646,48 @@ impl PyScene {
         self.inner.field_part()
     }
 
-    /// Add elements together (a chain's cells read once, scene::Scene::add_many): their ids and the cost change.
-    fn add(&mut self, py: Python<'_>, elements: &Bound<'_, PyDict>) -> PyResult<(Vec<u32>, f64)> {
-        let el = elements_from_py(elements, &self.em)?;
+    /// Keep a proposal (scene::Scene::keep): the elements `take_out` (ids) taken out and the elements `put_in` (an
+    /// element dict) put in, each scan re-termed once (a chain's cells read once): the new ids, numbered from
+    /// `next_id()`, and the cost change. Ids are never reused.
+    #[pyo3(signature = (put_in=None, take_out=None))]
+    fn keep(&mut self, py: Python<'_>, put_in: Option<&Bound<'_, PyDict>>, take_out: Option<Vec<u32>>) -> PyResult<(Vec<u32>, f64)> {
+        let p = self.proposal(put_in, take_out)?;
         let c = &mut self.inner;
-        Ok(py.detach(|| c.add_many(&el)))
+        Ok(py.detach(|| c.keep(&p)))
     }
 
-    /// Remove elements by id: the cost change.
-    fn remove(&mut self, py: Python<'_>, ids: Vec<u32>) -> PyResult<f64> {
-        let mut seen = std::collections::HashSet::new();
-        for &id in &ids {
-            self.inner.check_id(id).map_err(scene_err)?;
-            if !seen.insert(id) {
-                return Err(PyValueError::new_err(format!("element {id} twice")));
-            }
+    /// The id the next element kept would get: a proposal's elements are numbered from it in every read.
+    fn next_id(&self) -> u32 {
+        self.inner.next_id()
+    }
+
+    /// The live elements `ids` (scene::Element), as an element dict with the keys the caller gave them (`key`, -1
+    /// none) beside their sticks (n, 7), class (leaf), opacity, mismatch and group (-1 none).
+    fn elements<'py>(&self, py: Python<'py>, ids: Vec<u32>) -> PyResult<Bound<'py, PyDict>> {
+        let es: Vec<Element> = ids.iter().map(|&id| self.inner.element(id).ok_or_else(|| PyValueError::new_err(format!("no element {id}")))).collect::<PyResult<_>>()?;
+        let d = PyDict::new(py);
+        d.set_item("sticks", sticks_of(py, &es)?)?;
+        d.set_item("leaf", es.iter().map(|e| e.class == Class::Leaf).collect::<Vec<bool>>().into_pyarray(py))?;
+        d.set_item("opacity", es.iter().map(|e| e.opacity).collect::<Vec<f64>>().into_pyarray(py))?;
+        d.set_item("mismatch", es.iter().map(|e| e.mismatch).collect::<Vec<f64>>().into_pyarray(py))?;
+        d.set_item("group", es.iter().map(|e| e.group.map_or(-1, i64::from)).collect::<Vec<i64>>().into_pyarray(py))?;
+        d.set_item("key", es.iter().map(|e| e.key.map_or(-1, |k| k as i64)).collect::<Vec<i64>>().into_pyarray(py))?;
+        Ok(d)
+    }
+
+    /// Proposals' cost changes were each kept (scene::Scene::score), per scan and then, in a scene with a foliage
+    /// field, the field's part: `put_in` a list of element dicts (one or more elements each), `take_out` a list of id
+    /// lists beside it (none: nothing taken out); returns (proposals, scans), or (proposals, scans + 1) with a field,
+    /// the scene unchanged and its alignment held. A row sums to keeping it.
+    #[pyo3(signature = (put_in, take_out=None))]
+    fn score<'py>(&self, py: Python<'py>, put_in: Vec<Bound<'py, PyDict>>, take_out: Option<Vec<Vec<u32>>>) -> PyResult<Bound<'py, numpy::PyArray2<f64>>> {
+        let take_out = take_out.unwrap_or_else(|| vec![Vec::new(); put_in.len()]);
+        if take_out.len() != put_in.len() {
+            return Err(PyValueError::new_err("score: one take_out list per proposal"));
         }
-        let c = &mut self.inner;
-        Ok(py.detach(|| ids.into_iter().map(|id| c.remove(id)).sum()))
-    }
-
-    /// Replace an element: the cost change.
-    fn change(&mut self, py: Python<'_>, id: u32, element: &Bound<'_, PyDict>) -> PyResult<f64> {
-        self.inner.check_id(id).map_err(scene_err)?;
-        let e = self.one(element)?;
-        let c = &mut self.inner;
-        Ok(py.detach(|| c.change(id, e)))
-    }
-
-    /// Many hypotheses' costs to add, each alone, per scan and then, in a scene with a foliage field, the field's part:
-    /// `hypotheses` a list of element dicts (one or more elements each); returns (hypotheses, scans), or (hypotheses,
-    /// scans + 1) with a field, the scene unchanged and its alignment held. A row sums to the move.
-    fn costs_to_add<'py>(&self, py: Python<'py>, hypotheses: Vec<Bound<'py, PyDict>>) -> PyResult<Bound<'py, numpy::PyArray2<f64>>> {
-        let hs: Vec<Vec<Element>> = hypotheses.iter().map(|d| elements_from_py(d, &self.em)).collect::<PyResult<_>>()?;
+        let ps: Vec<Proposal> = put_in.iter().zip(take_out).map(|(d, t)| self.proposal(Some(d), Some(t))).collect::<PyResult<_>>()?;
         let c = &self.inner;
-        let out = py.detach(|| c.costs_to_add(&hs));
+        let out = py.detach(|| c.score(&ps));
         let (n, m) = (out.len(), out.first().map_or(self.inner.n_scans(), Vec::len));
         Ok(out.into_iter().flatten().collect::<Vec<f64>>().into_pyarray(py).reshape([n, m])?)
     }
@@ -635,7 +696,8 @@ impl PyScene {
     /// `beam` continuations, pieces 4 r long within `step` m, up to `max_length` m, inside the region: `inside` takes
     /// points (n, 3) and returns a bool per point), the scene unchanged. Per seed a dict: sticks (k, 7) in order along
     /// the chain; cost and scan (per scan, then with a field the field's part), its cost to add read exactly; kalman
-    /// (the chain state's own cost); seed_cost; steps; coupling (the departures' ½ Σ z²); length (m).
+    /// (the chain state's own cost); seed_cost; steps; prior, prior_radius, prior_bend and polarity (its axis prior row
+    /// under the scene's settings, apart from the cost; the beam ranked by cost plus prior); length (m).
     #[pyo3(signature = (seeds, inside, beam=3, max_length=1.5, step=(0.03, 0.10)))]
     fn grow<'py>(&self, py: Python<'py>, seeds: &Bound<'py, PyDict>, inside: Py<PyAny>, beam: usize, max_length: f64, step: (f64, f64))
         -> PyResult<Vec<Bound<'py, PyDict>>> {
@@ -654,7 +716,8 @@ impl PyScene {
             let d = PyDict::new(py);
             d.set_item("sticks", sticks_of(py, &g.sticks)?)?;
             d.set_item("scan", g.scan.clone().into_pyarray(py))?;
-            for (k, v) in [("cost", g.cost), ("kalman", g.kalman), ("seed_cost", g.seed_cost), ("coupling", g.coupling), ("length", g.length)] {
+            for (k, v) in [("cost", g.cost), ("kalman", g.kalman), ("seed_cost", g.seed_cost), ("prior", g.prior.total()), ("prior_radius", g.prior.radius),
+                           ("prior_bend", g.prior.bend), ("polarity", g.prior.polarity), ("length", g.length)] {
                 d.set_item(k, v)?;
             }
             d.set_item("steps", g.steps)?;
@@ -668,16 +731,21 @@ impl PyScene {
     /// directions, m) and tilted (rad); a patch's ln r and its centre moved (x, y, z, m). `expected` is positive
     /// semi-definite, the latents the cells share marginalised once, so summed over scans with `slope` it gives a
     /// Fisher-scoring step; `gradient_variance` (scans, n, n) is the slope's variance were the cells independent, for
-    /// the sandwich `E⁻¹ J E⁻¹`.
-    fn information<'py>(&self, py: Python<'py>, ids: Vec<u32>) -> PyResult<Bound<'py, PyDict>> {
+    /// the sandwich `E⁻¹ J E⁻¹`. Given a proposal (`put_in` an element dict, its elements numbered from `next_id()`;
+    /// `take_out` ids), the information in the scene as it would leave it, nothing kept: `ids` must be live there.
+    #[pyo3(signature = (ids, put_in=None, take_out=None))]
+    fn information<'py>(&self, py: Python<'py>, ids: Vec<u32>, put_in: Option<&Bound<'_, PyDict>>, take_out: Option<Vec<u32>>) -> PyResult<Bound<'py, PyDict>> {
+        let p = self.proposal(put_in, take_out)?;
         for (k, &id) in ids.iter().enumerate() {
-            self.inner.check_id(id).map_err(scene_err)?;
+            if self.inner.element_after(&p, id).is_none() {
+                return Err(PyValueError::new_err(format!("no element {id}")));
+            }
             if ids[..k].contains(&id) {
                 return Err(PyValueError::new_err(format!("element {id} twice")));
             }
         }
         let c = &self.inner;
-        let out = py.detach(|| c.information(&ids));
+        let out = py.detach(|| c.information(&p, &ids));
         let (s, n) = (out.len(), out.first().map_or(0, |m| m.slope.len()));
         let d = PyDict::new(py);
         d.set_item("slope", out.iter().flat_map(|x| x.slope.clone()).collect::<Vec<f64>>().into_pyarray(py).reshape([s, n])?)?;
@@ -695,13 +763,15 @@ impl PyScene {
         Ok(py.detach(|| c.divergence(&p, &q)).into_pyarray(py))
     }
 
-    /// One element's counts against the scene, per scan, in footprints (scene::ElementCounts): scan, mismatch_ss,
-    /// mismatch_w, mismatch_cells, on, empty, behind; `shift` (m, per scan) comes off the observed echoes.
-    #[pyo3(signature = (element, shift=None))]
-    fn counts<'py>(&self, py: Python<'py>, element: &Bound<'_, PyDict>, shift: Option<Vec<f64>>) -> PyResult<Bound<'py, PyDict>> {
+    /// One element's counts against the scene less the elements `take_out` (ids), per scan, in footprints
+    /// (scene::ElementCounts): scan, mismatch_ss, mismatch_w, mismatch_cells, on, empty, behind; `shift` (m, per scan)
+    /// comes off the observed echoes.
+    #[pyo3(signature = (element, shift=None, take_out=None))]
+    fn counts<'py>(&self, py: Python<'py>, element: &Bound<'_, PyDict>, shift: Option<Vec<f64>>, take_out: Option<Vec<u32>>) -> PyResult<Bound<'py, PyDict>> {
         let e = self.one(element)?;
+        let p = self.proposal(None, take_out)?;
         let c = &self.inner;
-        let st = py.detach(|| c.counts(e, &shift.unwrap_or_default()));
+        let st = py.detach(|| c.counts(e, &p.take_out, &shift.unwrap_or_default()));
         let d = PyDict::new(py);
         d.set_item("scan", st.iter().map(|x| x.scan).collect::<Vec<_>>().into_pyarray(py))?;
         d.set_item("mismatch_ss", st.iter().map(|x| x.mismatch_ss).collect::<Vec<_>>().into_pyarray(py))?;
@@ -721,13 +791,13 @@ impl PyScene {
     /// cell weight), footprint (m), across and along (where the ray passes the axis); from the same pass over each
     /// pulse, returns (the expected number of echoes the receiver records from the cell's layers and ground), beam (the
     /// share of the beam the element leaves) and owned (how many of the pulse's echoes are the element's in
-    /// expectation).
-    #[pyo3(signature = (elements, scan=0))]
-    fn predict<'py>(&self, py: Python<'py>, elements: &Bound<'_, PyDict>, scan: usize) -> PyResult<Bound<'py, PyDict>> {
+    /// expectation). With `take_out` (ids), against the scene less those elements.
+    #[pyo3(signature = (elements, scan=0, take_out=None))]
+    fn predict<'py>(&self, py: Python<'py>, elements: &Bound<'_, PyDict>, scan: usize, take_out: Option<Vec<u32>>) -> PyResult<Bound<'py, PyDict>> {
         self.inner.check_scan(scan).map_err(scene_err)?;
-        let es = elements_from_py(elements, &self.em)?;
+        let pr = self.proposal(Some(elements), take_out)?;
         let c = &self.inner;
-        let p = py.detach(|| c.predict(&es, scan));
+        let p = py.detach(|| c.predict(&pr, scan));
         predictions_dict(py, &p)
     }
 }
