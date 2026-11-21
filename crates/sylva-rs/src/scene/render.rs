@@ -463,9 +463,10 @@ pub(super) fn keep(mut ls: Vec<Layer>) -> Vec<Layer> {
     ls
 }
 
-/// How many of a cell's kept layers have a front share ([`front_shares`]): those up to its first wholly in it.
+/// How many of a cell's kept layers have a front share ([`front_shares`]): those up to its first wholly in it and
+/// opaque.
 pub(super) fn fronting(ls: &[Layer]) -> usize {
-    ls.iter().position(Layer::full).map_or(ls.len(), |i| i + 1)
+    ls.iter().position(|l| l.full() && l.op >= 1.0).map_or(ls.len(), |i| i + 1)
 }
 
 /// A cell's likelihood as a mixture (3dtrees research 130 slice-trim): per subset of its partial layers
@@ -491,15 +492,17 @@ pub(super) fn mixture<P: Real>(layers: &[Layer<P>]) -> Vec<(P, Vec<Layer<P>>)> {
     }).collect()
 }
 
-/// The front share of each of a cell's layers (nearest first): the chance it is the nearest layer in the cell's
-/// mixture ([`mixture`]), `w_i Π_{j<i} (1 − w_j)` over the entry weights, normalised over the layers (a cell whose
-/// layers are all partial is scored only where one is in). The first layer wholly in it takes the rest, and those
-/// behind it none. A cell's evidence is shared among its layers' terms by these, each reading it at its own nodes, so
-/// the cost doesn't jump where a partial layer enters in front of another.
+/// The front share of each of a cell's layers (nearest first): the chance it is the nearest thing a pulse meets of the
+/// cell's mixture ([`mixture`]), `w_i Π_{j<i} (1 − w_j)` over each layer's entry weight times its opacity (its
+/// presence share: [`Element`]'s), normalised over the layers (a cell whose layers are all partial is scored only
+/// where one is in). The first layer wholly in it and opaque takes the rest, and those behind it none. A cell's
+/// evidence is shared among its layers' terms by these, each reading it at its own nodes, so the cost doesn't jump
+/// where a partial layer enters in front of another, nor where a faint one does: a layer at presence ε in front takes
+/// a share of order ε, not the cell (3dtrees research 130 slice-s5).
 pub(super) fn front_shares<P: Real>(layers: &[Layer<P>]) -> Vec<P> {
     let mut left = P::c(1.0);
     let mut out: Vec<P> = layers.iter().map(|l| {
-        let w = l.entry();
+        let w = l.entry() * l.op;
         let share = left * w;
         left *= P::c(1.0) - w;
         share

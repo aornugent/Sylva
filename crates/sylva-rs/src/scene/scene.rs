@@ -619,7 +619,7 @@ mod tests {
     use crate::scene::render::{Form, Element};
     use crate::scene::settings::{Background, Settings};
     use crate::scene::term::ChainKey;
-    use super::super::fixtures::{add, cost, costs, field_box, piece_of, pole_view, remove, stick, swap, thin_pole_view};
+    use super::super::fixtures::{add, cost, costs, field_box, piece_of, pole_view, remove, sky_pole_view, stick, swap, thin_pole_view};
 
     /// The true pole has negative cost; a stick of the wrong radius, shifted, or porous has more; a stick where
     /// the pulses went through to the wall costs; a scene's move agrees with the difference of two
@@ -733,6 +733,26 @@ mod tests {
     /// by about 0.28 nats there). The pole slid 1 cm along the beam in 25 µm steps, its front crossing the face at
     /// y = 4.0 m against the empty scene's field (dense in the pole's voxels): its cost to add has no second
     /// difference over 1e-3 nats.
+    #[test]
+    fn a_faint_elements_cost_vanishes_with_its_presence() {
+        // a stick put in at presence ε (its opacity) over the pole's edge and open sky beside it, far in front of the
+        // pole and near enough that their returns can merge: its cost falls to 0 linearly (3dtrees research 130
+        // slice-s5: a miss's weight read at the layers' ranges and front shares by fill alone made it jump as ε left 0,
+        // and its merge with the pole, at a chance read from their energies with ε in its energy, fell as ε^0.53)
+        let v = sky_pole_view();
+        let (em, sc) = (Settings::default(), Background::default());
+        for spec in [None, Some(field_box())] {
+            let c = Scene::new(vec![v.clone()], &[stick(0.0, 4.0, 0.03)], em, sc, spec, 0);
+            for y in [0.5, 2.5] {
+                // the stick at range y, over the same cells wherever it is
+                let at = |op: f64| -> f64 { costs(&c, &[vec![Element { opacity: op, ..stick(0.01 * y, y, 0.005 * y) }]])[0].iter().sum() };
+                let slope: Vec<f64> = [1e-5, 1e-6, 1e-8].iter().map(|&e| at(e) / e).collect();
+                assert!((slope[0] - slope[2]).abs() < 0.01 * slope[2].abs() && slope[2].abs() > 1e-3, "{y} {slope:?}");
+                assert!(at(1e-10).abs() < 1e-6, "{}", at(1e-10));
+            }
+        }
+    }
+
     #[test]
     fn the_cost_is_continuous_across_a_voxel_face_with_a_field_held() {
         let v = pole_view();

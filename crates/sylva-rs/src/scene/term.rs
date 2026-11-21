@@ -80,31 +80,36 @@ pub(super) fn term_nodes(es: &[&Element], em: &Settings) -> (Vec<([i64; 3], f64)
 /// reference epoch): [`spread`] of the surface classes of the cells its members mostly fill ([`MOSTLY`]) that hold an
 /// echo with a surface fit. The echoes themselves read their own cells' class ([`cell_class`]).
 pub(super) fn term_spreads(v: &RangeImage, cells: &[(usize, Vec<Layer>)], slot: &[usize], other: bool, em: &Settings) -> Vec<f64> {
-    let mut ks: Vec<[u32; 3]> = vec![[0; 3]; slot.iter().max().map_or(0, |m| m + 1)];
+    let mut ks: Vec<[f64; 3]> = vec![[0.0; 3]; slot.iter().max().map_or(0, |m| m + 1)];
     for (cell, ls) in cells {
-        if let Some((e, k)) = vote(v, *cell, ls, em) {
-            ks[slot[e as usize]][k as usize] += 1;
+        for (e, k, w) in votes(v, *cell, ls, em) {
+            ks[slot[e as usize]][k as usize] += w;
         }
     }
     slot.iter().map(|&t| spread(&ks[t], other, em)).collect()
 }
 
-/// A cell's vote for a term's surface class ([`term_spreads`]): the element of its first layer wholly in it, and the
-/// cell's class, where that layer mostly fills it and the cell holds an echo with a surface fit.
-pub(super) fn vote(v: &RangeImage, cell: usize, ls: &[Layer], em: &Settings) -> Option<(u32, u8)> {
-    let front = ls.iter().find(|l| l.full())?;
-    (front.f > MOSTLY && v.cell[cell] == Cell::Echoes && v.excess[cell].is_finite()).then(|| (front.elem, em.surface(v.excess[cell] as f64)))
+/// A cell's votes for its terms' surface classes ([`term_spreads`]): where it holds an echo with a surface fit, each
+/// layer that mostly fills it votes the cell's class with its front share ([`front_shares`]), so a layer wholly in it
+/// and opaque in front has the whole vote, and a faint one a vote of order its presence (3dtrees research 130
+/// slice-s5: the first layer wholly in it took the vote whatever its opacity).
+pub(super) fn votes(v: &RangeImage, cell: usize, ls: &[Layer], em: &Settings) -> Vec<(u32, u8, f64)> {
+    if v.cell[cell] != Cell::Echoes || !v.excess[cell].is_finite() {
+        return Vec::new();
+    }
+    let k = em.surface(v.excess[cell] as f64);
+    ls.iter().zip(front_shares(ls)).filter(|(l, s)| *s > 0.0 && l.f > MOSTLY).map(|(l, s)| (l.elem, k, s)).collect()
 }
 
-/// A term's alignment spread (m, along the beam) from its cells' votes counted by surface class (`n`): the sd whose
+/// A term's alignment spread (m, along the beam) from its cells' votes summed by surface class (`n`): the sd whose
 /// variance is the votes' mean of their classes' variances ([`Settings::align_sd`]; mid's where it has none). It moves
 /// smoothly as votes come and go, where the median class it replaced stepped (3dtrees research 130 slice-s2).
-pub(super) fn spread(n: &[u32; 3], other: bool, em: &Settings) -> f64 {
-    let total: u32 = n.iter().sum();
-    if total == 0 {
+pub(super) fn spread(n: &[f64; 3], other: bool, em: &Settings) -> f64 {
+    let total: f64 = n.iter().sum();
+    if total <= 0.0 {
         return em.align_sd(1, other);
     }
-    ((0..3).map(|k| n[k] as f64 * em.align_sd(k as u8, other).powi(2)).sum::<f64>() / total as f64).sqrt()
+    ((0..3).map(|k| n[k] * em.align_sd(k as u8, other).powi(2)).sum::<f64>() / total).sqrt()
 }
 
 /// One cell a term has a front share in (`cell`, its index), as its ray likelihood scores it: its pulse per subset of its mixture

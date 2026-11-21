@@ -21,8 +21,8 @@
 //!     `Φ((ρ_dB + 10 log10(e_i cos ι_i) − floor(t_i)) / σ)`.
 //!   - Adjacent returns (layers and the ground) resolve into two echoes with the instrument's
 //!     [`Settings::p_resolve`] of their separation and energy ratio; else they merge into one, recorded if any
-//!     member is, pulled back from the nearer's depth by the measured pull ([`Settings::pull`]; energy: op · e · cos
-//!     · reflectance). A cell's likelihood is the mixture over these merge patterns.
+//!     member is, pulled back from the nearer's depth by the measured pull ([`Settings::pull`]; energy: e · cos ·
+//!     reflectance); they merge only where both are there (chance op_i op_j). A cell's likelihood is the mixture over these merge patterns.
 //!   - The first echo at r has density `Σ_i P_i op_i det_i t_ν(r − t_i − bias_k − δ; σ_k ⊕ spread_i)` over the
 //!     returns, plus `σ(r) e^{−τ(r)} Π_{t_j<r} (1 − op_j det_j)`, where P_i is the chance that nothing nearer was kept,
 //!     plus a uniform outlier share. Each later echo is read the same way behind the last, the medium's path
@@ -48,7 +48,7 @@
 //!   - **The fill-weighted entry** (3dtrees research 130 slice-trim): a layer is in its cell with its entry weight
 //!     ([`Layer::entry`]), a smooth step in its widest fill from 0 at [`MIN_FILL`] to 1 at [`FULL_FILL`]; a cell's
 //!     likelihood is the mixture over which of its partial layers are in it ([`mixture`]), and its evidence is shared
-//!     among its layers' terms by the chance each is the nearest ([`front_shares`]). So no fill, and no layer passing
+//!     among its layers' terms by the chance each is the nearest ([`super::render::front_shares`]). So no fill, and no layer passing
 //!     in front of another as it enters, steps the cost (a hard entry at 1 % did, by up to tenths of a nat on the
 //!     stand); where the receiver cut (a merge with the medium behind under 1e-6 of the beam, a merge pattern under
 //!     1e-4) it fades ([`smooth`]).
@@ -62,7 +62,7 @@ use crate::Point;
 use super::dual::{Over, Real};
 use super::foliage::{Foliage, Medium};
 use super::range_image::{Cell, RangeImage};
-use super::render::{Layer, smooth, mixture, front_shares};
+use super::render::{Layer, smooth, mixture};
 use super::settings::{Background, Settings, P_OUTLIER, T_MAX};
 
 /// What a cell's first echo says about an element: on it, none, in front of it, or behind it (the pulse passed
@@ -119,7 +119,9 @@ pub(super) fn obs_ground(v: &RangeImage, cell: usize, sc: &Background) -> (f64, 
 /// A cell as the likelihood reads it: its pulse per subset of its mixture with that subset's chance ([`mixture`]; the
 /// one with every layer in first), the same pulse in the empty scene (the medium and the ground alone: the same for
 /// every hypothesis), its first echo (NaN for none) and its weight ([`Settings::cell_weight`], at its first echo's
-/// range or else its layers' ranges weighted by their front shares, [`front_shares`]), in the layers' numbers `P`.
+/// range, or for a pulse with no echo where its beam ends: the ground, else [`T_MAX`]), in the layers' numbers `P`.
+/// The weight is the data's alone, the same for every hypothesis: read at the layers' ranges, a miss counted more or
+/// less as the hypothesis moved, and jumped as a faint layer entered (3dtrees research 130 slice-s5).
 pub(super) struct CellView<P = f64> {
     pub(super) obs: f64,
     pub(super) wt: P,
@@ -131,8 +133,8 @@ pub(super) struct CellView<P = f64> {
 /// ([`cell_class`]), against the foliage field `ext` and the background's ground.
 pub(super) fn cell_view<P: Real>(v: &RangeImage, cell: usize, layers: Vec<Layer<P>>, em: &Settings, sc: &Background, ext: &Foliage) -> CellView<P> {
     let (obs, ground, w) = obs_ground(v, cell, sc);
-    let at = if obs.is_finite() { P::c(obs) } else { front_shares(&layers).iter().zip(&layers).map(|(&s, l)| s * l.t).sum() };
-    let wt = em.cell_weight(at, v.steps(cell));
+    let at = if obs.is_finite() { obs } else { ground.map_or(T_MAX, |g| g.0) };
+    let wt = em.cell_weight(P::c(at), v.steps(cell));
     let (m, class, slots) = (ext.medium(&v.origin, &w), cell_class(v, cell, em), v.slots(cell, em.max_targets as usize));
     let pulses = mixture(&layers).into_iter()
         .map(|(p, ls)| (p, Pulse::on(occluders(ls, ground), class, &m, v.echoes(cell), v.echo_refls(cell), slots, em))).collect();
@@ -287,6 +289,7 @@ pub(super) struct Member<P, T> {
     pub(super) q: T,
     pub(super) s_q: [T; 3],
     pub(super) energy: T,
+    pub(super) op: f64,
     pub(super) share: [T; 3],
     pub(super) fill: [P; 3],
     pub(super) beam: P,
@@ -353,7 +356,7 @@ pub(super) fn receiver<P: Real, T: Over<P>>(occ: &[Occluder<P>], k: u8, shift: T
             let (b0, unit) = (beam, (db / 10.0).exp10() * (beam * cos));
             let share = ly.fq.map(|f| unit * f);
             beam *= P::c(1.0) - ly.f * ly.op;
-            Member { depth: shift + (ly.t + em.depth_bias(k, ly.t)), sd: em.depth_sd(k, ly.spread), s, q, s_q, energy: unit * (ly.f * ly.op), share,
+            Member { depth: shift + (ly.t + em.depth_bias(k, ly.t)), sd: em.depth_sd(k, ly.spread), s, q, s_q, energy: unit * ly.f, op: ly.op, share,
                      fill: ly.fq.map(|f| f * b0), beam }
         }
         Surface::Ground(cos) => {
@@ -362,14 +365,16 @@ pub(super) fn receiver<P: Real, T: Over<P>>(occ: &[Occluder<P>], k: u8, shift: T
             let s = em.p_detect::<P, P>(P::c(em.refl_ground), beam * cg, o.t) * em.ground_echo;
             let q = em.p_miss::<P, P>(P::c(em.refl_ground), beam * cg, o.t) * em.ground_echo + (1.0 - em.ground_echo);
             Member { depth: T::from(o.t), sd: P::c(em.noise(2).hypot(em.ground_sd / cos)), s: T::from(s), q: T::from(q), s_q: [T::from(s); 3],
-                     energy: T::from(share * em.ground_echo), share: [T::from(share); 3], fill: [beam; 3], beam: P::c(0.0) }
+                     energy: T::from(share * em.ground_echo), op: 1.0, share: [T::from(share); 3], fill: [beam; 3], beam: P::c(0.0) }
         }
     }).collect();
     let n = m.len();
-    // each adjacent pair's chance of resolving into two echoes
+    // each adjacent pair's chance of resolving into two echoes: they merge only where both are there (3dtrees research
+    // 130 slice-s5: an element's opacity scaled its energy instead, so a faint one merged at a chance falling as a power
+    // of its presence, about op^0.53, and a negligible one moved its neighbour's cost by as much)
     let pr: Vec<T> = (1..n).map(|j| {
         let e = (m[j - 1].energy.max(1e-300) / m[j].energy.max(1e-300)).log10() * 10.0;
-        em.p_resolve(occ[j].t - occ[j - 1].t, e.clamp(-60.0, 60.0))
+        T::c(1.0) - (T::c(1.0) - em.p_resolve(occ[j].t - occ[j - 1].t, e.clamp(-60.0, 60.0))) * T::c(m[j - 1].op * m[j].op)
     }).collect();
     let group = |first: usize, last: usize| {
         let g = &m[first..=last];
@@ -859,7 +864,7 @@ mod tests {
                     none *= 1.0 - m[j].s;
                     let ends = j + 1 == m.len() || {
                         let e = ((m[j].energy.max(1e-300) / m[j + 1].energy.max(1e-300)).log10() * 10.0).clamp(-60.0, 60.0);
-                        uniform() < em.p_resolve(occ[j + 1].t - occ[j].t, e)
+                        uniform() < 1.0 - (1.0 - em.p_resolve(occ[j + 1].t - occ[j].t, e)) * m[j].op * m[j + 1].op
                     };
                     if ends {
                         recorded += (uniform() < 1.0 - none) as usize;

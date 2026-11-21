@@ -22,6 +22,11 @@ pub(super) fn pole_image() -> RangeImage {
     pole_scan(0.03, 4.0, 4.0)
 }
 
+/// The pole with nothing behind it: a pulse that misses it, or isn't recorded on it, returns no echo.
+pub(super) fn sky_pole_view() -> Arc<RangeImage> {
+    Arc::new(pole_scan(0.03, 4.0, f64::INFINITY))
+}
+
 pub(super) fn thin_pole_view(r_pole: f64, y_pole: f64) -> Arc<RangeImage> {
     Arc::new(pole_scan(r_pole, y_pole, y_pole))
 }
@@ -69,7 +74,7 @@ pub(super) fn pole_scan_of(r_pole: f64, y_pole: f64, gap: f64, wood: f64) -> Ran
             let n = 2.0 * (-2.0 * u(seed).ln()).sqrt() * (2.0 * std::f64::consts::PI * u(seed * 7919)).cos();
             let n_refl = em.refl_noise * (-2.0 * u(seed * 31).ln()).sqrt() * (2.0 * std::f64::consts::PI * u(seed * 7919 * 31)).cos();
             let kept = ec > 0.0 && wood + 10.0 * ek.max(1e-12).log10() + n > em.floor(tm);
-            let wall = (y_pole + gap) / w[1];
+            let wall = if gap.is_finite() { (y_pole + gap) / w[1] } else { f64::NAN };
             let (ep, ew) = (ek * 10f64.powf(wood / 10.0), (1.0 - f) * 0.01);
             let (range, db) = if !kept {
                 (wall, 10.0 * ew.max(1e-12).log10())

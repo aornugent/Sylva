@@ -46,7 +46,7 @@ use super::pulse::mixture_taken;
 use super::render::{Element, Form, Layer, KBuffer, keep, numbered, render};
 use super::scene::{Proposal, Scene, redeposit};
 use super::settings::Settings;
-use super::term::{CellData, ChainKey, Term, eliminate, elem_data, spread, chain_key, settle, slots, term_nodes, vote, clipped, mean_of};
+use super::term::{CellData, ChainKey, Term, eliminate, elem_data, spread, chain_key, settle, slots, term_nodes, votes, clipped, mean_of};
 
 /// The clock's reference radius (m): dτ = ds / r · (r / R_CLOCK)^(1 − β), so β = 1 is length in radii and β = 0 is
 /// length in units of R_CLOCK, whatever the radius (`Settings::axis_clock`).
@@ -227,7 +227,7 @@ impl Quadratic {
 #[derive(Debug, Clone)]
 struct Read {
     q: Quadratic,
-    vote: Option<u8>,
+    vote: Option<(u8, f64)>,
     deposit: Deposit,
     plug: f64,
 }
@@ -242,7 +242,7 @@ struct ChainScan {
     /// Per cell its term has a front share in, its last read; their sum; the class votes.
     cells: HashMap<usize, Read>,
     sum: Option<Quadratic>,
-    votes: [u32; 3],
+    votes: [f64; 3],
     term: Option<Term>,
     /// The scene's terms it changes.
     ctx: HashMap<ChainKey, Option<Term>>,
@@ -269,7 +269,7 @@ pub struct Chain {
 struct ScanTrial {
     layers: Vec<(usize, Layer)>,
     gone: Vec<usize>,
-    fresh: Vec<(CellData, Option<u8>, Deposit, f64)>,
+    fresh: Vec<(CellData, Option<(u8, f64)>, Deposit, f64)>,
     term: Option<Term>,
     ctx: Vec<(ChainKey, Option<Term>)>,
     cost: f64,
@@ -436,21 +436,27 @@ impl Scene {
         let mine: Vec<usize> = (0..ids.len()).filter(|&k| ids[k] >= first).collect();
         let fresh_cells = elem_data(v, &cells, &elems, &slots(&owners), &mine, self.ref_epoch, em, &self.sc, &self.ext, self.field.as_ref().map(|f| &f.spec))
             .into_iter().next().map_or(Vec::new(), |d| d.cells);
-        let votes: HashMap<usize, u8> = cells.iter()
-            .filter_map(|(cell, ls)| vote(v, *cell, ls, em).filter(|x| ids[x.0 as usize] >= first).map(|x| (*cell, x.1))).collect();
+        // per cell, the chain's class vote and its pieces' summed front share there
+        let mut votes_of: HashMap<usize, (u8, f64)> = HashMap::new();
+        for (cell, ls) in &cells {
+            for (_, k, w) in votes(v, *cell, ls, em).into_iter().filter(|x| ids[x.0 as usize] >= first) {
+                votes_of.entry(*cell).or_insert((k, 0.0)).1 += w;
+            }
+        }
+        let votes = votes_of;
         let gone: Vec<usize> = touched.iter().copied().filter(|k| cs.cells.contains_key(k)).collect();
         // the term: the chain's sum less the cells re-read, those read exactly, its own nodes warm from its mode
         let mut sum = cs.sum.unwrap_or(Quadratic::ZERO);
         let mut tally = cs.votes;
         for k in &gone {
             sum.add(&cs.cells[k].q, -1.0);
-            if let Some(x) = cs.cells[k].vote {
-                tally[x as usize] -= 1;
+            if let Some((x, w)) = cs.cells[k].vote {
+                tally[x as usize] -= w;
             }
         }
         for f in &fresh_cells {
-            if let Some(&x) = votes.get(&f.cell) {
-                tally[x as usize] += 1;
+            if let Some(&(x, w)) = votes.get(&f.cell) {
+                tally[x as usize] += w;
             }
         }
         let mut members: Vec<Element> = cs.members.iter().map(|&k| c.pieces[k]).collect();
@@ -490,7 +496,7 @@ impl Scene {
         // the deposits of the cells it reads, at the term's mode, and the term's plug-in: the chain's less the cells
         // re-read, and those read now
         let x = term.as_ref().map_or(Vector2::zeros(), |t| Vector2::new(fit.held.shift(&t.align) + t.own_sd[0] * t.own[0], t.own_sd[1] * t.own[1]));
-        let fresh: Vec<(CellData, Option<u8>, Deposit, f64)> = fresh_cells.into_iter().map(|f| {
+        let fresh: Vec<(CellData, Option<(u8, f64)>, Deposit, f64)> = fresh_cells.into_iter().map(|f| {
             let (dep, plug) = if f.hits.is_empty() { (Vec::new(), 0.0) } else {
                 let (hits, p) = f.take(&mixture_taken(&f.pulses, x[0], x[1], em).1);
                 (foliage::deposit(hits.into_iter()), -p)
@@ -525,8 +531,8 @@ impl Scene {
             for cell in st.gone {
                 let r = cs.cells.remove(&cell).unwrap();
                 sum.add(&r.q, -1.0);
-                if let Some(x) = r.vote {
-                    cs.votes[x as usize] -= 1;
+                if let Some((x, w)) = r.vote {
+                    cs.votes[x as usize] -= w;
                 }
             }
             // the cells read now, each as a quadratic about the term's mode
@@ -536,8 +542,8 @@ impl Scene {
                 for (f, vote, deposit, plug) in st.fresh {
                     let q = Quadratic::of(&f.read(Dual2::var(x[0], 0), lv, &self.em), x);
                     sum.add(&q, 1.0);
-                    if let Some(v) = vote {
-                        cs.votes[v as usize] += 1;
+                    if let Some((v, w)) = vote {
+                        cs.votes[v as usize] += w;
                     }
                     cs.cells.insert(f.cell, Read { q, vote, deposit, plug });
                 }
