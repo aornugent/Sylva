@@ -764,11 +764,7 @@ mod tests {
     /// element out and puts another in scores what keeping it gives.
     #[test]
     fn scores_match_keeping() {
-        // a scanner of many targets: in an image of first echoes (one target, each pulse censored at its echo) a stick
-        // in the box takes no part of the field (3dtrees research 130 slice-s5, merging S3 and the field slice)
-        let mut v = pole_image();
-        v.instrument = Arc::new(crate::scene::instrument::Instrument { max_targets: 15, ..Default::default() });
-        let v = Arc::new(v);
+        let v = pole_view();
         let (em, sc) = (Settings::default(), Background::default());
         let mut c = Scene::new(vec![v.clone(), v.clone()], &[stick(0.0, 4.0, 0.03)], em, sc, Some(field_box()), 0);
         let hyps = vec![vec![stick(0.0, 4.0, 0.02)], vec![stick(0.2, 6.0, 0.03), stick(0.25, 6.0, 0.01)], vec![stick(5.0, 4.0, 0.03)], vec![stick(0.0365, 3.9, 0.008)]];
@@ -786,6 +782,30 @@ mod tests {
         let swap = Proposal { put_in: vec![stick(0.0, 4.0, 0.02)], take_out: vec![0] };
         let per = c.score(std::slice::from_ref(&swap)).remove(0);
         assert_eq!(per.iter().sum::<f64>(), c.keep(&swap).1);
+    }
+
+    /// A capped pulse is censored past its last echo only (3dtrees research 130 slice-s5): a stick in front of the
+    /// wall's echo, inside the field's box, costs about the same in an image of first echoes (one target) as with
+    /// many targets, and takes the same part of the field; a stick behind the wall's echo costs next to nothing at
+    /// one target and is refuted with many.
+    #[test]
+    fn censoring_frees_only_what_lies_past_the_last_echo() {
+        let (em, sc) = (Settings::default(), Background::default());
+        let view = |cap: usize| {
+            let mut v = pole_image();
+            v.instrument = Arc::new(crate::scene::instrument::Instrument { max_targets: cap, ..Default::default() });
+            Arc::new(v)
+        };
+        let at = |cap: usize, y: f64| -> Vec<f64> {
+            let c = Scene::new(vec![view(cap)], &[stick(0.0, 4.0, 0.03)], em, sc, Some(field_box()), 0);
+            costs(&c, &[vec![stick(0.2, y, 0.03)]]).remove(0)
+        };
+        let (one, many) = (at(1, 6.0), at(15, 6.0));
+        let sum = |x: &[f64]| -> f64 { x.iter().sum() };
+        assert!((sum(&one) - sum(&many)).abs() < 0.05 && sum(&one).abs() > 1.0, "{one:?} {many:?}");
+        assert!(one[one.len() - 1] != 0.0 && (one[one.len() - 1] - many[many.len() - 1]).abs() < 1e-6, "{one:?} {many:?}");
+        let (one, many) = (at(1, 8.5), at(15, 8.5));
+        assert!(sum(&one).abs() < 1e-6 && sum(&many) > 1.0, "{one:?} {many:?}");
     }
 
     /// The scans' alignment parts: each scan's cost less its terms'.

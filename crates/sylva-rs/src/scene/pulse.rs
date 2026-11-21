@@ -579,7 +579,11 @@ impl<P: Real, T: Over<P>> Pass<'_, P, T> {
     ///   evidence against them.
     ///
     /// After the last echo, the returns left and the medium's path to the beam's end record nothing, unless the pulse
-    /// is capped: a capped pulse says nothing past its last echo.
+    /// is capped: a capped pulse says nothing past its last echo, and only past it. A return left in front of the last
+    /// echo (the outlier branch matches an echo without moving on) would have taken a slot first, so it still wasn't
+    /// recorded; those past it, and the medium's path, are free (3dtrees research 130 slice-s5: every return left was
+    /// let off, so on a capped pulse an outlier explained a later echo for free and hypotheses in front of it went
+    /// unrefuted).
     ///
     /// `prefix` is the chance of the path to here (the pattern's and each earlier echo's branch); each branch adds
     /// `prefix` × its share × what follows to echo i's row of `resp`, under the owner it reads the echo as.
@@ -589,7 +593,8 @@ impl<P: Real, T: Over<P>> Pass<'_, P, T> {
         let occ = &p.occluders;
         if i == p.echoes.len() {
             if self.capped {
-                return T::c(1.0);
+                let last = p.echoes.last().map_or(f64::INFINITY, |&r| r as f64);
+                return rets[j..].iter().filter(|r| occ[r.first].t.v() < last).map(|r| r.q * taken + (1.0 - taken)).product::<T>();
             }
             return rets[j..].iter().map(|r| r.q * taken + (1.0 - taken)).product::<T>() * (-seen * (p.tau_end - tau0).max(0.0)).exp();
         }
