@@ -86,12 +86,11 @@ pub struct RangeImage {
     pub echo_range: Vec<f32>,
     /// Each echo's reflectance (dB), beside `echo_range`; empty where the source has none.
     pub echo_refl: Vec<f32>,
-    /// The instrument's cap on targets per pulse, read from the data: the most echoes at least a share [`CAP_SHARE`]
-    /// of the pulses with echoes returned (AM's VZ-2000i at 1.2 MHz records 4; the stand's simulator 3). Not the most
-    /// any pulse returned: two of AM 016's 40 M pulses carry 5, which read every 4-echo pulse there as uncapped and
-    /// counted its path past the fourth echo as clear (3dtrees research 130 rca-field-range). A pulse at its cap, or
-    /// past it, says nothing past its last echo ([`RangeImage::capped`]).
-    pub max_targets: usize,
+    /// Each pulse's targets as the scanner reported them, before the import dropped any (the exit window's echo,
+    /// the weak rule's, amplitude 0: Sylva's `target_count`), beside `echo_start`; empty where the source doesn't
+    /// say, when a pulse's kept echoes are its targets. The slots it used of the scanner's cap (3dtrees research 130
+    /// observation).
+    pub targets: Vec<u8>,
     /// Unit normal toward the scanner (world), `cos ι` and excess; NaN where no fit.
     pub normal: Vec<[f32; 3]>,
     pub cos_inc: Vec<f32>,
@@ -104,25 +103,6 @@ fn rot_t(r: &[[f64; 3]; 3], d: &Point) -> Point {
 
 fn rot_mul(r: &[[f64; 3]; 3], d: &Point) -> Point {
     [0, 1, 2].map(|k| r[k][0] * d[0] + r[k][1] * d[1] + r[k][2] * d[2])
-}
-
-/// The share of a scan's pulses with echoes that must reach a count of echoes for it to be the instrument's cap
-/// ([`RangeImage::max_targets`]).
-pub const CAP_SHARE: f64 = 1e-4;
-
-/// The cap on targets per pulse from the pulses' echo spans (`echo_start`): the most echoes at least [`CAP_SHARE`] of
-/// the pulses with echoes returned.
-fn cap(echo_start: &[u32]) -> usize {
-    let mut count: Vec<usize> = Vec::new();
-    for w in echo_start.windows(2) {
-        let n = (w[1] - w[0]) as usize;
-        if count.len() <= n {
-            count.resize(n + 1, 0);
-        }
-        count[n] += 1;
-    }
-    let returned: usize = count.iter().skip(1).sum();
-    (1..count.len()).rev().find(|&n| count[n] as f64 >= CAP_SHARE * returned as f64).unwrap_or(0)
 }
 
 impl RangeImage {
@@ -144,22 +124,25 @@ impl RangeImage {
         let f = ShotsFile::open(path)?;
         let groups: Vec<_> = (0..f.n_groups()).into_par_iter().map(|g| -> Result<_> {
             let f = f.reopen()?;
-            Ok((f.read_rays(g, &[])?, f.read_echo_f64(g, "gps_time")?, f.read_echo_f64(g, "reflectance").ok()))
+            Ok((f.read_rays(g, &[])?, f.read_echo_f64(g, "gps_time")?, f.read_echo_f64(g, "reflectance").ok(), f.read_echo_f64(g, "target_count").ok()))
         }).collect::<Result<_>>()?;
-        // pulses that returned, each with its first echo's time; the pattern's zenith range from every row
+        // pulses that returned, each with its first echo's time and its raw target count; the pattern's zenith range
+        // from every row
         let (mut zmin, mut zmax) = (f64::INFINITY, f64::NEG_INFINITY);
-        let mut pulses: Vec<(f64, Point, usize, usize)> = Vec::new();
+        let mut pulses: Vec<(f64, Point, usize, usize, u8)> = Vec::new();
         let mut echoes: Vec<f32> = Vec::new();
         let mut refls: Vec<f32> = Vec::new();
         let has_refl = groups.iter().all(|g| g.2.is_some());
-        for (rays, time, refl) in &groups {
+        let has_targets = groups.iter().all(|g| g.3.is_some());
+        for (rays, time, refl, targets) in &groups {
             let mut e = 0usize;
             for (i, &n) in rays.echo_count.iter().enumerate() {
                 let (z, a) = (rays.zenith[i] as f64, rays.azimuth[i] as f64);
                 let n = n as usize;
                 if n > 0 {
                     let d = [z.sin() * a.sin(), z.sin() * a.cos(), z.cos()];
-                    pulses.push((time[e], d, echoes.len(), n));
+                    let raw = targets.as_ref().map_or(n, |t| (t[e] as usize).max(n)).min(255) as u8;
+                    pulses.push((time[e], d, echoes.len(), n, raw));
                     echoes.extend_from_slice(&rays.range[e..e + n]);
                     if let (true, Some(r)) = (has_refl, refl) {
                         refls.extend(r[e..e + n].iter().map(|&x| x as f32));
@@ -168,7 +151,7 @@ impl RangeImage {
                 e += n;
             }
         }
-        for (rays, _, _) in &groups {
+        for (rays, _, _, _) in &groups {
             for i in 0..rays.zenith.len() {
                 let d = rot_t(&rot, &{
                     let (z, a) = (rays.zenith[i] as f64, rays.azimuth[i] as f64);
@@ -196,6 +179,9 @@ impl RangeImage {
         }
         let mut v = RangeImage::new(&time, &dir, echo_start, echo_range, (zmin, zmax), rot, origin, epoch, p);
         v.echo_refl = echo_refl;
+        if has_targets {
+            v.targets = pulses.iter().map(|q| q.4).collect();
+        }
         Ok(v)
     }
 
@@ -250,9 +236,8 @@ impl RangeImage {
                 cell[k] = Cell::Miss;
             }
         }
-        let max_targets = cap(&echo_start);
         let mut v = RangeImage {
-            lat, c0, n_lines: nl, n_cols: nc, rot, origin, epoch, cell, range: rng, pulse, echo_start, echo_range, echo_refl: Vec::new(), max_targets,
+            lat, c0, n_lines: nl, n_cols: nc, rot, origin, epoch, cell, range: rng, pulse, echo_start, echo_range, echo_refl: Vec::new(), targets: Vec::new(),
             normal: Vec::new(), cos_inc: Vec::new(), excess: Vec::new(),
         };
         let fits: Vec<([f32; 3], f32)> = (0..n).into_par_iter().map(|k| v.fit(k, direction, p)).collect();
@@ -379,11 +364,20 @@ impl RangeImage {
         (25.0 / n.max(1) as f64).sqrt() as f32
     }
 
-    /// Whether cell `k`'s pulse is capped: it returned as many echoes as the instrument records (`max_targets`), so it
-    /// says nothing past its last echo. A miss or no pulse is not.
-    pub fn capped(&self, k: usize) -> bool {
+    /// The slots cell `k`'s pulse had for the echoes it kept, of a scanner reporting `cap` targets per pulse: the cap
+    /// less the targets the import dropped from it ([`RangeImage::targets`]).
+    pub fn slots(&self, k: usize, cap: usize) -> usize {
+        let kept = self.echoes(k).len();
+        let raw = if self.targets.is_empty() || self.pulse[k] == u32::MAX { kept } else { self.targets[self.pulse[k] as usize] as usize };
+        cap.saturating_sub(raw.saturating_sub(kept))
+    }
+
+    /// Whether cell `k`'s pulse is censored after its last echo: the scanner reported as many targets for it as it
+    /// reports at most (`cap`, the programme's), counting the ones the import dropped, so it says nothing past its last
+    /// echo. A miss or no pulse is not.
+    pub fn capped(&self, k: usize, cap: usize) -> bool {
         let n = self.echoes(k).len();
-        n > 0 && n >= self.max_targets
+        n > 0 && n >= self.slots(k, cap)
     }
 
     /// The reflectances (dB) of cell `k`'s echoes, beside [`RangeImage::echoes`]; empty where unknown.
@@ -438,14 +432,14 @@ impl RangeImage {
     pub fn save(&self, path: impl AsRef<Path>) -> Result<()> {
         let path = path.as_ref();
         // destructured whole, so a new field fails to compile here until it is saved
-        let RangeImage { lat, c0, n_lines, n_cols, rot, origin, epoch, cell, range, pulse, echo_start, echo_range, echo_refl, max_targets,
+        let RangeImage { lat, c0, n_lines, n_cols, rot, origin, epoch, cell, range, pulse, echo_start, echo_range, echo_refl, targets,
                          normal, cos_inc, excess } = self;
         let Lattice { line, col, n_lines: lat_lines, n_cols: lat_cols, pulse_interval, line_period, zenith_step, azimuth_step, zenith0,
                       line_phase, zenith_profile, azimuth_profile, count, line_azimuth0, azimuth_per_col } = lat;
         let io = |e: std::io::Error| Error::file(path, e.to_string());
         let mut w = BufWriter::with_capacity(1 << 22, File::create(path).map_err(io)?);
         w.write_all(MAGIC).map_err(io)?;
-        let sizes = [build_version(), *c0 as u64, *n_lines as u64, *n_cols as u64, *epoch as u64, *max_targets as u64, *lat_lines as u64, *lat_cols as u64];
+        let sizes = [build_version(), *c0 as u64, *n_lines as u64, *n_cols as u64, *epoch as u64, 0, *lat_lines as u64, *lat_cols as u64];
         let reals = [*pulse_interval, *line_period, *zenith_step, *azimuth_step, *zenith0, *azimuth_per_col];
         put(&mut w, &sizes).map_err(io)?;
         put(&mut w, &reals).map_err(io)?;
@@ -457,6 +451,7 @@ impl RangeImage {
         put(&mut w, echo_start).map_err(io)?;
         put(&mut w, echo_range).map_err(io)?;
         put(&mut w, echo_refl).map_err(io)?;
+        put(&mut w, targets).map_err(io)?;
         put(&mut w, normal).map_err(io)?;
         put(&mut w, cos_inc).map_err(io)?;
         put(&mut w, excess).map_err(io)?;
@@ -494,7 +489,7 @@ impl RangeImage {
             lat: Lattice::default(), c0: sizes[1] as usize, n_lines: sizes[2] as usize, n_cols: sizes[3] as usize,
             rot: [rot[0], rot[1], rot[2]], origin: [origin[0], origin[1], origin[2]], epoch: sizes[4] as u32, cell,
             range: get(&mut r).map_err(io)?, pulse: get(&mut r).map_err(io)?, echo_start: get(&mut r).map_err(io)?,
-            echo_range: get(&mut r).map_err(io)?, echo_refl: get(&mut r).map_err(io)?, max_targets: sizes[5] as usize,
+            echo_range: get(&mut r).map_err(io)?, echo_refl: get(&mut r).map_err(io)?, targets: get(&mut r).map_err(io)?,
             normal: get(&mut r).map_err(io)?, cos_inc: get(&mut r).map_err(io)?, excess: get(&mut r).map_err(io)?,
         };
         v.lat = Lattice {
@@ -546,20 +541,6 @@ mod tests {
     use super::*;
     use crate::shots::reconstruct::dir;
 
-    /// The cap is the most echoes a share of the pulses reaches, not the most any pulse carries (3dtrees research 130
-    /// rca-field-range): 40,000 pulses of 0 to 4 echoes and two of 5 are capped at 4; a scan whose pulses carry at
-    /// most one echo at 1.
-    #[test]
-    fn a_few_pulses_past_the_cap_dont_move_it() {
-        let spans = |counts: &[u32]| std::iter::once(0).chain(counts.iter().scan(0, |a, &n| { *a += n; Some(*a) })).collect::<Vec<u32>>();
-        let mut counts: Vec<u32> = (0..40_000).map(|i| (i % 5) as u32).collect();
-        assert_eq!(cap(&spans(&counts)), 4);
-        counts[7] = 5;
-        counts[11] = 5;
-        assert_eq!(cap(&spans(&counts)), 4);
-        assert_eq!(cap(&spans(&[0, 1, 1, 0, 1])), 1);
-    }
-
     /// A scan of a vertical wall 5 m away (the y = 5 plane), lines 0.03° apart in azimuth, a hole of unrecorded
     /// pulses in it, and a pole 1 m in front of part of it: normals face the scanner, the hole reads as misses, and
     /// the wall beside the hole is less continuous.
@@ -590,6 +571,16 @@ mod tests {
         assert_eq!(v.cell[cell(95, 205)], Cell::Miss);
         assert_eq!(v.cell[cell(120, 300)], Cell::Echoes);
         assert_eq!(v.echoes(cell(120, 300)).len(), 1);
+        // every target the scanner reported takes a slot (3dtrees research 130 observation): of a two-target programme,
+        // a pulse whose one kept echo followed a dropped one (the exit window's) used both and is censored; one whose
+        // echo was its only target had a slot left
+        let (a, b) = (cell(120, 300), cell(121, 300));
+        let mut v = v;
+        v.targets = vec![1; v.echo_start.len() - 1];
+        v.targets[v.pulse[a] as usize] = 2;
+        assert_eq!((v.slots(a, 2), v.capped(a, 2)), (1, true));
+        assert_eq!((v.slots(b, 2), v.capped(b, 2)), (2, false));
+        assert!(!v.capped(cell(95, 205), 2), "a miss is never censored");
         let k = cell(150, 100);
         let n = v.normal[k];
         assert!(n[1] < -0.999, "{n:?}");

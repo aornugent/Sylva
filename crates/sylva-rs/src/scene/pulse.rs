@@ -133,10 +133,10 @@ pub(super) fn cell_view<P: Real>(v: &RangeImage, cell: usize, layers: Vec<Layer<
     let (obs, ground, w) = obs_ground(v, cell, sc);
     let at = if obs.is_finite() { P::c(obs) } else { front_shares(&layers).iter().zip(&layers).map(|(&s, l)| s * l.t).sum() };
     let wt = em.cell_weight(at, v.steps(cell));
-    let (m, class) = (ext.medium(&v.origin, &w), cell_class(v, cell, em));
+    let (m, class, slots) = (ext.medium(&v.origin, &w), cell_class(v, cell, em), v.slots(cell, em.max_targets as usize));
     let pulses = mixture(&layers).into_iter()
-        .map(|(p, ls)| (p, Pulse::on(occluders(ls, ground), class, &m, v.echoes(cell), v.echo_refls(cell), v.max_targets, em))).collect();
-    let empty = Pulse::on(occluders(Vec::new(), ground), class, &m, v.echoes(cell), v.echo_refls(cell), v.max_targets, em);
+        .map(|(p, ls)| (p, Pulse::on(occluders(ls, ground), class, &m, v.echoes(cell), v.echo_refls(cell), slots, em))).collect();
+    let empty = Pulse::on(occluders(Vec::new(), ground), class, &m, v.echoes(cell), v.echo_refls(cell), slots, em);
     CellView { obs, wt, pulses, empty }
 }
 
@@ -444,8 +444,8 @@ pub(super) fn merges<P: Real>(occ: &mut [Occluder<P>], m: &Medium, em: &Settings
 }
 
 /// One cell's pulse and its owners, as the likelihood reads it (3dtrees research 130 formulation.md: one pass per
-/// pulse): its echoes and their reflectances, the most echoes its scan records (`cap`, the target cap; a pulse at it is
-/// capped, [`RangeImage::capped`], and says nothing past its last echo), its occluders ([`Occluder`]), the surface class
+/// pulse): its echoes and their reflectances, the slots it had for them (`cap`: the programme's target cap less the
+/// targets the import dropped, [`RangeImage::slots`]; a pulse at it is censored and says nothing past its last echo), its occluders ([`Occluder`]), the surface class
 /// they are read at (its cell's: [`cell_class`]) and what its ray
 /// meets of the foliage field besides: the optical depth to the beam's end (`tau_end`) and, per echo (`medium`), the
 /// optical depth to it, σ at it and the optical depth to it plus the receiver's resolution, where the medium's path

@@ -37,6 +37,11 @@ params! {
         /// (research 130 slice 11, `edges.py`).
         pub beam_exit: f64 = 0.007,
         pub beam_divergence: f64 = 0.35e-3,
+        /// The most targets the scanner reports per pulse at its programme: the VZ-2000i's 1.2 MHz programme reports 4
+        /// (the RXP's `meas_max_targets` in all 40 AM scans; the datasheet), the stand's simulator 3. Every target the
+        /// scanner reported takes a slot, those the import drops too ([`super::range_image::RangeImage::slots`]); a
+        /// pulse that used them all is censored after its last echo (3dtrees research 130 observation).
+        pub max_targets: f64 = 4.0,
         /// Excess at the solid/mid and mid/fragmented boundaries of the surface class (`constants.py rca`: on raw
         /// scans they split alignment-rca's symptom, 1.1 / 2.8 / 4.4 mm between cells).
         pub class_edge_mid: f64 = 1.2,

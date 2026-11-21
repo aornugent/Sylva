@@ -335,7 +335,7 @@ pub fn walked(v: &RangeImage, em: &Settings, k: usize) -> Option<Walked> {
         return None;
     }
     let (echoes, refls) = (v.echoes(k), v.echo_refls(k));
-    let known = if v.capped(k) { echoes.last().map_or(f64::INFINITY, |&r| r as f64) } else { f64::INFINITY };
+    let known = if v.capped(k, em.max_targets as usize) { echoes.last().map_or(f64::INFINITY, |&r| r as f64) } else { f64::INFINITY };
     let (mut start, mut beam) = (0.0, 1.0);
     let (mut path, mut out) = (Vec::with_capacity(echoes.len() + 1), Vec::with_capacity(echoes.len()));
     for (i, &r) in echoes.iter().enumerate() {
@@ -586,7 +586,7 @@ mod tests {
     #[test]
     fn the_field_reads_the_medium_past_an_echo() {
         use crate::shots::reconstruct::dir;
-        let em = Settings::default();
+        let em = Settings { max_targets: 2.0, ..Settings::default() };   // a scanner of two targets: past them, censored
         let (sigma, left) = (1.0, 0.5);
         let sliver = em.refl_full_hit() + 10.0 * (1.0 - left).log10();
         assert!((em.beam_left(sliver) - left).abs() < 1e-9);
@@ -607,7 +607,6 @@ mod tests {
         let id = [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]];
         let mut v = RangeImage::new(&t, &d, start, range, (84.0, 96.0), id, [0.0; 3], 0, &super::super::range_image::RangeImageParams::default());
         v.echo_refl = refl;
-        assert_eq!(v.max_targets, 2);
         let sp = FoliageBox { lo: [-1.0, 4.0, -1.0], hi: [1.0, 6.0, 1.0], voxel: 0.25 };
         let (h, l) = FieldCounts::new(sp, &[&v], &em).counts().values().fold((0.0, 0.0), |(h, l), &(a, b)| (h + a, l + b));
         assert!((h / l / sigma - 1.0).abs() < 0.03, "the field reads {} against σ = {sigma}", h / l);
