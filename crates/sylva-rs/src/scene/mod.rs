@@ -15,7 +15,7 @@
 //! - [`render`]: elements and their layers in a view's cells, the k-buffer and its mixture.
 //! - [`pyramid`]: one scan's pulses aggregated over its lattice level by level: carving.
 //! - [`pulse`]: one cell's pulse against its owners and the one pass over it.
-//! - [`term`]: an element's (or a group's) term per scan: its cells, its own nodes and its deposit.
+//! - [`term`]: a chain's term per scan (a lone element is a chain of one): its cells, its own nodes and its deposit.
 //! - [`alignment`]: the scan alignment error, solved with the terms and held between refits.
 //! - [`chain`]: chains grown by the likelihood beside a scene, and the declared prior over a plant's wood: the axis
 //!   prior and the fork as an insertion, a chain's state, the grower.
@@ -44,7 +44,7 @@
 //! | one scan's pulses aggregated over its lattice, level by level | depth pyramid | [`pyramid::Pyramid`]: per tile its first echoes' nearest and farthest, its pulses, misses, echoes and energy; carving a voxel ([`pyramid::carve`]: every pulse in its cover clear past it) read off it at the level its cover fits (3dtrees research 130 slice-pyramid) |
 //! | a proposed part of the scene | element | a form (a stick, an axis and radius; or a patch, a ball) and a class |
 //! | what an element is made of, wood or leaf | class | `Class`: its reflectance; a mark, not a shape |
-//! | sticks joined end to end, scored as one | chain; group | `Element::group`, a key: a group's members are one term per scan, one set of nuisances (alignment shift, stem front shift, reflectance level) |
+//! | sticks joined end to end, scored as one | chain; group | `Element::group`, the caller's key; every element is in one chain (`ChainKey`: its group, or itself alone), and a chain's members are one term per scan, one set of nuisances (alignment shift, stem front shift, reflectance level) |
 //! | the declared prior over a plant's wood, on its own rows | axis prior; fork insertion | [`chain::axis_row`]: an axis's taper, form departures and bends as one process in length in radii, scored by departures only, the same however the wood is cut; [`chain::insertion_row`]: a lateral on its parent, conserving r^γ. Values in `Settings`; beside the cost, never in it; the grower proposes and ranks under it |
 //! | a chain grown piece by piece by the likelihood | grower; a chain's state | [`scene::Scene::grow`]; [`chain::Chain`]: its term in information form, updated by each piece's cells alone (3dtrees research 130 slice-grower) |
 //! | elements held against scans | scene | `Scene` |

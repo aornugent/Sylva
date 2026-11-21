@@ -11,7 +11,7 @@
 //!   quasi-likelihood). It replaced slice 7's ρ_res, `1 + (n − 1) ρ` with n an element's own footprints, which
 //!   differed between hypotheses and, once every fronted cell counted, favoured the thinner (slice 7c).
 //! - **Chains** (3dtrees research 130 slice 6): elements of one group ([`Element`]'s `group`) are one term per scan
-//!   ([`Owner`]), so a chain of short sticks shares its nuisances. A declared term over
+//!   ([`ChainKey`]), so a chain of short sticks shares its nuisances. A declared term over
 //!   its geometry alone (the axis prior, `chain::axis_row`) is the consumer's, beside the cost, never in it.
 
 use crate::Point;
@@ -26,24 +26,33 @@ use super::range_image::{Cell, RangeImage};
 use super::render::{MOSTLY, Form, Element, Layer, front_shares};
 use super::settings::{Background, Settings, ALIGN_SPACING};
 
-/// Whose term a cell's evidence enters, per scan: an element alone (by id), or a group (by its key). A group's members
-/// share one set of nuisances (one alignment shift, at their middles' mean; one stem front shift, its prior sd their
-/// mean; one reflectance level) and one surface class (the median over their cells: [`term_classes`]), so a chain of short sticks is
-/// charged its nuisances once. Its members' cells are scored as one element's.
+/// Whose term a cell's evidence enters, per scan: the element's chain. Every element is in one chain: the caller's
+/// group (its key) or, given none, a chain of its own (its id; group keys are numbered past every id, so lone elements'
+/// chains come first, by id, then groups by key). A chain's members share one set of nuisances (one alignment shift,
+/// at their middles' mean; one stem front shift, its prior sd their mean; one reflectance level) and one surface class
+/// (the median over their cells: [`term_classes`]), so a chain of short sticks is charged its nuisances once. Its
+/// members' cells are scored as one element's.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub(super) enum Owner {
-    Alone(u32),
-    Group(u32),
+pub(super) struct ChainKey(u64);
+
+/// Where group keys start among chain keys: past every element id.
+const GROUP_KEYS: u64 = 1 << 32;
+
+impl ChainKey {
+    /// The caller's group key, for a chain that is a group.
+    pub(super) fn group(self) -> Option<u32> {
+        self.0.checked_sub(GROUP_KEYS).map(|g| g as u32)
+    }
 }
 
-/// Element `id`'s owner.
-pub(super) fn owner(id: u32, e: &Element) -> Owner {
-    e.group.map_or(Owner::Alone(id), Owner::Group)
+/// Element `id`'s chain.
+pub(super) fn chain_key(id: u32, e: &Element) -> ChainKey {
+    ChainKey(e.group.map_or(id as u64, |g| GROUP_KEYS + g as u64))
 }
 
 /// Each element's term among its owners: the place its owner first appears.
-pub(super) fn slots(owners: &[Owner]) -> Vec<usize> {
-    let mut at: HashMap<Owner, usize> = HashMap::new();
+pub(super) fn slots(owners: &[ChainKey]) -> Vec<usize> {
+    let mut at: HashMap<ChainKey, usize> = HashMap::new();
     owners.iter().map(|o| {
         let n = at.len();
         *at.entry(*o).or_insert(n)
@@ -60,7 +69,7 @@ pub(super) fn middle(es: &[&Element]) -> Point {
     [0, 1, 2].map(|k| mean_of(es, |e| e.mid()[k]))
 }
 
-/// A term's latent nodes ([`Owner`]: an element's, or a group's members' together): its alignment hats at its middle
+/// A term's latent nodes ([`ChainKey`]: an element's, or a group's members' together): its alignment hats at its middle
 /// ([`hats`]) and its stem front shift's prior sd (its members' mean). The cost ([`elem_data`]) and the information
 /// ([`Shared`]) read them here, so a group's front shift has one prior in both.
 pub(super) fn term_nodes(es: &[&Element], em: &Settings) -> (Vec<([i64; 3], f64)>, f64) {
@@ -114,7 +123,7 @@ pub(super) struct CellData {
     pub(super) hits: Vec<(usize, [i32; 3], f64, f64)>,
 }
 
-/// One term's data in one scan (an element's, or a group's: [`Owner`]): the cells its members own (its evidence:
+/// One term's data in one scan (an element's, or a group's: [`ChainKey`]): the cells its members own (its evidence:
 /// [`elem_data`]), and its latent nodes: its alignment nodes with their weights (its alignment shift is `Σ w z`, each
 /// hat's weight times its surface class's along-beam spread), and the prior sds of its own two nodes, the stem front
 /// shift (m; 0 when off) and the reflectance level (dB; 0 while reflectance isn't read).

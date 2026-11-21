@@ -46,7 +46,7 @@ use super::pulse::mixture_taken;
 use super::render::{Element, Form, Layer, KBuffer, keep, numbered, render};
 use super::scene::{Proposal, Scene, redeposit};
 use super::settings::Settings;
-use super::term::{CellData, Owner, Term, eliminate, elem_data, median_class, owner, settle, slots, term_nodes, vote, clipped, mean_of};
+use super::term::{CellData, ChainKey, Term, eliminate, elem_data, median_class, chain_key, settle, slots, term_nodes, vote, clipped, mean_of};
 
 /// The clock's reference radius (m): dτ = ds / r · (r / R_CLOCK)^(1 − β), so β = 1 is length in radii and β = 0 is
 /// length in units of R_CLOCK, whatever the radius (`Settings::axis_clock`).
@@ -245,7 +245,7 @@ struct ChainScan {
     votes: [u32; 3],
     term: Option<Term>,
     /// The scene's terms it changes.
-    ctx: HashMap<Owner, Option<Term>>,
+    ctx: HashMap<ChainKey, Option<Term>>,
 }
 
 /// A chain grown beside a scene, the scene unchanged: its pieces (numbered from the scene's next id), their order
@@ -271,7 +271,7 @@ struct ScanTrial {
     gone: Vec<usize>,
     fresh: Vec<(CellData, Option<u8>, Deposit, f64)>,
     term: Option<Term>,
-    ctx: Vec<(Owner, Option<Term>)>,
+    ctx: Vec<(ChainKey, Option<Term>)>,
     cost: f64,
 }
 
@@ -308,7 +308,7 @@ impl Scene {
     /// Grow each seed stick into a chain by the likelihood (the module's docs), inside the region `inside` (a test of
     /// points), in parallel over seeds, the scene unchanged.
     pub fn grow(&self, seeds: &[Element], inside: &(dyn Fn(&[Point]) -> Vec<bool> + Sync), opts: &Grow) -> Vec<Grown> {
-        let g = self.groups.keys().max().map_or(0, |m| m + 1);
+        let g = self.elems.iter().flatten().filter_map(|e| e.group).max().map_or(0, |m| m + 1);
         seeds.par_iter().map(|e| self.grow_one(Element { group: Some(g), ..*e }, inside, opts)).collect()
     }
 
@@ -422,7 +422,7 @@ impl Scene {
     fn try_scan(&self, s: usize, c: &Chain, cs: &ChainScan, e: Element, id: u32) -> ScanTrial {
         let (v, em, fit) = (&*self.views[s], &self.em, &self.fits[s]);
         let first = self.elems.len() as u32;
-        let g = Owner::Group(e.group.expect("a chain's piece has its group"));
+        let g = chain_key(id, &e);
         let layers = render(v, &e, id, em);
         let mut own = KBuffer::default();
         let touched = own.enter(id, &layers);
@@ -432,7 +432,7 @@ impl Scene {
         let mut ids = Vec::new();
         let cells = numbered(touched.iter().map(|&cell| (cell, in_cell(cell))).collect(), &mut ids);
         let elems: Vec<Element> = ids.iter().map(|&i| if i >= first { piece(i) } else { self.elems[i as usize].unwrap() }).collect();
-        let owners: Vec<Owner> = ids.iter().zip(&elems).map(|(&i, x)| if i >= first { g } else { owner(i, x) }).collect();
+        let owners: Vec<ChainKey> = ids.iter().zip(&elems).map(|(&i, x)| if i >= first { g } else { chain_key(i, x) }).collect();
         let mine: Vec<usize> = (0..ids.len()).filter(|&k| ids[k] >= first).collect();
         let fresh_cells = elem_data(v, &cells, &elems, &slots(&owners), &mine, self.ref_epoch, em, &self.sc, &self.ext, self.field.as_ref().map(|f| &f.spec))
             .into_iter().next().map_or(Vec::new(), |d| d.cells);
@@ -501,7 +501,7 @@ impl Scene {
         if let Some(t) = &mut term {
             t.plug = cs.term.as_ref().map_or(0.0, |t| t.plug) - gone.iter().map(|k| cs.cells[k].plug).sum::<f64>() + fresh.iter().map(|x| x.3).sum::<f64>();
         }
-        let mut over: HashMap<Owner, Option<Term>> = cs.ctx.clone();
+        let mut over: HashMap<ChainKey, Option<Term>> = cs.ctx.clone();
         over.extend(ctx.iter().cloned());
         over.insert(g, term.clone());
         let cost = fit.total(&over) - fit.cost;

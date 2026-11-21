@@ -63,7 +63,7 @@ pub enum Class {
 /// An element hypothesis: its form, its class, its section's radius (a stick's a₀; a patch's extent), its opacity
 /// (1 solid), its shape mismatch sd (m), its group and the caller's key. The caller supplies opacity and mismatch
 /// (each with a declared default). Elements of one `group` (a chain: research 130 slice 6) are one term per scan
-/// ([`Owner`]); none, the element is alone. `key` is the caller's name for the element in its candidate graph (which
+/// ([`super::term::ChainKey`]); none, the element is a chain of its own. `key` is the caller's name for the element in its candidate graph (which
 /// end it continues, which axis it inserts on and at which s*, in the caller's encoding): carried with the element and
 /// read back with it ([`super::scene::Scene::element`]), never read by the scene (research 130 core.md §4.3, item 4).
 #[derive(Debug, Clone, Copy)]

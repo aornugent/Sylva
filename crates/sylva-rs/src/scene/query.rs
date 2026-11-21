@@ -13,7 +13,7 @@ use super::range_image::Cell;
 use super::render::{MOSTLY, Form, Element, Layer, placed, render, keep, front_shares, layer};
 use super::scene::{Proposal, Scene, View};
 use super::settings::Settings;
-use super::term::{Owner, owner, slots, term_nodes, term_classes, Term};
+use super::term::{ChainKey, chain_key, slots, term_nodes, term_classes, Term};
 
 /// What an element predicts in one cell it fronts ([`Scene::predict`]), on the path the likelihood scores: its fill,
 /// the chance its echo is recorded, the chance the pulse arrives (meets nothing of the foliage field before the
@@ -128,11 +128,11 @@ pub(super) struct Shared {
 }
 
 impl Shared {
-    /// For `elems`, a group's members sharing one term's nodes ([`Owner`]: hats at their middles' mean, one front
+    /// For `elems`, a group's members sharing one term's nodes ([`ChainKey`]: hats at their middles' mean, one front
     /// shift and one reflectance level), as the cost has them when the group is these elements.
     pub(super) fn new(n: usize, elems: &[Element], em: &Settings) -> Shared {
         let mut nodes: HashMap<[i64; 3], usize> = HashMap::new();
-        let slot = slots(&elems.iter().enumerate().map(|(k, e)| owner(k as u32, e)).collect::<Vec<_>>());
+        let slot = slots(&elems.iter().enumerate().map(|(k, e)| chain_key(k as u32, e)).collect::<Vec<_>>());
         let terms = slot.iter().max().map_or(0, |m| m + 1);
         let tn: Vec<_> = (0..terms).map(|t| term_nodes(&elems.iter().zip(&slot).filter(|(_, &u)| u == t).map(|(e, _)| e).collect::<Vec<_>>(), em)).collect();
         for (k, _) in tn.iter().flat_map(|t| &t.0) {
@@ -214,7 +214,7 @@ impl Scene {
         }).collect();
         let n = self.elems.len() as u32;
         let els: Vec<Element> = es.iter().copied().chain(ids.iter().map(|&i| self.elems[i as usize].unwrap())).collect();
-        let owners: Vec<Owner> = es.iter().enumerate().map(|(k, e)| owner(n + k as u32, e)).chain(ids.iter().zip(&els[es.len()..]).map(|(&i, e)| owner(i, e))).collect();
+        let owners: Vec<ChainKey> = es.iter().enumerate().map(|(k, e)| chain_key(n + k as u32, e)).chain(ids.iter().zip(&els[es.len()..]).map(|(&i, e)| chain_key(i, e))).collect();
         let other = v.epoch != self.ref_epoch;
         let cls = term_classes(v, &cells, &slots(&owners), em);
         let mut out: Vec<CellPrediction> = cells.iter().filter(|(cell, ls)| (ls[0].elem as usize) < es.len() && v.cell[*cell] != Cell::NoPulse).map(|(cell, ls)| {
@@ -306,7 +306,7 @@ impl Scene {
     /// the alignment's nodes, which neighbours share. So the alignment, which moves neighbours' depths together,
     /// cancels in their depth difference, where each element's own information charges it in full. Far apart (no node
     /// or cell in common) the information is the elements' own, side by side. Members of one group (a chain) share
-    /// one term's nodes ([`Owner`]), as their cost does when `ids` are the whole group; a chain's knots are a Jacobian
+    /// one term's nodes ([`ChainKey`]), as their cost does when `ids` are the whole group; a chain's knots are a Jacobian
     /// away from its sticks' parameters (research 130 slice 6).
     ///
     /// **What it means under the evidence discount** (research 130 step 3b). Each cell's log-likelihood counts
@@ -403,7 +403,7 @@ impl Scene {
             let ls = a.layers(cell);
             let owners: Vec<(usize, &Term, [f64; 2])> = front_shares(&ls).iter().enumerate().filter(|(_, &w)| w > 0.0).filter_map(|(i, _)| {
                 let id = ls[i].elem;
-                let term = a.term(&owner(id, &a.element(id)?))?;
+                let term = a.term(&chain_key(id, &a.element(id)?))?;
                 Some((i, term, [fit.held.shift(&term.align) + term.own_sd[0] * term.own[0], term.own_sd[1] * term.own[1]]))
             }).collect();
             (!owners.is_empty()).then_some((cell, ls, owners))

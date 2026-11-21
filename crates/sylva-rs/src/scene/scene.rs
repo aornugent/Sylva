@@ -24,14 +24,14 @@ use nalgebra::Vector2;
 use rayon::prelude::*;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
-use super::alignment::{Reference, solve_alignment, Fit, Changes};
+use super::alignment::{solve_alignment, Fit, Changes};
 use super::foliage::{self, FieldCounts, FixedHits, Foliage, FoliageBox};
 use super::range_image::RangeImage;
 use super::render::{Element, Layer, KBuffer, render, render_all, kept, keep, fronting, numbered};
 use super::settings::{Background, Settings};
-use super::term::{Owner, owner, slots, ElemData, Term, elem_data};
+use super::term::{ChainKey, chain_key, slots, ElemData, Term, elem_data};
 
-/// What one scan says about one element, or one group ([`Owner`]: `group`, and `elem` its first member), its cost
+/// What one scan says about one element, or one group ([`ChainKey`]: `group`, and `elem` its first member), its cost
 /// split into parts that sum to `cost`. A group's row reads its members' cells together.
 /// - `cells`: cells it has a front share in ([`front_shares`]); `cells_on`: those it is the nearest layer of whose first echo is
 ///   its ([`Outcome::On`]); `across`: footprints across its diameter; `surface`: its term's surface class in this
@@ -128,8 +128,8 @@ pub struct Scene {
     pub(super) field: Option<FieldCounts>,
     pub(super) ref_epoch: u32,
     pub(super) elems: Vec<Option<Element>>,
-    /// Per group key, its live members' ids.
-    pub(super) groups: HashMap<u32, BTreeSet<u32>>,
+    /// Per chain, its live members' ids (a lone element's chain is itself).
+    pub(super) chains: HashMap<ChainKey, BTreeSet<u32>>,
     /// [image]: its k-buffer, every element's layers by cell.
     pub(super) buffers: Vec<KBuffer>,
     /// [image][id]: the cells the element's layers enter ([`entered`]; none where the image renders none of it, or it
@@ -171,7 +171,7 @@ impl Scene {
     /// field is estimated in its box as the residual of the elements, otherwise it is the background's κ.
     pub fn new(views: Vec<Arc<RangeImage>>, elems: &[Element], em: Settings, sc: Background, spec: Option<FoliageBox>, ref_epoch: u32) -> Self {
         let mut c = Scene { views, em, sc, ext: Foliage::uniform(sc.kappa), field: None, ref_epoch, elems: elems.iter().map(|e| Some(*e)).collect(),
-                             groups: HashMap::new(), buffers: Vec::new(), entered: Vec::new(), fits: Vec::new() };
+                             chains: HashMap::new(), buffers: Vec::new(), entered: Vec::new(), fits: Vec::new() };
         for (i, e) in elems.iter().enumerate() {
             c.join(i as u32, e);
         }
@@ -229,20 +229,18 @@ impl Scene {
         self.refit_alignment()
     }
 
-    /// Enter element `id` in its group's members.
+    /// Enter element `id` in its chain's members.
     pub(super) fn join(&mut self, id: u32, e: &Element) {
-        if let Some(g) = e.group {
-            self.groups.entry(g).or_default().insert(id);
-        }
+        self.chains.entry(chain_key(id, e)).or_default().insert(id);
     }
 
-    /// Take element `id` out of its group's members.
+    /// Take element `id` out of its chain's members.
     pub(super) fn leave(&mut self, id: u32, e: &Element) {
-        if let Some(set) = e.group.and_then(|g| self.groups.get_mut(&g)) {
-            set.remove(&id);
-            if set.is_empty() {
-                self.groups.remove(&e.group.unwrap());
-            }
+        let o = chain_key(id, e);
+        let set = self.chains.get_mut(&o).expect("a live element's chain");
+        set.remove(&id);
+        if set.is_empty() {
+            self.chains.remove(&o);
         }
     }
 
@@ -291,10 +289,10 @@ impl Scene {
     /// an element's term, or a group's under its first member's id.
     pub fn rows(&self, p: &Proposal) -> Vec<ElementScan> {
         let (views, delta) = self.views_after(p);
-        let mut first: HashMap<u32, u32> = HashMap::new();
+        let mut first: HashMap<ChainKey, u32> = HashMap::new();
         for i in (0..self.next_id() + p.put_in.len() as u32).rev() {
-            if let Some(g) = self.element_after(p, i).and_then(|e| e.group) {
-                first.insert(g, i);
+            if let Some(e) = self.element_after(p, i) {
+                first.insert(chain_key(i, &e), i);
             }
         }
         // the field's part of a term's cost to remove: its deposit given back, from the counts the proposal leaves
@@ -305,13 +303,10 @@ impl Scene {
         });
         let mut rows = Vec::new();
         for (s, (fit, v)) in self.fits.iter().zip(&views).enumerate() {
-            let mut terms: BTreeMap<Owner, &Term> = fit.terms.iter().filter(|(o, _)| !v.index.contains_key(o)).map(|(o, t)| (*o, t)).collect();
+            let mut terms: BTreeMap<ChainKey, &Term> = fit.terms.iter().filter(|(o, _)| !v.index.contains_key(o)).map(|(o, t)| (*o, t)).collect();
             terms.extend(v.terms.iter().filter_map(|(o, t)| t.as_ref().map(|t| (*o, t))));
             for (o, t) in terms {
-                let (i, group) = match o {
-                    Owner::Alone(i) => (i, None),
-                    Owner::Group(g) => (first[&g], Some(g)),
-                };
+                let (i, group) = (first[&o], o.group());
                 // the shift's posterior from the held alignment, and the own nodes' with it marginalised
                 let var = fit.held.between(&t.align, &t.align);
                 let own_sd = |j: usize| t.own_sd[j] * (t.own_cov[(j, j)] + t.own_link[j] * t.own_link[j] * var).max(0.0).sqrt();
@@ -403,12 +398,8 @@ impl Scene {
         }
         let fit = &mut self.fits[s];
         for (o, t) in terms {
-            let old = match t {
-                Some(t) => fit.terms.insert(o, t),
-                None => fit.terms.remove(&o),
-            };
+            let old = fit.put(o, t);
             redeposit(delta, old.as_ref(), fit.terms.get(&o));
-            fit.note(o);
         }
         let before = fit.cost;
         fit.cost = fit.total(&HashMap::new());
@@ -416,11 +407,11 @@ impl Scene {
     }
 
     /// Scan `s`'s data for every live element whose layers enter its cells ([`elem_data`]), each term with its owner.
-    pub(super) fn data(&self, s: usize) -> Vec<(Owner, ElemData)> {
+    pub(super) fn data(&self, s: usize) -> Vec<(ChainKey, ElemData)> {
         let mut ids: Vec<u32> = (0..self.elems.len() as u32).filter(|&i| self.entered[s][i as usize].is_some()).collect();
         let cells = numbered(self.buffers[s].cells(), &mut ids);
         let elems: Vec<Element> = ids.iter().map(|&i| self.elems[i as usize].unwrap()).collect();
-        let owners: Vec<Owner> = ids.iter().zip(&elems).map(|(&i, e)| owner(i, e)).collect();
+        let owners: Vec<ChainKey> = ids.iter().zip(&elems).map(|(&i, e)| chain_key(i, e)).collect();
         let data = elem_data(&self.views[s], &cells, &elems, &slots(&owners), &(0..ids.len()).collect::<Vec<_>>(), self.ref_epoch, &self.em, &self.sc, &self.ext,
                              self.field.as_ref().map(|f| &f.spec));
         data.into_iter().map(|d| (owners[d.members[0]], d)).collect()
@@ -428,11 +419,9 @@ impl Scene {
 
     /// Scan `s` solved afresh for the elements as they are ([`solve_alignment`]), its alignment held there.
     pub(super) fn solve(&self, s: usize) -> Fit {
-        let (owners, data): (Vec<Owner>, Vec<ElemData>) = self.data(s).into_iter().unzip();
-        let (mut held, terms) = solve_alignment(&data, &self.em);
-        let fit_terms: BTreeMap<Owner, Term> = owners.into_iter().zip(terms).collect();
-        held.reference = fit_terms.iter().map(|(o, t)| (*o, Reference::of(t))).collect();
-        let mut fit = Fit { terms: fit_terms, held, moved: BTreeSet::new(), cost: 0.0 };
+        let (owners, data): (Vec<ChainKey>, Vec<ElemData>) = self.data(s).into_iter().unzip();
+        let (held, terms) = solve_alignment(&data, &self.em);
+        let mut fit = Fit { terms: owners.into_iter().zip(terms).collect(), held, replaced: BTreeMap::new(), cost: 0.0 };
         fit.cost = fit.total(&HashMap::new());
         fit
     }
@@ -467,23 +456,20 @@ impl Scene {
     /// the term of `skip` (a chain grown beside the scene: [`super::chain`], which keeps its own term).
     #[allow(clippy::too_many_arguments)]
     pub(super) fn terms_after(&self, s: usize, without: &[u32], with: &[(Element, Option<&[usize]>)], first: u32, fresh: &dyn Fn(usize) -> Vec<Layer>,
-                              touched: &HashSet<usize>, start: &[u32], skip: Option<Owner>) -> Changes {
+                              touched: &HashSet<usize>, start: &[u32], skip: Option<ChainKey>) -> Changes {
         let (v, em, fit, buf) = (&*self.views[s], &self.em, &self.fits[s], &self.buffers[s]);
         let added = |i: u32| i >= first && ((i - first) as usize) < with.len();
         let entered = |i: u32| -> Option<&[usize]> { if added(i) { with[(i - first) as usize].1 } else { self.entered[s][i as usize].as_deref() } };
         let element = |i: u32| if added(i) { with[(i - first) as usize].0 } else { self.elems[i as usize].unwrap() };
-        let present = |i: u32| entered(i).is_some() && (added(i) || !without.contains(&i)) && Some(owner(i, &element(i))) != skip;
+        let present = |i: u32| entered(i).is_some() && (added(i) || !without.contains(&i)) && Some(chain_key(i, &element(i))) != skip;
         // a cell's k-buffer after the move
         let after = |c: usize| keep(buf.get(c).iter().filter(|l| !without.contains(&l.elem) && !added(l.elem)).copied().chain(fresh(c)).collect());
-        let owner_of = |i: u32| owner(i, &element(i));
-        // every present member of the groups of `ids` and of the elements taken out
+        let owner_of = |i: u32| chain_key(i, &element(i));
+        // every present member of the chains of `ids` and of the elements taken out
         let whole = |ids: &mut BTreeSet<u32>| {
-            let groups: BTreeSet<u32> = ids.iter().map(|&i| element(i)).chain(without.iter().map(|&i| self.elems[i as usize].unwrap())).filter_map(|e| e.group).collect();
-            if groups.is_empty() {
-                return;
-            }
-            ids.extend(groups.iter().filter_map(|g| self.groups.get(g)).flatten());
-            ids.extend((0..with.len() as u32).filter(|&k| with[k as usize].0.group.is_some_and(|g| groups.contains(&g))).map(|k| first + k));
+            let chains: BTreeSet<ChainKey> = ids.iter().map(|&i| owner_of(i)).chain(without.iter().map(|&i| chain_key(i, &self.elems[i as usize].unwrap()))).collect();
+            ids.extend(chains.iter().filter_map(|o| self.chains.get(o)).flatten());
+            ids.extend((0..with.len() as u32).map(|k| first + k).filter(|&i| chains.contains(&owner_of(i))));
             ids.retain(|&i| present(i));
         };
         // the terms with a front share in the cells the move touches, before it and after, and the elements it adds
@@ -502,25 +488,25 @@ impl Scene {
         let mut ids: Vec<u32> = near.iter().copied().collect();
         let cells = numbered(cells.into_iter().map(|c| (c, after(c))).collect(), &mut ids);
         let el: Vec<Element> = ids.iter().map(|&i| element(i)).collect();
-        let owners: Vec<Owner> = ids.iter().map(|&i| owner_of(i)).collect();
+        let owners: Vec<ChainKey> = ids.iter().map(|&i| owner_of(i)).collect();
         let data = elem_data(v, &cells, &el, &slots(&owners), &(0..near.len()).collect::<Vec<_>>(), self.ref_epoch, em, &self.sc, &self.ext,
                              self.field.as_ref().map(|f| &f.spec));
         // a held term's own nodes start where its reference's did, so an unchanged term is recomputed exactly
-        let mut terms: Vec<(Owner, Option<Term>)> = data.par_iter().map(|d| {
+        let mut terms: Vec<(ChainKey, Option<Term>)> = data.par_iter().map(|d| {
             let o = owners[d.members[0]];
-            (o, Some(d.term(fit.held.shift(&d.align), fit.held.reference.get(&o).map_or(Vector2::zeros(), |t| t.start), em)))
+            (o, Some(d.term(fit.held.shift(&d.align), fit.reference(&o).map_or(Vector2::zeros(), |t| t.start), em)))
         }).collect();
         // the owners of the elements taken out or unseen now, unless a member is still scored
-        let scored: HashSet<Owner> = terms.iter().map(|t| t.0).collect();
-        let left = without.iter().map(|&i| owner(i, &self.elems[i as usize].unwrap())).chain((0..with.len() as u32).map(|k| owner_of(first + k)));
-        terms.extend(left.collect::<BTreeSet<Owner>>().into_iter().filter(|o| !scored.contains(o) && Some(*o) != skip).map(|o| (o, None)));
+        let scored: HashSet<ChainKey> = terms.iter().map(|t| t.0).collect();
+        let left = without.iter().map(|&i| chain_key(i, &self.elems[i as usize].unwrap())).chain((0..with.len() as u32).map(|k| owner_of(first + k)));
+        terms.extend(left.collect::<BTreeSet<ChainKey>>().into_iter().filter(|o| !scored.contains(o) && Some(*o) != skip).map(|o| (o, None)));
         terms
     }
 
     /// Each proposal's cost change were it kept ([`Scene::check_proposal`]), per scan and then, when the scene holds a
     /// foliage field, the field's part (the change in [`Scene::field_part`]): (proposals × scans, or scans + 1), in
     /// parallel, the scene unchanged, its foliage field and alignment held. A row sums to keeping it, bit for bit. A
-    /// proposal's elements of one group are one term ([`Owner`]: a chain), joined by the scene's members of that group,
+    /// proposal's elements of one group are one term ([`ChainKey`]: a chain), joined by the scene's members of that group,
     /// which are rescored with it; its other elements are each alone.
     pub fn score(&self, ps: &[Proposal]) -> Vec<Vec<f64>> {
         ps.par_iter().map(|p| {
@@ -530,7 +516,7 @@ impl Scene {
                 if v.terms.is_empty() {
                     return 0.0;
                 }
-                let over: HashMap<Owner, Option<Term>> = v.terms.into_iter().collect();
+                let over: HashMap<ChainKey, Option<Term>> = v.terms.into_iter().collect();
                 for (o, t) in &over {
                     redeposit(&mut delta, self.fits[s].terms.get(o), t.as_ref());
                 }
@@ -591,7 +577,7 @@ pub(super) struct View<'a> {
     pub(super) fresh: KBuffer,
     pub(super) cells: Vec<Option<Vec<usize>>>,
     pub(super) terms: Changes,
-    pub(super) index: HashMap<Owner, usize>,
+    pub(super) index: HashMap<ChainKey, usize>,
 }
 
 impl View<'_> {
@@ -616,8 +602,8 @@ impl View<'_> {
         keep(self.scene.buffers[self.s].get(cell).iter().filter(|l| !self.p.take_out.contains(&l.elem)).copied().chain(self.fresh.get(cell).iter().copied()).collect())
     }
 
-    /// Owner `o`'s term after the proposal.
-    pub(super) fn term(&self, o: &Owner) -> Option<&Term> {
+    /// ChainKey `o`'s term after the proposal.
+    pub(super) fn term(&self, o: &ChainKey) -> Option<&Term> {
         match self.index.get(o) {
             Some(&k) => self.terms[k].1.as_ref(),
             None => self.scene.fits[self.s].terms.get(o),
@@ -628,11 +614,11 @@ impl View<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::{BTreeMap, BTreeSet, HashMap};
+    use std::collections::{BTreeMap, HashMap};
     use crate::scene::foliage::{self, Deposit, FieldCounts, Foliage};
     use crate::scene::render::{Form, Element};
     use crate::scene::settings::{Background, Settings};
-    use crate::scene::term::Owner;
+    use crate::scene::term::ChainKey;
     use super::super::fixtures::{add, cost, costs, field_box, piece_of, pole_view, remove, stick, swap, thin_pole_view};
 
     /// The true pole has negative cost; a stick of the wrong radius, shifted, or porous has more; a stick where
@@ -860,18 +846,18 @@ mod tests {
         let (em, sc) = (Settings::default(), Background::default());
         let front = stick(0.02, 3.9, 0.02);
         let mut c = Scene::new(vec![v.clone(), v.clone()], &[stick(0.0, 4.0, 0.03), front, piece_of(-0.2, 0.0, Some(5))], em, sc, Some(field_box()), 0);
+        let refit: Vec<BTreeMap<ChainKey, u64>> = c.fits.iter().map(|f| f.terms.iter().map(|(o, t)| (*o, t.cost().to_bits())).collect()).collect();
         let check = |c: &Scene| {
             for s in 0..c.n_scans() {
                 let fit = &c.fits[s];
-                let fresh: BTreeMap<Owner, (f64, Deposit)> = c.data(s).into_iter().map(|(o, d)| {
-                    let t = d.term(fit.held.shift(&d.align), fit.held.reference.get(&o).map_or(Vector2::zeros(), |t| t.start), &em);
+                let fresh: BTreeMap<ChainKey, (f64, Deposit)> = c.data(s).into_iter().map(|(o, d)| {
+                    let t = d.term(fit.held.shift(&d.align), fit.reference(&o).map_or(Vector2::zeros(), |t| t.start), &em);
                     (o, (t.cost(), t.deposit))
                 }).collect();
-                assert_eq!(fresh, fit.terms.iter().map(|(o, t)| (*o, (t.cost(), t.deposit.clone()))).collect::<BTreeMap<Owner, _>>());
-                // the owners the fit notes as moved are those whose term differs from the alignment's reference
-                let moved: BTreeSet<Owner> = fit.terms.keys().chain(fit.held.reference.keys()).copied()
-                    .filter(|o| !matches!((fit.held.reference.get(o), fit.terms.get(o)), (Some(r), Some(t)) if r.same_alignment(t))).collect();
-                assert_eq!(moved, fit.moved);
+                assert_eq!(fresh, fit.terms.iter().map(|(o, t)| (*o, (t.cost(), t.deposit.clone()))).collect::<BTreeMap<ChainKey, _>>());
+                // the alignment's reference is every chain's term at the refit: those a move replaced, and the rest
+                let reference: BTreeMap<ChainKey, u64> = fit.terms.keys().chain(fit.replaced.keys()).filter_map(|o| fit.reference(o).map(|t| (*o, t.cost().to_bits()))).collect();
+                assert_eq!(reference, refit[s]);
             }
             assert!(c.fits.iter().flat_map(|f| f.terms.values()).any(|t| !t.deposit.is_empty()));
             assert_eq!(c.field.as_ref().unwrap().counts(), recounted(c));

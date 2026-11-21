@@ -22,7 +22,7 @@ use nalgebra::Vector2;
 use rayon::prelude::*;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use super::settings::Settings;
-use super::term::{Owner, ElemData, Eliminated, cap, Local, Term, MAX_NEWTON};
+use super::term::{ChainKey, ElemData, Eliminated, cap, Local, Term, MAX_NEWTON};
 
 /// The scan alignment error's nodes about a place: trilinear hats on a grid of spacing ℓ, normalised so the alignment
 /// error's variance is the same everywhere (`t(x) = Σ w_j z_j / √Σ w_j²`); each node carries the along-beam shift.
@@ -44,8 +44,7 @@ pub fn hats(x: &Point, l: f64) -> Vec<([i64; 3], f64)> {
 
 /// The scan alignment error held at its mode (research 130 offset-field-design.md §3, step 3a): the nodes' mode ẑ
 /// and covariance Σ₀ = Λ₀⁻¹ at the last refit, `m` = Σ₀ G₀ (the step Newton would still take, G₀ the cost's slope in
-/// the nodes there) and `gm` = G₀ᵀ Σ₀ G₀, and what it reads of the terms the refit was taken with (`reference`, by
-/// [`Owner`]: [`Reference`]).
+/// the nodes there) and `gm` = G₀ᵀ Σ₀ G₀; the terms the refit was taken with are the fit's ([`Fit::reference`]).
 ///
 /// With its own nodes eliminated, each term (an element's or a group's) meets the nodes through its alignment shift alone: slope γ and
 /// curvature h along its weights r. For the elements now in the scan, `Λ = I + Σ h r rᵀ` and `G = ẑ + Σ γ r`, and the
@@ -60,28 +59,11 @@ pub(super) struct Held {
     pub(super) m: Vec<f64>,
     pub(super) gm: f64,
     pub(super) logdet: f64,
-    pub(super) reference: BTreeMap<Owner, Reference>,
 }
 
-/// What the held alignment keeps of a term at its refit: how it meets the nodes (its weights, its cost's slope and
-/// curvature in its shift) and where its own nodes' Newton began, so a move recomputes an unchanged term exactly.
-#[derive(Debug, Clone)]
-pub(super) struct Reference {
-    pub(super) align: Vec<([i64; 3], f64)>,
-    pub(super) slope: f64,
-    pub(super) curv: f64,
-    pub(super) start: Vector2<f64>,
-}
-
-impl Reference {
-    pub(super) fn of(t: &Term) -> Reference {
-        Reference { align: t.align.clone(), slope: t.slope, curv: t.curv, start: t.start }
-    }
-
-    /// Whether term `t` enters the scan alignment error as this did (the same nodes, slope and curvature).
-    pub(super) fn same_alignment(&self, t: &Term) -> bool {
-        self.align == t.align && self.slope == t.slope && self.curv == t.curv
-    }
+/// Whether term `t` enters the scan alignment error as `r` did (the same nodes, slope and curvature).
+pub(super) fn same_alignment(r: &Term, t: &Term) -> bool {
+    r.align == t.align && r.slope == t.slope && r.curv == t.curv
 }
 
 impl Held {
@@ -168,7 +150,7 @@ pub(super) fn held(index: HashMap<[i64; 3], usize>, z: Vec<f64>, grad: nalgebra:
     };
     let m: Vec<f64> = (&cov * &grad).iter().copied().collect();
     let gm = grad.iter().zip(&m).map(|(a, b)| a * b).sum();
-    Held { index, z, cov, m, gm, logdet, reference: BTreeMap::new() }
+    Held { index, z, cov, m, gm, logdet }
 }
 
 /// A scan's exact Laplace marginal over the alignment error's nodes, given each element's data (the held
@@ -231,29 +213,39 @@ pub(super) fn solve_alignment(data: &[ElemData], em: &Settings) -> (Held, Vec<Te
     (held(index, z, grad, hess), terms)
 }
 
-/// One scan's fit: per [`Owner`] its term (none where the scan doesn't see it), the held alignment, the owners whose
-/// term differs from the alignment's reference (`moved`: they alone are its columns, [`Held::part`]), and the scan's
-/// cost.
+/// One scan's fit: per [`ChainKey`] its term (none where the scan doesn't see it), the held alignment, the term each chain
+/// a move has touched since the refit had then (`replaced`, none for a chain the scan didn't see: with the terms no move
+/// touched, the alignment's reference), and the scan's cost. The chains whose term differs from the reference alone are
+/// the held alignment's columns ([`Held::part`]), and a move recomputes a term from its reference's start, so an
+/// unchanged term comes out the same.
 pub(super) struct Fit {
-    pub(super) terms: BTreeMap<Owner, Term>,
+    pub(super) terms: BTreeMap<ChainKey, Term>,
     pub(super) held: Held,
-    pub(super) moved: BTreeSet<Owner>,
+    pub(super) replaced: BTreeMap<ChainKey, Option<Term>>,
     pub(super) cost: f64,
 }
 
 /// A move's changes to a scan's fit: the terms by owner (none: it left the scan).
-pub(super) type Changes = Vec<(Owner, Option<Term>)>;
+pub(super) type Changes = Vec<(ChainKey, Option<Term>)>;
 
 impl Fit {
-    /// The scan's cost with the terms `over` (none: the term left) in place of its own: every term's cost, in owner
+    /// ChainKey `o`'s term at the last refit (none where the scan didn't see it): the alignment's reference.
+    pub(super) fn reference(&self, o: &ChainKey) -> Option<&Term> {
+        match self.replaced.get(o) {
+            Some(t) => t.as_ref(),
+            None => self.terms.get(o),
+        }
+    }
+
+    /// The scan's cost with the terms `over` (none: the term left) in place of its own: every term's cost, in chain
     /// order, plus the held alignment's part ([`Held::part`]), its columns the terms that differ from the reference
-    /// (those `moved` and in `over`), in owner order.
-    pub(super) fn total(&self, over: &HashMap<Owner, Option<Term>>) -> f64 {
-        let now = |o: &Owner| match over.get(o) {
+    /// (among those replaced and in `over`), in chain order.
+    pub(super) fn total(&self, over: &HashMap<ChainKey, Option<Term>>) -> f64 {
+        let now = |o: &ChainKey| match over.get(o) {
             Some(t) => t.as_ref(),
             None => self.terms.get(o),
         };
-        let mut new: Vec<&Owner> = over.keys().filter(|o| !self.terms.contains_key(o)).collect();
+        let mut new: Vec<&ChainKey> = over.keys().filter(|o| !self.terms.contains_key(o)).collect();
         new.sort_unstable();
         let mut cost = 0.0;
         let mut add = new.into_iter().peekable();
@@ -264,12 +256,12 @@ impl Fit {
             cost += now(o).map_or(0.0, Term::cost);
         }
         cost += add.map(|n| now(n).map_or(0.0, Term::cost)).sum::<f64>();
-        let owners: BTreeSet<&Owner> = self.moved.iter().chain(over.keys()).collect();
+        let owners: BTreeSet<&ChainKey> = self.replaced.keys().chain(over.keys()).collect();
         let mut cols: Vec<(&[([i64; 3], f64)], f64, f64)> = Vec::new();
         for o in owners {
-            let (was, now) = (self.held.reference.get(o), now(o));
+            let (was, now) = (self.reference(o), now(o));
             match (was, now) {
-                (Some(r), Some(t)) if r.same_alignment(t) => {}
+                (Some(r), Some(t)) if same_alignment(r, t) => {}
                 (Some(r), Some(t)) if r.align == t.align => cols.push((&t.align, t.curv - r.curv, t.slope - r.slope)),
                 (r, t) => {
                     cols.extend(r.map(|r| (&r.align[..], -r.curv, -r.slope)));
@@ -280,13 +272,15 @@ impl Fit {
         cost + self.held.part(&cols)
     }
 
-    /// Note whether owner `o`'s term, as the fit now holds it, differs from the alignment's reference.
-    pub(super) fn note(&mut self, o: Owner) {
-        let same = match (self.held.reference.get(&o), self.terms.get(&o)) {
-            (Some(r), Some(t)) => r.same_alignment(t),
-            (r, t) => r.is_none() && t.is_none(),
+    /// Put chain `o`'s new term in (none: it left the scan), keeping its term at the refit the first time a move
+    /// touches it: the term it replaced.
+    pub(super) fn put(&mut self, o: ChainKey, t: Option<Term>) -> Option<Term> {
+        let old = match t {
+            Some(t) => self.terms.insert(o, t),
+            None => self.terms.remove(&o),
         };
-        if same { self.moved.remove(&o) } else { self.moved.insert(o) };
+        self.replaced.entry(o).or_insert_with(|| old.clone());
+        old
     }
 }
 
