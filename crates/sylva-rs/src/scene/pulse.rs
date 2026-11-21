@@ -319,6 +319,13 @@ pub(super) struct Member<P, T> {
     pub(super) share: [T; 3],
     pub(super) fill: [P; 3],
     pub(super) beam: P,
+    /// Its reflectance (dB), the beam's share it meets times cos ι at the three section radii, the chance it returns
+    /// when met (its opacity; the ground's `ground_echo`) and its detection floor: its detection re-read in a dimmer
+    /// beam ([`Pass::dim`]).
+    pub(super) refl: T,
+    pub(super) lit: [P; 3],
+    pub(super) rec: f64,
+    pub(super) floor: P,
 }
 
 /// What the receiver makes of a pulse's occluders (3dtrees research 130 formulation.md: the owners deposit energy
@@ -383,7 +390,7 @@ pub(super) fn receiver<P: Real, T: Over<P>>(occ: &[Occluder<P>], k: u8, shift: T
             let share = ly.fq.map(|f| unit * f);
             beam *= P::c(1.0) - ly.f * ly.op;
             Member { depth: shift + (ly.t + em.depth_bias(k, ly.t)), sd: em.depth_sd(k, ly.spread), s, q, s_q, energy: unit * ly.f, op: ly.op, share,
-                     fill: ly.fq.map(|f| f * b0), beam }
+                     fill: ly.fq.map(|f| f * b0), beam, refl: db, lit: ly.fq.map(|f| f * b0 * cos), rec: ly.op, floor: o.floor }
         }
         Surface::Ground(cos) => {
             let cg = cos.powf(em.refl_incidence);
@@ -391,7 +398,8 @@ pub(super) fn receiver<P: Real, T: Over<P>>(occ: &[Occluder<P>], k: u8, shift: T
             let s = em.p_detect::<P, P>(P::c(em.refl_ground), beam * cg, o.floor) * em.ground_echo;
             let q = em.p_miss::<P, P>(P::c(em.refl_ground), beam * cg, o.floor) * em.ground_echo + (1.0 - em.ground_echo);
             Member { depth: T::from(o.t), sd: P::c(em.noise(2).hypot(em.ground_sd / cos)), s: T::from(s), q: T::from(q), s_q: [T::from(s); 3],
-                     energy: T::from(share * em.ground_echo), op: 1.0, share: [T::from(share); 3], fill: [beam; 3], beam: P::c(0.0) }
+                     energy: T::from(share * em.ground_echo), op: 1.0, share: [T::from(share); 3], fill: [beam; 3], beam: P::c(0.0),
+                     refl: T::from(P::c(em.refl_ground)), lit: [beam * cg; 3], rec: em.ground_echo, floor: o.floor }
         }
     }).collect();
     let n = m.len();
@@ -580,6 +588,27 @@ pub(super) struct Pass<'a, P, T> {
 }
 
 impl<P: Real, T: Over<P>> Pass<'_, P, T> {
+    /// Return `r` met in `k` of the beam the scene left it (`taken`: the medium's echoes in front took the rest): each
+    /// member's detection and miss re-read at that beam, and its reflectance `10 log10 k` dimmer. Itself at k = 1.
+    pub(super) fn dim(&self, r: &Return<P, T>, k: f64) -> Return<P, T> {
+        if k >= 1.0 {
+            return *r;
+        }
+        let em = self.em;
+        let parts: Vec<([T; 3], T)> = self.rx.members[r.first..=r.last].iter().map(|x| {
+            let s_q = x.lit.map(|e| em.p_detect(x.refl, e * k, x.floor) * x.rec);
+            let q_q = x.lit.map(|e| em.p_miss(x.refl, e * k, x.floor) * x.rec + (1.0 - x.rec));
+            (s_q, (q_q[0] + q_q[1] * 4.0 + q_q[2]) / 6.0)
+        }).collect();
+        let db = r.db.map(|d| d + 10.0 * k.max(1e-30).log10());
+        if let [(s_q, q)] = parts[..] {
+            return Return { s: (s_q[0] + s_q[1] * 4.0 + s_q[2]) / 6.0, q, s_q, db, ..*r };
+        }
+        let none: T = parts.iter().map(|x| x.1).product();
+        let s_q = [0, 1, 2].map(|i| T::c(1.0) - parts.iter().map(|x| T::c(1.0) - x.0[i]).product::<T>());
+        Return { s: T::c(1.0) - none, q: none, s_q, db, ..*r }
+    }
+
     /// The chance of echoes `i..` given returns `rets[j..]` not yet accounted for: the pulse meets occluders (the
     /// returns) and a medium (the foliage field), and after any echo the next surface is the medium's (3dtrees
     /// research 130 slice 2c; step 3c's reading, kept where sound). Each echo is one of those returns (the ones before
@@ -595,9 +624,14 @@ impl<P: Real, T: Over<P>> Pass<'_, P, T> {
     /// - **The rest of the beam:** the medium's echo reads `10 log10` of the beam the scene leaves, `scene` (the share
     ///   the returns matched so far leave: the beam behind a return's last member) × `taken` (what the medium's own
     ///   echoes left), dimmer: behind an edge of fill f, `1 − f`, as a located edge reads f.
-    /// - **Behind an occluder:** the returns behind a medium echo are met with the chance `taken` (as an element's
-    ///   opacity is a chance): one that read as a full hit leaves nothing for them to return, and its pulse is no
-    ///   evidence against them.
+    /// - **Behind the medium's echoes:** a return is always *met* (no chance of being blocked: a medium echo is not a
+    ///   stop), and met *dimmed*, in the beam the echoes in front left, `taken` of what the scene left ([`Pass::dim`]):
+    ///   its detection, its miss and its brightness all read there, the ground's alike. So `taken` enters once, as the
+    ///   beam; one that read as a full hit leaves none, and the returns behind it record nothing and say nothing.
+    ///   (3dtrees research 130 slice-defects D1: `taken` was the chance a return is met, its detection and brightness
+    ///   read at the elements' beam alone, so behind a leaf echo an element's edge was predicted brighter and more
+    ///   surely recorded than it could be. The stopped/partial branch, t1-branch, will split `taken` into a chance of
+    ///   stopping and the share an unstopped echo leaves.)
     ///
     /// After the last echo, the returns left and the medium's path to the beam's end record nothing, unless the pulse
     /// is capped: a capped pulse says nothing past its last echo, and only past it. A return left in front of the last
@@ -615,9 +649,9 @@ impl<P: Real, T: Over<P>> Pass<'_, P, T> {
         if i == p.echoes.len() {
             if self.capped {
                 let last = p.echoes.last().map_or(f64::INFINITY, |&r| r as f64);
-                return rets[j..].iter().filter(|r| occ[r.first].t.v() < last).map(|r| r.q * taken + (1.0 - taken)).product::<T>();
+                return rets[j..].iter().filter(|r| occ[r.first].t.v() < last).map(|r| self.dim(r, taken).q).product::<T>();
             }
-            return rets[j..].iter().map(|r| r.q * taken + (1.0 - taken)).product::<T>() * (-seen * (p.tau_end - tau0).max(0.0)).exp();
+            return rets[j..].iter().map(|r| self.dim(r, taken).q).product::<T>() * (-seen * (p.tau_end - tau0).max(0.0)).exp();
         }
         let (o, x) = (p.echoes[i] as f64, p.refls.get(i).map_or(f64::NAN, |&x| x as f64));
         let [tau_o, sig_o, tau_after] = p.medium[i];
@@ -625,19 +659,20 @@ impl<P: Real, T: Over<P>> Pass<'_, P, T> {
         // one of the returns
         let mut none = T::c(1.0);
         for (k, r) in rets.iter().enumerate().skip(j) {
-            let d = none * ((occ[r.first].tau - tau0).max(0.0) * -seen).exp() * r.s * taken * r.density(o, x, em, occ);
+            let r = &self.dim(r, taken);
+            let d = none * ((occ[r.first].tau - tau0).max(0.0) * -seen).exp() * r.s * r.density(o, x, em, occ);
             if d.v() > 0.0 {
                 let f = d * (1.0 - P_OUTLIER);
                 let rest = self.lik(rets, i + 1, k + 1, self.rx.members[r.last].beam, taken, em.beam_after(seen, x), tau_after, prefix * f.v(), resp);
                 resp[row + r.first] += prefix * f.v() * rest.v();
                 total += f * rest;
             }
-            none *= r.q * taken + (1.0 - taken);
+            none *= r.q;
         }
         // the medium's
         if o < self.t_end && seen > 0.0 {
             let jn = (j..rets.len()).find(|&k| occ[rets[k].first].t.v() >= o).unwrap_or(rets.len());
-            let none: T = rets[j..jn].iter().map(|r| r.q * taken + (1.0 - taken)).product();
+            let none: T = rets[j..jn].iter().map(|r| self.dim(r, taken).q).product();
             let d = none * (seen * sig_o * (-seen * (tau_o - tau0).max(0.0)).exp()) * em.refl_background(P::c(x) - (scene * taken).max(1e-6).log10() * 10.0);
             if d.v() > 0.0 {
                 let f = d * (1.0 - P_OUTLIER);
@@ -750,6 +785,33 @@ mod tests {
     fn pulse_in(em: &Settings, echoes: &[f32], refls: &[f32], capped: bool, layers: &[Layer], ground: Option<(f64, f64)>, ext: &Foliage) -> Pulse {
         let cap = if capped { echoes.len() } else { usize::MAX };
         Pulse::on(occluders(layers.to_vec(), ground), 1, &ext.medium(&[0.0; 3], &[0.0, 1.0, 0.0]), echoes, refls, cap, &Instrument::default(), em)
+    }
+
+    /// Slice-defects D1: behind a leaf echo that left half the beam, a return is met in that half: its echo's
+    /// reflectance reads 3 dB dimmer than with nothing in front, an element's and the ground's alike, and a faint
+    /// return there is recorded less often (a later echo missing is more likely).
+    #[test]
+    fn a_return_behind_a_leaf_echo_is_met_in_the_beam_it_left() {
+        let em = Settings::default();
+        let flat = Foliage::uniform(0.05);
+        let leaf = (em.refl_full_hit() + 10.0 * 0.5f64.log10()) as f32;
+        assert!((em.beam_after(1.0, leaf as f64) - 0.5).abs() < 1e-6);
+        let best = |layers: &[Layer], ground: Option<(f64, f64)>, echoes: &[f32], front: &[f32]| -> f64 {
+            (0..=1000).map(|i| -35.0 + 0.025 * i as f64).map(|x| {
+                let refls: Vec<f32> = front.iter().copied().chain([x as f32]).collect();
+                (x, pulse_in(&em, echoes, &refls, false, layers, ground, &flat).read(0.0, 0.0, &em).ll)
+            }).max_by(|a, b| a.1.total_cmp(&b.1)).unwrap().0
+        };
+        let stick = [layer(8.0, 1.0, 1.0)];
+        let (alone, behind) = (best(&stick, None, &[8.0], &[]), best(&stick, None, &[3.0, 8.0], &[leaf]));
+        assert!((behind - alone - 10.0 * 0.5f64.log10()).abs() < 0.1, "an element: alone {alone}, behind {behind}");
+        let (alone, behind) = (best(&[], Some((10.0, 0.6)), &[10.0], &[]), best(&[], Some((10.0, 0.6)), &[3.0, 10.0], &[leaf]));
+        assert!((behind - alone - 10.0 * 0.5f64.log10()).abs() < 0.1, "the ground: alone {alone}, behind {behind}");
+        // a faint edge behind the leaf: its pulse with no later echo is likelier than with nothing in front to dim it
+        let edge = [layer(8.0, 0.05, 1.0)];
+        let gone = |front: &[f32], echoes: &[f32]| pulse_in(&em, echoes, front, false, &edge, None, &flat).read(0.0, 0.0, &em).ll
+            - pulse_in(&em, echoes, front, false, &[], None, &flat).read(0.0, 0.0, &em).ll;
+        assert!(gone(&[leaf], &[3.0]) > gone(&[], &[]) + 1e-3, "{} {}", gone(&[leaf], &[3.0]), gone(&[], &[]));
     }
 
     /// One cell's log-likelihood on a ray along y against a medium `ext`.
