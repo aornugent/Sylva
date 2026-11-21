@@ -17,7 +17,7 @@
 //!   exactly, through the own nodes' Newton warm from the chain's mode, the rest from the sum less the quadratics of
 //!   the cells it enters. So growing a chain takes time linear in its length, and scoring an extension costs the
 //!   piece's cells. The quadratics are the Laplace step the term already takes, each about its own last read; a grown
-//!   chain's cost is read again exactly (`costs_to_add`) when it is handed over.
+//!   chain's cost is read again exactly (`score`) when it is handed over.
 //! - **The grower** ([`Scene::grow`]): from a seed stick, a beam of a few chains grows one piece at a time, the ends
 //!   taking turns. A piece leaves the end along its axis, 4 r long within [`Grow`]'s `step`; its options are the
 //!   coupling's: straight at the radius or e^(±2 sd) of it, or turned one or two bend sds either way in two planes.
@@ -35,7 +35,7 @@ use super::dual::{Dual2, Real};
 use super::foliage::{self, Deposit, FixedHits};
 use super::pulse::mixture_taken;
 use super::render::{Element, Form, Layer, KBuffer, keep, numbered, render};
-use super::scene::{Scene, redeposit};
+use super::scene::{Proposal, Scene, redeposit};
 use super::term::{CellData, Owner, Term, eliminate, elem_data, median_class, owner, settle, slots, term_nodes, vote, clipped, mean_of};
 
 /// The coupling's declared row (3dtrees research 128: taper and form departures; research 130 slice 7: the bend sd
@@ -307,7 +307,7 @@ impl Scene {
         }
         let best = beam.into_iter().min_by(|a, b| a.score().total_cmp(&b.score())).unwrap();
         let sticks = best.sticks();
-        let scan = self.costs_to_add(&[sticks.clone()]).remove(0);
+        let scan = self.score(&[Proposal::put(&sticks)]).remove(0);
         Grown { cost: scan.iter().sum(), scan, sticks, kalman: best.cost, seed_cost, steps: best.steps, coupling: best.coupling, length: best.length }
     }
 
@@ -515,7 +515,7 @@ mod tests {
     use super::super::fixtures::{field_box, piece_of, pole_view};
 
     /// The chain's state grown piece by piece is its full rebuild: after each piece its cells are those the group's
-    /// term reads when the chain is scored whole, and its cost to add is `costs_to_add`'s for the whole chain within
+    /// term reads when the chain is scored whole, and its cost to add is `score`'s for the whole chain within
     /// the Laplace step's error (each cell a quadratic about its last read), with a foliage field and without.
     #[test]
     fn the_chains_state_is_its_full_rebuild() {
@@ -528,7 +528,7 @@ mod tests {
                 let z = -0.15 + 0.03 * k as f64;
                 c = scene.take(&c, scene.try_piece(&c, piece_of(z, z + 0.03, Some(7))), 1, 0.0);
                 let sticks = c.sticks();
-                let whole = scene.costs_to_add(&[sticks.clone()]).remove(0).iter().sum::<f64>();
+                let whole = scene.score(&[Proposal::put(&sticks)]).remove(0).iter().sum::<f64>();
                 assert!((c.cost - whole).abs() < 1e-3 * whole.abs().max(1.0), "{k} pieces: {} against {whole}", c.cost);
                 let rendered = render_all(&v, &sticks, &em);
                 let d = &elem_data(&v, &KBuffer::of(&rendered).cells(), &sticks, &vec![0; sticks.len()], &(0..sticks.len()).collect::<Vec<_>>(), 0, &em, &sc, &scene.ext,

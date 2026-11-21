@@ -462,10 +462,11 @@ impl FieldCounts {
         fixed(ln_nb(h as f64 / FIXED, l as f64 / FIXED, self.prior.0, self.prior.1))
     }
 
-    /// The change in the term were the hits changed by `delta`.
-    fn fixed_change(&self, delta: &FixedHits) -> i128 {
+    /// The change in the term were the hits changed by `base` and then by `delta` (from the counts `base` leaves).
+    fn fixed_change(&self, base: &FixedHits, delta: &FixedHits) -> i128 {
         delta.iter().map(|(k, &d)| {
-            let c = self.counts.get(k).copied().unwrap_or([0, 0]);
+            let mut c = self.counts.get(k).copied().unwrap_or([0, 0]);
+            c[0] += base.get(k).copied().unwrap_or(0);
             self.fixed_term([c[0] + d, c[1]]) - self.fixed_term(c)
         }).sum()
     }
@@ -473,12 +474,18 @@ impl FieldCounts {
     /// The change in the field's part of the cost were the hits changed by `delta` (deposits given back or taken:
     /// [`give`]); the counts stay as they are.
     pub fn change(&self, delta: &FixedHits) -> f64 {
-        -self.fixed_change(delta) as f64 / FIXED
+        self.change_after(&FixedHits::default(), delta)
+    }
+
+    /// The change in the field's part of the cost were the hits changed by `delta`, from the counts a change `base`
+    /// would leave (a proposal's: [`super::scene::Proposal`]), exactly as if `base` were applied first.
+    pub fn change_after(&self, base: &FixedHits, delta: &FixedHits) -> f64 {
+        -self.fixed_change(base, delta) as f64 / FIXED
     }
 
     /// Change the hits by `delta`: the change in the field's part of the cost.
     pub fn apply(&mut self, delta: FixedHits) -> f64 {
-        let t = self.fixed_change(&delta);
+        let t = self.fixed_change(&FixedHits::default(), &delta);
         self.term += t;
         for (k, d) in delta {
             let e = self.counts.entry(k).or_insert([0, 0]);
@@ -502,7 +509,20 @@ impl FieldCounts {
 
     /// The weighted counts per voxel, (hits, path).
     pub fn counts(&self) -> Counts {
-        self.counts.iter().map(|(&k, &[h, l])| (k, (h as f64 / FIXED, l as f64 / FIXED))).collect()
+        self.counts_after(&FixedHits::default())
+    }
+
+    /// The weighted counts per voxel, (hits, path), were the hits changed by `delta`.
+    pub fn counts_after(&self, delta: &FixedHits) -> Counts {
+        let mut c = self.counts.clone();
+        for (k, &d) in delta {
+            let e = c.entry(*k).or_insert([0, 0]);
+            e[0] += d;
+            if *e == [0, 0] {
+                c.remove(k);
+            }
+        }
+        c.iter().map(|(&k, &[h, l])| (k, (h as f64 / FIXED, l as f64 / FIXED))).collect()
     }
 
     /// The field a pulse meets: the posterior from the counts.

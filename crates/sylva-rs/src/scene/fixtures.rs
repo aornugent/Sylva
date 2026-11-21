@@ -10,7 +10,7 @@ use super::foliage::FoliageBox;
 use super::range_image::RangeImage;
 use super::range_image::RangeImageParams;
 use super::render::{Form, Class, Element};
-use super::scene::{ElementScan, Scene};
+use super::scene::{ElementScan, Proposal, Scene};
 use super::settings::{Background, Settings};
 
 /// The test scan's receiver: returns closer than this merge (m).
@@ -97,11 +97,33 @@ pub(super) fn pole_view() -> Arc<RangeImage> {
 /// A scene's cost and rows.
 pub(super) fn cost(v: &Arc<RangeImage>, els: &[Element], em: &Settings, sc: &Background) -> (f64, Vec<ElementScan>) {
     let s = Scene::new(vec![v.clone()], els, *em, *sc, None, 0);
-    (s.cost(), s.rows())
+    (s.cost(), s.rows(&Proposal::default()))
+}
+
+/// Keep one element: its id and the cost change.
+pub(super) fn add(c: &mut Scene, e: Element) -> (u32, f64) {
+    let (ids, d) = c.keep(&Proposal::put(&[e]));
+    (ids[0], d)
+}
+
+/// Take one element out: the cost change.
+pub(super) fn remove(c: &mut Scene, id: u32) -> f64 {
+    c.keep(&Proposal::take(&[id])).1
+}
+
+/// Swap element `id` for `e`: its new id and the cost change.
+pub(super) fn swap(c: &mut Scene, id: u32, e: Element) -> (u32, f64) {
+    let (ids, d) = c.keep(&Proposal { put_in: vec![e], take_out: vec![id] });
+    (ids[0], d)
+}
+
+/// Each hypothesis's cost to put in, per scan (and the field's part).
+pub(super) fn costs(c: &Scene, hyps: &[Vec<Element>]) -> Vec<Vec<f64>> {
+    c.score(&hyps.iter().map(|h| Proposal::put(h)).collect::<Vec<_>>())
 }
 
 pub(super) fn stick(x: f64, y: f64, r: f64) -> Element {
-    Element { form: Form::Stick { a: [x, y, -0.2], b: [x, y, 0.2] }, class: Class::Wood, r, opacity: 1.0, mismatch: 0.002, group: None }
+    Element { form: Form::Stick { a: [x, y, -0.2], b: [x, y, 0.2] }, class: Class::Wood, r, opacity: 1.0, mismatch: 0.002, group: None, key: None }
 }
 
 /// The field's box about the test scan's pole and wall.

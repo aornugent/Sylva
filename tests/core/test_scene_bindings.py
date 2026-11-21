@@ -53,9 +53,12 @@ def test_bad_input_raises_instead_of_panicking():
     for bad in (pole(r=0.0), pole(r=-1.0), pole(opacity=np.array([1.5])),
                 dict(a=np.zeros((1, 3)), b=np.zeros((1, 3)), r=np.array([0.03]))):
         with pytest.raises(ValueError):
-            sc.add(bad)
-    for call in (lambda: sc.remove([7]), lambda: sc.change(7, pole()), lambda: sc.predict(pole(), 3),
-                 lambda: sc.information([7]), lambda: sc.remove([0, 0])):
+            sc.keep(bad)
+        with pytest.raises(ValueError):
+            sc.score([bad])
+    for call in (lambda: sc.keep(take_out=[7]), lambda: sc.keep(pole(), [7]), lambda: sc.predict(pole(), 3),
+                 lambda: sc.information([7]), lambda: sc.keep(take_out=[0, 0]), lambda: sc.score([pole()], [[7]]),
+                 lambda: sc.information([0], take_out=[0]), lambda: sc.rows(take_out=[3]), lambda: sc.score([pole()], [[], []])):
         with pytest.raises(ValueError):
             call()
 
@@ -74,7 +77,25 @@ def test_an_empty_scene_costs_nothing_and_a_pole_is_pinned_down():
     j = info['gradient_variance'][0]
     assert j.shape == (5, 5) and np.linalg.eigvalsh(j).min() > -1e-6 * np.abs(j).max() and j[2, 2] < info['expected'][0][2, 2]
     assert 0 < rows['arc'][0] <= np.pi
-    assert np.isclose(sc.costs_to_add([pole(r=0.02)]).sum(), sc.costs_to_add([pole(r=0.02)])[0, 0])
+    assert np.isclose(sc.score([pole(r=0.02)]).sum(), sc.score([pole(r=0.02)])[0, 0])
+
+
+def test_reads_for_a_proposal_are_the_reads_after_keeping_it():
+    """Research 130 slice-s1: rows and information for a proposal (put in, or swapped for a live element), nothing
+    kept, equal the rows and information after keeping it; its elements are numbered from `next_id()`, and keys the
+    caller gives ride along with them."""
+    v = pole_image()
+    sc = _core.Scene([v], pole())
+    wide = pole(r=0.033, key=np.array([12]))
+    me = sc.next_id()
+    rows, info = sc.rows(wide, [0]), sc.information([me], wide, [0])
+    cost = sc.score([wide], [[0]]).sum()
+    assert sc.next_id() == me and np.isclose(sc.cost(), _core.Scene([v], pole()).cost(), rtol=0, atol=0)
+    ids, d = sc.keep(wide, [0])
+    assert list(ids) == [me] and d == cost and list(sc.elements(ids)['key']) == [12]
+    after = sc.rows()
+    assert all(np.array_equal(rows[k], after[k]) for k in after)
+    assert np.array_equal(info['expected'], sc.information([me])['expected'])
 
 
 
@@ -94,7 +115,7 @@ def test_the_held_alignment_crosses_the_binding():
     the cost is a fresh scene's of the same elements."""
     v = pole_image()
     sc = _core.Scene([v], pole())
-    _, d = sc.add(pole(r=0.02))
+    sc.keep(pole(r=0.02))
     both = {k: np.concatenate([pole()[k], pole(r=0.02)[k]]) for k in pole()}
     fresh = _core.Scene([v], both).cost()
     assert np.isclose(sc.cost(), fresh, rtol=0.01, atol=0.05)
@@ -155,17 +176,18 @@ def test_the_grower_and_the_coupling_cross_the_binding():
 
 
 def test_the_collapsed_field_crosses_the_binding():
-    """With a foliage field (its prior the settings'), `costs_to_add` carries the field's part last and sums to the
-    move, the rows carry a `field` part beside the cost, and each row's parts (the plug-in of the hits it takes in its
-    ray parts) sum to its cost."""
+    """With a foliage field (its prior the settings'), `score` carries the field's part last and sums to keeping it,
+    the field's counts for a proposal are those after keeping it, the rows carry a `field` part beside the cost, and
+    each row's parts (the plug-in of the hits it takes in its ray parts) sum to its cost."""
     v = pole_image()
     box = dict(lo=[-0.5, 2.9, -0.3], hi=[0.5, 8.9, 0.3], voxel=0.1)
     side = dict(a=np.array([[0.2, 4.0, -0.1]]), b=np.array([[0.2, 4.0, 0.1]]), r=np.array([0.02]))
     sc = _core.Scene([v], side, None, None, box)
-    c = sc.costs_to_add([pole()])
+    c = sc.score([pole()])
     assert c.shape == (1, 2) and c[0, 1] != 0.0
-    _, d = sc.add(pole())
-    assert np.isclose(c.sum(), d)
+    counts = sc.foliage_voxels(pole())
+    _, d = sc.keep(pole())
+    assert c.sum() == d and all(np.array_equal(counts[k], sc.foliage_voxels()[k]) for k in counts)
     rows = sc.rows()
     assert rows['field'].shape == rows['cost'].shape
     parts = sum(rows[k] for k in ('ray_on', 'ray_empty', 'ray_in_front', 'ray_behind', 'alignment'))
@@ -197,15 +219,14 @@ def test_the_rules_consumers_read_beside_the_cost_cross_the_binding():
     assert keys.shape == (2, 8, 3) and np.allclose((w ** 2).sum(1), 1.0) and (w[1] > 0).sum() == 1
 
 
-def test_a_chain_added_together():
-    """Research 130 slice-consolidate: `add` of a list is one move (Sylva's add_many), the cost as adding one by one,
-    with a field."""
+def test_a_chain_kept_together():
+    """Research 130 slice-consolidate: `keep` of a list is one move, the cost as keeping one by one, with a field."""
     v = pole_image()
     box = dict(lo=[-0.5, 2.9, -0.3], hi=[0.5, 8.9, 0.3], voxel=0.1)
     halves = dict(a=np.array([[0.0, 4.0, -0.1], [0.0, 4.0, 0.0]]), b=np.array([[0.0, 4.0, 0.0], [0.0, 4.0, 0.1]]), r=np.array([0.03, 0.03]),
                   group=np.array([4, 4]))
     one, many = _core.Scene([v], pole(), None, None, box), _core.Scene([v], pole(), None, None, box)
     for k in range(2):
-        one.add({key: x[k:k + 1] for key, x in halves.items()})
-    ids, _ = many.add(halves)
+        one.keep({key: x[k:k + 1] for key, x in halves.items()})
+    ids, _ = many.keep(halves)
     assert list(ids) == [1, 2] and one.cost() == many.cost()

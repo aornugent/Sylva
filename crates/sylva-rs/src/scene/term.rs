@@ -506,7 +506,7 @@ mod tests {
             assert_eq!(a, b);
         }
         assert_eq!(w.cost, l.cost);
-        let patch = Element { form: Form::Patch { centre: [0.0, 4.0, 0.0] }, class: Class::Leaf, r: 0.03, opacity: 1.0, mismatch: 0.002, group: None };
+        let patch = Element { form: Form::Patch { centre: [0.0, 4.0, 0.0] }, class: Class::Leaf, r: 0.03, opacity: 1.0, mismatch: 0.002, group: None, key: None };
         assert_eq!(rows(patch).front_shift_sd, 0.0);
     }
 

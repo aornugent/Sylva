@@ -47,7 +47,8 @@
 //! | a declared term over a chain's geometry alone | coupling | [`chain::Coupling`]: taper, form departures and bends (the bend sd by radius) as a Gaussian Markov process along the chain; it proposes and ranks the grower's continuations and gives a chain's row, beside the cost, never in it |
 //! | a chain grown piece by piece by the likelihood | grower; a chain's state | [`scene::Scene::grow`]; [`chain::Chain`]: its term in information form, updated by each piece's cells alone (3dtrees research 130 slice-grower) |
 //! | elements held against scans | scene | `Scene` |
-//! | `−log` likelihood ratio against the empty scene | cost | also of a move: `add`, `remove`, `change`, `costs_to_add` |
+//! | `−log` likelihood ratio against the empty scene | cost | also of a proposal: `score`, `keep` |
+//! | elements put in and live elements taken out, scored or kept as one | proposal | `Proposal`: add, remove, swap and join in one shape; every read takes one and answers for the scene as it would leave it |
 //! | a cell's likelihood of its pulse | ray likelihood | the scene's data term |
 //! | an element's coverage of a cell's beam | fill | the beam (a uniform disc) convolved with the section |
 //! | what a cell's first echo says about an element | outcome | on it, empty (none), in front, behind (passed through) |

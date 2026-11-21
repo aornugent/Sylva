@@ -10,10 +10,13 @@
 //! the pass over it), [`super::term`] (an element's term per scan), [`super::alignment`] (the scan alignment error)
 //! and [`super::query`] (predictions, counts, information, divergence).
 //!
-//! - **The scene** ([`Scene`]) holds elements against range images, each rendered once. A move (add, remove,
-//!   change) returns its cost change with the alignment held, recomputing only the terms of the elements whose cells
-//!   it touches; `refit_alignment` re-solves the alignment. Its rows ([`ElementScan`]) split each (element, scan)'s cost into its parts, and
-//!   [`Scene::information`] gives the slope and Fisher information of an element's cost in its geometry.
+//! - **The scene** ([`Scene`]) holds elements against range images, each rendered once. A [`Proposal`] (elements put
+//!   in, live elements taken out: add, remove, swap and join in one shape) is scored by [`Scene::score`], nothing
+//!   kept, and applied by [`Scene::keep`], both with the alignment held, recomputing only the terms of the elements
+//!   whose cells it touches; `refit_alignment` re-solves the alignment. Every read takes a proposal and answers for the
+//!   scene as it would leave it ([`View`]): its rows ([`ElementScan`]) split each (element, scan)'s cost into its parts,
+//!   and [`Scene::information`] gives the slope and Fisher information of an element's cost in its geometry, so a refit
+//!   is a sequence of reads.
 //!
 //! Cells no element touches cancel. Context (neighbours, competitors) enters as more elements in the set.
 
@@ -91,9 +94,9 @@ impl std::error::Error for SceneError {}
 
 /// A scene: elements held against some range images, and the cost of a move (synthesis §16's incremental form).
 ///
-/// - Each element is rendered once per image, and re-rendered only when it is added or changed.
-/// - A scan's cost is a term per element it sees, plus the scan alignment error's part. Moves (`add`, `remove`,
-///   `change`) and queries (`costs_to_add`, `information`) hold the alignment ([`Held`]): its mode
+/// - Each element is rendered once per image, when it is kept.
+/// - A scan's cost is a term per element it sees, plus the scan alignment error's part. `keep` and the reads (`score`,
+///   `information`, `rows`) hold the alignment ([`Held`]): its mode
 ///   and precision stay as the last refit left them, and a move's change to them is a rank-k correction on the nodes
 ///   it touches. So a move recomputes only the terms of the elements whose cells it touches, not the scan, and
 ///   removing an element restores the cost exactly (synthesis §18 invariant 7). [`Scene::refit_alignment`] re-solves
@@ -274,33 +277,38 @@ impl Scene {
         if s < self.views.len() { Ok(()) } else { Err(SceneError(format!("no scan {s}: the scene holds {}", self.views.len()))) }
     }
 
-    /// The foliage field and its counts: per voxel with counts, (voxel, σ as held, the counts as the scene now is).
-    /// Empty when the field is held from elsewhere.
-    pub fn foliage(&self) -> (Option<FoliageBox>, Vec<([i32; 3], f64, (f64, f64))>) {
+    /// The foliage field and its counts as proposal `p` would leave them ([`Scene::check_proposal`]): per voxel with
+    /// counts, (voxel, σ as held, the counts). Empty when the field is held from elsewhere.
+    pub fn foliage(&self, p: &Proposal) -> (Option<FoliageBox>, Vec<([i32; 3], f64, (f64, f64))>) {
         let Some(f) = &self.field else { return (self.ext.spec, Vec::new()) };
-        let mut out: Vec<_> = f.counts().into_iter().map(|(k, c)| (k, self.ext.sigma(&k), c)).collect();
+        let (_, delta) = self.views_after(p);
+        let mut out: Vec<_> = f.counts_after(&delta).into_iter().map(|(k, c)| (k, self.ext.sigma(&k), c)).collect();
         out.sort_by_key(|x| x.0);
         (self.ext.spec, out)
     }
 
-    /// A row per (term, scan), by element id: an element's term, or a group's under its first member's id.
-    pub fn rows(&self) -> Vec<ElementScan> {
+    /// A row per (term, scan) of the scene as proposal `p` would leave it ([`Scene::check_proposal`]), by element id:
+    /// an element's term, or a group's under its first member's id.
+    pub fn rows(&self, p: &Proposal) -> Vec<ElementScan> {
+        let (views, delta) = self.views_after(p);
         let mut first: HashMap<u32, u32> = HashMap::new();
-        for (i, e) in self.elems.iter().enumerate().rev() {
-            if let Some(g) = e.and_then(|e| e.group) {
-                first.insert(g, i as u32);
+        for i in (0..self.next_id() + p.put_in.len() as u32).rev() {
+            if let Some(g) = self.element_after(p, i).and_then(|e| e.group) {
+                first.insert(g, i);
             }
         }
-        // the field's part of a term's cost to remove: its deposit given back
+        // the field's part of a term's cost to remove: its deposit given back, from the counts the proposal leaves
         let field = |t: &Term| self.field.as_ref().map_or(0.0, |f| {
             let mut back = FixedHits::default();
             redeposit(&mut back, Some(t), None);
-            -f.change(&back)
+            -f.change_after(&delta, &back)
         });
         let mut rows = Vec::new();
-        for (s, fit) in self.fits.iter().enumerate() {
-            for (o, t) in &fit.terms {
-                let (i, group) = match *o {
+        for (s, (fit, v)) in self.fits.iter().zip(&views).enumerate() {
+            let mut terms: BTreeMap<Owner, &Term> = fit.terms.iter().filter(|(o, _)| !v.index.contains_key(o)).map(|(o, t)| (*o, t)).collect();
+            terms.extend(v.terms.iter().filter_map(|(o, t)| t.as_ref().map(|t| (*o, t))));
+            for (o, t) in terms {
+                let (i, group) = match o {
                     Owner::Alone(i) => (i, None),
                     Owner::Group(g) => (first[&g], Some(g)),
                 };
@@ -321,78 +329,71 @@ impl Scene {
         rows
     }
 
-    /// Add an element: its id and the cost change.
-    pub fn add(&mut self, e: Element) -> (u32, f64) {
-        let (ids, d) = self.add_many(&[e]);
-        (ids[0], d)
-    }
-
-    /// Add elements together: their ids and the cost change. Every element is rendered first and each scan re-termed
-    /// once ([`Scene::reterm`]), so a chain costs its cells once: added one by one, each member re-terms its group whole.
-    /// The scene is the same, bit for bit, as after adding them one by one.
-    pub fn add_many(&mut self, es: &[Element]) -> (Vec<u32>, f64) {
-        let first = self.elems.len() as u32;
-        let em = self.em;
-        let layers: Vec<Vec<Vec<(usize, Layer)>>> = self.views.par_iter()
-            .map(|v| es.iter().enumerate().map(|(k, e)| render(v, e, first + k as u32, &em)).collect()).collect();
-        let changes: Vec<Changes> = (0..self.views.len()).into_par_iter().map(|s| {
-            if layers[s].iter().all(Vec::is_empty) {
-                return Changes::default();
-            }
-            let with: Vec<(Element, Vec<(usize, Layer)>)> = es.iter().copied().zip(layers[s].iter().cloned()).collect();
-            self.reterm(s, &[], &with, first)
+    /// Keep a proposal ([`Scene::check_proposal`]): its elements taken out and put in, each scan re-termed once, so a
+    /// chain costs its cells once. The new elements' ids follow the scene's, in order (ids are never reused, so a swap
+    /// gives new ones); the cost change. Taking out what was just put in restores the cost exactly.
+    pub fn keep(&mut self, p: &Proposal) -> (Vec<u32>, f64) {
+        let first = self.next_id();
+        let afters: Vec<(Vec<Vec<(usize, Layer)>>, Changes)> = (0..self.views.len()).into_par_iter().map(|s| {
+            let v = self.after(s, p);
+            (v.layers, v.terms)
         }).collect();
-        for (k, e) in es.iter().enumerate() {
+        for &id in &p.take_out {
+            let gone = self.elems[id as usize].take().expect("a live element");
+            self.leave(id, &gone);
+        }
+        for (k, e) in p.put_in.iter().enumerate() {
             self.elems.push(Some(*e));
             self.join(first + k as u32, e);
         }
         let (mut d, mut delta) = (0.0, FixedHits::default());
-        for (s, (ls, ch)) in layers.into_iter().zip(changes).enumerate() {
+        for (s, (ls, ch)) in afters.into_iter().enumerate() {
+            for &id in &p.take_out {
+                if let Some(old) = self.entered[s][id as usize].take() {
+                    self.buffers[s].leave(id, &old);
+                }
+            }
             for (k, l) in ls.iter().enumerate() {
                 let cells = entered(&mut self.buffers[s], first + k as u32, l);
                 self.entered[s].push(cells);
             }
             d += self.apply(s, ch, &mut delta);
         }
-        ((first..first + es.len() as u32).collect(), d + self.give(delta))
+        ((first..first + p.put_in.len() as u32).collect(), d + self.give(delta))
     }
 
-    /// Remove a live element ([`Scene::check_id`]): the cost change.
-    pub fn remove(&mut self, id: u32) -> f64 {
-        let first = self.elems.len() as u32;
-        let changes: Vec<Changes> = (0..self.views.len()).into_par_iter()
-            .map(|s| if self.entered[s][id as usize].is_none() { Changes::default() } else { self.reterm(s, &[id], &[], first) }).collect();
-        let gone = self.elems[id as usize].take().expect("a live element");
-        self.leave(id, &gone);
-        let (mut d, mut delta) = (0.0, FixedHits::default());
-        for (s, ch) in changes.into_iter().enumerate() {
-            if let Some(old) = self.entered[s][id as usize].take() {
-                self.buffers[s].leave(id, &old);
+    /// An error unless a proposal can be read or kept: the elements it takes out live and each once, the elements it
+    /// puts in scoreable ([`Element::invalid`]).
+    pub fn check_proposal(&self, p: &Proposal) -> Result<(), SceneError> {
+        for (k, &id) in p.take_out.iter().enumerate() {
+            self.check_id(id)?;
+            if p.take_out[..k].contains(&id) {
+                return Err(SceneError(format!("element {id} taken out twice")));
             }
-            d += self.apply(s, ch, &mut delta);
         }
-        d + self.give(delta)
+        match p.put_in.iter().enumerate().find_map(|(k, e)| e.invalid().map(|why| (k, why))) {
+            Some((k, why)) => Err(SceneError(format!("element {k} put in: {why}"))),
+            None => Ok(()),
+        }
     }
 
-    /// Replace a live element ([`Scene::check_id`]): the cost change.
-    pub fn change(&mut self, id: u32, e: Element) -> f64 {
-        let em = self.em;
-        let layers: Vec<Vec<(usize, Layer)>> = self.views.par_iter().map(|v| render(v, &e, id, &em)).collect();
-        let changes: Vec<Changes> = (0..self.views.len()).into_par_iter().map(|s| {
-            if layers[s].is_empty() && self.entered[s][id as usize].is_none() { Changes::default() } else { self.reterm(s, &[id], &[(e, layers[s].clone())], id) }
-        }).collect();
-        let old = self.elems[id as usize].replace(e).expect("a live element");
-        self.leave(id, &old);
-        self.join(id, &e);
-        let (mut d, mut delta) = (0.0, FixedHits::default());
-        for (s, (l, ch)) in layers.into_iter().zip(changes).enumerate() {
-            if let Some(old) = self.entered[s][id as usize].take() {
-                self.buffers[s].leave(id, &old);
-            }
-            self.entered[s][id as usize] = entered(&mut self.buffers[s], id, &l);
-            d += self.apply(s, ch, &mut delta);
+    /// The id the next element kept would get: a proposal's elements are numbered from it in every read.
+    pub fn next_id(&self) -> u32 {
+        self.elems.len() as u32
+    }
+
+    /// Element `id`, if it is live.
+    pub fn element(&self, id: u32) -> Option<Element> {
+        self.elems.get(id as usize).copied().flatten()
+    }
+
+    /// Element `id`, if it is live after proposal `p` (one it puts in numbered from [`Scene::next_id`]).
+    pub fn element_after(&self, p: &Proposal, id: u32) -> Option<Element> {
+        match id.checked_sub(self.next_id()) {
+            Some(k) => p.put_in.get(k as usize).copied(),
+            None if p.take_out.contains(&id) => None,
+            None => self.element(id),
         }
-        d + self.give(delta)
     }
 
     /// Put a move's new terms into scan `s`'s fit, their deposits' change added to `delta`: the fit's cost change.
@@ -436,23 +437,32 @@ impl Scene {
         fit
     }
 
-    /// Scan `s` with the live elements `without` taken out and the elements `with` (each with its layers in
-    /// the scan) put in as ids `first`, `first + 1`, …: the new term of every owner whose term changes (none: it left
-    /// the scan), the alignment held. A term reads only the cells its members are the front of, each with its layers at
-    /// the cell's own surface class, and its class reads the same cells ([`term_classes`]). So the terms that change are
-    /// those of the fronts of the cells the move touches (before it and after); and a group's term is its members'
-    /// together, so every present member of a group one of those (or an element taken out) belongs to is rescored with
-    /// it, and its pooled evidence never goes stale.
-    pub(super) fn reterm(&self, s: usize, without: &[u32], with: &[(Element, Vec<(usize, Layer)>)], first: u32) -> Changes {
+    /// Scan `s` as proposal `p` would leave it, nothing kept ([`View`]): its elements rendered as ids from
+    /// [`Scene::next_id`], and the new term of every owner whose term changes (none: it left the scan), the alignment
+    /// held. A term reads only the cells its members are the front of, each with its layers at the cell's own surface
+    /// class, and its class reads the same cells ([`term_classes`]). So the terms that change are those of the fronts of
+    /// the cells the proposal touches (before it and after); and a group's term is its members' together, so every
+    /// present member of a group one of those (or an element taken out) belongs to is rescored with it, and its pooled
+    /// evidence never goes stale. A scan the proposal doesn't touch has no new terms.
+    pub(super) fn after<'a>(&'a self, s: usize, p: &'a Proposal) -> View<'a> {
+        let first = self.next_id();
+        let layers: Vec<Vec<(usize, Layer)>> = p.put_in.iter().enumerate().map(|(k, e)| render(&self.views[s], e, first + k as u32, &self.em)).collect();
         let mut fresh = KBuffer::default();
-        let cells: Vec<Option<Vec<usize>>> = with.iter().enumerate().map(|(k, (_, ls))| entered(&mut fresh, first + k as u32, ls)).collect();
-        let touched: HashSet<usize> = without.iter().flat_map(|&w| self.entered[s][w as usize].iter().flatten()).chain(cells.iter().flatten().flatten()).copied().collect();
-        let with: Vec<(Element, Option<&[usize]>)> = with.iter().zip(&cells).map(|((e, _), c)| (*e, c.as_deref())).collect();
-        let start: Vec<u32> = (0..with.len() as u32).map(|k| first + k).collect();
-        self.terms_after(s, without, &with, first, &|c| fresh.get(c).to_vec(), &touched, &start, None)
+        let cells: Vec<Option<Vec<usize>>> = layers.iter().enumerate().map(|(k, ls)| entered(&mut fresh, first + k as u32, ls)).collect();
+        let moved = layers.iter().any(|l| !l.is_empty()) || p.take_out.iter().any(|&w| self.entered[s][w as usize].is_some());
+        let terms = if moved {
+            let touched: HashSet<usize> = p.take_out.iter().flat_map(|&w| self.entered[s][w as usize].iter().flatten()).chain(cells.iter().flatten().flatten()).copied().collect();
+            let with: Vec<(Element, Option<&[usize]>)> = p.put_in.iter().zip(&cells).map(|(e, c)| (*e, c.as_deref())).collect();
+            let start: Vec<u32> = (0..with.len() as u32).map(|k| first + k).collect();
+            self.terms_after(s, &p.take_out, &with, first, &|c| fresh.get(c).to_vec(), &touched, &start, None)
+        } else {
+            Changes::default()
+        };
+        let index = terms.iter().enumerate().map(|(k, t)| (t.0, k)).collect();
+        View { scene: self, s, p, first, layers, fresh, cells, terms, index }
     }
 
-    /// [`Scene::reterm`]'s rule, for a move that touches the cells `touched` and adds the elements `start` (its
+    /// [`Scene::after`]'s rule, for a move that touches the cells `touched` and adds the elements `start` (its
     /// elements `with` put in from `first`, each with the cells it enters ([`entered`]); their layers in a cell `fresh`), leaving out
     /// the term of `skip` (a chain grown beside the scene: [`super::chain`], which keeps its own term).
     #[allow(clippy::too_many_arguments)]
@@ -507,22 +517,20 @@ impl Scene {
         terms
     }
 
-    /// Each hypothesis's cost to add alone (one or more elements), per scan and then, when the scene holds a foliage
-    /// field, the field's part (the change in [`Scene::field_part`]): (hypotheses × scans, or scans + 1), in parallel,
-    /// the scene unchanged, its foliage field and alignment held. A row sums to adding it then removing it. A hypothesis's
-    /// elements of one group are one term ([`Owner`]: a chain), joined by the scene's members of that group, which are
-    /// rescored with it; its other elements are each alone.
-    pub fn costs_to_add(&self, hyps: &[Vec<Element>]) -> Vec<Vec<f64>> {
-        let first = self.elems.len() as u32;
-        hyps.par_iter().map(|h| {
-            let layers: Vec<Vec<Vec<(usize, Layer)>>> = self.views.iter().map(|v| h.iter().map(|e| render(v, e, 0, &self.em)).collect()).collect();
+    /// Each proposal's cost change were it kept ([`Scene::check_proposal`]), per scan and then, when the scene holds a
+    /// foliage field, the field's part (the change in [`Scene::field_part`]): (proposals × scans, or scans + 1), in
+    /// parallel, the scene unchanged, its foliage field and alignment held. A row sums to keeping it, bit for bit. A
+    /// proposal's elements of one group are one term ([`Owner`]: a chain), joined by the scene's members of that group,
+    /// which are rescored with it; its other elements are each alone.
+    pub fn score(&self, ps: &[Proposal]) -> Vec<Vec<f64>> {
+        ps.par_iter().map(|p| {
             let mut delta = FixedHits::default();
-            let mut out: Vec<f64> = layers.iter().enumerate().map(|(s, ls)| {
-                if ls.iter().all(Vec::is_empty) {
+            let mut out: Vec<f64> = (0..self.views.len()).map(|s| {
+                let v = self.after(s, p);
+                if v.terms.is_empty() {
                     return 0.0;
                 }
-                let with: Vec<(Element, Vec<(usize, Layer)>)> = h.iter().copied().zip(ls.iter().cloned()).collect();
-                let over: HashMap<Owner, Option<Term>> = self.reterm(s, &[], &with, first).into_iter().collect();
+                let over: HashMap<Owner, Option<Term>> = v.terms.into_iter().collect();
                 for (o, t) in &over {
                     redeposit(&mut delta, self.fits[s].terms.get(o), t.as_ref());
                 }
@@ -535,6 +543,86 @@ impl Scene {
         }).collect()
     }
 
+    /// Every scan as proposal `p` would leave it ([`Scene::after`]), and the change to the foliage field's counts were
+    /// it kept: each changed term's old deposit given back, its new one taken.
+    pub(super) fn views_after<'a>(&'a self, p: &'a Proposal) -> (Vec<View<'a>>, FixedHits) {
+        let views: Vec<View> = (0..self.views.len()).into_par_iter().map(|s| self.after(s, p)).collect();
+        let mut delta = FixedHits::default();
+        for v in &views {
+            for (o, t) in &v.terms {
+                redeposit(&mut delta, self.fits[v.s].terms.get(o), t.as_ref());
+            }
+        }
+        (views, delta)
+    }
+}
+
+/// What a proposal puts in and takes out of the scene: the elements it adds (numbered from [`Scene::next_id`], in
+/// order, as [`Scene::keep`] would number them) and the live elements it removes. One shape covers add, remove, swap
+/// and join (a chain's members taken out and put back under another chain's key). Reads take one and answer for the
+/// scene as it would leave it; `keep` applies it.
+#[derive(Debug, Clone, Default)]
+pub struct Proposal {
+    pub put_in: Vec<Element>,
+    pub take_out: Vec<u32>,
+}
+
+impl Proposal {
+    /// A proposal that puts elements in and takes nothing out.
+    pub fn put(es: &[Element]) -> Proposal {
+        Proposal { put_in: es.to_vec(), take_out: Vec::new() }
+    }
+
+    /// A proposal that takes live elements out and puts nothing in.
+    pub fn take(ids: &[u32]) -> Proposal {
+        Proposal { put_in: Vec::new(), take_out: ids.to_vec() }
+    }
+}
+
+/// One scan as a proposal would leave it ([`Scene::after`]), nothing kept: the proposal's elements' layers and the
+/// cells each enters (none where the scan renders none of it), and the changed terms. Reads look elements, cells and
+/// terms up through it, so a read for a proposal is the read the scene would give after keeping it.
+pub(super) struct View<'a> {
+    pub(super) scene: &'a Scene,
+    pub(super) s: usize,
+    pub(super) p: &'a Proposal,
+    pub(super) first: u32,
+    pub(super) layers: Vec<Vec<(usize, Layer)>>,
+    pub(super) fresh: KBuffer,
+    pub(super) cells: Vec<Option<Vec<usize>>>,
+    pub(super) terms: Changes,
+    pub(super) index: HashMap<Owner, usize>,
+}
+
+impl View<'_> {
+    /// Element `i`, live after the proposal (one it puts in from `first`).
+    pub(super) fn element(&self, i: u32) -> Option<Element> {
+        self.scene.element_after(self.p, i)
+    }
+
+    /// The cells element `i`'s layers enter after the proposal ([`entered`]).
+    pub(super) fn entered(&self, i: u32) -> Option<&[usize]> {
+        if i >= self.first {
+            self.cells.get((i - self.first) as usize).and_then(|c| c.as_deref())
+        } else if self.p.take_out.contains(&i) {
+            None
+        } else {
+            self.scene.entered[self.s][i as usize].as_deref()
+        }
+    }
+
+    /// Cell `cell`'s layers after the proposal, as its pulse reads them ([`kept`]).
+    pub(super) fn layers(&self, cell: usize) -> Vec<Layer> {
+        keep(self.scene.buffers[self.s].get(cell).iter().filter(|l| !self.p.take_out.contains(&l.elem)).copied().chain(self.fresh.get(cell).iter().copied()).collect())
+    }
+
+    /// Owner `o`'s term after the proposal.
+    pub(super) fn term(&self, o: &Owner) -> Option<&Term> {
+        match self.index.get(o) {
+            Some(&k) => self.terms[k].1.as_ref(),
+            None => self.scene.fits[self.s].terms.get(o),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -545,7 +633,7 @@ mod tests {
     use crate::scene::render::{Form, Element};
     use crate::scene::settings::{Background, Settings};
     use crate::scene::term::Owner;
-    use super::super::fixtures::{cost, field_box, piece_of, pole_view, stick, thin_pole_view};
+    use super::super::fixtures::{add, cost, costs, field_box, piece_of, pole_view, remove, stick, swap, thin_pole_view};
 
     /// The true pole has negative cost; a stick of the wrong radius, shifted, or porous has more; a stick where
     /// the pulses went through to the wall costs; a scene's move agrees with the difference of two
@@ -564,7 +652,7 @@ mod tests {
         assert!(e(stick(0.2, 6.0, 0.03)) > 1.0);
         let pair = [stick(0.0, 4.0, 0.03), stick(0.2, 6.0, 0.03)];
         let both = cost(&v, &pair, &em, &sc);
-        let delta: f64 = Scene::new(vec![v.clone()], &pair[..1], em, sc, None, 0).costs_to_add(&[vec![pair[1]]])[0].iter().sum();
+        let delta: f64 = costs(&Scene::new(vec![v.clone()], &pair[..1], em, sc, None, 0), &[vec![pair[1]]])[0].iter().sum();
         assert!((delta - (both.0 - truth)).abs() < 1e-6, "{delta} vs {}", both.0 - truth);
         let parts = alignment_parts(&Scene::new(vec![v.clone()], &pair, em, sc, None, 0));
         let sum: f64 = both.1.iter().map(|r| r.cost).sum::<f64>() + parts;
@@ -580,7 +668,7 @@ mod tests {
         let v = pole_view();
         let (em, sc) = (Settings::default(), Background::default());
         let pole = stick(0.0, 4.0, 0.03);
-        let sigma = |c: &Scene| c.foliage().1.iter().find(|x| x.0 == [5, 10, 3]).map_or(f64::NAN, |x| x.1);
+        let sigma = |c: &Scene| c.foliage(&Proposal::default()).1.iter().find(|x| x.0 == [5, 10, 3]).map_or(f64::NAN, |x| x.1);
         let mut c = Scene::new(vec![v.clone()], &[], em, sc, Some(field_box()), 0);
         assert_eq!(c.cost(), 0.0);
         let dense = sigma(&c);
@@ -588,12 +676,12 @@ mod tests {
         let fresh = Scene::new(vec![v.clone()], &[pole], em, sc, Some(field_box()), 0);
         assert!(sigma(&fresh) < 0.5 * dense, "{} vs {dense}", sigma(&fresh));
         // each datum is scored once: the elements' cells and the field's part hold the whole cost
-        let rows = |c: &Scene| c.rows().iter().map(|r| r.cost).sum::<f64>() + alignment_parts(c) + c.field_part();
+        let rows = |c: &Scene| c.rows(&Proposal::default()).iter().map(|r| r.cost).sum::<f64>() + alignment_parts(c) + c.field_part();
         assert!((rows(&fresh) - fresh.cost()).abs() < 1e-9 * fresh.cost().abs(), "{} vs {}", rows(&fresh), fresh.cost());
-        let (id, d) = c.add(pole);
+        let (id, d) = add(&mut c, pole);
         assert!((d - c.cost()).abs() < 1e-9 * d.abs().max(1.0) && d < 0.0, "{d}");
         assert!((rows(&c) - c.cost()).abs() < 1e-9 * c.cost().abs().max(1.0), "{} vs {}", rows(&c), c.cost());
-        c.remove(id);
+        remove(&mut c, id);
         assert_eq!(c.cost(), 0.0);
     }
 
@@ -607,7 +695,7 @@ mod tests {
         let v = pole_view();
         let (em, sc) = (Settings::default(), Background::default());
         let counts = |els: &[Element]| -> HashMap<[i32; 3], (f64, f64)> {
-            Scene::new(vec![v.clone()], els, em, sc, Some(field_box()), 0).foliage().1.into_iter().map(|x| (x.0, x.2)).collect()
+            Scene::new(vec![v.clone()], els, em, sc, Some(field_box()), 0).foliage(&Proposal::default()).1.into_iter().map(|x| (x.0, x.2)).collect()
         };
         let (empty, pole) = (counts(&[]), counts(&[stick(0.0, 4.0, 0.03), stick(0.0365, 3.9, 0.008)]));
         let mut taken = 0.0;
@@ -627,8 +715,9 @@ mod tests {
 
     /// The field is fixed through moves (research 130 slice 2b), as the alignment is held: moves keep its counts
     /// exactly (the empty scene's less every term's deposit, recomputed from scratch), adding then removing an element
-    /// and moving one there and back restore the cost exactly, and after a small move, or one to a wrong, wider stick,
-    /// the cost is near a fresh build's of the moved scene.
+    /// restores the cost exactly and swapping one there and back to rounding (each swap gives a new id, so the held
+    /// alignment carries a column out and one in), and after a small move, or one to a wrong, wider stick, the cost is
+    /// near a fresh build's of the moved scene.
     #[test]
     fn held_moves_keep_the_fields_counts() {
         let v = pole_view();
@@ -637,17 +726,17 @@ mod tests {
         let (pole, nudged, wrong, side) = (stick(0.0, 4.0, 0.03), stick(0.002, 4.0, 0.03), stick(0.01, 4.0, 0.033), stick(0.15, 4.5, 0.02));
         let mut c = Scene::new(vec![v.clone()], &[pole], em, sc, spec, 0);
         let e0 = c.cost();
-        let (id, _) = c.add(side);
-        c.remove(id);
+        let (id, _) = add(&mut c, side);
+        remove(&mut c, id);
         assert_eq!(c.cost(), e0);
-        c.change(0, wrong);
+        let (id, _) = swap(&mut c, 0, wrong);
         assert_eq!(c.field.as_ref().unwrap().counts(), recounted(&c));
-        c.change(0, pole);
-        assert_eq!(c.cost(), e0);
+        swap(&mut c, id, pole);
+        assert!((c.cost() - e0).abs() < 1e-9 * e0.abs(), "{} vs {e0}", c.cost());
         // moved against a fresh build, nats: 0.001 nudged, 0.8 wrong
         for (e, tol) in [(nudged, 0.01), (wrong, 1.0)] {
             let mut c = Scene::new(vec![v.clone()], &[pole], em, sc, spec, 0);
-            c.change(0, e);
+            swap(&mut c, 0, e);
             let fresh = Scene::new(vec![v.clone()], &[e], em, sc, spec, 0).cost();
             assert!((c.cost() - fresh).abs() < tol, "moved {} vs fresh {fresh}", c.cost());
         }
@@ -664,37 +753,34 @@ mod tests {
         let (em, sc) = (Settings::default(), Background::default());
         let c = Scene::new(vec![v.clone()], &[], em, sc, Some(field_box()), 0);
         let hyps: Vec<Vec<Element>> = (0..=400).map(|i| vec![stick(0.0, 4.025 + 2.5e-5 * i as f64, 0.03)]).collect();
-        let costs: Vec<f64> = c.costs_to_add(&hyps).iter().map(|r| r.iter().sum()).collect();
+        let costs: Vec<f64> = costs(&c, &hyps).iter().map(|r| r.iter().sum()).collect();
         let worst = costs.windows(3).map(|w| (w[0] - 2.0 * w[1] + w[2]).abs()).fold(0.0, f64::max);
         assert!(worst < 1e-3, "a second difference of {worst} nats");
     }
 
-    /// Many hypotheses at once: each one's cost per scan, and the foliage field's part, sum to adding then removing
-    /// it, the scene unchanged.
+    /// Many proposals at once: each one's cost per scan, and the foliage field's part, sum to keeping it, bit for bit
+    /// (and taking its elements out again restores the cost exactly), the scene unchanged; a proposal that takes an
+    /// element out and puts another in scores what keeping it gives.
     #[test]
-    fn costs_to_add_match_add_then_remove() {
+    fn scores_match_keeping() {
         let v = pole_view();
         let (em, sc) = (Settings::default(), Background::default());
         let mut c = Scene::new(vec![v.clone(), v.clone()], &[stick(0.0, 4.0, 0.03)], em, sc, Some(field_box()), 0);
         let hyps = vec![vec![stick(0.0, 4.0, 0.02)], vec![stick(0.2, 6.0, 0.03), stick(0.25, 6.0, 0.01)], vec![stick(5.0, 4.0, 0.03)], vec![stick(0.0365, 3.9, 0.008)]];
         let e0 = c.cost();
-        let all = c.costs_to_add(&hyps);
+        let all = costs(&c, &hyps);
         assert_eq!(c.cost(), e0);
         for (h, per) in hyps.iter().zip(&all) {
-            let (ids, d): (Vec<u32>, f64) = h.iter().fold((Vec::new(), 0.0), |(mut ids, d), e| {
-                let (id, de) = c.add(*e);
-                ids.push(id);
-                (ids, d + de)
-            });
-            for id in ids {
-                c.remove(id);
-            }
-            let total: f64 = per.iter().sum();
-            assert!((total - d).abs() < 1e-6 * d.abs().max(1.0), "{total} vs {d}");
+            let (ids, d) = c.keep(&Proposal::put(h));
+            assert_eq!(per.iter().sum::<f64>(), d);
+            c.keep(&Proposal::take(&ids));
             assert_eq!(c.cost(), e0);
         }
         // a stick outside the box takes nothing from the field
         assert!(all[1][2] != 0.0 && all[2][2] == 0.0, "{all:?}");
+        let swap = Proposal { put_in: vec![stick(0.0, 4.0, 0.02)], take_out: vec![0] };
+        let per = c.score(std::slice::from_ref(&swap)).remove(0);
+        assert_eq!(per.iter().sum::<f64>(), c.keep(&swap).1);
     }
 
     /// The scans' alignment parts: each scan's cost less its terms'.
@@ -722,12 +808,13 @@ mod tests {
         let field = |c: &Scene| c.field.clone().unwrap();
         let mut c = Scene::new(vec![v.clone(), v.clone()], &[pole], em, sc, Some(field_box()), 0);
         let (f0, e0) = (c.field_part(), c.cost());
-        let (id, _) = c.add(side);
-        c.change(0, wrong);
-        c.remove(id);
-        c.change(0, pole);
-        assert_eq!((c.field_part(), c.cost()), (f0, e0));
-        c.change(0, wrong);
+        let (id, _) = add(&mut c, side);
+        let (w, _) = swap(&mut c, 0, wrong);
+        remove(&mut c, id);
+        let (p, _) = swap(&mut c, w, pole);
+        assert_eq!(c.field_part(), f0);
+        assert!((c.cost() - e0).abs() < 1e-9 * e0.abs(), "{} vs {e0}", c.cost());
+        swap(&mut c, p, wrong);
         assert_eq!(field(&c).counts(), recounted(&c));
         let (a0, b0) = field(&c).prior;
         let recomputed: f64 = field(&c).counts().values().map(|&(h, l)| foliage::ln_nb(h, l, a0, b0)).sum();
@@ -735,8 +822,8 @@ mod tests {
         c.refit_alignment();
         assert_eq!(field(&c).counts(), recounted(&c));
         let before = c.field_part();
-        let per = c.costs_to_add(&[vec![side]]);
-        c.add(side);
+        let per = costs(&c, &[vec![side]]);
+        add(&mut c, side);
         assert!((per[0][2] - (c.field_part() - before)).abs() < 1e-9, "{} vs {}", per[0][2], c.field_part() - before);
     }
 
@@ -757,16 +844,16 @@ mod tests {
         // the pole's cost to add, from the scene without it; and to remove, from the scene with it
         let (without, mut with) = (scene(&[], Some(field_box())), scene(&[pole], Some(field_box())));
         let (out_held, mut in_held) = (held(&[], without.foliage_field()), held(&[pole], with.foliage_field()));
-        let add = |c: &Scene| -> f64 { c.costs_to_add(&[vec![pole]])[0].iter().sum() };
-        let (collapsed, today) = (add(&without) + with.remove(0), add(&out_held) + in_held.remove(0));
+        let put = |c: &Scene| -> f64 { costs(c, &[vec![pole]])[0].iter().sum() };
+        let (collapsed, today) = (put(&without) + remove(&mut with, 0), put(&out_held) + remove(&mut in_held, 0));
         assert!(collapsed.abs() < 0.1 * today.abs(), "collapsed {collapsed} vs today {today}");
     }
 
     /// A move's change is a full recompute's (3dtrees research 130 slice-structure, slice-soft): each cell read at its
-    /// own surface class, a term depends on no other term's class, so after adds, changes and removes among neighbours
+    /// own surface class, a term depends on no other term's class, so after adds, swaps and removes among neighbours
     /// that share cells (a group among them), every scan's terms, their deposits included, equal its terms recomputed
     /// from scratch at the held alignment (each from its reference's start), bit for bit, and so do the field's counts;
-    /// and the moves undone restore the cost exactly.
+    /// and the moves undone restore the cost to rounding (a swap gives a new id).
     #[test]
     fn a_moves_terms_are_a_full_recompute() {
         let v = pole_view();
@@ -790,28 +877,28 @@ mod tests {
             assert_eq!(c.field.as_ref().unwrap().counts(), recounted(c));
         };
         let e0 = c.cost();
-        let (a, _) = c.add(stick(0.01, 3.95, 0.025));
+        let (a, _) = add(&mut c, stick(0.01, 3.95, 0.025));
         check(&c);
-        c.change(1, stick(0.05, 3.85, 0.03));
+        let (f, _) = swap(&mut c, 1, stick(0.05, 3.85, 0.03));
         check(&c);
         // its edge partial in front of the pole's: cells two terms share
-        c.change(1, stick(0.0365, 3.9, 0.008));
+        let (f, _) = swap(&mut c, f, stick(0.0365, 3.9, 0.008));
         check(&c);
-        let (b, _) = c.add(piece_of(0.0, 0.2, Some(5)));
+        let (b, _) = add(&mut c, piece_of(0.0, 0.2, Some(5)));
         check(&c);
-        c.remove(a);
+        remove(&mut c, a);
         check(&c);
-        c.remove(b);
-        c.change(1, front);
+        remove(&mut c, b);
+        swap(&mut c, f, front);
         check(&c);
-        assert_eq!(c.cost(), e0);
+        assert!((c.cost() - e0).abs() < 1e-9 * e0.abs(), "{} vs {e0}", c.cost());
     }
 
-    /// Adding elements together is adding them one by one, bit for bit: a chain of four pieces of the pole (one group)
+    /// Keeping elements together is keeping them one by one, bit for bit: a chain of four pieces of the pole (one group)
     /// and a stick beside it, with a foliage field, give the same cost, rows and field counts either way; and removing
     /// them restores the cost exactly.
     #[test]
-    fn add_many_is_adding_one_by_one() {
+    fn keeping_together_is_keeping_one_by_one() {
         let v = pole_view();
         let (em, sc) = (Settings::default(), Background::default());
         let es = [piece_of(-0.2, -0.1, Some(7)), piece_of(-0.1, 0.0, Some(7)), stick(0.15, 4.5, 0.02), piece_of(0.0, 0.1, Some(7)), piece_of(0.1, 0.2, Some(7))];
@@ -819,24 +906,24 @@ mod tests {
         let (mut one, mut many) = (build(), build());
         let e0 = one.cost();
         for e in &es {
-            one.add(*e);
+            add(&mut one, *e);
         }
-        let (ids, d) = many.add_many(&es);
+        let (ids, d) = many.keep(&Proposal::put(&es));
         assert_eq!(ids, vec![1, 2, 3, 4, 5]);
         assert_eq!(one.cost(), many.cost());
         assert!((d - (many.cost() - e0)).abs() < 1e-9 * d.abs().max(1.0));
-        let rows = |c: &Scene| c.rows().iter().map(|r| (r.elem, r.scan, r.cost.to_bits(), r.field.to_bits())).collect::<Vec<_>>();
+        let rows = |c: &Scene| c.rows(&Proposal::default()).iter().map(|r| (r.elem, r.scan, r.cost.to_bits(), r.field.to_bits())).collect::<Vec<_>>();
+        // the rows read for the proposal, nothing kept, are the rows after keeping it
+        assert_eq!(rows(&one), build().rows(&Proposal::put(&es)).iter().map(|r| (r.elem, r.scan, r.cost.to_bits(), r.field.to_bits())).collect::<Vec<_>>());
         assert_eq!(rows(&one), rows(&many));
         assert_eq!(one.field.as_ref().unwrap().counts(), many.field.as_ref().unwrap().counts());
-        for id in ids {
-            many.remove(id);
-        }
+        many.keep(&Proposal::take(&ids));
         assert_eq!(many.cost(), e0);
     }
 
     /// A move that touches one member rescores its whole group, so its pooled terms never go stale: pieces of the
     /// pole 10 cm apart (no cell in common), added one by one, reach the same cost as the group built at once;
-    /// removing a member restores the cost exactly, and `costs_to_add` of a member joining a group equals adding it.
+    /// removing a member restores the cost exactly, and the score of a member joining a group equals keeping it.
     #[test]
     fn a_touched_member_rescores_its_group() {
         let v = thin_pole_view(0.0015, 6.0);
@@ -846,15 +933,15 @@ mod tests {
         let at_once = Scene::new(vec![v.clone()], &pieces, em, sc, None, 0);
         let mut by_one = Scene::new(vec![v.clone()], &pieces[..1], em, sc, None, 0);
         for p in &pieces[1..] {
-            let t: f64 = by_one.costs_to_add(&[vec![*p]])[0].iter().sum();
+            let t: f64 = costs(&by_one, &[vec![*p]])[0].iter().sum();
             let e0 = by_one.cost();
-            assert_eq!(t, by_one.add(*p).1);
-            let (id, _) = by_one.add(Element { group: Some(1), ..*p });
-            by_one.remove(id);
+            assert_eq!(t, add(&mut by_one, *p).1);
+            let (id, _) = add(&mut by_one, Element { group: Some(1), ..*p });
+            remove(&mut by_one, id);
             assert_eq!(by_one.cost(), e0 + t);
         }
         by_one.refit_alignment();
         assert!((by_one.cost() - at_once.cost()).abs() < 1e-9 * at_once.cost().abs().max(1.0), "{} vs {}", by_one.cost(), at_once.cost());
-        assert_eq!(by_one.rows().len(), 1);
+        assert_eq!(by_one.rows(&Proposal::default()).len(), 1);
     }
 }
