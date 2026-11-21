@@ -117,12 +117,34 @@ pub(super) fn obs_ground(v: &RangeImage, cell: usize, sc: &Background) -> (f64, 
     (obs, ground, w)
 }
 
+/// The range a cell's weight is read at ([`Settings::cell_weight`]), from the data alone, the same for every
+/// hypothesis: its first echo `obs`; for a pulse with no echo, the nearest first echo among its eight neighbouring
+/// cells (where its footprint overlaps theirs on the surface beside it), else the `ground`'s range, else [`T_MAX`].
+/// A stand-in until a shared misfit per element replaces per-cell weights (3dtrees research 130 slice-miss-weight:
+/// read where the beam ends, a miss beside an element at 3 m counted as about 26 echoes there; read at the layers'
+/// ranges before slice-s5, it moved with the hypothesis and jumped as a faint layer entered).
+pub(super) fn weight_range(v: &RangeImage, cell: usize, obs: f64, ground: Option<(f64, f64)>) -> f64 {
+    if obs.is_finite() {
+        return obs;
+    }
+    let (l, c, nl, nc) = ((cell / v.n_cols) as i64, (cell % v.n_cols) as i64, v.n_lines as i64, v.n_cols as i64);
+    let mut near = f64::INFINITY;
+    for (dl, dc) in [(-1, -1), (-1, 0), (-1, 1), (0, -1), (0, 1), (1, -1), (1, 0), (1, 1)] {
+        let (ll, cc) = (l + dl, c + dc);
+        if ll >= 0 && cc >= 0 && ll < nl && cc < nc {
+            let j = (ll * nc + cc) as usize;
+            if v.cell[j] == Cell::Echoes {
+                near = near.min(v.range[j] as f64);
+            }
+        }
+    }
+    if near.is_finite() { near } else { ground.map_or(T_MAX, |g| g.0) }
+}
+
 /// A cell as the likelihood reads it: its pulse per subset of its mixture with that subset's chance ([`mixture`]; the
 /// one with every layer in first), the same pulse in the empty scene (the medium and the ground alone: the same for
-/// every hypothesis), its first echo (NaN for none) and its weight ([`Settings::cell_weight`], at its first echo's
-/// range, or for a pulse with no echo where its beam ends: the ground, else [`T_MAX`]), in the layers' numbers `P`.
-/// The weight is the data's alone, the same for every hypothesis: read at the layers' ranges, a miss counted more or
-/// less as the hypothesis moved, and jumped as a faint layer entered (3dtrees research 130 slice-s5).
+/// every hypothesis), its first echo (NaN for none) and its weight ([`Settings::cell_weight`] at [`weight_range`]), in
+/// the layers' numbers `P`.
 pub(super) struct CellView<P = f64> {
     pub(super) obs: f64,
     pub(super) wt: P,
@@ -134,8 +156,7 @@ pub(super) struct CellView<P = f64> {
 /// ([`cell_class`]), against the foliage field `ext` and the background's ground.
 pub(super) fn cell_view<P: Real>(v: &RangeImage, cell: usize, layers: Vec<Layer<P>>, em: &Settings, sc: &Background, ext: &Foliage) -> CellView<P> {
     let (obs, ground, w) = obs_ground(v, cell, sc);
-    let at = if obs.is_finite() { obs } else { ground.map_or(T_MAX, |g| g.0) };
-    let wt = em.cell_weight(P::c(at), v.steps(cell));
+    let wt = em.cell_weight(P::c(weight_range(v, cell, obs, ground)), v.steps(cell));
     let (m, class, slots) = (ext.medium(&v.origin, &w), cell_class(v, cell, em), v.slots(cell));
     let pulses = mixture(&layers).into_iter()
         .map(|(p, ls)| (p, Pulse::on(occluders(ls, ground), class, &m, v.echoes(cell), v.echo_refls(cell), slots, &v.instrument, em))).collect();
@@ -660,6 +681,25 @@ mod tests {
     use crate::scene::settings::{Background, Settings};
     use crate::scene::term::elem_data;
     use super::super::fixtures::{cost, pole_scan, pole_view, stick};
+
+    #[test]
+    fn a_miss_is_weighted_at_the_nearest_echo_beside_it() {
+        // the pole over open sky: a miss beside the pole reads the pole's range, one with no echo beside it the
+        // longest, and none reads a layer (the weight is the data's alone)
+        let v = pole_scan(0.03, 4.0, f64::INFINITY);
+        let (mut beside, mut open) = (0, Vec::new());
+        for k in 0..v.n_lines * v.n_cols {
+            if v.cell[k] != Cell::Miss {
+                continue;
+            }
+            let r = weight_range(&v, k, f64::NAN, None);
+            if r == T_MAX { open.push(k) } else { assert!((r - 4.0).abs() < 0.05, "{r}"); beside += 1 }
+        }
+        assert!(beside > 0 && !open.is_empty(), "{beside} {}", open.len());
+        // with no echo beside it, the ground's range where the ray meets it; an echo's own range wins
+        assert_eq!(weight_range(&v, open[0], f64::NAN, Some((12.0, 0.5))), 12.0);
+        assert_eq!(weight_range(&v, open[0], 3.0, None), 3.0);
+    }
 
     /// A pole 0.5 m in front of a wall, closer than the pulse's resolution: its edge echoes merge with the wall's
     /// into one at the measured pull behind the pole's. With the wall in the scene (the front of a ball 2 m in radius), the
