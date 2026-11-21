@@ -177,8 +177,8 @@ params! {
         /// spike-dgp: the realization read, what a pulse meets of the field: the same counts at weight 1/m (the cell
         /// weight times `discount`, φ taken out), under its own Gamma prior of this mean (1/m) worth this much weighted
         /// path (m), refitted by type-II on the counts at that weight. A path of 0 reads the intensity, as before.
-        pub read_prior_mean: f64 = 0.0,
-        pub read_prior_path: f64 = 0.0,
+        pub read_prior_mean: f64 = 0.15344,
+        pub read_prior_path: f64 = 0.1767,
         /// spike-dgp: the fill prior of an echo's object (one geometric beam, [`Settings::beam_after`]): this share
         /// fills the beam it meets, the rest a fill uniform on (0, 1).
         pub fill_full: f64 = 0.2,
