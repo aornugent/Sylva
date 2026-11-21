@@ -74,7 +74,7 @@ params! {
         /// is declared: `leaf.py` am's single-echo peak in rank-3 voxels plus the stand's partial-fill offset (1.9 dB);
         /// not measured (leaf-reflectance.md). AM's ground is measured on its ground echoes (`ground.py am`, slice 2d).
         /// AM's measured values come from day-1 scans about a second box that no held-out check holds out.
-        pub refl_wood: f64 = -15.1,
+        pub refl_wood: f64 = -15.2,
         pub refl_leaf: f64 = -15.6,
         pub refl_ground: f64 = -16.9,
         /// The ground plane ([`Background`]'s `ground_z`), as AM's ground echoes measure it (3dtrees research 130 slice
@@ -95,8 +95,8 @@ params! {
         /// a fitted peak follows the nearer unless the farther outweighs it, far less than their energy-weighted range
         /// says (3dtrees research 130 slice 2c: AM's edges with one echo and a surface within the resolution behind,
         /// fitted by least absolute deviations, `reflectance.py site`'s `merge_summary`; slices 9, consolidate, grid).
-        pub pull_a: f64 = 2.299,
-        pub pull_b: f64 = 0.043,
+        pub pull_a: f64 = 2.304,
+        pub pull_b: f64 = 0.078,
         /// The merge share behind a layer, calibrated per site (3dtrees research 130 slice 2c): the foliage field's own
         /// share M (`1 − exp(−b ∫ σ (1 − p))`, [`super::scene`]'s merges) predicts a site's merges beside wood too
         /// poorly to stand alone (slice-soft), so the share is `logistic(merge_a + merge_field M + merge_range t +
@@ -104,10 +104,10 @@ params! {
         /// [`super::scene::Scene::predict`] reports it, on edges whose pulse merged with a surface within the
         /// resolution behind (`reflectance.py site`'s `merge_summary`, the field held in; AM's from day-1 scans the
         /// held-out checks never hold out: slices 2d, products; rca-field-range, with the field on its prior's voxel).
-        pub merge_a: f64 = -2.5756,
-        pub merge_field: f64 = 7.8619,
-        pub merge_range: f64 = -0.1014,
-        pub merge_fill: f64 = 3.234,
+        pub merge_a: f64 = -2.9895,
+        pub merge_field: f64 = 8.0447,
+        pub merge_range: f64 = -0.0689,
+        pub merge_fill: f64 = 3.3675,
         /// Located edges (3dtrees research 130 step 2): an echo's reflectance (dB) is read beside its range. A return's
         /// predicted reflectance is `10 log10` of its members' energy shares (each fill × the beam left × cos^k ι ×
         /// the surface's reflectance, k `refl_incidence`, which sets the detection too; a merged return sums them), so
@@ -121,9 +121,9 @@ params! {
         /// (`reflectance.py site`, slice 9; re-measured with the field fixed at the build and the cell weight's
         /// zenith factor, slice-grid).
         pub refl_noise: f64 = 0.37,
-        pub refl_dof: f64 = 4.1,
-        pub refl_edge: f64 = 11.28,
-        pub refl_incidence: f64 = 0.3,
+        pub refl_dof: f64 = 3.8,
+        pub refl_edge: f64 = 10.89,
+        pub refl_incidence: f64 = 0.25,
         pub refl_level_sd: f64 = 0.78,
         pub refl_background_mean: f64 = -21.29,
         pub refl_background_sd: f64 = 6.28,
@@ -171,8 +171,8 @@ params! {
         /// prior doesn't carry to another voxel (pooled voxels aren't Gamma of the same shape), and the field's part of
         /// the cost moves by thousands of nats between 0.125 and 0.25 m (research 130 field-closed-form), so a field
         /// on another voxel reads a prior not measured for it.
-        pub field_prior_mean: f64 = 0.1168,
-        pub field_prior_path: f64 = 0.5323,
+        pub field_prior_mean: f64 = 0.11938,
+        pub field_prior_path: f64 = 0.5177,
         pub field_prior_voxel: f64 = 0.125,
     }
 }
