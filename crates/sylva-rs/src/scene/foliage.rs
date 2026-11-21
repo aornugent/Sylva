@@ -484,6 +484,9 @@ pub struct FieldCounts {
     pub prior: (f64, f64),
     /// The grains' radius and the beam's exit width and divergence ([`Foliage`]'s `grains`).
     pub grains: [f64; 3],
+    /// spike-dgp: the realization read's prior shape and rate and the counts' scale (φ: weight 1/m); a rate of 0
+    /// reads the intensity.
+    pub read: (f64, f64, f64),
     /// Per voxel, the empty scene's weighted counts (hits, path).
     counts: FixedCounts,
     /// Per voxel with echoes taken, their sums ([`Taken`]).
@@ -543,7 +546,8 @@ impl FieldCounts {
                 acc
             }).reduce(FixedCounts::default, merged)
         }).fold(FixedCounts::default(), merged);
-        FieldCounts { spec, prior, grains: [em.grain_radius, em.beam_exit, em.beam_divergence], counts, taken: Default::default(), term: 0 }
+        let read = (em.read_prior_mean * em.read_prior_path, em.read_prior_path, em.discount);
+        FieldCounts { spec, prior, grains: [em.grain_radius, em.beam_exit, em.beam_divergence], read, counts, taken: Default::default(), term: 0 }
     }
 
     /// Voxel `k`'s empty counts (hits, path).
@@ -667,8 +671,10 @@ impl FieldCounts {
 
     /// The field a pulse reads: the posterior from the empty scene's counts (data alone, the same for every scene).
     pub fn field(&self, kappa: f64) -> Foliage {
-        let counts: Counts = self.counts.iter().map(|(&k, &[h, l])| (k, (h as f64 / FIXED, l as f64 / FIXED))).collect();
-        let mut f = Foliage::from_counts(kappa, self.spec, &counts, self.prior);
+        // spike-dgp: the realization read, the same counts at weight 1/m under its own prior, where one is given
+        let (c, prior) = if self.read.1 > 0.0 { (self.read.2, (self.read.0, self.read.1)) } else { (1.0, self.prior) };
+        let counts: Counts = self.counts.iter().map(|(&k, &[h, l])| (k, (c * h as f64 / FIXED, c * l as f64 / FIXED))).collect();
+        let mut f = Foliage::from_counts(kappa, self.spec, &counts, prior);
         f.grains = self.grains;
         f
     }
@@ -686,7 +692,7 @@ mod tests {
     fn the_voxel_formula_is_the_posterior_moment() {
         let spec = FoliageBox { lo: [0.0; 3], hi: [1.0; 3], voxel: 1.0 };
         let (h, l, a0, b0) = (3.0, 4.0, 0.05, 0.5);
-        let mut f = FieldCounts { spec, prior: (a0, b0), grains: [0.0; 3], counts: Default::default(), taken: Default::default(), term: 0 };
+        let mut f = FieldCounts { spec, prior: (a0, b0), grains: [0.0; 3], read: (0.0, 0.0, 1.0), counts: Default::default(), taken: Default::default(), term: 0 };
         f.counts.insert([0, 0, 0], [fx(h), fx(l)]);
         let (al, beta, w, sig) = (a0 + h, b0 + l, 0.7, 0.9);
         let mut d = FixedHits::default();
@@ -791,9 +797,9 @@ mod tests {
     fn the_field_reads_the_medium_past_an_echo() {
         use crate::shots::reconstruct::dir;
         let em = Settings::default();
-        let (sigma, left) = (1.0, 0.5);
-        let sliver = em.refl_full_hit() + 10.0 * (1.0 - left).log10();
-        assert!((em.beam_after(1.0, sliver) - left).abs() < 1e-9);
+        let sigma = 1.0;
+        let sliver = em.refl_full_hit() + 10.0 * 0.5f64.log10();
+        let left = em.beam_after(1.0, sliver);   // spike-dgp: the beam the sliver's fill leaves, read from its brightness
         let u = |s: u64| ((s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407) >> 11) as f64 + 0.5) / (1u64 << 53) as f64;
         let (mut t, mut d, mut start, mut range, mut refl) = (Vec::new(), Vec::new(), vec![0u32], Vec::new(), Vec::new());
         for l in 0..200usize {
@@ -818,17 +824,6 @@ mod tests {
         assert!((h / l / sigma - 1.0).abs() < 0.03, "the field reads {} against σ = {sigma}", h / l);
     }
 
-    /// An echo's reflectance is its share of the emitted beam, so two echoes taking 40 % each leave 20 %, not 36 %, and
-    /// a third taking 40 % leaves nothing (3dtrees research 130 observation).
-    #[test]
-    fn shares_of_the_emitted_beam_subtract() {
-        let em = Settings::default();
-        let x = em.refl_full_hit() + 10.0 * 0.4f64.log10();
-        let two = em.beam_after(em.beam_after(1.0, x), x);
-        assert!((two - 0.2).abs() < 1e-9, "{two}");
-        assert_eq!(em.beam_after(two, x), 0.0);
-        assert_eq!(em.beam_after(0.7, f64::NAN), 0.7);
-    }
 
     /// One walk per ray (3dtrees research 130 slice-structure): the medium's optical depths, hazards and merge
     /// integrals, as sums over the walk's segments, equal a traversal of their own for each (36f7313's), to float

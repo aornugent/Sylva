@@ -174,6 +174,14 @@ params! {
         /// pyramid's blocked and open tiles (`grain2d.py`); 0 is today's point field, its echoes weighted by the cell's
         /// own weight.
         pub grain_radius: f64 = 0.0,
+        /// spike-dgp: the realization read, what a pulse meets of the field: the same counts at weight 1/m (the cell
+        /// weight times `discount`, φ taken out), under its own Gamma prior of this mean (1/m) worth this much weighted
+        /// path (m), refitted by type-II on the counts at that weight. A path of 0 reads the intensity, as before.
+        pub read_prior_mean: f64 = 0.0,
+        pub read_prior_path: f64 = 0.0,
+        /// spike-dgp: the fill prior of an echo's object (one geometric beam, [`Settings::beam_after`]): this share
+        /// fills the beam it meets, the rest a fill uniform on (0, 1).
+        pub fill_full: f64 = 0.2,
         /// The declared prior over a plant's wood ([`super::chain::axis_row`], [`super::chain::insertion_row`]; 3dtrees
         /// research 130 slice-s8): a consumer's rows beside the cost, never in it, and never read by the evidence.
         /// The clock: dτ = ds / r · (r / 1 cm)^(1 − β), β = `axis_clock` (1: length in radii). The axis prior samples
@@ -354,7 +362,67 @@ impl Settings {
     /// 130 vz2000i-echoes, observation); the beam goes on unchanged where the reflectance is unknown. The pulse's
     /// medium, the foliage field's counts and the depth pyramid read an echo the same way.
     pub fn beam_after(&self, beam: f64, x: f64) -> f64 {
-        if x.is_finite() { (beam - 10f64.powf((x - self.refl_full_hit()) / 10.0)).clamp(0.0, 1.0) } else { beam }
+        if !x.is_finite() {
+            return beam;
+        }
+        if beam <= 0.0 {
+            return 0.0;
+        }
+        // spike-dgp: one geometric beam. The echo's object fills f of the beam it meets; its brightness against a full
+        // hit in that beam, `x − full − 10 log10 beam`, is noisy evidence of 10 log10 f (the scene's own reading
+        // spread: refl_noise ⊕ refl_edge (1 − f), t of refl_dof, the level's sd in quadrature). What's left is
+        // beam × (1 − E[f | reading]) under the fill prior (`fill_full` at f = 1, the rest uniform).
+        beam * (1.0 - self.fill_given(x - self.refl_full_hit() - 10.0 * beam.log10()))
+    }
+
+    /// spike-dgp: E[f | u], the mean fill of an echo's object given its reading u (dB against a full hit in the beam
+    /// it met), from a table over u built once per reading model.
+    pub fn fill_given(&self, u: f64) -> f64 {
+        use std::cell::RefCell;
+        const U0: f64 = -80.0;
+        const DU: f64 = 0.02;
+        const N: usize = 6001;
+        thread_local!(static TABLE: RefCell<(u64, Vec<f64>)> = const { RefCell::new((u64::MAX, Vec::new())) });
+        let key = [self.refl_noise, self.refl_edge, self.refl_dof, self.refl_level_sd, self.fill_full]
+            .iter().fold(0xcbf29ce484222325u64, |h, x| (h ^ x.to_bits()).wrapping_mul(0x100000001b3));
+        TABLE.with(|t| {
+            let mut t = t.borrow_mut();
+            if t.0 != key {
+                let (nu, p) = (self.refl_dof, self.fill_full);
+                let like = |u: f64, f: f64| {
+                    let s = self.refl_noise.hypot(self.refl_edge * (1.0 - f)).hypot(self.refl_level_sd);
+                    let z = (u - 10.0 * f.log10()) / s;
+                    (1.0 + z * z / nu).powf(-0.5 * (nu + 1.0)) / s
+                };
+                // the partial fills on a log grid from 1e-6 to 1, each with its uniform prior mass f ln10 dg
+                let (gn, g0) = (1200usize, -6.0f64);
+                let dg = -g0 / gn as f64;
+                let grid: Vec<(f64, f64)> = (0..gn).map(|i| {
+                    let f = 10f64.powf(g0 + (i as f64 + 0.5) * dg);
+                    (f, f * std::f64::consts::LN_10 * dg)
+                }).collect();
+                t.1 = (0..N).map(|i| {
+                    let u = U0 + i as f64 * DU;
+                    let full = p * like(u, 1.0);
+                    let (mut num, mut den) = (full, full);
+                    for &(f, w) in &grid {
+                        let l = (1.0 - p) * w * like(u, f);
+                        num += l * f;
+                        den += l;
+                    }
+                    if den > 0.0 { num / den } else { 0.0 }
+                }).collect();
+                // a brighter reading never means less fill: far above a full hit, the partial fills' wide reading
+                // spread outweighs the full hit's narrow one, an artefact of the reading model's tails
+                for i in 1..N {
+                    t.1[i] = t.1[i].max(t.1[i - 1]);
+                }
+                t.0 = key;
+            }
+            let x = ((u - U0) / DU).clamp(0.0, (N - 1) as f64);
+            let (i, a) = ((x.floor() as usize).min(N - 2), x - x.floor());
+            t.1[i] * (1.0 - a) + t.1[i + 1] * a
+        })
     }
 
     /// The stem front shift's prior sd (m) at radius r.
@@ -380,5 +448,21 @@ impl Settings {
         let along = [self.align_along_solid, self.align_along_mid, self.align_along_fragmented][k as usize];
         let epoch = [self.align_epoch_solid, self.align_epoch_mid, self.align_epoch_fragmented][k as usize];
         if other { (along.powi(2) + epoch.powi(2)).sqrt() } else { along }
+    }
+}
+
+#[cfg(test)]
+mod spike_tests {
+    use super::Settings;
+    /// spike-dgp: the beam an echo leaves by its share, read through its fill: k = -ln(left) / s (printed).
+    #[test]
+    fn the_fill_law_prints() {
+        let em = Settings::default();
+        for s in [0.02, 0.05, 0.1, 0.2, 0.3, 0.45, 0.6, 0.8, 1.0, 1.5] {
+            let x = em.refl_full_hit() + 10.0 * f64::log10(s);
+            let left = em.beam_after(1.0, x);
+            eprintln!("s {s}: left {left:.3} k {:.2} subtracted {:.2} (edge {} level {} noise {} dof {})", -left.ln() / s, (1.0f64 - s).max(0.0),
+                      em.refl_edge, em.refl_level_sd, em.refl_noise, em.refl_dof);
+        }
     }
 }

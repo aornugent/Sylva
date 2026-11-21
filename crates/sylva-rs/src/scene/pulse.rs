@@ -731,7 +731,7 @@ mod tests {
         // half of what the return left; in front of every return it leaves 0.7, as `seen` reads it
         let em = Settings::default();
         let x = em.refl_full_hit() + 10.0 * 0.3f64.log10();
-        assert!((taken_after(0.6, 1.0, x, &em) * 0.6 - 0.3).abs() < 1e-9);
+        assert!((taken_after(0.6, 1.0, x, &em) * 0.6 - em.beam_after(0.6, x)).abs() < 1e-9);
         assert!((taken_after(1.0, 1.0, x, &em) - em.beam_after(1.0, x)).abs() < 1e-12);
         assert_eq!(taken_after(0.6, 1.0, f64::NAN, &em), 1.0);
     }
@@ -795,7 +795,7 @@ mod tests {
         let em = Settings::default();
         let flat = Foliage::uniform(0.05);
         let leaf = (em.refl_full_hit() + 10.0 * 0.5f64.log10()) as f32;
-        assert!((em.beam_after(1.0, leaf as f64) - 0.5).abs() < 1e-6);
+        let left = em.beam_after(1.0, leaf as f64);   // spike-dgp: the leaf's fill read from its brightness
         let best = |layers: &[Layer], ground: Option<(f64, f64)>, echoes: &[f32], front: &[f32]| -> f64 {
             (0..=1000).map(|i| -35.0 + 0.025 * i as f64).map(|x| {
                 let refls: Vec<f32> = front.iter().copied().chain([x as f32]).collect();
@@ -804,9 +804,9 @@ mod tests {
         };
         let stick = [layer(8.0, 1.0, 1.0)];
         let (alone, behind) = (best(&stick, None, &[8.0], &[]), best(&stick, None, &[3.0, 8.0], &[leaf]));
-        assert!((behind - alone - 10.0 * 0.5f64.log10()).abs() < 0.1, "an element: alone {alone}, behind {behind}");
+        assert!((behind - alone - 10.0 * left.log10()).abs() < 0.1, "an element: alone {alone}, behind {behind}");
         let (alone, behind) = (best(&[], Some((10.0, 0.6)), &[10.0], &[]), best(&[], Some((10.0, 0.6)), &[3.0, 10.0], &[leaf]));
-        assert!((behind - alone - 10.0 * 0.5f64.log10()).abs() < 0.1, "the ground: alone {alone}, behind {behind}");
+        assert!((behind - alone - 10.0 * left.log10()).abs() < 0.1, "the ground: alone {alone}, behind {behind}");
         // a faint edge behind the leaf: its pulse with no later echo is likelier than with nothing in front to dim it
         let edge = [layer(8.0, 0.05, 1.0)];
         let gone = |front: &[f32], echoes: &[f32]| pulse_in(&em, echoes, front, false, &edge, None, &flat).read(0.0, 0.0, &em).ll
