@@ -36,7 +36,7 @@
 //!   integrals as sums over them ([`Medium`]); the field's counts lay its path on the same segments.
 //! - **Energy after an echo.** A pulse's echo energies are bounded by its emitted energy (synthesis §4): an echo's
 //!   reflectance against a full-footprint hit on the dimmest canopy surface ([`Settings::refl_full_hit`]) is the
-//!   share of the beam it took ([`Settings::beam_left`], as the pulse reads it), so a full hit on leaf or wood reads
+//!   share of the emitted beam it took ([`Settings::beam_after`]: shares subtract), as the pulse reads it, so a full hit on leaf or wood reads
 //!   as the whole beam, and only the rest goes on. So each stretch after an echo counts as transmission in proportion
 //!   to the beam left: none past an opaque hit, most past a sliver. Where echoes carry no reflectance, the beam is
 //!   taken to go on whole. The beam left is read as the chance the pulse goes on (the pulse reads the medium past an
@@ -317,7 +317,7 @@ fn traverse(sp: &FoliageBox, o: &Point, w: &Point, t_min: f64, t_max: f64, mut f
 }
 
 /// One pulse as everything that reads its path reads it (3dtrees research 130 slice-pyramid: the restart and
-/// beam-left conventions in one place): the stretches of its ray it shows clear, each with the beam the echoes before it left ([`Settings::beam_left`]): from the origin to its first echo, then from
+/// beam-left conventions in one place): the stretches of its ray it shows clear, each with the beam the echoes before it left ([`Settings::beam_after`]): from the origin to its first echo, then from
 /// each echo plus the receiver's resolution to the next (a surface closer behind an echo would have merged with it),
 /// and after the last on, unless the pulse is capped ([`RangeImage::capped`]: it says nothing past its last echo);
 /// each echo's range; its clear range ([`Settings::free_to`] of its first echo,
@@ -342,7 +342,7 @@ pub fn walked(v: &RangeImage, em: &Settings, k: usize) -> Option<Walked> {
         path.push((start, r as f64, beam));
         out.push(r as f64);
         if let Some(&db) = refls.get(i) {
-            beam *= em.beam_left(db as f64);
+            beam = em.beam_after(beam, db as f64);
         }
         start = r as f64 + em.resolution();
     }
@@ -353,7 +353,7 @@ pub fn walked(v: &RangeImage, em: &Settings, k: usize) -> Option<Walked> {
 
 /// The beam cell `k`'s echoes leave ([`Walked`]'s `beam`, without its stretches).
 pub fn beam_left(v: &RangeImage, em: &Settings, k: usize) -> f64 {
-    v.echo_refls(k).iter().fold(1.0, |b, &db| b * em.beam_left(db as f64))
+    v.echo_refls(k).iter().fold(1.0, |b, &db| em.beam_after(b, db as f64))
 }
 
 /// The echoes of image `v`'s cell `k` the field counts as hits, those inside the box: (the echo's index in its
@@ -578,7 +578,7 @@ mod tests {
     }
 
     /// The field recovers the medium past an echo as the pulse reads it (3dtrees research 130 rca-field-range): every
-    /// pulse first meets a sliver at 3 m whose reflectance leaves half the beam ([`Settings::beam_left`]), then a
+    /// pulse first meets a sliver at 3 m whose reflectance leaves half the beam ([`Settings::beam_after`]), then a
     /// medium of σ = 1/m, which past the sliver the pulse reads thinned by the beam left (`pulse`'s `seen`): its
     /// second echo where an exponential free path of rate σ/2 from the receiver's resolution ends. The empty scene's
     /// counts over the box behind read σ: each later echo one hit, its stretch's path at the beam left. Counting the
@@ -589,7 +589,7 @@ mod tests {
         let em = Settings { max_targets: 2.0, ..Settings::default() };   // a scanner of two targets: past them, censored
         let (sigma, left) = (1.0, 0.5);
         let sliver = em.refl_full_hit() + 10.0 * (1.0 - left).log10();
-        assert!((em.beam_left(sliver) - left).abs() < 1e-9);
+        assert!((em.beam_after(1.0, sliver) - left).abs() < 1e-9);
         let u = |s: u64| ((s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407) >> 11) as f64 + 0.5) / (1u64 << 53) as f64;
         let (mut t, mut d, mut start, mut range, mut refl) = (Vec::new(), Vec::new(), vec![0u32], Vec::new(), Vec::new());
         for l in 0..200usize {
@@ -610,6 +610,18 @@ mod tests {
         let sp = FoliageBox { lo: [-1.0, 4.0, -1.0], hi: [1.0, 6.0, 1.0], voxel: 0.25 };
         let (h, l) = FieldCounts::new(sp, &[&v], &em).counts().values().fold((0.0, 0.0), |(h, l), &(a, b)| (h + a, l + b));
         assert!((h / l / sigma - 1.0).abs() < 0.03, "the field reads {} against σ = {sigma}", h / l);
+    }
+
+    /// An echo's reflectance is its share of the emitted beam, so two echoes taking 40 % each leave 20 %, not 36 %, and
+    /// a third taking 40 % leaves nothing (3dtrees research 130 observation).
+    #[test]
+    fn shares_of_the_emitted_beam_subtract() {
+        let em = Settings::default();
+        let x = em.refl_full_hit() + 10.0 * 0.4f64.log10();
+        let two = em.beam_after(em.beam_after(1.0, x), x);
+        assert!((two - 0.2).abs() < 1e-9, "{two}");
+        assert_eq!(em.beam_after(two, x), 0.0);
+        assert_eq!(em.beam_after(0.7, f64::NAN), 0.7);
     }
 
     /// One walk per ray (3dtrees research 130 slice-structure): the medium's optical depths, hazards and merge

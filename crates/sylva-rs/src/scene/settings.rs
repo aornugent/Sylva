@@ -331,11 +331,13 @@ impl Settings {
         self.refl_wood.min(self.refl_leaf)
     }
 
-    /// The share of the beam an echo of reflectance `x` (dB) leaves: what its share against a full hit
-    /// ([`Settings::refl_full_hit`]) says it didn't take; the whole beam where its reflectance is unknown. The pulse's
-    /// medium and the foliage field's counts read an echo the same way.
-    pub fn beam_left(&self, x: f64) -> f64 {
-        if x.is_finite() { (1.0 - 10f64.powf((x - self.refl_full_hit()) / 10.0)).clamp(0.0, 1.0) } else { 1.0 }
+    /// The beam left after an echo of reflectance `x` (dB) where `beam` of the emitted beam reached it: an echo's
+    /// reflectance against a full hit ([`Settings::refl_full_hit`]) is its share of the *emitted* beam, so the shares
+    /// of a pulse's echoes subtract (multiplying them read the beam behind several echoes too wide: 3dtrees research
+    /// 130 vz2000i-echoes, observation); the beam goes on unchanged where the reflectance is unknown. The pulse's
+    /// medium, the foliage field's counts and the depth pyramid read an echo the same way.
+    pub fn beam_after(&self, beam: f64, x: f64) -> f64 {
+        if x.is_finite() { (beam - 10f64.powf((x - self.refl_full_hit()) / 10.0)).clamp(0.0, 1.0) } else { beam }
     }
 
     /// The stem front shift's prior sd (m) at radius r.

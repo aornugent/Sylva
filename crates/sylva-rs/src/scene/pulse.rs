@@ -554,7 +554,7 @@ impl<P: Real, T: Over<P>> Pass<'_, P, T> {
     /// it not recorded; [`Return::density`], its merge with the medium behind inside it), an echo of the medium (the
     /// returns before it not recorded) or an outlier.
     /// - **The medium's echoes** are a Poisson process along the ray in the beam the echoes so far left, `seen`: each
-    ///   echo leaves the share of the beam its reflectance says it didn't take ([`Settings::beam_left`]), as the field
+    ///   echo takes the share of the emitted beam its reflectance says ([`Settings::beam_after`]), as the field
     ///   reads them ([`super::foliage`]).
     ///   That beam is read from the echoes alone, the same for every hypothesis, so how often a pulse echoes again
     ///   doesn't lean on the scene's beam (on the stand's checks the scene's beam there favoured a wider stick
@@ -584,7 +584,6 @@ impl<P: Real, T: Over<P>> Pass<'_, P, T> {
         }
         let (o, x) = (p.echoes[i] as f64, p.refls.get(i).map_or(f64::NAN, |&x| x as f64));
         let [tau_o, sig_o, tau_after] = p.medium[i];
-        let left = em.beam_left(x);
         let mut total = T::c(0.0);
         // one of the returns
         let mut none = T::c(1.0);
@@ -592,7 +591,7 @@ impl<P: Real, T: Over<P>> Pass<'_, P, T> {
             let d = none * ((occ[r.first].tau - tau0).max(0.0) * -seen).exp() * r.s * taken * r.density(o, x, em, occ);
             if d.v() > 0.0 {
                 let f = d * (1.0 - P_OUTLIER);
-                let rest = self.lik(rets, i + 1, k + 1, self.rx.members[r.last].beam, taken, seen * left, tau_after, prefix * f.v(), resp);
+                let rest = self.lik(rets, i + 1, k + 1, self.rx.members[r.last].beam, taken, em.beam_after(seen, x), tau_after, prefix * f.v(), resp);
                 resp[row + r.first] += prefix * f.v() * rest.v();
                 total += f * rest;
             }
@@ -605,7 +604,7 @@ impl<P: Real, T: Over<P>> Pass<'_, P, T> {
             let d = none * (seen * sig_o * (-seen * (tau_o - tau0).max(0.0)).exp()) * em.refl_background(P::c(x) - (scene * taken).max(1e-6).log10() * 10.0);
             if d.v() > 0.0 {
                 let f = d * (1.0 - P_OUTLIER);
-                let rest = self.lik(rets, i + 1, jn, scene, taken * left, seen * left, tau_after, prefix * f.v(), resp);
+                let rest = self.lik(rets, i + 1, jn, scene, em.beam_after(taken, x), em.beam_after(seen, x), tau_after, prefix * f.v(), resp);
                 resp[row + self.owners - 2] += prefix * f.v() * rest.v();
                 total += f * rest;
             }
