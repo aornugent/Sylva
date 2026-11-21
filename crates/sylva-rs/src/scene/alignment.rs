@@ -11,8 +11,8 @@
 //!   declares). A cell's depths move by the shift at its front element. Neighbours sharing nodes share one shift,
 //!   and one scan's joint evidence on a place is capped by the prior. **Surface classes** (3dtrees research 130
 //!   slice-structure): every echo reads the depth bias and noise of its own cell's class ([`cell_class`]: the excess
-//!   there, data); a term's class, which sets its along spread, is the median over the cells it mostly fills
-//!   ([`term_classes`]). So no term's evidence depends on another's class. With it, the **stem
+//!   there, data); a term's along spread is its cells' classes' spreads mixed by their votes over the cells it mostly
+//!   fills ([`term_spreads`]), smooth in the votes. So no term's evidence depends on another's class. With it, the **stem
 //!   front shift** (slice 14): a node of the element's own per scan, its section's departure from round as that view
 //!   sees it. A scan's cost is the Laplace marginal of its data over both and the reflectance levels
 //!   ([`solve_alignment`]); between refits the alignment is held ([`Held`], research 130 step 3a).
@@ -294,7 +294,7 @@ mod tests {
     use crate::scene::render::{Element, Layer, KBuffer, render_all, mixture};
     use crate::scene::scene::Scene;
     use crate::scene::settings::{Background, Settings};
-    use crate::scene::term::{term_classes, ElemData};
+    use crate::scene::term::{term_spreads, ElemData};
     use super::super::fixtures::{add, cost, costs, pole_image, pole_view, remove, stick, swap};
 
     /// The joint arrowhead Newton ([`solve_alignment`]) ends at the scan's minimum: on the pole alone and with a stick
@@ -389,7 +389,7 @@ mod tests {
         let (gh_x, gh_w) = ([-2.0201828704560856, -0.9585724646138185, 0.0, 0.9585724646138185, 2.0201828704560856],
                             [0.019953242059045913, 0.39361932315224116, 0.9453087204829419, 0.39361932315224116, 0.019953242059045913]);
         let buf = KBuffer::of(&rendered).cells();
-        let s_along = em.align_sd(term_classes(&v, &buf, &[0], &em)[0], false).hypot(em.front_shift_sd(el.r));
+        let s_along = term_spreads(&v, &buf, &[0], false, &em)[0].hypot(em.front_shift_sd(el.r));
         let ed = |shift: f64, level: f64| -> f64 {
             buf.iter().map(|&(cell, ref ls)| {
                 let echoes = v.echoes(cell);

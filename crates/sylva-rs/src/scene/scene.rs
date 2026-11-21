@@ -34,8 +34,8 @@ use super::term::{ChainKey, chain_key, slots, ElemData, Term, elem_data};
 /// What one scan says about one element, or one group ([`ChainKey`]: `group`, and `elem` its first member), its cost
 /// split into parts that sum to `cost`. A group's row reads its members' cells together.
 /// - `cells`: cells it has a front share in ([`front_shares`]); `cells_on`: those it is the nearest layer of whose first echo is
-///   its ([`Outcome::On`]); `across`: footprints across its diameter; `surface`: its term's surface class in this
-///   scan ([`term_classes`]).
+///   its ([`Outcome::On`]); `across`: footprints across its diameter; `align_prior_sd`: its term's alignment
+///   spread in this scan, the prior sd of its alignment shift ([`term_spreads`]: from its cells' surface classes).
 /// - `arc`: the arc of a stick's outline its echoes span (rad, 0 to π; the support function's coverage, as the
 ///   candidates' arcs): `asin(x_max / r) − asin(x_min / r)` over its `cells_on` rays' places across its axis, so π
 ///   where the scan sees its whole near side, less where it is hidden or seen past the edge only.
@@ -62,7 +62,7 @@ pub struct ElementScan {
     pub cells_on: u32,
     pub arc: f64,
     pub footprints_across: f64,
-    pub surface: u8,
+    pub align_prior_sd: f64,
     pub cost: f64,
     pub ray_on: f64,
     pub ray_empty: f64,
@@ -311,7 +311,7 @@ impl Scene {
                 let var = fit.held.between(&t.align, &t.align);
                 let own_sd = |j: usize| t.own_sd[j] * (t.own_cov[(j, j)] + t.own_link[j] * t.own_link[j] * var).max(0.0).sqrt();
                 rows.push(ElementScan {
-                    elem: i, group, scan: s as u32, cells: t.cells, cells_on: t.cells_on, arc: t.arc, footprints_across: t.across, surface: t.surface,
+                    elem: i, group, scan: s as u32, cells: t.cells, cells_on: t.cells_on, arc: t.arc, footprints_across: t.across, align_prior_sd: t.spread,
                     cost: t.cost(), ray_on: t.ray[0], ray_empty: t.ray[1], ray_in_front: t.ray[2], ray_behind: t.ray[3],
                     alignment: t.cost() - t.ray.iter().sum::<f64>(), field: field(t),
                     discount: self.em.discount,
@@ -429,7 +429,7 @@ impl Scene {
     /// Scan `s` as proposal `p` would leave it, nothing kept ([`View`]): its elements rendered as ids from
     /// [`Scene::next_id`], and the new term of every owner whose term changes (none: it left the scan), the alignment
     /// held. A term reads only the cells its members are the front of, each with its layers at the cell's own surface
-    /// class, and its class reads the same cells ([`term_classes`]). So the terms that change are those of the fronts of
+    /// class, and its alignment spread reads the same cells ([`term_spreads`]). So the terms that change are those of the fronts of
     /// the cells the proposal touches (before it and after); and a group's term is its members' together, so every
     /// present member of a group one of those (or an element taken out) belongs to is rescored with it, and its pooled
     /// evidence never goes stale. A scan the proposal doesn't touch has no new terms.

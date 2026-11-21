@@ -29,8 +29,8 @@ use super::settings::{Background, Settings, ALIGN_SPACING};
 /// Whose term a cell's evidence enters, per scan: the element's chain. Every element is in one chain: the caller's
 /// group (its key) or, given none, a chain of its own (its id; group keys are numbered past every id, so lone elements'
 /// chains come first, by id, then groups by key). A chain's members share one set of nuisances (one alignment shift,
-/// at their middles' mean; one stem front shift, its prior sd their mean; one reflectance level) and one surface class
-/// (the median over their cells: [`term_classes`]), so a chain of short sticks is charged its nuisances once. Its
+/// at their middles' mean; one stem front shift, its prior sd their mean; one reflectance level) and one alignment
+/// spread (from their cells' surface classes: [`term_spreads`]), so a chain of short sticks is charged its nuisances once. Its
 /// members' cells are scored as one element's.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(super) struct ChainKey(u64);
@@ -76,37 +76,35 @@ pub(super) fn term_nodes(es: &[&Element], em: &Settings) -> (Vec<([i64; 3], f64)
     (hats(&middle(es), ALIGN_SPACING), mean_of(es, |e| e.front_shift_sd(em)))
 }
 
-/// Each element's term's surface class in one view (`slot`, per element: [`slots`]), which sets the term's alignment
-/// spread: the median class of the cells its members mostly fill ([`MOSTLY`]) that hold an echo with a surface fit (mid
-/// where none). The echoes themselves read their own cells' class ([`cell_class`]).
-pub(super) fn term_classes(v: &RangeImage, cells: &[(usize, Vec<Layer>)], slot: &[usize], em: &Settings) -> Vec<u8> {
+/// Each element's term's alignment spread in one view (`slot`, per element: [`slots`]; `other` for a scan off the
+/// reference epoch): [`spread`] of the surface classes of the cells its members mostly fill ([`MOSTLY`]) that hold an
+/// echo with a surface fit. The echoes themselves read their own cells' class ([`cell_class`]).
+pub(super) fn term_spreads(v: &RangeImage, cells: &[(usize, Vec<Layer>)], slot: &[usize], other: bool, em: &Settings) -> Vec<f64> {
     let mut ks: Vec<[u32; 3]> = vec![[0; 3]; slot.iter().max().map_or(0, |m| m + 1)];
     for (cell, ls) in cells {
         if let Some((e, k)) = vote(v, *cell, ls, em) {
             ks[slot[e as usize]][k as usize] += 1;
         }
     }
-    slot.iter().map(|&t| median_class(&ks[t])).collect()
+    slot.iter().map(|&t| spread(&ks[t], other, em)).collect()
 }
 
-/// A cell's vote for a term's surface class ([`term_classes`]): the element of its first layer wholly in it, and the
+/// A cell's vote for a term's surface class ([`term_spreads`]): the element of its first layer wholly in it, and the
 /// cell's class, where that layer mostly fills it and the cell holds an echo with a surface fit.
 pub(super) fn vote(v: &RangeImage, cell: usize, ls: &[Layer], em: &Settings) -> Option<(u32, u8)> {
     let front = ls.iter().find(|l| l.full())?;
     (front.f > MOSTLY && v.cell[cell] == Cell::Echoes && v.excess[cell].is_finite()).then(|| (front.elem, em.surface(v.excess[cell] as f64)))
 }
 
-/// The median of a term's votes, counted by class (mid where it has none).
-pub(super) fn median_class(n: &[u32; 3]) -> u8 {
+/// A term's alignment spread (m, along the beam) from its cells' votes counted by surface class (`n`): the sd whose
+/// variance is the votes' mean of their classes' variances ([`Settings::align_sd`]; mid's where it has none). It moves
+/// smoothly as votes come and go, where the median class it replaced stepped (3dtrees research 130 slice-s2).
+pub(super) fn spread(n: &[u32; 3], other: bool, em: &Settings) -> f64 {
     let total: u32 = n.iter().sum();
     if total == 0 {
-        return 1;
+        return em.align_sd(1, other);
     }
-    let mut seen = 0;
-    (0..3u8).find(|&k| {
-        seen += n[k as usize];
-        seen > total / 2
-    }).unwrap_or(1)
+    ((0..3).map(|k| n[k] as f64 * em.align_sd(k as u8, other).powi(2)).sum::<f64>() / total as f64).sqrt()
 }
 
 /// One cell a term has a front share in (`cell`, its index), as its ray likelihood scores it: its pulse per subset of its mixture
@@ -131,7 +129,7 @@ pub(super) struct ElemData {
     /// Its members, as indices into the elements it was built from.
     pub(super) members: Vec<usize>,
     pub(super) cells: Vec<CellData>,
-    pub(super) surface: u8,
+    pub(super) spread: f64,
     /// Cells whose first echo is its.
     pub(super) cells_on: u32,
     /// The least and greatest of those cells' rays' place across its axis, in radii (clamped to ±1; a stick's).
@@ -202,7 +200,7 @@ impl ElemData {
                 _ => 0.0,
             },
             across: self.across,
-            surface: self.surface,
+            spread: self.spread,
             deposit: at.deposit,
         }
     }
@@ -341,7 +339,7 @@ pub(super) struct Term {
     pub(super) cells_on: u32,
     pub(super) arc: f64,
     pub(super) across: f64,
-    pub(super) surface: u8,
+    pub(super) spread: f64,
     pub(super) deposit: Deposit,
     pub(super) plug: f64,
 }
@@ -359,13 +357,13 @@ pub(super) const MAX_NEWTON: usize = 40;
 /// from the cells they may front: `cells`, in index order, each with its k-buffer as its pulse reads it
 /// ([`super::render::kept`]), its layers' `elem` indices into `elems`. A cell's evidence belongs to its
 /// layers' terms by their front shares ([`front_shares`]: wholly its front element's where that is wholly in it); its echoes read the cell's own surface class ([`cell_class`]) and its shift the term's
-/// alignment spread ([`term_classes`]), so a term depends on no other term's class. With the foliage field's box
+/// alignment spread ([`term_spreads`]), so a term depends on no other term's class. With the foliage field's box
 /// `field`, each cell holds the hits the field counts of its echoes, for the terms' deposits.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn elem_data(v: &RangeImage, cells: &[(usize, Vec<Layer>)], elems: &[Element], slot: &[usize], score: &[usize], ref_epoch: u32,
              em: &Settings, sc: &Background, ext: &Foliage, field: Option<&FoliageBox>) -> Vec<ElemData> {
-    let cls = term_classes(v, cells, slot, em);
     let other = v.epoch != ref_epoch;
+    let spreads = term_spreads(v, cells, slot, other, em);
     let level = if em.refl_noise > 0.0 && !v.echo_refl.is_empty() { em.refl_level_sd } else { 0.0 };
     let (mut members, mut at, mut by_elem): (Vec<Vec<usize>>, HashMap<usize, usize>, HashMap<u32, usize>) = Default::default();
     for &i in score {
@@ -378,9 +376,8 @@ pub(super) fn elem_data(v: &RangeImage, cells: &[(usize, Vec<Layer>)], elems: &[
     }
     let mut data: Vec<ElemData> = members.into_iter().map(|ms| {
         let es: Vec<&Element> = ms.iter().map(|&i| &elems[i]).collect();
-        let (k, (hs, front)) = (cls[ms[0]], term_nodes(&es, em));
-        let s_along = em.align_sd(k, other);
-        ElemData { cells: Vec::new(), surface: k, cells_on: 0, on_across: [f64::INFINITY, f64::NEG_INFINITY],
+        let (s_along, (hs, front)) = (spreads[ms[0]], term_nodes(&es, em));
+        ElemData { cells: Vec::new(), spread: s_along, cells_on: 0, on_across: [f64::INFINITY, f64::NEG_INFINITY],
                    across: mean_of(&es, |e| 2.0 * e.r / em.footprint(norm(&sub(&e.mid(), &v.origin)))),
                    align: hs.into_iter().map(|(key, w)| (key, w * s_along)).collect(), own_sd: Vector2::new(front, level), members: ms }
     }).collect();
@@ -401,7 +398,7 @@ pub(super) fn elem_data(v: &RangeImage, cells: &[(usize, Vec<Layer>)], elems: &[
         }
         let front = ls[0];
         let cv = cell_view(v, cell, ls.clone(), em, sc, ext);
-        let (mu, sd) = depth_sd(front_echo(&cv.pulses[0].1.receiver(0.0, 0.0, em), cls[front.elem as usize], elems[front.elem as usize].front_shift_sd(em), other, em).as_ref());
+        let (mu, sd) = depth_sd(front_echo(&cv.pulses[0].1.receiver(0.0, 0.0, em), spreads[front.elem as usize], elems[front.elem as usize].front_shift_sd(em)).as_ref());
         let outcome = Outcome::of(cv.obs, mu, sd);
         if let Some(&d) = by_elem.get(&front.elem) {
             let el = &mut data[d];

@@ -427,7 +427,7 @@ fn predictions_dict<'py>(py: Python<'py>, p: &[CellPrediction]) -> PyResult<Boun
     let d = PyDict::new(py);
     d.set_item("cell", p.iter().map(|x| x.cell as i64).collect::<Vec<_>>().into_pyarray(py))?;
     d.set_item("elem", p.iter().map(|x| x.elem).collect::<Vec<_>>().into_pyarray(py))?;
-    d.set_item("surface", p.iter().map(|x| x.surface).collect::<Vec<_>>().into_pyarray(py))?;
+    d.set_item("align_prior_sd", p.iter().map(|x| x.align_prior_sd).collect::<Vec<_>>().into_pyarray(py))?;
     d.set_item("outcome", p.iter().map(|x| x.outcome as u8).collect::<Vec<_>>().into_pyarray(py))?;
     d.set_item("read", p.iter().map(|x| x.read).collect::<Vec<_>>().into_pyarray(py))?;
     type F = fn(&CellPrediction) -> f64;
@@ -446,7 +446,7 @@ fn rows_dict<'py>(py: Python<'py>, rows: &[ElementScan]) -> PyResult<Bound<'py, 
     d.set_item("scan", rows.iter().map(|r| r.scan).collect::<Vec<_>>().into_pyarray(py))?;
     d.set_item("cells", rows.iter().map(|r| r.cells).collect::<Vec<_>>().into_pyarray(py))?;
     d.set_item("cells_on", rows.iter().map(|r| r.cells_on).collect::<Vec<_>>().into_pyarray(py))?;
-    d.set_item("surface", rows.iter().map(|r| r.surface).collect::<Vec<_>>().into_pyarray(py))?;
+    d.set_item("align_prior_sd", rows.iter().map(|r| r.align_prior_sd).collect::<Vec<_>>().into_pyarray(py))?;
     type F = fn(&ElementScan) -> f64;
     for (k, f) in [("arc", (|r| r.arc) as F), ("footprints_across", |r| r.footprints_across), ("cost", |r| r.cost), ("ray_on", |r| r.ray_on), ("ray_empty", |r| r.ray_empty),
                    ("ray_in_front", |r| r.ray_in_front), ("ray_behind", |r| r.ray_behind), ("alignment", |r| r.alignment),
@@ -589,7 +589,7 @@ impl PyScene {
         py.detach(|| c.refit_alignment())
     }
 
-    /// Per (term, scan) (scene::ElementScan): elem (a group's first member), group (-1 alone), scan, cells, cells_on, arc (rad), footprints_across, surface; its cost
+    /// Per (term, scan) (scene::ElementScan): elem (a group's first member), group (-1 alone), scan, cells, cells_on, arc (rad), footprints_across, align_prior_sd (its term's alignment spread, m: the prior sd of its alignment shift); its cost
     /// and the parts it sums (ray_on, ray_empty, ray_in_front, ray_behind, and alignment: its own nodes' prior and
     /// log-determinant; with each scan's alignment part, its cost less its rows', and the field's `field_part()`, they sum
     /// to `cost()`); beside it, not
@@ -749,7 +749,7 @@ impl PyScene {
     }
 
     /// What elements predict in scan `scan` against the scene, per cell one of them fronts (scene::CellPrediction): cell
-    /// (flat index), elem (which of them, its row), surface, outcome (0 on, 1 empty, 2 in front, 3 behind), fill,
+    /// (flat index), elem (which of them, its row), align_prior_sd (its term's alignment spread, m), outcome (0 on, 1 empty, 2 in front, 3 behind), fill,
     /// recorded, arrives, depth, sd, refl (the echo's predicted reflectance, dB), cos (the mean cos ι where the element
     /// meets the footprint), obs, obs_refl (the first echo's reflectance, dB), read (any echo the likelihood reads is
     /// on it), merge (the foliage field's own merge share with the medium behind, before the site's map), weight (the

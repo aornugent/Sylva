@@ -13,7 +13,7 @@ use super::range_image::Cell;
 use super::render::{MOSTLY, Form, Element, Layer, placed, render, keep, front_shares, layer};
 use super::scene::{Proposal, Scene, View};
 use super::settings::Settings;
-use super::term::{ChainKey, chain_key, slots, term_nodes, term_classes, Term};
+use super::term::{ChainKey, chain_key, slots, term_nodes, term_spreads, Term};
 
 /// What an element predicts in one cell it fronts ([`Scene::predict`]), on the path the likelihood scores: its fill,
 /// the chance its echo is recorded, the chance the pulse arrives (meets nothing of the foliage field before the
@@ -39,7 +39,7 @@ pub struct CellPrediction {
     pub sd: f64,
     pub refl: f64,
     pub cos: f64,
-    pub surface: u8,
+    pub align_prior_sd: f64,
     pub obs: f64,
     pub obs_refl: f64,
     pub outcome: Outcome,
@@ -216,7 +216,7 @@ impl Scene {
         let els: Vec<Element> = es.iter().copied().chain(ids.iter().map(|&i| self.elems[i as usize].unwrap())).collect();
         let owners: Vec<ChainKey> = es.iter().enumerate().map(|(k, e)| chain_key(n + k as u32, e)).chain(ids.iter().zip(&els[es.len()..]).map(|(&i, e)| chain_key(i, e))).collect();
         let other = v.epoch != self.ref_epoch;
-        let cls = term_classes(v, &cells, &slots(&owners), em);
+        let spreads = term_spreads(v, &cells, &slots(&owners), other, em);
         let mut out: Vec<CellPrediction> = cells.iter().filter(|(cell, ls)| (ls[0].elem as usize) < es.len() && v.cell[*cell] != Cell::NoPulse).map(|(cell, ls)| {
             let cell = *cell;
             let ly = ls[0];
@@ -224,12 +224,12 @@ impl Scene {
             let cv = cell_view(v, cell, ls.clone(), em, &self.sc, &self.ext);
             let pulse = &cv.pulses[0].1;
             let r = pulse.read(0.0, 0.0, em);
-            let fe = front_echo(&r.rx, cls[k], es[k].front_shift_sd(em), other, em);
+            let fe = front_echo(&r.rx, spreads[k], es[k].front_shift_sd(em));
             let (depth, sd) = depth_sd(fe.as_ref());
             // the element's occluder: none where it lies past the beam's end
             let at = pulse.occluders.iter().position(|o| matches!(o.surface, Surface::Layer(l) if l.elem == ly.elem));
             CellPrediction {
-                cell, elem: ly.elem, fill: ly.f, recorded: fe.map_or(0.0, |f| f.s), arrives: fe.map_or(0.0, |f| (-pulse.occluders[f.first].tau).exp()), surface: cls[k], depth, sd,
+                cell, elem: ly.elem, fill: ly.f, recorded: fe.map_or(0.0, |f| f.s), arrives: fe.map_or(0.0, |f| (-pulse.occluders[f.first].tau).exp()), align_prior_sd: spreads[k], depth, sd,
                 refl: fe.map_or(f64::NAN, |f| if f.db[1] > -200.0 { f.db[1] } else { f64::NAN }), cos: ly.cos, obs: cv.obs,
                 obs_refl: pulse.refls.first().map_or(f64::NAN, |&x| x as f64),
                 outcome: Outcome::of(cv.obs, depth, sd), read: pulse.echoes.iter().any(|&r| Outcome::of(r as f64, depth, sd) == Outcome::On),
@@ -334,7 +334,6 @@ impl Scene {
         after.iter().map(|a| {
             let (s, v) = (a.s, &*self.views[a.s]);
             let refl = em.refl_noise > 0.0 && !v.echo_refl.is_empty();
-            let other = v.epoch != self.ref_epoch;
             let shared = Shared::new(n, &es, em);
             // per cell: its slope's part, and the element's echo's observables with their loadings and weights
             type Rows = Vec<(Vec<f64>, Vec<(usize, f64)>, f64, f64)>;
@@ -366,7 +365,7 @@ impl Scene {
                     let info = cell_information(em, p.v(), sd * sd, ls[0].f);
                     for &(i, term, _) in &owners {
                         let Some(k) = ids.iter().position(|&id| id == ls[i].elem) else { continue };
-                        let align = em.align_sd(term.surface, other);
+                        let align = term.spread;
                         let load = |d: &Geometry| shared.load(k, align, d.g[SHIFT], d.g[LEVEL], em.refl_level_sd);
                         let w = w * shares[i];
                         rows.push((x[0].clone(), load(&p), info[0], w));
@@ -449,7 +448,6 @@ impl Scene {
             let at = |es: &[Element]| -> BTreeMap<usize, CellPrediction> { self.predict(&Proposal::put(es), s).into_iter().map(|c| (c.cell, c)).collect() };
             let (pp, qq) = (at(p), at(q));
             let refl = em.refl_noise > 0.0 && !self.views[s].echo_refl.is_empty();
-            let other = self.views[s].epoch != self.ref_epoch;
             let mut shared = Shared::new(1, p, em);
             let mut bernoulli = 0.0;
             let echo = |c: Option<&CellPrediction>| c.map_or(0.0, |c| c.arrives * c.recorded).clamp(1e-3, 1.0 - 1e-3);
@@ -461,7 +459,7 @@ impl Scene {
                 bernoulli += w * (ea * (ea / eb).ln() + (1.0 - ea) * ((1.0 - ea) / (1.0 - eb)).ln());
                 let (Some(a), Some(b)) = (a, b) else { continue };
                 let k = a.elem as usize;
-                let (align, front) = (em.align_sd(a.surface, other), p[k].front_shift_sd(em));
+                let (align, front) = (a.align_prior_sd, p[k].front_shift_sd(em));
                 let [_, depth, refl_info] = cell_information(em, ea, a.sd * a.sd - align * align - front * front, a.fill);
                 let load = shared.load(k, align, 1.0, 0.0, em.refl_level_sd);
                 shared.add(&[b.depth - a.depth], &load, depth, w);

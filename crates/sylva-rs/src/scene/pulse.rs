@@ -149,11 +149,11 @@ pub(super) fn cell_class(v: &RangeImage, cell: usize, em: &Settings) -> u8 {
 
 /// The front element's echo in a cell as the likelihood reads it: the first return of the most likely way the cell's
 /// occluders come back ([`Receiver::front`]; none without an occluder), its sd widened by the alignment error's spread
-/// at the front element's term's surface class `k` ([`term_classes`]) and the stem front shift's prior spread (the front element's, `front_sd`;
-/// `other` for a scan off the reference epoch). [`Outcome::of`] against it is the one rule for "the cell's first echo
+/// at the front element's term (`spread`: [`term_spreads`], the epoch's part in it) and the stem front shift's prior
+/// spread (the front element's, `front_sd`). [`Outcome::of`] against it is the one rule for "the cell's first echo
 /// is the element's".
-pub(super) fn front_echo(rx: &Receiver<f64>, k: u8, front_sd: f64, other: bool, em: &Settings) -> Option<Return> {
-    rx.front().map(|f| Return { sd: f.sd.hypot(em.align_sd(k, other)).hypot(front_sd), ..f })
+pub(super) fn front_echo(rx: &Receiver<f64>, spread: f64, front_sd: f64) -> Option<Return> {
+    rx.front().map(|f| Return { sd: f.sd.hypot(spread).hypot(front_sd), ..f })
 }
 
 /// The depth and sd of an element's echo (NaN for none), as [`Outcome::of`] reads it.

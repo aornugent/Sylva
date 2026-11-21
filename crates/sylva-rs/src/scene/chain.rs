@@ -46,7 +46,7 @@ use super::pulse::mixture_taken;
 use super::render::{Element, Form, Layer, KBuffer, keep, numbered, render};
 use super::scene::{Proposal, Scene, redeposit};
 use super::settings::Settings;
-use super::term::{CellData, ChainKey, Term, eliminate, elem_data, median_class, chain_key, settle, slots, term_nodes, vote, clipped, mean_of};
+use super::term::{CellData, ChainKey, Term, eliminate, elem_data, spread, chain_key, settle, slots, term_nodes, vote, clipped, mean_of};
 
 /// The clock's reference radius (m): dτ = ds / r · (r / R_CLOCK)^(1 − β), so β = 1 is length in radii and β = 0 is
 /// length in units of R_CLOCK, whatever the radius (`Settings::axis_clock`).
@@ -467,9 +467,9 @@ impl Scene {
         };
         let mut term = (!members.is_empty()).then(|| {
             let es: Vec<&Element> = members.iter().collect();
-            let class = median_class(&tally);
+            let s_along = spread(&tally, v.epoch != self.ref_epoch, em);
             let (hs, front) = term_nodes(&es, em);
-            let align: Vec<([i64; 3], f64)> = hs.into_iter().map(|(k, w)| (k, w * em.align_sd(class, v.epoch != self.ref_epoch))).collect();
+            let align: Vec<([i64; 3], f64)> = hs.into_iter().map(|(k, w)| (k, w * s_along)).collect();
             let level = if em.refl_noise > 0.0 && !v.echo_refl.is_empty() { em.refl_level_sd } else { 0.0 };
             let own_sd = Vector2::new(front, level);
             let a = fit.held.shift(&align);
@@ -484,7 +484,7 @@ impl Scene {
             Term {
                 align, fit: -at.ll + 0.5 * (y[0] * y[0] + y[1] * y[1]), logdet: 0.5 * el.det.ln(), slope: el.slope, curv: el.curv, own: y, start, own_sd,
                 own_cov: el.pi, own_link: el.pl, ray: [0.0; 4], cells: (cs.cells.len() - gone.len() + fresh_cells.len()) as u32, cells_on: 0, arc: 0.0,
-                across: mean_of(&es, |x| 2.0 * x.r / em.footprint(norm(&sub(&x.mid(), &v.origin)))), surface: class, deposit: Vec::new(), plug: 0.0,
+                across: mean_of(&es, |x| 2.0 * x.r / em.footprint(norm(&sub(&x.mid(), &v.origin)))), spread: s_along, deposit: Vec::new(), plug: 0.0,
             }
         });
         // the deposits of the cells it reads, at the term's mode, and the term's plug-in: the chain's less the cells
