@@ -206,7 +206,7 @@ impl RangeImage {
     }
 
     /// One scan's range image from pulses with at most one echo each: `range` NaN for a pulse fired with no echo;
-    /// the pattern's zenith range is the pulses' own.
+    /// the pattern's zenith range is the pulses' own; its instrument's cap is 1, each pulse censored after its echo.
     pub fn from_first_echoes(time: &[f64], direction: &[Point], range: &[f32], rot: [[f64; 3]; 3], origin: Point, epoch: u32, p: &RangeImageParams) -> RangeImage {
         let mut echo_start = vec![0u32];
         let mut echo_range = Vec::new();
@@ -218,7 +218,11 @@ impl RangeImage {
         }
         let z = direction.iter().map(|d| rot_t(&rot, d)[2].clamp(-1.0, 1.0).acos().to_degrees());
         let zr = z.fold((f64::INFINITY, f64::NEG_INFINITY), |(a, b), z| (a.min(z), b.max(z)));
-        RangeImage::new(time, direction, echo_start, echo_range, zr, rot, origin, epoch, p)
+        let mut v = RangeImage::new(time, direction, echo_start, echo_range, zr, rot, origin, epoch, p);
+        // an image of first echoes holds one target a pulse: past it, censored (3dtrees research 130 S3; read as
+        // uncapped under the programme's cap since slice-observation, it moved the stand's perturbed alignment check)
+        v.instrument = Arc::new(Instrument { max_targets: 1, ..Instrument::default() });
+        v
     }
 
     /// The range image of one scan from its pulses in acquisition order: `time` (s), `direction` (world, unit),
