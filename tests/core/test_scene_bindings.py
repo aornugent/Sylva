@@ -201,13 +201,13 @@ def test_the_collapsed_field_crosses_the_binding():
 
 
 def test_the_rules_consumers_read_beside_the_cost_cross_the_binding():
-    """The footprint, the detection floor, a fill with its slope in ln r and the field's marginal per voxel, the
-    scene's own rules, under the settings given (the defaults without)."""
+    """The footprint, detection at a given floor (the floor is the instrument's: a range image's `floor`), a fill with
+    its slope in ln r and the field's marginal per voxel, the scene's own rules, under the settings given (the defaults
+    without)."""
     from math import lgamma, log
     s = _core.settings_defaults()
     t = np.array([4.0, 30.0])
     assert np.allclose(_core.footprint(t), s['beam_exit'] + s['beam_divergence'] * t)
-    assert np.allclose(_core.floor(t, dict(floor_db=-40.0)), -40.0 + s['floor_slope'] * np.log10(np.maximum(t, s['floor_ref']) / s['floor_ref']))
     f, g = _core.beam_fill(np.array([0.0, 0.03, 0.1]), 0.03, np.full(3, 0.004))
     assert np.allclose(f, [1.0, 0.5, 0.0]) and g[0] == 0.0 and g[1] > 0.0
     h = 1e-6
@@ -217,8 +217,8 @@ def test_the_rules_consumers_read_beside_the_cost_cross_the_binding():
     nb = _core.field_ln_nb(np.array([2.0, 0.0]), np.array([3.0, 0.0]), 0.05, 0.4)
     assert np.allclose(nb, [lgamma(a0 + 2) - lgamma(a0) + a0 * log(b0) - (a0 + 2) * log(b0 + 3), 0.0])
     from math import erfc, sqrt
-    floor = _core.floor(np.array([4.0]))[0]
-    p = _core.p_detect(np.array([-15.0]), np.array([0.5]), np.array([4.0]))
+    floor = -40.5
+    p = _core.p_detect(np.array([-15.0]), np.array([0.5]), np.array([floor]))
     assert np.isclose(p[0], 0.5 * erfc(-((-15.0 + 10 * np.log10(0.5) - floor) / s['detect_sd']) / sqrt(2)))
     assert np.allclose(_core.mismatch_sd(np.array([0.01, 0.1])), s['mismatch_base'] + s['mismatch_slope'] * np.array([0.01, 0.1]))
     keys, w = _core.alignment_hats(np.array([[0.3, 4.1, -0.7], [2.0, 2.0, 2.0]]))

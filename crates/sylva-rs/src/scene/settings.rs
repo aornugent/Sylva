@@ -37,11 +37,6 @@ params! {
         /// (research 130 slice 11, `edges.py`).
         pub beam_exit: f64 = 0.007,
         pub beam_divergence: f64 = 0.35e-3,
-        /// The most targets the scanner reports per pulse at its programme: the VZ-2000i's 1.2 MHz programme reports 4
-        /// (the RXP's `meas_max_targets` in all 40 AM scans; the datasheet), the stand's simulator 3. Every target the
-        /// scanner reported takes a slot, those the import drops too ([`super::range_image::RangeImage::slots`]); a
-        /// pulse that used them all is censored after its last echo (3dtrees research 130 observation).
-        pub max_targets: f64 = 4.0,
         /// Excess at the solid/mid and mid/fragmented boundaries of the surface class (`constants.py rca`: on raw
         /// scans they split alignment-rca's symptom, 1.1 / 2.8 / 4.4 mm between cells).
         pub class_edge_mid: f64 = 1.2,
@@ -59,13 +54,10 @@ params! {
         pub bias_slope_solid: f64 = -0.000028,
         pub bias_slope_mid: f64 = -0.000034,
         pub bias_slope_fragmented: f64 = -0.000067,
-        /// The detection floor: an echo is recorded when its reflectance (dB, the surface's at full fill and face-on
-        /// plus `10 log10` of its energy share) clears `floor_db + floor_slope log10(max(ρ, floor_ref) / floor_ref)`
-        /// at range ρ ([`Settings::floor`]), within a spread `detect_sd` (dB). The scanner's floor is in amplitude,
-        /// so in reflectance it rises with range (`constants.py floor`, from the faintest echoes).
-        pub floor_db: f64 = -40.5,
-        pub floor_slope: f64 = 15.0,
-        pub floor_ref: f64 = 7.0,
+        /// The detection's spread (dB) about the scan's instrument's floor ([`super::instrument::Instrument::floor`]):
+        /// an echo is recorded when its reflectance (the surface's at full fill and face-on plus `10 log10` of its energy
+        /// share) clears the floor, give or take this; it is the spread of the predicted reflectance more than the
+        /// receiver's (3dtrees research 130 observation).
         pub detect_sd: f64 = 2.0,
         /// The surfaces' reflectance (dB at full fill, face-on): wood and leaf (an element renders with its class's)
         /// and the ground. The dimmer of wood and leaf is the reference the foliage field reads an echo's energy share
@@ -74,7 +66,7 @@ params! {
         /// is declared: `leaf.py` am's single-echo peak in rank-3 voxels plus the stand's partial-fill offset (1.9 dB);
         /// not measured (leaf-reflectance.md). AM's ground is measured on its ground echoes (`ground.py am`, slice 2d).
         /// AM's measured values come from day-1 scans about a second box that no held-out check holds out.
-        pub refl_wood: f64 = -15.2,
+        pub refl_wood: f64 = -15.1,
         pub refl_leaf: f64 = -15.6,
         pub refl_ground: f64 = -16.9,
         /// The ground plane ([`Background`]'s `ground_z`), as AM's ground echoes measure it (3dtrees research 130 slice
@@ -95,8 +87,8 @@ params! {
         /// a fitted peak follows the nearer unless the farther outweighs it, far less than their energy-weighted range
         /// says (3dtrees research 130 slice 2c: AM's edges with one echo and a surface within the resolution behind,
         /// fitted by least absolute deviations, `reflectance.py site`'s `merge_summary`; slices 9, consolidate, grid).
-        pub pull_a: f64 = 2.304,
-        pub pull_b: f64 = 0.078,
+        pub pull_a: f64 = 2.229,
+        pub pull_b: f64 = 0.052,
         /// The merge share behind a layer, calibrated per site (3dtrees research 130 slice 2c): the foliage field's own
         /// share M (`1 − exp(−b ∫ σ (1 − p))`, [`super::scene`]'s merges) predicts a site's merges beside wood too
         /// poorly to stand alone (slice-soft), so the share is `logistic(merge_a + merge_field M + merge_range t +
@@ -104,10 +96,10 @@ params! {
         /// [`super::scene::Scene::predict`] reports it, on edges whose pulse merged with a surface within the
         /// resolution behind (`reflectance.py site`'s `merge_summary`, the field held in; AM's from day-1 scans the
         /// held-out checks never hold out: slices 2d, products; rca-field-range, with the field on its prior's voxel).
-        pub merge_a: f64 = -2.9895,
-        pub merge_field: f64 = 8.0447,
-        pub merge_range: f64 = -0.0689,
-        pub merge_fill: f64 = 3.3675,
+        pub merge_a: f64 = -2.7019,
+        pub merge_field: f64 = 7.7823,
+        pub merge_range: f64 = -0.0948,
+        pub merge_fill: f64 = 3.2474,
         /// Located edges (3dtrees research 130 step 2): an echo's reflectance (dB) is read beside its range. A return's
         /// predicted reflectance is `10 log10` of its members' energy shares (each fill × the beam left × cos^k ι ×
         /// the surface's reflectance, k `refl_incidence`, which sets the detection too; a merged return sums them), so
@@ -122,9 +114,9 @@ params! {
         /// zenith factor, slice-grid).
         pub refl_noise: f64 = 0.37,
         pub refl_dof: f64 = 3.8,
-        pub refl_edge: f64 = 10.89,
-        pub refl_incidence: f64 = 0.25,
-        pub refl_level_sd: f64 = 0.78,
+        pub refl_edge: f64 = 11.35,
+        pub refl_incidence: f64 = 0.3,
+        pub refl_level_sd: f64 = 0.76,
         pub refl_background_mean: f64 = -21.29,
         pub refl_background_sd: f64 = 6.28,
         /// The scan alignment error (research 130 offset-field-design.md): an along-beam shift per (scan, place),
@@ -272,34 +264,29 @@ impl Settings {
         }
     }
 
-    /// The detection floor (dB) at range `range`.
-    pub fn floor<P: Real>(&self, range: P) -> P {
-        (range.max(self.floor_ref) / self.floor_ref).log10() * self.floor_slope + self.floor_db
-    }
-
-    /// The chance an echo of energy share `e` (fill × cos) off a surface of reflectance `db` (dB) at range `range` is
-    /// recorded: above the detection floor.
-    pub fn p_detect<P: Real, T: Over<P>>(&self, db: T, e: P, range: P) -> T {
-        (-((db + e.max(1e-12).log10() * 10.0 - self.floor(range)) / self.detect_sd) / std::f64::consts::SQRT_2).erfc() * 0.5
+    /// The chance an echo of energy share `e` (fill × cos) off a surface of reflectance `db` (dB) is recorded where the
+    /// detection floor is `floor` (dB; the scan's instrument's at its range): above it.
+    pub fn p_detect<P: Real, T: Over<P>>(&self, db: T, e: P, floor: P) -> T {
+        (-((db + e.max(1e-12).log10() * 10.0 - floor) / self.detect_sd) / std::f64::consts::SQRT_2).erfc() * 0.5
     }
 
     /// The chance it is not recorded: `1 − p_detect`, computed as its own tail. `1 − p_detect` cancels to 0 once
     /// p_detect rounds to 1 (z > 8.3, a bright near-full hit; 3dtrees research 130 rca-level-modes.md).
-    pub fn p_miss<P: Real, T: Over<P>>(&self, db: T, e: P, range: P) -> T {
-        (((db + e.max(1e-12).log10() * 10.0 - self.floor(range)) / self.detect_sd) / std::f64::consts::SQRT_2).erfc() * 0.5
+    pub fn p_miss<P: Real, T: Over<P>>(&self, db: T, e: P, floor: P) -> T {
+        (((db + e.max(1e-12).log10() * 10.0 - floor) / self.detect_sd) / std::f64::consts::SQRT_2).erfc() * 0.5
     }
 
     /// The density of an echo's reflectance `x` (dB) given its return's predicted reflectance `pred`, give or take
-    /// `spread` (dB, the element's own uncertainty), and fill `fill` at range `range`, as recorded: the per-echo noise,
+    /// `spread` (dB, the element's own uncertainty), and fill `fill` where the floor is `floor` (dB), as recorded: the per-echo noise,
     /// truncated by the detection floor (its chance of clearing the floor is the return's own, so this is the
     /// reflectance's density given that it was recorded; the truncation is read as a Gaussian's). 1 when `x` is
     /// unknown or reflectance is off.
-    pub fn refl_density<P: Real, T: Over<P>>(&self, x: f64, pred: T, spread: T, fill: P, range: P) -> T {
+    pub fn refl_density<P: Real, T: Over<P>>(&self, x: f64, pred: T, spread: T, fill: P, floor: P) -> T {
         if !x.is_finite() || self.refl_noise <= 0.0 {
             return T::c(1.0);
         }
         let s = T::from(P::c(self.refl_noise).hypot((P::c(1.0) - fill.clamp(0.0, 1.0)) * self.refl_edge)).hypot(spread);
-        let fl = self.floor(range);
+        let fl = floor;
         let nu = self.refl_dof;
         let t = (-((-(pred - x) / s).sq() / nu + 1.0).ln() * (0.5 * (nu + 1.0)) + t_log_norm(nu)).exp() / s;
         t * ((-((P::c(x) - fl) / self.detect_sd) / std::f64::consts::SQRT_2).erfc() * 0.5)

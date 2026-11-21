@@ -7,7 +7,7 @@
 //!
 //! - **Settings and background:** flat dicts of the records' fields (`Settings`, `Background`), each optional;
 //!   `settings_defaults()` returns the settings' defaults (AM's). An unknown key raises. A few of the scene's rules for
-//!   what consumers read beside the cost: `footprint`, `floor`, `p_detect` (the detection's chance), `mismatch_sd`
+//!   what consumers read beside the cost: `footprint`, `p_detect` (the detection's chance), `mismatch_sd`
 //!   (the shape mismatch's prior), `beam_fill` (a fill and its slope in ln r), `field_ln_nb` (the foliage field's
 //!   marginal per voxel) and `alignment_hats` (the scan alignment error's nodes about points).
 //! - **Elements:** a dict of arrays, one row per element: `a`, `b` (n, 3) and `r` (n,) are required; `opacity` (n,)
@@ -94,24 +94,17 @@ fn footprint<'py>(py: Python<'py>, range: PyReadonlyArray1<f64>, settings: Optio
     Ok(range.as_slice()?.iter().map(|&t| em.footprint(t)).collect::<Vec<_>>().into_pyarray(py))
 }
 
-/// The detection floor (dB) at each range (`Settings::floor`), under `settings` (the defaults without).
-#[pyfunction]
-#[pyo3(signature = (range, settings=None))]
-fn floor<'py>(py: Python<'py>, range: PyReadonlyArray1<f64>, settings: Option<&Bound<'_, PyDict>>) -> PyResult<Bound<'py, PyArray1<f64>>> {
-    let em = self::settings(settings)?;
-    Ok(range.as_slice()?.iter().map(|&t| em.floor(t)).collect::<Vec<_>>().into_pyarray(py))
-}
-
 /// The chance an echo is recorded (`Settings::p_detect`) off a surface of reflectance `db` (dB, at full fill and face-on)
-/// taking energy share `share` (its fill × cos^k ι) at range `range` (arrays alike), under `settings`.
+/// taking energy share `share` (its fill × cos^k ι) where the detection floor is `floor` (dB: a range image's
+/// instrument's at the echo's range, `RangeImage.floor`) (arrays alike), under `settings`.
 #[pyfunction]
-#[pyo3(signature = (db, share, range, settings=None))]
-fn p_detect<'py>(py: Python<'py>, db: PyReadonlyArray1<f64>, share: PyReadonlyArray1<f64>, range: PyReadonlyArray1<f64>,
+#[pyo3(signature = (db, share, floor, settings=None))]
+fn p_detect<'py>(py: Python<'py>, db: PyReadonlyArray1<f64>, share: PyReadonlyArray1<f64>, floor: PyReadonlyArray1<f64>,
                  settings: Option<&Bound<'_, PyDict>>) -> PyResult<Bound<'py, PyArray1<f64>>> {
     let em = self::settings(settings)?;
-    let (d, e, t) = (db.as_slice()?, share.as_slice()?, range.as_slice()?);
+    let (d, e, t) = (db.as_slice()?, share.as_slice()?, floor.as_slice()?);
     if d.len() != e.len() || t.len() != e.len() {
-        return Err(PyValueError::new_err("p_detect: db, share and range need one value each"));
+        return Err(PyValueError::new_err("p_detect: db, share and floor need one value each"));
     }
     Ok(d.iter().zip(e).zip(t).map(|((&d, &e), &t)| em.p_detect::<f64, f64>(d, e, t)).collect::<Vec<_>>().into_pyarray(py))
 }
@@ -277,6 +270,28 @@ struct PyRangeImage {
     pyramid: std::sync::Mutex<Option<(String, Arc<Pyramid>)>>,
 }
 
+/// The instrument's record applied to an image as it is made: `max_targets`, `weak_amplitude`, `weak_range` and,
+/// when given, `floor` (dB every `Instrument::STEP` m from 0; else the table read off the scan's own echoes stays).
+/// An unknown key raises.
+fn with_instrument(v: &mut RangeImage, d: Option<&Bound<'_, PyDict>>) -> PyResult<()> {
+    let Some(d) = d else { return Ok(()) };
+    let mut i = (*v.instrument).clone();
+    for (k, x) in d.iter() {
+        match k.extract::<String>()?.as_str() {
+            "max_targets" => i.max_targets = x.extract()?,
+            "weak_amplitude" => i.weak_amplitude = x.extract()?,
+            "weak_range" => i.weak_range = x.extract()?,
+            "floor" => {
+                i.floor = x.extract()?;
+                i.floor_step = sylva_rs::scene::instrument::Instrument::STEP;
+            }
+            other => return Err(PyValueError::new_err(format!("instrument: unknown key {other}"))),
+        }
+    }
+    v.instrument = Arc::new(i);
+    Ok(())
+}
+
 impl PyRangeImage {
     fn of(inner: RangeImage) -> Self {
         PyRangeImage { inner: Arc::new(inner), pyramid: std::sync::Mutex::new(None) }
@@ -328,12 +343,31 @@ impl PyRangeImage {
         self.inner.step()
     }
 
+    /// The instrument that recorded the scan (scene::instrument): max_targets, floor (dB every floor_step m from 0),
+    /// floor_step, weak_amplitude, weak_range.
+    fn instrument<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
+        let i = &self.inner.instrument;
+        let d = PyDict::new(py);
+        d.set_item("max_targets", i.max_targets)?;
+        d.set_item("floor", i.floor.clone().into_pyarray(py))?;
+        d.set_item("floor_step", i.floor_step)?;
+        d.set_item("weak_amplitude", i.weak_amplitude)?;
+        d.set_item("weak_range", i.weak_range)?;
+        Ok(d)
+    }
+
+    /// The detection floor (dB) at each range, the instrument's.
+    fn floor<'py>(&self, py: Python<'py>, range: PyReadonlyArray1<f64>) -> PyResult<Bound<'py, PyArray1<f64>>> {
+        Ok(range.as_slice()?.iter().map(|&t| self.inner.instrument.floor(t)).collect::<Vec<_>>().into_pyarray(py))
+    }
+
     /// One scan's range image from its shots file and the pose in its sidecar (`.json` beside it).
     #[staticmethod]
-    #[pyo3(signature = (path, epoch=0))]
-    fn from_file(py: Python<'_>, path: std::path::PathBuf, epoch: u32) -> PyResult<Self> {
+    #[pyo3(signature = (path, epoch=0, instrument=None))]
+    fn from_file(py: Python<'_>, path: std::path::PathBuf, epoch: u32, instrument: Option<&Bound<'_, PyDict>>) -> PyResult<Self> {
         let p = RangeImageParams::default();
-        let inner = py.detach(|| RangeImage::from_file(&path, epoch, &p)).map_err(|e| PyValueError::new_err(e.to_string()))?;
+        let mut inner = py.detach(|| RangeImage::from_file(&path, epoch, &p)).map_err(|e| PyValueError::new_err(e.to_string()))?;
+        with_instrument(&mut inner, instrument)?;
         Ok(PyRangeImage::of(inner))
     }
 
@@ -344,8 +378,10 @@ impl PyRangeImage {
 
     /// The image `save` wrote; raises for a file from a build with another `build_version`.
     #[staticmethod]
-    fn load(py: Python<'_>, path: std::path::PathBuf) -> PyResult<Self> {
-        let inner = py.detach(|| RangeImage::load(&path)).map_err(|e| PyValueError::new_err(e.to_string()))?;
+    #[pyo3(signature = (path, instrument=None))]
+    fn load(py: Python<'_>, path: std::path::PathBuf, instrument: Option<&Bound<'_, PyDict>>) -> PyResult<Self> {
+        let mut inner = py.detach(|| RangeImage::load(&path)).map_err(|e| PyValueError::new_err(e.to_string()))?;
+        with_instrument(&mut inner, instrument)?;
         Ok(PyRangeImage::of(inner))
     }
 
@@ -495,7 +531,6 @@ pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(candidates, m)?)?;
     m.add_function(wrap_pyfunction!(settings_defaults, m)?)?;
     m.add_function(wrap_pyfunction!(footprint, m)?)?;
-    m.add_function(wrap_pyfunction!(floor, m)?)?;
     m.add_function(wrap_pyfunction!(beam_fill, m)?)?;
     m.add_function(wrap_pyfunction!(p_detect, m)?)?;
     m.add_function(wrap_pyfunction!(mismatch_sd, m)?)?;

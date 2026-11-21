@@ -8,7 +8,8 @@
 //! - [`lattice`]: each pulse's native (line, col) cell from its time.
 //! - [`range_image`]: one scan's observations on its lattice, and the signals read off them.
 //! - [`moments`]: surfel moments per (voxel, scan), and the candidate elements read off them.
-//! - [`settings`]: the instrument and site settings and the background.
+//! - [`instrument`]: the instrument that recorded a scan: its cap and detection floor, owned by its range image.
+//! - [`settings`]: the site settings and the background.
 //! - [`foliage`]: the foliage field, a residual extinction on voxels.
 //! - [`dual`]: forward derivatives in any number of variables: second order for the own nodes' Newton, first order
 //!   for the geometry's slope and Fisher information.
@@ -90,6 +91,7 @@ pub mod dual;
 #[cfg(test)]
 mod fixtures;
 pub mod foliage;
+pub mod instrument;
 pub mod lattice;
 pub mod moments;
 pub mod pulse;
