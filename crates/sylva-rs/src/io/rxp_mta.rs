@@ -229,6 +229,8 @@ struct ShotRec {
     o: [f32; 3],
     d: [f32; 3],
     facet: u8,
+    /// The targets RiVLib reported for the shot, before any filter: the slots its pulse used of the scanner's cap.
+    targets: u8,
 }
 
 #[derive(Clone, Copy)]
@@ -284,6 +286,7 @@ struct Out {
     uncertain: Vec<u8>,
     range: Vec<f32>,
     pulse: Vec<u64>,
+    targets: Vec<u8>,
 }
 
 struct Pipeline<'a> {
@@ -632,6 +635,7 @@ impl Pipeline<'_> {
             o.uncertain.push(uncertain as u8);
             o.range.push(r as f32);
             o.pulse.push(((pl as u64) << 24) | ps as u64);
+            o.targets.push(shot.targets);
             self.n.kept += 1;
         }
     }
@@ -756,7 +760,7 @@ pub fn read_rxp_mta_with_stats(path: &Path, opts: &RxpOptions, m: &MtaOptions) -
                 let l = cur.as_mut().unwrap();
                 debug_assert_eq!(shot_no as usize, l.shots.len());
                 let (time, ox, oy, oz, dx, dy, dz, facet) = (s.time, s.ox, s.oy, s.oz, s.dx, s.dy, s.dz, s.facet);
-                l.shots.push(ShotRec { time, o: [ox, oy, oz], d: [dx, dy, dz], facet });
+                l.shots.push(ShotRec { time, o: [ox, oy, oz], d: [dx, dy, dz], facet, targets: s.n_echo });
                 for _ in 0..n_echo {
                     let e = echo_buf[ei];
                     ei += 1;
@@ -845,6 +849,7 @@ fn finish(o: Out, opts: &RxpOptions, m: &MtaOptions) -> PointCloud {
     a.insert("scan_line_index".into(), Attr::I32(sel(&o.line, &keep)));
     a.insert("shot_index_line".into(), Attr::I32(sel(&o.shot, &keep)));
     a.insert("mirror_facet".into(), Attr::U8(sel(&o.facet, &keep)));
+    a.insert("target_count".into(), Attr::U8(sel(&o.targets, &keep)));
     if m.keep_uncertain {
         a.insert("mta_uncertain_point".into(), Attr::U8(sel(&o.uncertain, &keep)));
     }
