@@ -14,18 +14,23 @@
 //!   ([`Settings`]'s `field_prior_mean` and `field_prior_path`: shape `a₀ = m₀ b₀`, rate `b₀`), measured per site as the
 //!   empty scene's type-II maximum. Each voxel's weighted counts, echoes in it (h) and ray length through it (L), give
 //!   σ the Gamma posterior `(a₀ + h, b₀ + L)`.
-//! - **The field's term in the cost** (3dtrees research 130 formulation.md: the field collapsed). σ integrated out,
-//!   a voxel's counts have the closed-form marginal `ln NB(h, L) = ln Γ(a₀ + h) − ln Γ(a₀) + a₀ ln b₀ − (a₀ + h)
-//!   ln(b₀ + L)` (a Gamma-mixed Poisson), and the field's term is its sum over the voxels, every count scored. It
-//!   depends on the scene only through the counts, so a move changes it on the voxels whose hits its terms' deposits
-//!   change, exactly ([`FieldCounts`]); the scene's cost holds its change against the empty scene's counts. So an
-//!   element whose echoes a denser medium could explain pays for them: the medium's alternative is read with its Occam
-//!   factor, not at a σ̂ the element's own echoes were left out of.
-//! - **What a pulse meets behind an element's front** (the medium behind its returns, their merges and τ inside the
-//!   ray likelihood) is σ's posterior mean `α / β` per voxel, for the optical depth, the hazard and the merge share
-//!   alike (3dtrees research 130 slice 2c: one medium, read the same at every point of a pulse; the Gamma–Poisson
-//!   predictive it replaces read each cell as a draw of its own). That part isn't conjugate (the merge share is a
-//!   calibrated map, not a likelihood in σ), so it stays this first-order reading, held between refits (below).
+//! - **The field's term in the cost: the exact formula per voxel** (3dtrees research 130 field-closed-form,
+//!   field-slice). Each echo a term takes a share of enters its voxel's formula with its densities under the term and
+//!   the medium, read once from the pass over its pulse ([`Echo`]); the scene's gain is the expectation, over the
+//!   voxel's density under its empty-scene posterior, of the product of those echoes' factors ([`FieldCounts`]). With
+//!   an echo's field weight its cell's, that is the exact marginal over the density and over who made each echo, given
+//!   the per-echo densities: the field value a pulse reads cancels from the cost, so no round of EM and no plug-in is
+//!   needed, and an element whose echoes a denser medium could explain pays for them with the medium's own penalty
+//!   for extra freedom. A move changes it on the voxels whose echoes its terms' deposits change, exactly.
+//! - **What a pulse reads of the field** (the medium's hazard, optical depths and merges inside the ray likelihood)
+//!   is the empty scene's posterior mean per voxel, `(a₀ + H) / (b₀ + L)`: data alone, the same for every scene. In
+//!   the cost it only weighs the echoes between the terms and the medium, which the exact formula then undoes; it
+//!   still sets the merge share, the few centimetres of path between a return and its echo, and the terms' own
+//!   nodes' modes.
+//! - **Grains** ([`Settings::grain_radius`]; 3dtrees research 130 grain-field): σ is a point's extinction among opaque
+//!   grains of radius s, and a pulse of footprint w reads it times `(1 + w/2s)²` ([`grain_factor`]), so the field's
+//!   counts weigh each stretch's path by that factor too, and each echo and stretch counts the cell's share of a
+//!   grain's grown shadow ([`field_weight`]) in place of the cell's weight.
 //! - **A pulse's echo sequence:** every echo is a hit, and the path up to it is transmission, from the origin for the
 //!   first and from the previous echo plus the receiver's resolution after that (a surface closer behind an echo would
 //!   have merged with it: [`Settings::resolution`]). The report is the first K returns in time (research 130 slice
@@ -46,9 +51,8 @@
 //!   hits the other scans' field predicts (3dtrees research 130 rca-field-range). (On held-out transmission
 //!   this reading is as good as the first echo's alone or better: research 130 slices 12c, 13b. A clumping factor Ω
 //!   on the optical depth wasn't supported: slice 12c.) Each echo and each voxel's piece of a ray counts
-//!   [`Settings::cell_weight`] at its own range: how many neighbouring beams overlap there (slice-path). φ there is a
-//!   compound Poisson's clump size: mulga's leaf hits are clumped, and their dispersion is flat in cell size
-//!   (synthesis §2).
+//!   [`field_weight`] at its own range: without grains the cell's weight, how many neighbouring beams overlap there
+//!   (slice-path); with them, the cell's share of a grain.
 //! - **Soft attribution: what the field counts** (3dtrees research 130 slice-soft; formulation.md "Soft attribution
 //!   and the representation under it"). Every ray counts its whole path, in the beam its echoes left: the ray
 //!   likelihood reads the medium's path in every way it explains a pulse (an echo is the medium's, an element's or an
@@ -58,10 +62,9 @@
 //!   term's [`Deposit`]). So each echo's mass sums to one between the field and the elements, and nothing about an
 //!   element is set aside. The empty scene's counts read every echo as the medium's.
 //! - **Through moves** ([`FieldCounts`]): a move changes the deposits of the terms it recomputes (each term's old
-//!   deposit back, its new one out), and the field's term with them, exactly; what a pulse meets is the field fixed at
-//!   the scene's build (one step of EM: the responsibilities given κ, then the field given them), so the cost is a
-//!   function of the scene and that field, not of the moves that led to it. The field's own term is never stale; only
-//!   that reading is fixed.
+//!   deposit back, its new one out), and the field's term with them, exactly; what a pulse reads is the empty scene's
+//!   field, so the cost is a function of the scene alone, and a scene reached by moves is a fresh build of its
+//!   elements, to the held alignment's error.
 //! - **Counts and the term are fixed point** ([`FIXED`]): integer sums are exact in any order, so a move and its undo
 //!   restore them exactly and a count over threads is reproducible.
 use super::dual::Real;
@@ -88,33 +91,64 @@ pub const FIXED: f64 = (1u64 << 40) as f64;
 /// Weighted counts per voxel in fixed point ([`FIXED`]): [hits, path].
 pub type FixedCounts = HashMap<[i32; 3], [i64; 2], std::hash::BuildHasherDefault<VoxelHasher>>;
 
-/// Weighted hits per voxel in fixed point: what the elements take, and a move's change to it (the path is never
-/// taken).
-pub type FixedHits = HashMap<[i32; 3], i64, std::hash::BuildHasherDefault<VoxelHasher>>;
-
-/// The hits a term's elements take from the field (the module docs: soft attribution), per voxel in fixed point, in
-/// voxel order: a function of the term alone, so a move's change to the counts is its terms' old deposits less
-/// their new ones, exactly.
-pub type Deposit = Vec<([i32; 3], i64)>;
-
-/// A deposit from (voxel, hits) pairs: each voxel's sum, in the pairs' order, in fixed point.
-pub fn deposit(hits: impl Iterator<Item = ([i32; 3], f64)>) -> Deposit {
-    let mut by: std::collections::BTreeMap<[i32; 3], f64> = Default::default();
-    for (k, h) in hits {
-        *by.entry(k).or_default() += h;
-    }
-    by.into_iter().map(|(k, h)| (k, (h * FIXED).round() as i64)).filter(|x| x.1 != 0).collect()
+/// An echo a term takes a share of, as the voxel's exact formula reads it (3dtrees research 130 field-slice,
+/// field-closed-form): its voxel; ω, its count in the field (the field's weight times the term's front share); and,
+/// from the pass over its pulse at the read field, `a = σ̂ t / f` and `b = 1 − t`, with t the share the term's layers
+/// take, σ̂ the hazard the pulse read at the echo and f the grain factor there ([`grain_factor`]). Its factor in the
+/// voxel's formula is `(a / n + b)^ω`, n the voxel's density: the echo's exact evidence for the term over the medium
+/// at density n, less the read-field evidence the cell's ratio already holds for it.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Echo {
+    pub voxel: [i32; 3],
+    pub omega: f64,
+    pub a: f64,
+    pub b: f64,
 }
 
-/// Add a deposit's hits to `acc` with `sign` (+1 back to the field, −1 out of it); a voxel that comes to nothing is
-/// dropped.
+/// The least share a term takes of an echo that counts: below it the echo is the medium's (its factor is within
+/// ω × 10⁻³ of 1).
+pub const T_MIN: f64 = 1e-3;
+
+/// The echoes a term takes a share of, in voxel order: a function of the term alone, so a move's change to the field
+/// is its terms' old deposits given back and their new ones taken, exactly.
+pub type Deposit = Vec<Echo>;
+
+/// A deposit from echoes: those with a share of at least [`T_MIN`], in voxel order.
+pub fn deposit(echoes: impl Iterator<Item = Echo>) -> Deposit {
+    let mut d: Deposit = echoes.filter(|e| e.omega > 0.0 && e.b <= 1.0 - T_MIN).collect();
+    d.sort_by(|x, y| x.voxel.cmp(&y.voxel));
+    d
+}
+
+/// A change to what the scene's terms take, per voxel: each echo with its sign (+1 given back to the field, −1 taken
+/// from it).
+pub type FixedHits = HashMap<[i32; 3], Vec<(i64, Echo)>, std::hash::BuildHasherDefault<VoxelHasher>>;
+
+/// Add a deposit's echoes to `acc` with `sign` (+1 back to the field, −1 out of it).
 pub fn give(acc: &mut FixedHits, d: &Deposit, sign: i64) {
-    for &(k, h) in d {
-        let e = acc.entry(k).or_insert(0);
-        *e += sign * h;
-        if *e == 0 {
-            acc.remove(&k);
-        }
+    for e in d {
+        acc.entry(e.voxel).or_default().push((sign, *e));
+    }
+}
+
+/// The grain factor at range `range` (3dtrees research 130 grain-field): a pulse of footprint w meets `(1 + w/2s)²`
+/// times the extinction a point meets among opaque grains of radius s ([`Settings::grain_radius`]); 1 without grains.
+pub fn grain_factor(em: &Settings, range: f64) -> f64 {
+    let s = em.grain_radius;
+    if s > 0.0 { (1.0 + 0.5 * em.footprint(range) / s).powi(2) } else { 1.0 }
+}
+
+/// The weight the field counts an echo, and a stretch of path, with at range `range` on a lattice of `steps`: with
+/// grains, one grain stops every cell its grown shadow covers, so each echo counts the cell's share of a grain,
+/// `min(1, cell / (π (s + w/2)²))` (3dtrees research 130 grain-field: φ's part in the field); without, the cell's own
+/// weight ([`Settings::cell_weight`]).
+pub fn field_weight(em: &Settings, range: f64, steps: (f64, f64)) -> f64 {
+    let s = em.grain_radius;
+    if s > 0.0 {
+        let grown = std::f64::consts::PI * (s + 0.5 * em.footprint(range)).powi(2);
+        (range * range * steps.0 * steps.1 / grown).min(1.0)
+    } else {
+        em.cell_weight(range, steps)
     }
 }
 
@@ -158,18 +192,32 @@ pub struct Foliage {
     pub kappa: f64,
     pub spec: Option<FoliageBox>,
     pub post: HashMap<[i32; 3], (f64, f64)>,
+    /// The grains' radius and the beam's exit width and divergence ([`grain_factor`]): σ is a point's extinction, and
+    /// a pulse reads it times the grain factor at its range. A radius of 0: no grains.
+    pub grains: [f64; 3],
 }
 
 impl Foliage {
     /// The background alone: κ everywhere.
     pub fn uniform(kappa: f64) -> Self {
-        Foliage { kappa, spec: None, post: HashMap::new() }
+        Foliage { kappa, spec: None, post: HashMap::new(), grains: [0.0; 3] }
     }
 
     /// The field's posterior from counts, under the prior (shape `a0`, rate `b0`).
     pub fn from_counts(kappa: f64, spec: FoliageBox, counts: &Counts, (a0, b0): (f64, f64)) -> Self {
         let post = counts.iter().map(|(&k, &(h, l))| (k, (h + a0, l + b0))).collect();
-        Foliage { kappa, spec: Some(spec), post }
+        Foliage { kappa, spec: Some(spec), post, grains: [0.0; 3] }
+    }
+
+    /// The grain factor at range `t` ([`grain_factor`]).
+    pub fn factor(&self, t: f64) -> f64 {
+        let [s, exit, div] = self.grains;
+        if s > 0.0 { (1.0 + 0.5 * (exit + div * t) / s).powi(2) } else { 1.0 }
+    }
+
+    /// The hazard a pulse reads in voxel `k` at range `t`: σ there times the grain factor (κ where it has no data).
+    pub fn hazard_at(&self, k: &[i32; 3], t: f64) -> f64 {
+        self.post.get(k).map_or(self.kappa, |&(a, b)| a / b * self.factor(t))
     }
 
     /// σ's posterior mean in voxel `k` (κ where it has no data). The geometric mean `exp ψ(α) / β`, the bound's own
@@ -183,7 +231,7 @@ impl Foliage {
     pub fn medium(&self, o: &Point, w: &Point) -> Medium {
         let mut before = 0.0;
         let segs = self.spec.map_or(Vec::new(), |sp| Walk::new(&sp, o, w).0.into_iter().map(|(k, a, b)| {
-            let sig = self.sigma(&k);
+            let sig = self.hazard_at(&k, 0.5 * (a + b));
             let s = [a, b, sig, before];
             before += (sig - self.kappa) * (b - a);
             s
@@ -360,7 +408,7 @@ pub fn beam_left(v: &RangeImage, em: &Settings, k: usize) -> f64 {
 /// pulse, its voxel, its weight), [`Settings::cell_weight`] at the echo's range: one hit, whatever the echoes before it
 /// left, since the beam left is the chance the pulse got there and its path counts it (the module docs). The empty
 /// scene counts each whole; a scene's elements explain their responsibilities' share (the module docs).
-pub fn hits(v: &RangeImage, sp: &FoliageBox, em: &Settings, k: usize) -> Vec<(usize, [i32; 3], f64)> {
+pub fn hits(v: &RangeImage, sp: &FoliageBox, em: &Settings, k: usize) -> Vec<(usize, [i32; 3], f64, f64)> {
     if v.cell[k] != Cell::Echoes {
         return Vec::new();
     }
@@ -369,7 +417,7 @@ pub fn hits(v: &RangeImage, sp: &FoliageBox, em: &Settings, k: usize) -> Vec<(us
     let steps = v.steps(k);
     p.echoes.iter().enumerate().filter_map(|(i, &r)| {
         let x = [0, 1, 2].map(|a| v.origin[a] + w[a] * r);
-        inside(sp, &x).then(|| (i, key(sp, &x), em.cell_weight(r, steps)))
+        inside(sp, &x).then(|| (i, key(sp, &x), field_weight(em, r, steps), r))
     }).collect()
 }
 
@@ -387,10 +435,11 @@ fn ray(v: &RangeImage, sp: &FoliageBox, em: &Settings, k: usize, acc: &mut Fixed
     let walk = Walk::new(sp, &v.origin, &w);
     for &(from, to, beam) in &p.path {
         for (key, a, b) in walk.within(from, to) {
-            accumulate(acc, key, 0.0, em.cell_weight(0.5 * (a + b), steps) * beam * (b - a));
+            let mid = 0.5 * (a + b);
+            accumulate(acc, key, 0.0, field_weight(em, mid, steps) * grain_factor(em, mid) * beam * (b - a));
         }
     }
-    for (_, key, h) in hits(v, sp, em, k) {
+    for (_, key, h, _) in hits(v, sp, em, k) {
         accumulate(acc, key, h, 0.0);
     }
 }
@@ -419,25 +468,68 @@ fn merged(mut a: FixedCounts, b: FixedCounts) -> FixedCounts {
 
 /// The field's counts and its part of the cost, kept as the scene changes (the module docs).
 ///
-/// Its part of the cost is `ln NB(∅) − ln NB(E)`, each summed over the voxels: the field's term of the empty scene's
-/// counts (every echo the medium's) less the scene's. The plug-in of the hits the elements take, how the empty scene's
-/// pulses already read them inside each cell's ratio, is each term's own (`Term`'s `plug`), so each echo is scored once,
-/// its responsibilities sharing it (3dtrees research 130 formulation.md, slice-soft).
+/// The counts are the empty scene's, every ray whole and every echo the medium's: data alone, the same for every
+/// scene. What the scene's terms take enters each voxel's exact formula (3dtrees research 130 field-closed-form,
+/// field-slice): with the voxel's density n under its posterior from those counts, Gamma(a₀ + H, b₀ + L), the scene
+/// gains `ln E[Π_e (a_e / n + b_e)^(ω_e)]` over the echoes its terms take a share of ([`Echo`]), and the field's part of
+/// the cost is minus that, summed over the voxels. With every echo's field weight its cell's weight, this is the exact
+/// marginal over the density and the attributions, given each echo's densities under the terms and the medium:
+/// the field value the cells' ratios read cancels from the cost. It is computed on a grid in ln n, from 10⁻⁸ (below
+/// which the integrand is a power of n, integrated in closed form) to well past the empty posterior, each voxel's sums
+/// over its echoes kept in fixed point, so a move and its undo restore it exactly.
 #[derive(Debug, Clone)]
 pub struct FieldCounts {
     pub spec: FoliageBox,
     /// The prior's shape and rate.
     pub prior: (f64, f64),
-    /// Per voxel, the weighted counts the field explains: the empty scene's less the hits the elements take (the
-    /// scene's deposits).
+    /// The grains' radius and the beam's exit width and divergence ([`Foliage`]'s `grains`).
+    pub grains: [f64; 3],
+    /// Per voxel, the empty scene's weighted counts (hits, path).
     counts: FixedCounts,
-    /// In fixed point: the field's term `Σ ln NB`, and the empty scene's.
+    /// Per voxel with echoes taken, their sums ([`Taken`]).
+    taken: HashMap<[i32; 3], Taken, std::hash::BuildHasherDefault<VoxelHasher>>,
+    /// In fixed point: the scene's gain over the empty scene, `Σ_v ln E[…]`.
     term: i128,
-    empty: i128,
+}
+
+/// A voxel's sums over the echoes taken there, in fixed point: how many, Σ ω, Σ ω (1 − b) (the hits taken, as
+/// reported), Σ ω ln a (the closed-form tail) and, per node of its grid, Σ ω ln(a / n + b).
+#[derive(Debug, Clone, Default)]
+struct Taken {
+    count: i64,
+    omega: i64,
+    hits: i64,
+    tail: i64,
+    nodes: Vec<i64>,
+}
+
+/// The lowest density on a voxel's grid (1/m).
+const N_LO: f64 = 1e-8;
+
+/// A voxel's grid in u = ln n, from its empty counts: (lowest u, step, nodes), midpoints `u_lo + (k + ½) du`.
+fn grid((a0, b0): (f64, f64), h: f64, l: f64) -> (f64, f64, usize) {
+    let al = a0 + h;
+    let hi = ((al + 6.0 * (al + 1.0).sqrt() + 10.0) / (b0 + l)).ln();
+    let lo = N_LO.ln();
+    let du = (0.25 / (al + 1.0).sqrt()).min(0.05);
+    (lo, du, ((hi - lo) / du).ceil() as usize)
 }
 
 fn fixed(x: f64) -> i128 {
     (x * FIXED).round() as i128
+}
+
+fn fx(x: f64) -> i64 {
+    (x * FIXED).round() as i64
+}
+
+fn lse(xs: impl Iterator<Item = f64>) -> f64 {
+    let v: Vec<f64> = xs.collect();
+    let m = v.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+    if !m.is_finite() {
+        return m;
+    }
+    m + v.iter().map(|x| (x - m).exp()).sum::<f64>().ln()
 }
 
 impl FieldCounts {
@@ -451,83 +543,134 @@ impl FieldCounts {
                 acc
             }).reduce(FixedCounts::default, merged)
         }).fold(FixedCounts::default(), merged);
-        let mut f = FieldCounts { spec, prior, counts, term: 0, empty: 0 };
-        f.term = f.counts.values().map(|&c| f.fixed_term(c)).sum();
-        f.empty = f.term;
-        f
+        FieldCounts { spec, prior, grains: [em.grain_radius, em.beam_exit, em.beam_divergence], counts, taken: Default::default(), term: 0 }
     }
 
-    /// A voxel's `ln NB` in fixed point.
-    fn fixed_term(&self, [h, l]: [i64; 2]) -> i128 {
-        fixed(ln_nb(h as f64 / FIXED, l as f64 / FIXED, self.prior.0, self.prior.1))
+    /// Voxel `k`'s empty counts (hits, path).
+    fn empty(&self, k: &[i32; 3]) -> (f64, f64) {
+        self.counts.get(k).map_or((0.0, 0.0), |&[h, l]| (h as f64 / FIXED, l as f64 / FIXED))
     }
 
-    /// The change in the term were the hits changed by `base` and then by `delta` (from the counts `base` leaves).
+    /// One echo's sums on voxel `k`'s grid, times `sign`.
+    fn add_echo(&self, t: &mut Taken, k: &[i32; 3], e: &Echo, sign: i64) {
+        let (h, l) = self.empty(k);
+        let (lo, du, n) = grid(self.prior, h, l);
+        if t.nodes.is_empty() {
+            t.nodes = vec![0; n];
+        }
+        t.count += sign;
+        t.omega += sign * fx(e.omega);
+        t.hits += sign * fx(e.omega * (1.0 - e.b));
+        t.tail += sign * fx(e.omega * e.a.ln());
+        for (i, x) in t.nodes.iter_mut().enumerate() {
+            let nn = (lo + (i as f64 + 0.5) * du).exp();
+            *x += sign * fx(e.omega * (e.a / nn + e.b).ln());
+        }
+    }
+
+    /// Voxel `k`'s gain `ln E[…]` from its sums.
+    fn gain(&self, k: &[i32; 3], t: &Taken) -> f64 {
+        if t.count == 0 {
+            return 0.0;
+        }
+        let (h, l) = self.empty(k);
+        let (a0, b0) = self.prior;
+        let (lo, du, _) = grid(self.prior, h, l);
+        let (al, beta) = (a0 + h, b0 + l);
+        let free = (al - t.omega as f64 / FIXED).max(a0);
+        let node = |i: usize| lo + (i as f64 + 0.5) * du;
+        let with = lse(t.nodes.iter().enumerate().map(|(i, &x)| {
+            let u = node(i);
+            al * u - beta * u.exp() + x as f64 / FIXED + du.ln()
+        }).chain(std::iter::once(free * lo + t.tail as f64 / FIXED - free.ln())));
+        let without = lse((0..t.nodes.len()).map(|i| {
+            let u = node(i);
+            al * u - beta * u.exp() + du.ln()
+        }).chain(std::iter::once(al * lo - al.ln())));
+        with - without
+    }
+
+    /// The change in the scene's gain were the echoes taken changed by `base` and then by `delta`.
     fn fixed_change(&self, base: &FixedHits, delta: &FixedHits) -> i128 {
-        delta.iter().map(|(k, &d)| {
-            let mut c = self.counts.get(k).copied().unwrap_or([0, 0]);
-            c[0] += base.get(k).copied().unwrap_or(0);
-            self.fixed_term([c[0] + d, c[1]]) - self.fixed_term(c)
+        delta.iter().map(|(k, es)| {
+            let mut t = self.taken.get(k).cloned().unwrap_or_default();
+            for (sign, e) in base.get(k).into_iter().flatten() {
+                self.add_echo(&mut t, k, e, -sign);
+            }
+            let before = fixed(self.gain(k, &t));
+            for (sign, e) in es {
+                self.add_echo(&mut t, k, e, -sign);
+            }
+            fixed(self.gain(k, &t)) - before
         }).sum()
     }
 
-    /// The change in the field's part of the cost were the hits changed by `delta` (deposits given back or taken:
-    /// [`give`]); the counts stay as they are.
+    /// The change in the field's part of the cost were the echoes taken changed by `delta` (deposits given back or
+    /// taken: [`give`]); nothing changes.
     pub fn change(&self, delta: &FixedHits) -> f64 {
         self.change_after(&FixedHits::default(), delta)
     }
 
-    /// The change in the field's part of the cost were the hits changed by `delta`, from the counts a change `base`
+    /// The change in the field's part of the cost were the echoes taken changed by `delta`, from what a change `base`
     /// would leave (a proposal's: [`super::scene::Proposal`]), exactly as if `base` were applied first.
     pub fn change_after(&self, base: &FixedHits, delta: &FixedHits) -> f64 {
         -self.fixed_change(base, delta) as f64 / FIXED
     }
 
-    /// Change the hits by `delta`: the change in the field's part of the cost.
+    /// Change the echoes taken by `delta`: the change in the field's part of the cost.
     pub fn apply(&mut self, delta: FixedHits) -> f64 {
-        let t = self.fixed_change(&FixedHits::default(), &delta);
-        self.term += t;
-        for (k, d) in delta {
-            let e = self.counts.entry(k).or_insert([0, 0]);
-            e[0] += d;
-            if *e == [0, 0] {
-                self.counts.remove(&k);
+        let mut total = 0i128;
+        for (k, es) in delta {
+            let mut t = self.taken.remove(&k).unwrap_or_default();
+            let before = fixed(self.gain(&k, &t));
+            for (sign, e) in &es {
+                self.add_echo(&mut t, &k, e, -sign);
+            }
+            let after = fixed(self.gain(&k, &t));
+            total += after - before;
+            if t.count != 0 {
+                self.taken.insert(k, t);
             }
         }
-        -t as f64 / FIXED
+        self.term += total;
+        -total as f64 / FIXED
     }
 
     /// The field's part of the scene's cost (above).
     pub fn cost(&self) -> f64 {
-        (self.empty - self.term) as f64 / FIXED
+        -self.term as f64 / FIXED
     }
 
-    /// The field's term `Σ ln NB` over the voxels: the log marginal likelihood of the counts.
-    pub fn marginal(&self) -> f64 {
-        self.term as f64 / FIXED
-    }
-
-    /// The weighted counts per voxel, (hits, path).
+    /// The weighted counts per voxel, (hits, path): the empty scene's less the hits the terms take, at the shares their
+    /// pulses read.
     pub fn counts(&self) -> Counts {
         self.counts_after(&FixedHits::default())
     }
 
-    /// The weighted counts per voxel, (hits, path), were the hits changed by `delta`.
+    /// The weighted counts per voxel, (hits, path), were the echoes taken changed by `delta`.
     pub fn counts_after(&self, delta: &FixedHits) -> Counts {
         let mut c = self.counts.clone();
-        for (k, &d) in delta {
-            let e = c.entry(*k).or_insert([0, 0]);
-            e[0] += d;
-            if *e == [0, 0] {
-                c.remove(k);
+        for (k, t) in &self.taken {
+            if let Some(e) = c.get_mut(k) {
+                e[0] -= t.hits;
+            }
+        }
+        for (k, es) in delta {
+            if let Some(x) = c.get_mut(k) {
+                for (sign, e) in es {
+                    x[0] += sign * fx(e.omega * (1.0 - e.b));
+                }
             }
         }
         c.iter().map(|(&k, &[h, l])| (k, (h as f64 / FIXED, l as f64 / FIXED))).collect()
     }
 
-    /// The field a pulse meets: the posterior from the counts.
+    /// The field a pulse reads: the posterior from the empty scene's counts (data alone, the same for every scene).
     pub fn field(&self, kappa: f64) -> Foliage {
-        Foliage::from_counts(kappa, self.spec, &self.counts(), self.prior)
+        let counts: Counts = self.counts.iter().map(|(&k, &[h, l])| (k, (h as f64 / FIXED, l as f64 / FIXED))).collect();
+        let mut f = Foliage::from_counts(kappa, self.spec, &counts, self.prior);
+        f.grains = self.grains;
+        f
     }
 }
 
@@ -535,6 +678,47 @@ impl FieldCounts {
 mod tests {
     use super::*;
     use crate::transform::norm;
+
+    /// The voxel's exact formula (research 130 field-slice): an echo a term takes wholly gains `ω ln σ̂ + ln Γ(α − ω)
+    /// − ln Γ(α) + ω ln β` (the density's posterior moment), one it takes none of gains nothing, and a half share
+    /// matches a fine direct integral; giving the echoes back restores the term exactly.
+    #[test]
+    fn the_voxel_formula_is_the_posterior_moment() {
+        let spec = FoliageBox { lo: [0.0; 3], hi: [1.0; 3], voxel: 1.0 };
+        let (h, l, a0, b0) = (3.0, 4.0, 0.05, 0.5);
+        let mut f = FieldCounts { spec, prior: (a0, b0), grains: [0.0; 3], counts: Default::default(), taken: Default::default(), term: 0 };
+        f.counts.insert([0, 0, 0], [fx(h), fx(l)]);
+        let (al, beta, w, sig) = (a0 + h, b0 + l, 0.7, 0.9);
+        let mut d = FixedHits::default();
+        give(&mut d, &vec![Echo { voxel: [0, 0, 0], omega: w, a: sig, b: 0.0 }], -1);
+        let want = w * sig.ln() + libm::lgamma(al - w) - libm::lgamma(al) + w * beta.ln();
+        assert!((-f.change(&d) - want).abs() < 1e-6, "{} vs {want}", -f.change(&d));
+        let mut none = FixedHits::default();
+        give(&mut none, &vec![Echo { voxel: [0, 0, 0], omega: w, a: 0.0, b: 1.0 }], -1);
+        assert!(f.change(&none).abs() < 1e-9);
+        let mut half = FixedHits::default();
+        give(&mut half, &vec![Echo { voxel: [0, 0, 0], omega: w, a: 0.5 * sig, b: 0.5 }], -1);
+        let n = 400_000;
+        let (lo, hi) = (-40.0f64, 4.0f64);
+        let du = (hi - lo) / n as f64;
+        let (mut num, mut den) = (0.0, 0.0);
+        for i in 0..n {
+            let u = lo + (i as f64 + 0.5) * du;
+            let base = (al * u - beta * u.exp()).exp();
+            num += base * (0.5 * sig / u.exp() + 0.5).powf(w);
+            den += base;
+        }
+        let want = (num / den).ln();
+        assert!((-f.change(&half) - want).abs() < 1e-5, "{} vs {want}", -f.change(&half));
+        let (c0, ch) = (f.cost(), f.change(&half));
+        f.apply(half.clone());
+        assert!((f.cost() - c0 - ch).abs() < 1e-9);
+        let mut back = FixedHits::default();
+        give(&mut back, &vec![Echo { voxel: [0, 0, 0], omega: w, a: 0.5 * sig, b: 0.5 }], 1);
+        f.apply(back);
+        assert_eq!(f.cost(), c0);
+        assert!(f.taken.is_empty());
+    }
 
     /// A ray through a box of 1 m voxels: the segments tile the clipped ray, and a uniform field's optical depth is κ t.
     #[test]

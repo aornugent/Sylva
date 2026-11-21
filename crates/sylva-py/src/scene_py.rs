@@ -28,8 +28,8 @@
 //! - **The foliage field:** `foliage` is a dict `lo`, `hi` (the box, 3 each) and `voxel` (m; its prior is the
 //!   settings' `field_prior_*`); the field is then what the elements leave of each echo there (`FoliageBox`; soft
 //!   attribution, 3dtrees research 130 slice-soft), its marginal in
-//!   the cost, exact through moves, and what a pulse meets of it fixed at the build (one step of EM from the
-//!   background) or held from another scene (`hold_foliage`); `foliage_voxels()` gives it per voxel.
+//!   the cost, exact through moves, and what a pulse reads of it the empty scene's field (data alone) or held from
+//!   another scene (`hold_foliage`); `foliage_voxels()` gives it per voxel.
 
 use numpy::{IntoPyArray, PyArray1, PyArray2, PyArray3, PyArrayMethods, PyReadonlyArray1, PyReadonlyArray2};
 use pyo3::exceptions::PyValueError;
@@ -593,7 +593,7 @@ impl PyScene {
     /// and the parts it sums (ray_on, ray_empty, ray_in_front, ray_behind, and alignment: its own nodes' prior and
     /// log-determinant; with each scan's alignment part, its cost less its rows', and the field's `field_part()`, they sum
     /// to `cost()`); beside it, not
-    /// in it, field: the change in the foliage field's term in its cost to remove in this scan (the plug-in of the hits it takes is in its ray_* parts); the evidence discount (discount); the
+    /// in it, field: the change in the foliage field's term in its cost to remove in this scan ; the evidence discount (discount); the
     /// posterior along the beam at it, the alignment held: align_shift, align_sd, front_shift, front_shift_sd (m); and
     /// its reflectance level's: refl_level, refl_level_sd (dB). Given a proposal (`put_in` an element dict, its
     /// elements numbered from `next_id()`; `take_out` ids), the rows of the scene as it would leave it, nothing kept.
