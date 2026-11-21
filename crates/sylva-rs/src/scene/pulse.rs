@@ -265,13 +265,14 @@ impl<P: Real, T: Over<P>> Return<P, T> {
         ((self.db[0] / 10.0).exp10() + (self.db[1] / 10.0).exp10() * 4.0 + (self.db[2] / 10.0).exp10()).log10() * 10.0 - 10.0 * 6f64.log10()
     }
 
-    /// The density of its echo's reflectance `x` (dB) as recorded ([`Settings::refl_density`], at its floor), with
-    /// `add` more energy share merged into it (a medium surface's, read at the medium's spread for its part): a mixture
+    /// The density of its echo's reflectance `x` (dB) as recorded ([`Settings::refl_density`], at its floor), its own
+    /// energy share times `dim` (the beam the medium's echoes in front left it: [`Pass::lik`]), with `add` more energy
+    /// share merged into it (a medium surface's, read at the medium's spread for its part): a mixture
     /// over the shape mismatch's three section radii, each weighted by its rule weight and its chance of being recorded
     /// (a radius whose section misses the beam records nothing, so it says nothing of the reflectance), each widened by
     /// the reflectance's spread between adjacent radii. Three sharp points would leave gaps between them that a
     /// reflectance noise of tenths of a dB reads as misfits.
-    pub(super) fn refl_density(&self, x: f64, em: &Settings, add: P) -> T {
+    pub(super) fn refl_density(&self, x: f64, em: &Settings, add: P, dim: f64) -> T {
         if !x.is_finite() || em.refl_noise <= 0.0 {
             return T::c(1.0);
         }
@@ -280,7 +281,7 @@ impl<P: Real, T: Over<P>> Return<P, T> {
         if total.v() <= 0.0 {
             return T::c(1.0);
         }
-        let db = self.db.map(|d| if add.v() > 0.0 { ((d / 10.0).exp10() + add).log10() * 10.0 } else { d });
+        let db = self.db.map(|d| if add.v() > 0.0 { ((d / 10.0).exp10() * dim + add).log10() * 10.0 } else if dim < 1.0 { d + 10.0 * dim.max(1e-30).log10() } else { d });
         let gap = |a: T, b: T| if a.v() > -200.0 && b.v() > -200.0 { (if a.v() < b.v() { b - a } else { a - b }) / 2.0 } else { T::c(0.0) };
         let (g1, g2) = (gap(db[1], db[0]), gap(db[2], db[1]));
         let spread = if g2.v() > g1.v() { g2 } else { g1 };
@@ -288,19 +289,19 @@ impl<P: Real, T: Over<P>> Return<P, T> {
         (0..3).filter(|&q| w[q].v() > 0.0).map(|q| w[q] * em.refl_density(x, db[q], spread.hypot(medium(q)), self.fill[q], self.floor)).sum::<T>() / total
     }
 
-    /// The density of its echo at range `o` with reflectance `x` (dB; NaN unknown), its members among `occ`: its own
-    /// echo, or, in its merge share, merged with the medium surface behind it, pulled back by the measured pull
+    /// The density of its echo at range `o` with reflectance `x` (dB; NaN unknown), its members among `occ`, its
+    /// energy share times `dim` ([`Return::refl_density`]): its own echo, or, in its merge share, merged with the medium surface behind it, pulled back by the measured pull
     /// ([`Settings::pull`], its sd as large) and brighter by that surface's energy (3dtrees research 130 slice 2c: a
     /// mixture inside the return, never another return).
-    pub(super) fn density(&self, o: f64, x: f64, em: &Settings, occ: &[Occluder<P>]) -> T {
+    pub(super) fn density(&self, o: f64, x: f64, em: &Settings, occ: &[Occluder<P>], dim: f64) -> T {
         let (t, merge) = (occ[self.first].t, occ[self.last].merge);
-        let alone = t_pdf((T::c(o) - self.mu) / self.sd, em.noise_dof) / self.sd * self.refl_density(x, em, P::c(0.0));
+        let alone = t_pdf((T::c(o) - self.mu) / self.sd, em.noise_dof) / self.sd * self.refl_density(x, em, P::c(0.0), dim);
         let m = merge.share;
         if m.v() <= 0.0 {
             return alone;
         }
         let sd = self.sd.hypot(T::from(merge.pull));
-        alone * (P::c(1.0) - m) + t_pdf((T::c(o) - self.mu - merge.pull) / sd, em.noise_dof) * m / sd * self.refl_density(x, em, merge.energy)
+        alone * (P::c(1.0) - m) + t_pdf((T::c(o) - self.mu - merge.pull) / sd, em.noise_dof) * m / sd * self.refl_density(x, em, merge.energy, dim)
     }
 }
 
@@ -625,7 +626,11 @@ impl<P: Real, T: Over<P>> Pass<'_, P, T> {
         // one of the returns
         let mut none = T::c(1.0);
         for (k, r) in rets.iter().enumerate().skip(j) {
-            let d = none * ((occ[r.first].tau - tau0).max(0.0) * -seen).exp() * r.s * taken * r.density(o, x, em, occ);
+            // the ground reads its brightness in the beam the medium's echoes in front left, as the medium's own echo
+            // does (3dtrees research 130 slice-t2: read in the elements' beam alone, every ground echo behind leaf
+            // echoes read too dim for every hypothesis, and an element dimming the beam in front was paid for it)
+            let dim = if matches!(occ[r.first].surface, Surface::Ground(_)) { taken } else { 1.0 };
+            let d = none * ((occ[r.first].tau - tau0).max(0.0) * -seen).exp() * r.s * taken * r.density(o, x, em, occ, dim);
             if d.v() > 0.0 {
                 let f = d * (1.0 - P_OUTLIER);
                 let rest = self.lik(rets, i + 1, k + 1, self.rx.members[r.last].beam, taken, em.beam_after(seen, x), tau_after, prefix * f.v(), resp);
@@ -733,6 +738,25 @@ mod tests {
         Pulse::on(occluders(layers.to_vec(), ground), 1, &ext.medium(&[0.0; 3], &[0.0, 1.0, 0.0]), echoes, refls, cap, &Instrument::default(), em)
     }
 
+    /// Slice-t2: a ground echo behind a leaf echo that left half the beam is read at half the brightness (3 dB
+    /// dimmer) than the same ground alone, as the medium's own echoes read the beam: the reflectance its pulse
+    /// likes best moves by `10 log10` of the beam left.
+    #[test]
+    fn the_ground_behind_a_leaf_echo_reads_the_beam_it_left() {
+        let em = Settings::default();
+        let flat = Foliage::uniform(0.05);
+        let leaf = (em.refl_full_hit() + 10.0 * 0.5f64.log10()) as f32;
+        assert!((em.beam_after(1.0, leaf as f64) - 0.5).abs() < 1e-6);
+        let best = |echoes: &[f32], leaf: &[f32]| -> f64 {
+            (0..=800).map(|i| -30.0 + 0.025 * i as f64).map(|x| {
+                let refls: Vec<f32> = leaf.iter().copied().chain([x as f32]).collect();
+                (x, pulse_in(&em, echoes, &refls, false, &[], Some((10.0, 0.6)), &flat).read(0.0, 0.0, &em).ll)
+            }).max_by(|a, b| a.1.total_cmp(&b.1)).unwrap().0
+        };
+        let (alone, behind) = (best(&[10.0], &[]), best(&[3.0, 10.0], &[leaf]));
+        assert!((behind - alone - 10.0 * 0.5f64.log10()).abs() < 0.1, "alone {alone}, behind {behind}");
+    }
+
     /// One cell's log-likelihood on a ray along y against a medium `ext`.
     fn ll_of(echoes: &[f32], refls: &[f32], capped: bool, layers: &[Layer], ext: &Foliage) -> f64 {
         pulse_of(echoes, refls, capped, layers, None, ext).read(0.0, 0.0, &Settings::default()).ll
@@ -781,7 +805,7 @@ mod tests {
         assert!(m.pull > 0.0 && m.pull < 0.5, "{m:?}");
         let at = r.mu + m.pull;
         let plain = [Occluder { merge: Merge::none(), ..p.occluders[0] }];
-        let (merged, alone) = (r.density(at, x, &em, &p.occluders), r.density(at, x, &em, &plain));
+        let (merged, alone) = (r.density(at, x, &em, &p.occluders, 1.0), r.density(at, x, &em, &plain, 1.0));
         assert!(merged > 1.5 * alone, "{merged} vs {alone}");
         // two layers within the resolution merge into one echo the measured pull behind the nearer
         let pair = receiver(&occluders(vec![layer(4.0, 0.5, 1.0), layer(4.3, 1.0, 1.0)], None), 1, 0.0, 0.0, &em).patterns;
