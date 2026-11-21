@@ -17,7 +17,8 @@
 //! - [`pulse`]: one cell's pulse against its owners and the one pass over it.
 //! - [`term`]: an element's (or a group's) term per scan: its cells, its own nodes and its deposit.
 //! - [`alignment`]: the scan alignment error, solved with the terms and held between refits.
-//! - [`chain`]: chains grown by the likelihood beside a scene: the coupling along them, a chain's state, the grower.
+//! - [`chain`]: chains grown by the likelihood beside a scene, and the declared prior over a plant's wood: the axis
+//!   prior and the fork as an insertion, a chain's state, the grower.
 //! - [`query`]: what the scene predicts and how well it pins elements down, without moving them.
 //! - [`scene`]: the [`scene::Scene`] that holds elements against scans: its cost, moves and rows.
 //!
@@ -44,7 +45,7 @@
 //! | a proposed part of the scene | element | a form (a stick, an axis and radius; or a patch, a ball) and a class |
 //! | what an element is made of, wood or leaf | class | `Class`: its reflectance; a mark, not a shape |
 //! | sticks joined end to end, scored as one | chain; group | `Element::group`, a key: a group's members are one term per scan, one set of nuisances (alignment shift, stem front shift, reflectance level) |
-//! | a declared term over a chain's geometry alone | coupling | [`chain::Coupling`]: taper, form departures and bends (the bend sd by radius) as a Gaussian Markov process along the chain; it proposes and ranks the grower's continuations and gives a chain's row, beside the cost, never in it |
+//! | the declared prior over a plant's wood, on its own rows | axis prior; fork insertion | [`chain::axis_row`]: an axis's taper, form departures and bends as one process in length in radii, scored by departures only, the same however the wood is cut; [`chain::insertion_row`]: a lateral on its parent, conserving r^γ. Values in `Settings`; beside the cost, never in it; the grower proposes and ranks under it |
 //! | a chain grown piece by piece by the likelihood | grower; a chain's state | [`scene::Scene::grow`]; [`chain::Chain`]: its term in information form, updated by each piece's cells alone (3dtrees research 130 slice-grower) |
 //! | elements held against scans | scene | `Scene` |
 //! | `−log` likelihood ratio against the empty scene | cost | also of a proposal: `score`, `keep` |
