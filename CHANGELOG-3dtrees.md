@@ -38,6 +38,11 @@ branch `3dtrees/125-rebase`.
 - `synthetic.scan(..., solids=)` puts solid, opaque capped cylinders in a beam scan beside the points. 3dtrees needs it
   because wood drawn as surface points echoes off its back face and widens thin silhouettes, so its bench couldn't
   score wood under 2 cm. Scans without solids are unchanged.
+- The RXP reader's `keep_uncertain` keeps an MTA-uncertain echo in zone 1, on the pulse it was recorded after, where
+  upstream keeps it at the learned model's best zone; confident zone calls stand. 3dtrees needs it because the model
+  (trained on a VZ-600i) marks about a quarter of Alice Mulga's VZ-2000i echoes uncertain: dropped they leave false
+  misses, kept at the model's zone they put 5-7 % of a scan's echoes in zone 2, on the wrong pulse (3dtrees research
+  130, pulse-resolution.md). Changes the output only with `keep_uncertain=True`.
 - Parity cases for the pair table (`tests/parity/cases_joint.py`) are recorded against 3dtrees' numpy oracle, so a
   change shows. Tests only.
 - Our bindings live in `crates/sylva-py/src/fork_py.rs`, reached from upstream's `lib.rs` by one `mod` line and one
