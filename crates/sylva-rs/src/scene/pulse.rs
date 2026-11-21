@@ -722,7 +722,7 @@ mod tests {
     fn a_merge_with_the_medium_reads_the_pull() {
         let em = Settings { pull_a: 1.0, pull_b: 0.1, merge_a: -2.0, merge_field: 10.0, merge_range: 0.0, merge_fill: 0.0, ..Settings::default() };
         let spec = FoliageBox { lo: [-0.5, 4.0, -0.5], hi: [0.5, 5.0, 0.5], voxel: 1.0 };
-        let dense = Foliage { kappa: 0.05, spec: Some(spec), post: HashMap::from([([0, 0, 0], (5.0, 1.0))]) };
+        let dense = Foliage { kappa: 0.05, spec: Some(spec), post: HashMap::from([([0, 0, 0], (5.0, 1.0))]), grains: [0.0; 3] };
         let merge = |f: f64, ext: &Foliage| pulse_in(&em, &[], &[], false, &[layer(4.0, f, 1.0)], None, ext).occluders[0].merge;
         let p = pulse_in(&em, &[], &[], false, &[layer(4.0, 0.3, 1.0)], None, &dense);
         let m = p.occluders[0].merge;
@@ -796,7 +796,7 @@ mod tests {
         let data = elem_data(&v, &KBuffer::of(&rendered).cells(), &es, &[0, 1], &[0, 1], 0, &em, &sc, &Foliage::uniform(sc.kappa), None);
         let mut out: Vec<Pulse> = data.into_iter().flat_map(|d| d.cells.into_iter().flat_map(|c| c.pulses.into_iter().map(|p| p.1))).collect();
         let spec = FoliageBox { lo: [-0.5, 4.0, -0.5], hi: [0.5, 5.0, 0.5], voxel: 1.0 };
-        let dense = Foliage { kappa: 0.05, spec: Some(spec), post: HashMap::from([([0, 0, 0], (5.0, 1.0))]) };
+        let dense = Foliage { kappa: 0.05, spec: Some(spec), post: HashMap::from([([0, 0, 0], (5.0, 1.0))]), grains: [0.0; 3] };
         let (flat, wood) = (Foliage::uniform(0.05), em.refl_wood as f32);
         out.push(pulse_of(&[4.0, 4.3, 7.0], &[wood - 5.0, wood - 3.0, -20.0], false, &[layer(4.0, 0.5, 1.0), layer(4.3, 1.0, 1.0)], None, &flat));
         out.push(pulse_of(&[4.02, 4.4], &[wood - 5.0, -18.0], true, &[layer(4.0, 0.3, 1.0), layer(10.0, 1.0, 1.0)], None, &dense));

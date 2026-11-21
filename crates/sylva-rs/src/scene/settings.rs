@@ -166,6 +166,14 @@ params! {
         pub field_prior_mean: f64 = 0.11938,
         pub field_prior_path: f64 = 0.5177,
         pub field_prior_voxel: f64 = 0.125,
+        /// The foliage field's grains (3dtrees research 130 field-slice, grain-field): the field is opaque grains, each a
+        /// disc of this radius (m) across the ray, scattered at the field's density, so a pulse of footprint w touches a
+        /// grain when its centre falls within the grain grown by w/2. Then a pulse meets `(1 + w/2s)²` times the
+        /// extinction a point would, and one grain stops every cell its grown shadow covers, so each of the field's
+        /// echoes counts once per grain rather than once per cell ([`super::foliage::field_weight`]). Measured on the
+        /// pyramid's blocked and open tiles (`grain2d.py`); 0 is today's point field, its echoes weighted by the cell's
+        /// own weight.
+        pub grain_radius: f64 = 0.0,
         /// The declared prior over a plant's wood ([`super::chain::axis_row`], [`super::chain::insertion_row`]; 3dtrees
         /// research 130 slice-s8): a consumer's rows beside the cost, never in it, and never read by the evidence.
         /// The clock: dτ = ds / r · (r / 1 cm)^(1 − β), β = `axis_clock` (1: length in radii). The axis prior samples

@@ -116,14 +116,14 @@ pub(super) fn spread(n: &[f64; 3], other: bool, em: &Settings) -> f64 {
 /// ([`CellView`]), its weight times the term's front share ([`front_shares`]), its log-likelihood under the empty
 /// scene (the medium and the ground alone: the same for every hypothesis), what its first echo says about its
 /// front element, and, with a foliage field, the hits the field counts of its echoes ([`foliage::hits`]: the echo, its
-/// voxel, its weight times the term's front share, and ln σ̂ there, the held field the empty scene reads it at).
+/// voxel, its field weight times the term's front share, the hazard its pulse reads there and the grain factor there).
 pub(super) struct CellData {
     pub(super) cell: usize,
     pub(super) pulses: Vec<(f64, Pulse)>,
     pub(super) wt: f64,
     pub(super) base: f64,
     pub(super) outcome: Outcome,
-    pub(super) hits: Vec<(usize, [i32; 3], f64, f64)>,
+    pub(super) hits: Vec<(usize, [i32; 3], f64, f64, f64)>,
 }
 
 /// One term's data in one scan (an element's, or a group's: [`ChainKey`]): the cells its members own (its evidence:
@@ -153,25 +153,22 @@ impl ElemData {
     /// Its ray likelihood at `x` = (δ, reflectance level), in total and by [`Outcome`] (in its order), and −ll's slope
     /// and curvature in (δ, level) there, in closed form, one pass over its cells ([`Dual2`]; the value is the `f64`
     /// one), the curvature's negative eigenvalues set to 0. Without a level node only δ's are filled. With `deposit`,
-    /// from the same pass, what its elements take of the foliage field's hits there and their plug-in ([`Local`]'s
-    /// `deposit` and `plug`), the plug-in in its parts by outcome too.
+    /// from the same pass, the echoes its elements take a share of ([`Local`]'s `deposit`).
     pub(super) fn quad(&self, x: (f64, f64), em: &Settings, deposit: bool) -> Local {
         let level = if self.own_sd[1] > 0.0 { Dual2::var(x.1, 1) } else { Dual2::c(x.1) };
-        let (mut total, mut parts, mut hits, mut plug) = (Dual2::<2>::c(0.0), [0.0; 4], Vec::new(), 0.0);
+        let (mut total, mut parts, mut echoes) = (Dual2::<2>::c(0.0), [0.0; 4], Vec::new());
         for c in &self.cells {
-            let (l, p) = if deposit && !c.hits.is_empty() {
+            let l = if deposit && !c.hits.is_empty() {
                 let (ll, taken) = mixture_taken(&c.pulses, Dual2::var(x.0, 0), level, em);
-                let (h, p) = c.take(&taken);
-                hits.extend(h);
-                ((ll - c.base) * c.wt, p)
+                echoes.extend(c.take(&taken));
+                (ll - c.base) * c.wt
             } else {
-                (c.read(Dual2::var(x.0, 0), level, em), 0.0)
+                c.read(Dual2::var(x.0, 0), level, em)
             };
             total += l;
-            parts[c.outcome as usize] += l.v + p;
-            plug += p;
+            parts[c.outcome as usize] += l.v;
         }
-        Local { ll: total.v, parts, g: -total.g, hess: clipped(-total.h), deposit: foliage::deposit(hits.into_iter()), plug }
+        Local { ll: total.v, parts, g: -total.g, hess: clipped(-total.h), deposit: foliage::deposit(echoes.into_iter()) }
     }
 
     /// Its curvature with its own nodes `y` eliminated ([`eliminate`]).
@@ -197,7 +194,6 @@ impl ElemData {
             own_cov: e.pi,
             own_link: e.pl,
             ray: at.parts.map(|x| -x),
-            plug: -at.plug,
             cells: self.cells.len() as u32,
             cells_on: self.cells_on,
             arc: match self.on_across {
@@ -218,15 +214,11 @@ impl CellData {
         (mixture_ll(&self.pulses, shift, level, em) - self.base) * self.wt
     }
 
-    /// What its term explains of the field's hits at the shares `taken` of its echoes (its layers' responsibilities):
-    /// per hit its voxel and weight (the field's count of it: [`foliage::hits`]), and their plug-in `Σ w t ln σ̂`, how
-    /// the empty scene's pulse already reads them in the cell's ratio, as a log-likelihood (the field's term reads them
-    /// by its marginal instead: [`Term`]'s `plug`). The plug-in weighs each echo as the cell's ratio does (`wt`), not as
-    /// the field counts it, so σ̂ cancels from the cost but through the responsibilities (3dtrees research 130
-    /// field-closed-form, slice-path).
-    pub(super) fn take(&self, taken: &[f64]) -> (Vec<([i32; 3], f64)>, f64) {
-        let hits: Vec<([i32; 3], f64)> = self.hits.iter().map(|&(i, k, w, _)| (k, w * taken[i])).collect();
-        (hits, self.hits.iter().map(|&(i, _, _, ln_sigma)| self.wt * taken[i] * ln_sigma).sum())
+    /// The echoes its term takes a share of at the shares `taken` (its layers' responsibilities), as the voxel's exact
+    /// formula reads them ([`foliage::Echo`]: `a = σ̂ t / f`, `b = 1 − t`, at the hazard σ̂ its pulse read; 3dtrees
+    /// research 130 field-slice).
+    pub(super) fn take(&self, taken: &[f64]) -> Vec<foliage::Echo> {
+        self.hits.iter().map(|&(i, k, w, sigma, f)| foliage::Echo { voxel: k, omega: w, a: sigma * taken[i] / f, b: 1.0 - taken[i] }).collect()
     }
 }
 
@@ -305,15 +297,13 @@ pub(super) fn cap(step: Vector2<f64>) -> Vector2<f64> {
 /// One term's ray likelihood at a point (δ, reflectance level), by outcome, and −ll's slope and curvature there
 /// ([`ElemData::quad`]); and, asked for, what its elements take of the foliage field's hits there (soft attribution;
 /// [`foliage`]'s module docs): per hit, its weight (front share included) times the share of its echo the cell's
-/// layers take by their responsibilities ([`mixture_taken`]), and their plug-in ([`CellData::take`]), in `parts` but
-/// not in `ll`.
+/// layers take by their responsibilities ([`mixture_taken`], [`CellData::take`]).
 pub(super) struct Local {
     pub(super) ll: f64,
     pub(super) parts: [f64; 4],
     pub(super) g: Vector2<f64>,
     pub(super) hess: Matrix2<f64>,
     pub(super) deposit: Deposit,
-    pub(super) plug: f64,
 }
 
 /// One (element, scan)'s part of its scan's cost at an alignment shift, `fit + logdet`: `fit` its ray likelihood's
@@ -322,11 +312,8 @@ pub(super) struct Local {
 /// eliminated), where its own nodes' Newton began (`start`: a move recomputes a held term from its reference's, so an
 /// unchanged term comes out the same), and what its row reports: ŷ, its own nodes' covariance given the shift P⁻¹ and how they follow it
 /// (`own_link`: ŷ moves by −`own_link` per unit of shift), the ray likelihood's cost by outcome, and its cells; and,
-/// with a foliage field, the hits its elements take from it at its nodes (`deposit`, from its last read: [`ElemData::quad`])
-/// and their plug-in: `plug`, `−Σ h ln σ̂` at the held field, which the cells' ratios read as the empty scene's and the
-/// field's term reads by its marginal, so each hit is scored once (3dtrees research 130 formulation.md). It is linear
-/// in the deposit at the held σ̂, so it is the term's own; it stays out of the own nodes' Newton, and in its cost and
-/// its `ray` by outcome.
+/// with a foliage field, the echoes its elements take a share of at its nodes (`deposit`, from its last read:
+/// [`ElemData::quad`]), which the field's exact formula reads ([`super::foliage::FieldCounts`]).
 #[derive(Debug, Clone)]
 pub(super) struct Term {
     pub(super) align: Vec<([i64; 3], f64)>,
@@ -346,12 +333,11 @@ pub(super) struct Term {
     pub(super) across: f64,
     pub(super) spread: f64,
     pub(super) deposit: Deposit,
-    pub(super) plug: f64,
 }
 
 impl Term {
     pub(super) fn cost(&self) -> f64 {
-        self.fit + self.logdet + self.plug
+        self.fit + self.logdet
     }
 }
 
@@ -416,7 +402,7 @@ pub(super) fn elem_data(v: &RangeImage, cells: &[(usize, Vec<Layer>)], elems: &[
         let base = cv.empty.read(0.0, 0.0, em).ll;
         let hits = field.map_or(Vec::new(), |sp| foliage::hits(v, sp, em, cell));
         for (d, s) in shares {
-            let hits = hits.iter().map(|&(i, k, w)| (i, k, w * s, ext.sigma(&k).ln())).collect();
+            let hits = hits.iter().map(|&(i, k, w, r)| (i, k, w * s, ext.hazard_at(&k, r), ext.factor(r))).collect();
             data[d].cells.push(CellData { cell, pulses: cv.pulses.clone(), wt: cv.wt * s, base, outcome, hits });
         }
     }
@@ -457,8 +443,8 @@ mod tests {
         };
         let soft = |c: &CellData| if interior(c) { mixture_taken(&c.pulses, 0.0, 0.0, &em).1 } else { vec![0.0; c.pulses[0].1.echoes.len()] };
         let total = |taken: &dyn Fn(&CellData) -> Vec<f64>| -> f64 {
-            foliage::deposit(d.cells.iter().flat_map(|c| c.take(&taken(c)).0))
-                .iter().map(|x| x.1 as f64).sum()
+            foliage::deposit(d.cells.iter().flat_map(|c| c.take(&taken(c))))
+                .iter().map(|x| x.omega * (1.0 - x.b)).sum()
         };
         let (whole, soft) = (total(&behind), total(&soft));
         assert!(whole > 0.0 && (soft / whole - 1.0).abs() < 0.01, "{soft} vs {whole}");

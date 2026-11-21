@@ -104,17 +104,10 @@ impl std::error::Error for SceneError {}
 ///   the scene is built refitted.
 /// - With a foliage field, each term's deposit (the hits its elements take from the field, [`Term`]'s `deposit`)
 ///   changes with the term, so a move changes the field's counts by its terms' old deposits less their new ones, and
-///   the field's term with them, exactly. What a pulse meets of the field is fixed at the build: one step of EM from κ
-///   (the terms read the background, their deposits make the field, and the terms read it), or a field held from
-///   another scene ([`Scene::hold_foliage`]). The first step carries nearly all of EM's change (3dtrees research 130
-///   rca-em: the stand's 1,893 of 2,028 nats, AM's all but 0.13), so a scene reached by moves is compared with a fresh
-///   build of the same elements.
-/// - Two approximations make the field's EM a surrogate, not the bound it would be (rca-em): the E-step reads σ's
-///   posterior mean `α / β` where the mean-field bound's own step reads `exp(E ln σ)` (so iterating to a fixed point
-///   drains the voxels the elements hold, without each voxel's Occam term), and the plug-in (each term's, [`Term`]'s
-///   `plug`) takes the empty scene to read every echo the elements take as the medium's (weighting it by the empty
-///   pulse's medium responsibility moved the stand's build by 962 nats and away from EM's fixed point, no check improving:
-///   3dtrees research 130 slice-review).
+///   the field's exact formula with them, exactly ([`super::foliage`]). What a pulse reads of the field is the empty
+///   scene's, data alone, or a field held from another scene ([`Scene::hold_foliage`]), so a build is one solve and a
+///   scene reached by moves is a fresh build of its elements, to the held alignment's error (3dtrees research 130
+///   field-slice: the round of EM and the plug-in it needed are gone).
 /// - Element ids are stable and never reused.
 /// - The reference epoch (the scanning day the alignment error's spread is stated for) is declared: a scan of another epoch adds the other-epoch part
 ///   to its alignment error.
@@ -181,11 +174,10 @@ impl Scene {
             (b, cells)
         }).unzip();
         c.field = spec.map(|sp| FieldCounts::new(sp, &c.views.iter().map(|v| &**v).collect::<Vec<_>>(), &em));
-        c.refit_alignment();
         if let Some(f) = &c.field {
             c.ext = f.field(c.sc.kappa);
-            c.refit_alignment();
         }
+        c.refit_alignment();
         c
     }
 
@@ -619,7 +611,7 @@ mod tests {
     use crate::scene::render::{Form, Element};
     use crate::scene::settings::{Background, Settings};
     use crate::scene::term::ChainKey;
-    use super::super::fixtures::{add, cost, costs, field_box, piece_of, pole_view, remove, sky_pole_view, stick, swap, thin_pole_view};
+    use super::super::fixtures::{add, cost, costs, field_box, piece_of, pole_image, pole_view, remove, sky_pole_view, stick, swap, thin_pole_view};
 
     /// The true pole has negative cost; a stick of the wrong radius, shifted, or porous has more; a stick where
     /// the pulses went through to the wall costs; a scene's move agrees with the difference of two
@@ -645,8 +637,9 @@ mod tests {
         assert!((sum - both.0).abs() < 1e-6);
     }
 
-    /// The foliage field is what the elements leave: the empty scene's field holds the pole's echoes (its voxel is
-    /// dense), and a scene built with the pole takes its share of them out. Added to the empty scene, its field fixed,
+    /// The foliage field is what the elements leave: the empty scene's counts hold the pole's echoes (its voxel is
+    /// dense), and a scene built with the pole takes its share of them out (the field it reads is the empty scene's,
+    /// data alone: 3dtrees research 130 field-slice). Added to the empty scene, its field fixed,
     /// the pole costs less than nothing, that change is the cost, the rows, the alignment parts and the field's part sum
     /// to it, and removing it restores the empty scene exactly; built with the pole, the rows sum to the cost too.
     #[test]
@@ -654,13 +647,15 @@ mod tests {
         let v = pole_view();
         let (em, sc) = (Settings::default(), Background::default());
         let pole = stick(0.0, 4.0, 0.03);
+        let hits = |c: &Scene| c.foliage(&Proposal::default()).1.iter().find(|x| x.0 == [5, 10, 3]).map_or(f64::NAN, |x| x.2 .0);
         let sigma = |c: &Scene| c.foliage(&Proposal::default()).1.iter().find(|x| x.0 == [5, 10, 3]).map_or(f64::NAN, |x| x.1);
         let mut c = Scene::new(vec![v.clone()], &[], em, sc, Some(field_box()), 0);
         assert_eq!(c.cost(), 0.0);
         let dense = sigma(&c);
         assert!(dense > 1.0, "{dense}");
         let fresh = Scene::new(vec![v.clone()], &[pole], em, sc, Some(field_box()), 0);
-        assert!(sigma(&fresh) < 0.5 * dense, "{} vs {dense}", sigma(&fresh));
+        assert_eq!(sigma(&fresh), dense);
+        assert!(hits(&fresh) < 0.5 * hits(&c), "{} vs {}", hits(&fresh), hits(&c));
         // each datum is scored once: the elements' cells and the field's part hold the whole cost
         let rows = |c: &Scene| c.rows(&Proposal::default()).iter().map(|r| r.cost).sum::<f64>() + alignment_parts(c) + c.field_part();
         assert!((rows(&fresh) - fresh.cost()).abs() < 1e-9 * fresh.cost().abs(), "{} vs {}", rows(&fresh), fresh.cost());
@@ -769,7 +764,11 @@ mod tests {
     /// element out and puts another in scores what keeping it gives.
     #[test]
     fn scores_match_keeping() {
-        let v = pole_view();
+        // a scanner of many targets: in an image of first echoes (one target, each pulse censored at its echo) a stick
+        // in the box takes no part of the field (3dtrees research 130 slice-s5, merging S3 and the field slice)
+        let mut v = pole_image();
+        v.instrument = Arc::new(crate::scene::instrument::Instrument { max_targets: 15, ..Default::default() });
+        let v = Arc::new(v);
         let (em, sc) = (Settings::default(), Background::default());
         let mut c = Scene::new(vec![v.clone(), v.clone()], &[stick(0.0, 4.0, 0.03)], em, sc, Some(field_box()), 0);
         let hyps = vec![vec![stick(0.0, 4.0, 0.02)], vec![stick(0.2, 6.0, 0.03), stick(0.25, 6.0, 0.01)], vec![stick(5.0, 4.0, 0.03)], vec![stick(0.0365, 3.9, 0.008)]];
@@ -796,16 +795,20 @@ mod tests {
 
     /// The field's counts recomputed from scratch: the empty scene's, less every term's deposit as it now stands.
     fn recounted(c: &Scene) -> foliage::Counts {
+        refield(c).counts()
+    }
+
+    /// The field recomputed from scratch from every term's deposit as it now stands.
+    fn refield(c: &Scene) -> FieldCounts {
         let f = c.field.as_ref().unwrap();
         let mut fresh = FieldCounts::new(f.spec, &c.views.iter().map(|v| &**v).collect::<Vec<_>>(), &c.em);
         fresh.apply(redeposits(&[], &c.fits));
-        fresh.counts()
+        fresh
     }
 
-    /// The field collapsed (research 130 formulation.md): its term, `Σ ln NB` over the counts, is exact through moves
-    /// (its counts are the empty scene's less the terms' deposits recomputed from scratch, and the term a recompute
-    /// from the counts); a move's change to the field's part is the change in that part (the plug-in held); and adding
-    /// then removing restores it exactly.
+    /// The field's exact formula (research 130 field-slice) through moves: its part equals the same formula over the
+    /// terms' deposits recomputed from scratch, exactly; a proposal's change to it is the change a kept one makes; and
+    /// adding then removing restores it exactly.
     #[test]
     fn the_fields_marginal_is_exact_through_moves() {
         let v = pole_view();
@@ -818,13 +821,11 @@ mod tests {
         let (w, _) = swap(&mut c, 0, wrong);
         remove(&mut c, id);
         let (p, _) = swap(&mut c, w, pole);
-        assert_eq!(c.field_part(), f0);
+        assert!((c.field_part() - f0).abs() < 1e-9 * f0.abs(), "{} vs {f0}", c.field_part());
         assert!((c.cost() - e0).abs() < 1e-9 * e0.abs(), "{} vs {e0}", c.cost());
         swap(&mut c, p, wrong);
         assert_eq!(field(&c).counts(), recounted(&c));
-        let (a0, b0) = field(&c).prior;
-        let recomputed: f64 = field(&c).counts().values().map(|&(h, l)| foliage::ln_nb(h, l, a0, b0)).sum();
-        assert!((recomputed - field(&c).marginal()).abs() < 1e-9 * recomputed.abs(), "{recomputed} vs {}", field(&c).marginal());
+        assert!((refield(&c).cost() - c.field_part()).abs() < 1e-6, "{} vs {}", refield(&c).cost(), c.field_part());
         c.refit_alignment();
         assert_eq!(field(&c).counts(), recounted(&c));
         let before = c.field_part();
@@ -833,9 +834,9 @@ mod tests {
         assert!((per[0][2] - (c.field_part() - before)).abs() < 1e-9, "{} vs {}", per[0][2], c.field_part() - before);
     }
 
-    /// With the field collapsed, the pole's cost to add hardly depends on whether the field it is scored against was
-    /// fitted with it in, where the plug-in reading before the collapse (each field held fixed: the cells' ratios
-    /// alone) differs by far more: the field's term is a function of the scene alone.
+    /// The pole's cost to add, from the scene without it, is its cost to remove from the scene with it: the field's
+    /// exact formula is a function of the scene alone (3dtrees research 130 field-slice), where a held field read by
+    /// the cells' ratios alone (`hold_foliage`) differs by far more.
     #[test]
     fn a_hypothesiss_cost_does_not_depend_on_the_last_refit() {
         let v = pole_view();
@@ -852,7 +853,7 @@ mod tests {
         let (out_held, mut in_held) = (held(&[], without.foliage_field()), held(&[pole], with.foliage_field()));
         let put = |c: &Scene| -> f64 { costs(c, &[vec![pole]])[0].iter().sum() };
         let (collapsed, today) = (put(&without) + remove(&mut with, 0), put(&out_held) + remove(&mut in_held, 0));
-        assert!(collapsed.abs() < 0.1 * today.abs(), "collapsed {collapsed} vs today {today}");
+        assert!(collapsed.abs() < 1e-4, "collapsed {collapsed} vs held {today}");
     }
 
     /// A move's change is a full recompute's (3dtrees research 130 slice-structure, slice-soft): each cell read at its
