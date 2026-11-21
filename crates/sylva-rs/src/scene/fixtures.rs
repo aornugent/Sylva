@@ -68,7 +68,7 @@ pub(super) fn pole_scan_of(r_pole: f64, y_pole: f64, gap: f64, wood: f64) -> Ran
             let seed = (l * 400 + k) as u64 * 2 + 1;
             let n = 2.0 * (-2.0 * u(seed).ln()).sqrt() * (2.0 * std::f64::consts::PI * u(seed * 7919)).cos();
             let n_refl = em.refl_noise * (-2.0 * u(seed * 31).ln()).sqrt() * (2.0 * std::f64::consts::PI * u(seed * 7919 * 31)).cos();
-            let kept = ec > 0.0 && wood + 10.0 * ek.max(1e-12).log10() + n > em.floor(tm);
+            let kept = ec > 0.0 && wood + 10.0 * ek.max(1e-12).log10() + n > super::instrument::Instrument::default().floor(tm);
             let wall = (y_pole + gap) / w[1];
             let (ep, ew) = (ek * 10f64.powf(wood / 10.0), (1.0 - f) * 0.01);
             let (range, db) = if !kept {

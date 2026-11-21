@@ -24,7 +24,9 @@
 //!   fragmented) that sets the per-echo noise, the depth bias and the
 //!   scan alignment error's spread.
 
+use super::instrument::Instrument;
 use super::lattice::{scan_lattice, Lattice};
+use std::sync::Arc;
 use crate::error::{Error, Result};
 use crate::io::shots::ShotsFile;
 use crate::transform::{cross, dot, normalize};
@@ -91,6 +93,10 @@ pub struct RangeImage {
     /// say, when a pulse's kept echoes are its targets. The slots it used of the scanner's cap (3dtrees research 130
     /// observation).
     pub targets: Vec<u8>,
+    /// The instrument that recorded the scan ([`Instrument`]): its cap and detection floor. From the scan's own
+    /// echoes where they carry amplitude (the floor's table), else the default; a driver sets the rest from the
+    /// instrument's record ([`RangeImage::instrument`] is replaced whole).
+    pub instrument: Arc<Instrument>,
     /// Unit normal toward the scanner (world), `cos ι` and excess; NaN where no fit.
     pub normal: Vec<[f32; 3]>,
     pub cos_inc: Vec<f32>,
@@ -124,7 +130,7 @@ impl RangeImage {
         let f = ShotsFile::open(path)?;
         let groups: Vec<_> = (0..f.n_groups()).into_par_iter().map(|g| -> Result<_> {
             let f = f.reopen()?;
-            Ok((f.read_rays(g, &[])?, f.read_echo_f64(g, "gps_time")?, f.read_echo_f64(g, "reflectance").ok(), f.read_echo_f64(g, "target_count").ok()))
+            Ok((f.read_rays(g, &[])?, f.read_echo_f64(g, "gps_time")?, f.read_echo_f64(g, "reflectance").ok(), f.read_echo_f64(g, "target_count").ok(), f.read_echo_f64(g, "amplitude").ok()))
         }).collect::<Result<_>>()?;
         // pulses that returned, each with its first echo's time and its raw target count; the pattern's zenith range
         // from every row
@@ -134,7 +140,18 @@ impl RangeImage {
         let mut refls: Vec<f32> = Vec::new();
         let has_refl = groups.iter().all(|g| g.2.is_some());
         let has_targets = groups.iter().all(|g| g.3.is_some());
-        for (rays, time, refl, targets) in &groups {
+        // the scanner's floor table, reflectance − amplitude by range, off every echo that carries both
+        let (mut tr, mut tx, mut ta) = (Vec::new(), Vec::new(), Vec::new());
+        for (rays, _, refl, _, amp) in &groups {
+            if let (Some(x), Some(a)) = (refl, amp) {
+                tr.extend(rays.range.iter().copied());
+                tx.extend(x.iter().map(|&v| v as f32));
+                ta.extend(a.iter().map(|&v| v as f32));
+            }
+        }
+        let table = Instrument::table_from_echoes(&tr, &tx, &ta);
+        drop((tr, tx, ta));
+        for (rays, time, refl, targets, _) in &groups {
             let mut e = 0usize;
             for (i, &n) in rays.echo_count.iter().enumerate() {
                 let (z, a) = (rays.zenith[i] as f64, rays.azimuth[i] as f64);
@@ -151,7 +168,7 @@ impl RangeImage {
                 e += n;
             }
         }
-        for (rays, _, _, _) in &groups {
+        for (rays, _, _, _, _) in &groups {
             for i in 0..rays.zenith.len() {
                 let d = rot_t(&rot, &{
                     let (z, a) = (rays.zenith[i] as f64, rays.azimuth[i] as f64);
@@ -181,6 +198,9 @@ impl RangeImage {
         v.echo_refl = echo_refl;
         if has_targets {
             v.targets = pulses.iter().map(|q| q.4).collect();
+        }
+        if let Some(floor) = table {
+            v.instrument = Arc::new(Instrument { floor, ..Instrument::default() });
         }
         Ok(v)
     }
@@ -237,7 +257,7 @@ impl RangeImage {
             }
         }
         let mut v = RangeImage {
-            lat, c0, n_lines: nl, n_cols: nc, rot, origin, epoch, cell, range: rng, pulse, echo_start, echo_range, echo_refl: Vec::new(), targets: Vec::new(),
+            lat, c0, n_lines: nl, n_cols: nc, rot, origin, epoch, cell, range: rng, pulse, echo_start, echo_range, echo_refl: Vec::new(), targets: Vec::new(), instrument: Arc::new(Instrument::default()),
             normal: Vec::new(), cos_inc: Vec::new(), excess: Vec::new(),
         };
         let fits: Vec<([f32; 3], f32)> = (0..n).into_par_iter().map(|k| v.fit(k, direction, p)).collect();
@@ -366,7 +386,8 @@ impl RangeImage {
 
     /// The slots cell `k`'s pulse had for the echoes it kept, of a scanner reporting `cap` targets per pulse: the cap
     /// less the targets the import dropped from it ([`RangeImage::targets`]).
-    pub fn slots(&self, k: usize, cap: usize) -> usize {
+    pub fn slots(&self, k: usize) -> usize {
+        let cap = self.instrument.max_targets;
         let kept = self.echoes(k).len();
         let raw = if self.targets.is_empty() || self.pulse[k] == u32::MAX { kept } else { self.targets[self.pulse[k] as usize] as usize };
         cap.saturating_sub(raw.saturating_sub(kept))
@@ -375,9 +396,9 @@ impl RangeImage {
     /// Whether cell `k`'s pulse is censored after its last echo: the scanner reported as many targets for it as it
     /// reports at most (`cap`, the programme's), counting the ones the import dropped, so it says nothing past its last
     /// echo. A miss or no pulse is not.
-    pub fn capped(&self, k: usize, cap: usize) -> bool {
+    pub fn capped(&self, k: usize) -> bool {
         let n = self.echoes(k).len();
-        n > 0 && n >= self.slots(k, cap)
+        n > 0 && n >= self.slots(k)
     }
 
     /// The reflectances (dB) of cell `k`'s echoes, beside [`RangeImage::echoes`]; empty where unknown.
@@ -432,15 +453,15 @@ impl RangeImage {
     pub fn save(&self, path: impl AsRef<Path>) -> Result<()> {
         let path = path.as_ref();
         // destructured whole, so a new field fails to compile here until it is saved
-        let RangeImage { lat, c0, n_lines, n_cols, rot, origin, epoch, cell, range, pulse, echo_start, echo_range, echo_refl, targets,
+        let RangeImage { lat, c0, n_lines, n_cols, rot, origin, epoch, cell, range, pulse, echo_start, echo_range, echo_refl, targets, instrument,
                          normal, cos_inc, excess } = self;
         let Lattice { line, col, n_lines: lat_lines, n_cols: lat_cols, pulse_interval, line_period, zenith_step, azimuth_step, zenith0,
                       line_phase, zenith_profile, azimuth_profile, count, line_azimuth0, azimuth_per_col } = lat;
         let io = |e: std::io::Error| Error::file(path, e.to_string());
         let mut w = BufWriter::with_capacity(1 << 22, File::create(path).map_err(io)?);
         w.write_all(MAGIC).map_err(io)?;
-        let sizes = [build_version(), *c0 as u64, *n_lines as u64, *n_cols as u64, *epoch as u64, 0, *lat_lines as u64, *lat_cols as u64];
-        let reals = [*pulse_interval, *line_period, *zenith_step, *azimuth_step, *zenith0, *azimuth_per_col];
+        let sizes = [build_version(), *c0 as u64, *n_lines as u64, *n_cols as u64, *epoch as u64, instrument.max_targets as u64, *lat_lines as u64, *lat_cols as u64];
+        let reals = [*pulse_interval, *line_period, *zenith_step, *azimuth_step, *zenith0, *azimuth_per_col, instrument.floor_step, instrument.weak_amplitude, instrument.weak_range];
         put(&mut w, &sizes).map_err(io)?;
         put(&mut w, &reals).map_err(io)?;
         put(&mut w, rot).map_err(io)?;
@@ -452,6 +473,7 @@ impl RangeImage {
         put(&mut w, echo_range).map_err(io)?;
         put(&mut w, echo_refl).map_err(io)?;
         put(&mut w, targets).map_err(io)?;
+        put(&mut w, &instrument.floor).map_err(io)?;
         put(&mut w, normal).map_err(io)?;
         put(&mut w, cos_inc).map_err(io)?;
         put(&mut w, excess).map_err(io)?;
@@ -490,6 +512,8 @@ impl RangeImage {
             rot: [rot[0], rot[1], rot[2]], origin: [origin[0], origin[1], origin[2]], epoch: sizes[4] as u32, cell,
             range: get(&mut r).map_err(io)?, pulse: get(&mut r).map_err(io)?, echo_start: get(&mut r).map_err(io)?,
             echo_range: get(&mut r).map_err(io)?, echo_refl: get(&mut r).map_err(io)?, targets: get(&mut r).map_err(io)?,
+            instrument: Arc::new(Instrument { max_targets: sizes[5] as usize, floor: get(&mut r).map_err(io)?, floor_step: reals[6],
+                                              weak_amplitude: reals[7], weak_range: reals[8] }),
             normal: get(&mut r).map_err(io)?, cos_inc: get(&mut r).map_err(io)?, excess: get(&mut r).map_err(io)?,
         };
         v.lat = Lattice {
@@ -576,11 +600,12 @@ mod tests {
         // echo was its only target had a slot left
         let (a, b) = (cell(120, 300), cell(121, 300));
         let mut v = v;
+        v.instrument = Arc::new(Instrument { max_targets: 2, ..Instrument::default() });
         v.targets = vec![1; v.echo_start.len() - 1];
         v.targets[v.pulse[a] as usize] = 2;
-        assert_eq!((v.slots(a, 2), v.capped(a, 2)), (1, true));
-        assert_eq!((v.slots(b, 2), v.capped(b, 2)), (2, false));
-        assert!(!v.capped(cell(95, 205), 2), "a miss is never censored");
+        assert_eq!((v.slots(a), v.capped(a)), (1, true));
+        assert_eq!((v.slots(b), v.capped(b)), (2, false));
+        assert!(!v.capped(cell(95, 205)), "a miss is never censored");
         let k = cell(150, 100);
         let n = v.normal[k];
         assert!(n[1] < -0.999, "{n:?}");

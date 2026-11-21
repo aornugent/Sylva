@@ -401,7 +401,7 @@ mod tests {
                 let echoes = v.echoes(cell);
                 let wt = em.cell_weight(echoes.first().map_or(ls[0].t, |&r| r as f64), v.steps(cell));
                 let w = v.direction((cell / v.n_cols) as f64, (cell % v.n_cols) as f64);
-                let pulse = |ls: Vec<Layer>| Pulse::on(occluders(ls, None), cell_class(&v, cell, &em), &Foliage::uniform(sc.kappa).medium(&v.origin, &w), echoes, v.echo_refls(cell), v.slots(cell, em.max_targets as usize), &em);
+                let pulse = |ls: Vec<Layer>| Pulse::on(occluders(ls, None), cell_class(&v, cell, &em), &Foliage::uniform(sc.kappa).medium(&v.origin, &w), echoes, v.echo_refls(cell), v.slots(cell), &v.instrument, &em);
                 // a partial layer is in the cell with its entry weight
                 let lik: f64 = mixture(ls).into_iter().map(|(p, ls)| p * pulse(ls).read(shift, level, &em).ll.exp()).sum();
                 wt * (lik.ln() - pulse(Vec::new()).read(0.0, 0.0, &em).ll)
