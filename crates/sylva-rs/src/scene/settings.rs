@@ -131,6 +131,10 @@ params! {
         pub crown_full: f64 = 0.03472,
         pub crown_alpha: f64 = 0.05721,
         pub crown_beta: f64 = 0.92766,
+        /// The crown leaf's and the low cover's reflectance at a full fill against the full hit (dB, incidence and
+        /// material together; slice-dgp step 7: the stand's own, from its echoes' known fills).
+        pub crown_offset: f64 = 0.0,
+        pub low_offset: f64 = 0.0,
         pub low_noise: f64 = 0.4579,
         pub low_dof: f64 = 3.8,
         pub low_level: f64 = 1.3402,

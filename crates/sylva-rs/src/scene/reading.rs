@@ -37,14 +37,17 @@ pub const LOW_COVER: f64 = 1.5;
 /// One class's reading of its objects' fills: per u on the table, π(u) and E[1 − f | u, partial] (the module docs).
 #[derive(Debug)]
 pub struct Reading {
+    offset: f64,
     stop: Vec<f64>,
     left: Vec<f64>,
 }
 
 /// A class's numbers: the full hit's noise (dB, t scale) and its dof, the level's sd (dB), the darkening's scale at
-/// fill 0 (dB), the share of full fills and the partial fills' Beta(α, β).
+/// fill 0 (dB), the share of full fills and the partial fills' Beta(α, β), and its reflectance at a full fill against
+/// the full hit (dB, its offset).
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct ReadingModel {
+    pub offset: f64,
     pub noise: f64,
     pub dof: f64,
     pub level: f64,
@@ -57,13 +60,13 @@ pub struct ReadingModel {
 impl ReadingModel {
     /// The crown leaf's numbers, the site's.
     pub fn crown(em: &Settings) -> Self {
-        ReadingModel { noise: em.crown_noise, dof: em.crown_dof, level: em.crown_level, edge: em.crown_edge, full: em.crown_full,
+        ReadingModel { offset: em.crown_offset, noise: em.crown_noise, dof: em.crown_dof, level: em.crown_level, edge: em.crown_edge, full: em.crown_full,
                        alpha: em.crown_alpha, beta: em.crown_beta }
     }
 
     /// The low cover's numbers, the site's.
     pub fn low(em: &Settings) -> Self {
-        ReadingModel { noise: em.low_noise, dof: em.low_dof, level: em.low_level, edge: em.low_edge, full: em.low_full,
+        ReadingModel { offset: em.low_offset, noise: em.low_noise, dof: em.low_dof, level: em.low_level, edge: em.low_edge, full: em.low_full,
                        alpha: em.low_alpha, beta: em.low_beta }
     }
 
@@ -73,8 +76,8 @@ impl ReadingModel {
         if height < LOW_COVER { ReadingModel::low(em) } else { ReadingModel::crown(em) }
     }
 
-    fn key(&self) -> [u64; 7] {
-        [self.noise, self.dof, self.level, self.edge, self.full, self.alpha, self.beta].map(f64::to_bits)
+    fn key(&self) -> [u64; 8] {
+        [self.offset, self.noise, self.dof, self.level, self.edge, self.full, self.alpha, self.beta].map(f64::to_bits)
     }
 }
 
@@ -132,15 +135,15 @@ impl Reading {
             stop.push(if full + z > 0.0 { full / (full + z) } else { 0.0 });
             left.push(if z > 0.0 { l / z } else { 0.0 });
         }
-        Reading { stop, left }
+        Reading { offset: m.offset, stop, left }
     }
 
     /// The reading of a class with numbers `m`, computed once per process and shared.
     pub fn of(m: &ReadingModel) -> Arc<Reading> {
         use std::cell::RefCell;
-        static KEPT: OnceLock<Mutex<HashMap<[u64; 7], Arc<Reading>>>> = OnceLock::new();
+        static KEPT: OnceLock<Mutex<HashMap<[u64; 8], Arc<Reading>>>> = OnceLock::new();
         // each thread keeps the last it read, so a pulse's read takes no lock
-        thread_local!(static LAST: RefCell<Option<([u64; 7], Arc<Reading>)>> = const { RefCell::new(None) });
+        thread_local!(static LAST: RefCell<Option<([u64; 8], Arc<Reading>)>> = const { RefCell::new(None) });
         let key = m.key();
         if let Some(r) = LAST.with(|l| l.borrow().as_ref().filter(|x| x.0 == key).map(|x| x.1.clone())) {
             return r;
@@ -156,20 +159,20 @@ impl Reading {
         r
     }
 
-    fn at(table: &[f64], u: f64) -> f64 {
-        let x = ((u - U0) / DU).clamp(0.0, (NU - 1) as f64);
+    fn at(&self, table: &[f64], u: f64) -> f64 {
+        let x = ((u - self.offset - U0) / DU).clamp(0.0, (NU - 1) as f64);
         let (i, a) = ((x.floor() as usize).min(NU - 2), x - x.floor());
         table[i] * (1.0 - a) + table[i + 1] * a
     }
 
     /// π(u): the chance the object filled the beam it met.
     pub fn stop(&self, u: f64) -> f64 {
-        Reading::at(&self.stop, u)
+        self.at(&self.stop, u)
     }
 
     /// E[1 − f | u, partial]: the beam left behind an object that didn't fill it.
     pub fn left(&self, u: f64) -> f64 {
-        Reading::at(&self.left, u)
+        self.at(&self.left, u)
     }
 
     /// E[1 − f | u]: the beam left on average, for the readers linear in it.
