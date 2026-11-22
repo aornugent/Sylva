@@ -379,12 +379,14 @@ pub struct Walked {
 }
 
 /// Cell `k`'s pulse in image `v` as [`Walked`] reads it.
-pub fn walked(v: &RangeImage, em: &Settings, k: usize) -> Option<Walked> {
+pub fn walked(v: &RangeImage, em: &Settings, k: usize, ground_z: f64) -> Option<Walked> {
     if v.cell[k] == Cell::NoPulse {
         return None;
     }
     let (echoes, refls) = (v.echoes(k), v.echo_refls(k));
-    let leaf = Reading::of(&ReadingModel::leaf(em));
+    let w = v.direction((k / v.n_cols) as f64, (k % v.n_cols) as f64);
+    // an echo's class by its height above the terrain (NaN: the crown's), as the pulse reads it
+    let reading = |r: f64| Reading::of(&ReadingModel::medium(em, v.origin[2] + w[2] * r - ground_z));
     let known = if v.capped(k) { echoes.last().map_or(f64::INFINITY, |&r| r as f64) } else { f64::INFINITY };
     let (mut start, mut beam) = (0.0, 1.0);
     let (mut path, mut out) = (Vec::with_capacity(echoes.len() + 1), Vec::with_capacity(echoes.len()));
@@ -392,7 +394,7 @@ pub fn walked(v: &RangeImage, em: &Settings, k: usize) -> Option<Walked> {
         path.push((start, r as f64, beam));
         out.push(r as f64);
         if let Some(&db) = refls.get(i) {
-            beam = leaf.beam_after(em, beam, db as f64);
+            beam = reading(r as f64).beam_after(em, beam, db as f64);
         }
         start = r as f64 + em.resolution();
     }
@@ -403,8 +405,8 @@ pub fn walked(v: &RangeImage, em: &Settings, k: usize) -> Option<Walked> {
 
 /// The beam cell `k`'s echoes leave ([`Walked`]'s `beam`, without its stretches).
 pub fn beam_left(v: &RangeImage, em: &Settings, k: usize) -> f64 {
-    let leaf = Reading::of(&ReadingModel::leaf(em));
-    v.echo_refls(k).iter().fold(1.0, |b, &db| leaf.beam_after(em, b, db as f64))
+    let crown = Reading::of(&ReadingModel::crown(em));
+    v.echo_refls(k).iter().fold(1.0, |b, &db| crown.beam_after(em, b, db as f64))
 }
 
 /// The echoes of image `v`'s cell `k` the field counts as hits, those inside the box: (the echo's index in its
@@ -416,7 +418,7 @@ pub fn hits(v: &RangeImage, sp: &FoliageBox, em: &Settings, k: usize) -> Vec<(us
         return Vec::new();
     }
     let w = v.direction((k / v.n_cols) as f64, (k % v.n_cols) as f64);
-    let p = walked(v, em, k).expect("a pulse");
+    let p = walked(v, em, k, f64::NAN).expect("a pulse");
     let steps = v.steps(k);
     p.echoes.iter().enumerate().filter_map(|(i, &r)| {
         let x = [0, 1, 2].map(|a| v.origin[a] + w[a] * r);
@@ -428,12 +430,12 @@ pub fn hits(v: &RangeImage, sp: &FoliageBox, em: &Settings, k: usize) -> Vec<(us
 /// module docs): each echo a hit ([`hits`]) and each stretch it shows clear its path ([`walked`]), each voxel's piece of
 /// it weighted at its own range, as an echo there would be (3dtrees research 130 slice-path: the overlap of
 /// neighbouring beams is the voxel's, for its hits and its path alike).
-fn ray(v: &RangeImage, sp: &FoliageBox, em: &Settings, k: usize, acc: &mut FixedCounts) {
+fn ray(v: &RangeImage, sp: &FoliageBox, em: &Settings, ground_z: f64, k: usize, acc: &mut FixedCounts) {
     let w = v.direction((k / v.n_cols) as f64, (k % v.n_cols) as f64);
     if clip(sp, &v.origin, &w).is_none() {
         return;
     }
-    let Some(p) = walked(v, em, k) else { return }; // nothing observed
+    let Some(p) = walked(v, em, k, ground_z) else { return }; // nothing observed
     let steps = v.steps(k);
     let walk = Walk::new(sp, &v.origin, &w);
     for &(from, to, beam) in &p.path {
@@ -538,11 +540,11 @@ fn lse(xs: impl Iterator<Item = f64>) -> f64 {
 impl FieldCounts {
     /// The empty scene's counts of images `views` (every ray whole, every echo the medium's), under the prior in `em`;
     /// nothing taken yet.
-    pub fn new(spec: FoliageBox, views: &[&RangeImage], em: &Settings) -> Self {
+    pub fn new(spec: FoliageBox, views: &[&RangeImage], em: &Settings, ground_z: f64) -> Self {
         let prior = (em.field_prior_mean * em.field_prior_path, em.field_prior_path);
         let counts = views.iter().map(|v| {
             (0..v.cell.len()).into_par_iter().fold(FixedCounts::default, |mut acc, k| {
-                ray(v, &spec, em, k, &mut acc);
+                ray(v, &spec, em, ground_z, k, &mut acc);
                 acc
             }).reduce(FixedCounts::default, merged)
         }).fold(FixedCounts::default(), merged);
@@ -774,7 +776,7 @@ mod tests {
         assert!(v.echoes(pole)[0] < 4.1 && v.echoes(wall)[0] > 7.9);
         let per_metre = |k: usize| {
             let mut acc = FixedCounts::default();
-            ray(&v, &sp, &em, k, &mut acc);
+            ray(&v, &sp, &em, f64::NAN, k, &mut acc);
             let w = v.direction((k / v.n_cols) as f64, (k % v.n_cols) as f64);
             // the voxels from the box's face at 2.9 m to 3.8 m (rows 0..9 across the beam), over that length of ray
             let path: i64 = acc.iter().filter(|(key, _)| key[1] < 9).map(|(_, c)| c[1]).sum();
@@ -797,7 +799,7 @@ mod tests {
         let sigma = 1.0;
         let sliver = em.refl_full_hit() + 10.0 * 0.5f64.log10();
         // the beam the sliver leaves on average, its fill read through its brightness (slice-dgp)
-        let left = Reading::of(&ReadingModel::leaf(&em)).beam_after(&em, 1.0, sliver);
+        let left = Reading::of(&ReadingModel::crown(&em)).beam_after(&em, 1.0, sliver);
         let u = |s: u64| ((s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407) >> 11) as f64 + 0.5) / (1u64 << 53) as f64;
         let (mut t, mut d, mut start, mut range, mut refl) = (Vec::new(), Vec::new(), vec![0u32], Vec::new(), Vec::new());
         for l in 0..200usize {
@@ -818,7 +820,7 @@ mod tests {
         // a scanner of two targets: past them, censored
         v.instrument = std::sync::Arc::new(super::super::instrument::Instrument { max_targets: 2, ..Default::default() });
         let sp = FoliageBox { lo: [-1.0, 4.0, -1.0], hi: [1.0, 6.0, 1.0], voxel: 0.25 };
-        let (h, l) = FieldCounts::new(sp, &[&v], &em).counts().values().fold((0.0, 0.0), |(h, l), &(a, b)| (h + a, l + b));
+        let (h, l) = FieldCounts::new(sp, &[&v], &em, f64::NAN).counts().values().fold((0.0, 0.0), |(h, l), &(a, b)| (h + a, l + b));
         assert!((h / l / sigma - 1.0).abs() < 0.03, "the field reads {} against σ = {sigma}", h / l);
     }
 

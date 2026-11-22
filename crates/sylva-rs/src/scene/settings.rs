@@ -117,18 +117,26 @@ params! {
         pub refl_edge: f64 = 11.35,
         pub refl_incidence: f64 = 0.3,
         pub refl_level_sd: f64 = 0.76,
-        /// The medium's echoes' reading of their objects' fills ([`super::reading`]; 3dtrees research 130
-        /// slice-dgp): a full hit's noise (dB, t scale) and its dof, the object's level sd (dB), a partial fill's
-        /// darkening scale at fill 0 (dB, a half-t), the share of objects that fill the beam they meet, and the
-        /// partial fills' Beta(α, β). Until fitted on the closures (slice-dgp step 4): wood's spreads, test B's
-        /// share and a uniform prior.
-        pub leaf_noise: f64 = 0.37,
-        pub leaf_dof: f64 = 3.8,
-        pub leaf_level: f64 = 0.76,
-        pub leaf_edge: f64 = 11.35,
-        pub leaf_full: f64 = 0.2,
-        pub leaf_alpha: f64 = 1.0,
-        pub leaf_beta: f64 = 1.0,
+        /// The medium's echoes' reading of their objects' fills, per class ([`super::reading`]; 3dtrees research 130
+        /// slice-dgp): crown leaf, and low cover (an echo under [`super::reading::LOW_COVER`] above the terrain). Each:
+        /// a full hit's noise (dB, t scale) and its dof, the object's level sd (dB), a partial fill's darkening scale
+        /// at fill 0 (dB, a half-t), the share of objects that fill the beam they meet, and the partial fills'
+        /// Beta(α, β). The noise, level, share and Beta fitted on AM's training closures with the dof and the
+        /// darkening at wood's (`reading_fit.py`, slice-dgp step 4).
+        pub crown_noise: f64 = 0.4219,
+        pub crown_dof: f64 = 3.8,
+        pub crown_level: f64 = 1.1981,
+        pub crown_edge: f64 = 11.35,
+        pub crown_full: f64 = 0.03472,
+        pub crown_alpha: f64 = 0.05721,
+        pub crown_beta: f64 = 0.92766,
+        pub low_noise: f64 = 0.4579,
+        pub low_dof: f64 = 3.8,
+        pub low_level: f64 = 1.3402,
+        pub low_edge: f64 = 11.35,
+        pub low_full: f64 = 0.09739,
+        pub low_alpha: f64 = 0.13176,
+        pub low_beta: f64 = 0.81933,
         pub refl_background_mean: f64 = -21.29,
         pub refl_background_sd: f64 = 6.28,
         /// The scan alignment error (research 130 offset-field-design.md): an along-beam shift per (scan, place),

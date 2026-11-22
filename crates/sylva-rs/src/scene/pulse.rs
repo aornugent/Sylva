@@ -527,6 +527,11 @@ impl<P: Real, T: Over<P>> Reading<P, T> {
 
 impl<P: Real> Pulse<P> {
     /// The pulse against occluders `occ` along a ray already walked through the field (`m`, [`Medium`]).
+    /// The ground's range and cos ι along the ray, if the ray meets it.
+    pub(super) fn ground(&self) -> Option<(f64, f64)> {
+        self.occluders.last().and_then(|o| match o.surface { Surface::Ground(cos) => Some((o.t.v(), cos.v())), _ => None })
+    }
+
     pub(super) fn on(mut occ: Vec<Occluder<P>>, class: u8, m: &Medium, echoes: &[f32], refls: &[f32], cap: usize, inst: &Instrument, em: &Settings) -> Self {
         for x in occ.iter_mut() {
             x.tau = m.tau(x.t);
@@ -560,7 +565,8 @@ impl<P: Real> Pulse<P> {
         let rx = self.receiver(shift, level, em);
         let owners = rx.owners();
         let mut resp = vec![0.0; self.echoes.len() * owners];
-        let pass = Pass { pulse: self, rx: &rx, em, t_end: Self::end(&self.occluders), capped: self.capped(), owners, leaf: FillReading::of(&ReadingModel::leaf(em)) };
+        let pass = Pass { pulse: self, rx: &rx, em, t_end: Self::end(&self.occluders), capped: self.capped(), owners, crown: FillReading::of(&ReadingModel::crown(em)),
+                           low: FillReading::of(&ReadingModel::low(em)), ground: self.ground() };
         let total = rx.patterns.iter().map(|(p, rets)| *p * pass.lik(rets, 0, 0, P::c(1.0), 1.0, 1.0, 0.0, p.v(), &mut resp)).sum::<T>();
         if total.v() > 0.0 {
             resp.iter_mut().for_each(|r| *r /= total.v());
@@ -586,11 +592,23 @@ pub(super) struct Pass<'a, P, T> {
     pub(super) t_end: f64,
     pub(super) capped: bool,
     pub(super) owners: usize,
-    /// The medium's echoes' reading of their objects' fills ([`Reading`]).
-    pub(super) leaf: std::sync::Arc<FillReading>,
+    /// The medium's echoes' reading of their objects' fills, crown leaf and low cover ([`FillReading`]), and the
+    /// ground's range and cos ι along the ray, which sets an echo's class by its height.
+    pub(super) crown: std::sync::Arc<FillReading>,
+    pub(super) low: std::sync::Arc<FillReading>,
+    pub(super) ground: Option<(f64, f64)>,
 }
 
 impl<P: Real, T: Over<P>> Pass<'_, P, T> {
+    /// The reading of a medium's echo at range `o` by its class: low cover under [`super::reading::LOW_COVER`] above
+    /// the terrain, else crown leaf.
+    pub(super) fn reading_at(&self, o: f64) -> &FillReading {
+        match self.ground {
+            Some((t, cos)) if (t - o) * cos < super::reading::LOW_COVER => &self.low,
+            _ => &self.crown,
+        }
+    }
+
     /// Return `r` met in `k` of the beam the scene left it (`taken`: the medium's echoes in front took the rest): each
     /// member's detection and miss re-read at that beam, and its reflectance `10 log10 k` dimmer. Itself at k = 1.
     pub(super) fn dim(&self, r: &Return<P, T>, k: f64) -> Return<P, T> {
@@ -671,7 +689,7 @@ impl<P: Real, T: Over<P>> Pass<'_, P, T> {
             let d = none * ((occ[r.first].tau - tau0).max(0.0) * -seen).exp() * r.s * r.density(o, x, em, occ);
             if d.v() > 0.0 {
                 let f = d * (1.0 - P_OUTLIER);
-                let rest = self.lik(rets, i + 1, k + 1, self.rx.members[r.last].beam, taken, self.leaf.beam_after(em, seen, x), tau_after, prefix * f.v(), resp);
+                let rest = self.lik(rets, i + 1, k + 1, self.rx.members[r.last].beam, taken, self.reading_at(o).beam_after(em, seen, x), tau_after, prefix * f.v(), resp);
                 resp[row + r.first] += prefix * f.v() * rest.v();
                 total += f * rest;
             }
@@ -687,11 +705,12 @@ impl<P: Real, T: Over<P>> Pass<'_, P, T> {
                 // its object's fill: stopped, or partial (the beam on at the partial mean)
                 let (stop, left) = if x.is_finite() && (scene.v() * taken) > 0.0 {
                     let u = FillReading::reading(em, scene.v() * taken, x);
-                    (self.leaf.stop(u), self.leaf.left(u))
+                    let r = self.reading_at(o);
+                    (r.stop(u), r.left(u))
                 } else {
                     (0.0, 1.0)
                 };
-                let seen_on = self.leaf.beam_after(em, seen, x);
+                let seen_on = self.reading_at(o).beam_after(em, seen, x);
                 for (share, taken_on, seen_on) in [(1.0 - stop, taken * left, seen_on), (stop, 0.0, 0.0)] {
                     if share > 0.0 {
                         let fb = f * share;
@@ -798,7 +817,7 @@ mod tests {
         let em = Settings::default();
         let flat = Foliage::uniform(0.05);
         // a leaf echo whose reading leaves half the beam (slice-dgp: read through its fill, on its partial branch)
-        let r = FillReading::of(&ReadingModel::leaf(&em));
+        let r = FillReading::of(&ReadingModel::crown(&em));
         let u = (0..4000).map(|i| -30.0 + 0.01 * i as f64).find(|&u| r.left(u) <= 0.5).unwrap();
         let leaf = (em.refl_full_hit() + u) as f32;
         assert!(r.stop(u) < 0.05, "{}", r.stop(u));

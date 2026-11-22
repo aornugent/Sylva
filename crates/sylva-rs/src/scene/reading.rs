@@ -31,6 +31,8 @@ const NF: usize = 240;
 const G0: f64 = -5.0;
 /// The darkening's quadrature nodes (quantiles of a half-t).
 const ND: usize = 24;
+/// The height above the terrain (m) under which a medium's echo is low cover (3dtrees research 130 t1-branch).
+pub const LOW_COVER: f64 = 1.5;
 
 /// One class's reading of its objects' fills: per u on the table, π(u) and E[1 − f | u, partial] (the module docs).
 #[derive(Debug)]
@@ -53,10 +55,22 @@ pub struct ReadingModel {
 }
 
 impl ReadingModel {
-    /// The medium's echoes' class (crown leaf) from the site's numbers.
-    pub fn leaf(em: &Settings) -> Self {
-        ReadingModel { noise: em.leaf_noise, dof: em.leaf_dof, level: em.leaf_level, edge: em.leaf_edge, full: em.leaf_full,
-                       alpha: em.leaf_alpha, beta: em.leaf_beta }
+    /// The crown leaf's numbers, the site's.
+    pub fn crown(em: &Settings) -> Self {
+        ReadingModel { noise: em.crown_noise, dof: em.crown_dof, level: em.crown_level, edge: em.crown_edge, full: em.crown_full,
+                       alpha: em.crown_alpha, beta: em.crown_beta }
+    }
+
+    /// The low cover's numbers, the site's.
+    pub fn low(em: &Settings) -> Self {
+        ReadingModel { noise: em.low_noise, dof: em.low_dof, level: em.low_level, edge: em.low_edge, full: em.low_full,
+                       alpha: em.low_alpha, beta: em.low_beta }
+    }
+
+    /// The class of a medium's echo at `height` m above the terrain (NaN: unknown, the crown's): T1's rule, data alone
+    /// (an echo on an element is that element's return, not the medium's).
+    pub fn medium(em: &Settings, height: f64) -> Self {
+        if height < LOW_COVER { ReadingModel::low(em) } else { ReadingModel::crown(em) }
     }
 
     fn key(&self) -> [u64; 7] {
@@ -192,13 +206,13 @@ mod tests {
     #[test]
     fn a_brighter_reading_means_more_fill() {
         let em = Settings::default();
-        let r = Reading::new(&ReadingModel::leaf(&em));
+        let r = Reading::new(&ReadingModel::crown(&em));
         let us: Vec<f64> = (0..=120).map(|i| -30.0 + 0.25 * i as f64).collect();
         for w in us.windows(2) {
             assert!(r.stop(w[1]) >= r.stop(w[0]) - 1e-9 && r.mean_left(w[1]) <= r.mean_left(w[0]) + 1e-9, "{w:?}");
         }
         for u in [0.0, 1.0, 3.0] {
-            assert!(r.stop(u) > 0.7 && r.mean_left(u) < 0.03, "{u}: {} {}", r.stop(u), r.mean_left(u));
+            assert!(r.stop(u) > 0.5 && r.mean_left(u) < 0.1, "{u}: {} {}", r.stop(u), r.mean_left(u));
         }
         assert!(r.stop(-13.0) < 0.01 && r.left(-13.0) > 0.6);
     }
