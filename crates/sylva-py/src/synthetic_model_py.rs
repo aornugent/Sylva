@@ -202,7 +202,7 @@ fn synthetic_plot_terrain<'py>(py: Python<'py>, modes: PyReadonlyArray2<f64>, sl
 }
 
 #[pyfunction]
-fn synthetic_scan_beam<'py>(py: Python<'py>, xyz: PyReadonlyArray2<f64>, attrs: Option<&Bound<'_, PyDict>>, origin: (f64, f64, f64), resolution_deg: f64, min_zenith_deg: f64, max_zenith_deg: f64, max_echoes: usize, echo_separation: f64, range_noise: f64, range_noise_slope: f64, beam_divergence: f64, exit_diameter: f64, footprint_samples: usize, mixed_pixels: bool, target_radius: Option<f64>, oriented: bool, detection_threshold: f64, reflectance_map: Vec<(i64, f64)>, reflectance_default: f64, reflectance_attr: Option<String>, reflectance_constant: Option<f64>, max_range: f64, seed: u64, solid_a: Option<PyReadonlyArray2<f64>>, solid_b: Option<PyReadonlyArray2<f64>>, solid_r: Option<PyReadonlyArray1<f64>>, solid_point: Option<PyReadonlyArray1<i64>>, azimuth: (f64, f64), timing: (f64, f64), lambertian: bool, gaussian: bool, roughness: (f64, f64, u64), mesh_v: Option<PyReadonlyArray2<f64>>, mesh_n: Option<PyReadonlyArray2<f64>>, mesh_f: Option<PyReadonlyArray2<u32>>, mesh_point: Option<PyReadonlyArray1<u32>>) -> PyResult<Bound<'py, PyDict>> {
+fn synthetic_scan_beam<'py>(py: Python<'py>, xyz: PyReadonlyArray2<f64>, attrs: Option<&Bound<'_, PyDict>>, origin: (f64, f64, f64), resolution_deg: f64, min_zenith_deg: f64, max_zenith_deg: f64, max_echoes: usize, echo_separation: f64, range_noise: f64, range_noise_slope: f64, beam_divergence: f64, exit_diameter: f64, footprint_samples: usize, mixed_pixels: bool, target_radius: Option<f64>, oriented: bool, detection_threshold: f64, reflectance_map: Vec<(i64, f64)>, reflectance_default: f64, reflectance_attr: Option<String>, reflectance_constant: Option<f64>, max_range: f64, seed: u64, solid_a: Option<PyReadonlyArray2<f64>>, solid_b: Option<PyReadonlyArray2<f64>>, solid_r: Option<PyReadonlyArray1<f64>>, solid_point: Option<PyReadonlyArray1<i64>>, azimuth: (f64, f64), timing: (f64, f64), lambertian: bool, gaussian: bool, pedestal: (f64, f64, f64, f64), roughness: (f64, f64, u64), mesh_v: Option<PyReadonlyArray2<f64>>, mesh_n: Option<PyReadonlyArray2<f64>>, mesh_f: Option<PyReadonlyArray2<u32>>, mesh_point: Option<PyReadonlyArray1<u32>>) -> PyResult<Bound<'py, PyDict>> {
     let cloud = cloud_from_py(xyz, attrs)?;
     let mut p = BeamScan::new([origin.0, origin.1, origin.2]);
     if let (Some(v), Some(f), Some(pt)) = (mesh_v, mesh_f, mesh_point) {
@@ -249,6 +249,7 @@ fn synthetic_scan_beam<'py>(py: Python<'py>, xyz: PyReadonlyArray2<f64>, attrs: 
     (p.pulse_interval, p.line_period) = timing;
     p.lambertian = lambertian;
     p.gaussian = gaussian;
+    p.pedestal = [pedestal.0, pedestal.1, pedestal.2, pedestal.3];
     (p.roughness, p.roughness_length, p.roughness_seed) = roughness;
     let s = py.detach(|| scan::scan_beam(&cloud, &p)).map_err(err)?;
     shots_to_py(py, &s)
@@ -256,11 +257,12 @@ fn synthetic_scan_beam<'py>(py: Python<'py>, xyz: PyReadonlyArray2<f64>, attrs: 
 
 /// What a scanner's export holds of a beam scan (sylva_rs::synthetic::scan::export).
 #[pyfunction]
-#[pyo3(signature = (shots, min_reflectance=f64::NEG_INFINITY, floor_slope=0.0, floor_ref=7.0, refl_noise=0.0, range_a=0.0, range_b=0.0, yaw_mrad=0.0, offset_sd=0.0, offset_length=0.5, seed=0))]
+#[pyo3(signature = (shots, min_reflectance=f64::NEG_INFINITY, floor_slope=0.0, floor_ref=7.0, refl_noise=0.0, range_a=0.0, range_b=0.0, yaw_mrad=0.0, offset_sd=0.0, offset_length=0.5, seed=0, trigger=(f64::NEG_INFINITY, 0.0, 0.0)))]
 #[allow(clippy::too_many_arguments)]
-fn synthetic_export<'py>(py: Python<'py>, shots: &Bound<'_, PyDict>, min_reflectance: f64, floor_slope: f64, floor_ref: f64, refl_noise: f64, range_a: f64, range_b: f64, yaw_mrad: f64, offset_sd: f64, offset_length: f64, seed: u64) -> PyResult<Bound<'py, PyDict>> {
+fn synthetic_export<'py>(py: Python<'py>, shots: &Bound<'_, PyDict>, min_reflectance: f64, floor_slope: f64, floor_ref: f64, refl_noise: f64, range_a: f64, range_b: f64, yaw_mrad: f64, offset_sd: f64, offset_length: f64, seed: u64, trigger: (f64, f64, f64)) -> PyResult<Bound<'py, PyDict>> {
     let s = shots_from_py(shots)?;
-    let p = scan::Export { min_reflectance, floor_slope, floor_ref, refl_noise, range_a, range_b, yaw_mrad, offset_sd, offset_length, seed };
+    let p = scan::Export { min_reflectance, floor_slope, floor_ref, refl_noise, range_a, range_b, yaw_mrad, offset_sd, offset_length, seed,
+                           trigger_db: trigger.0, trigger_hold: trigger.1, trigger_relax: trigger.2 };
     let x = py.detach(|| scan::export(&s, &p)).map_err(err)?;
     shots_to_py(py, &x)
 }

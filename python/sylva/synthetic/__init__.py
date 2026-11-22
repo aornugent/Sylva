@@ -143,7 +143,7 @@ def scan(cloud: PointCloud, origin=(10.0, 10.0, 1.5), resolution_deg: float = 0.
          reflectance=None, target_radius: float | None = None, oriented: bool | None = None,
          detection_threshold: float | None = None, max_range: float | None = None,
          seed: int = 0, solids: dict | None = None, azimuth_deg=(0.0, 360.0),
-         timing=(0.825e-6, 6.593e-3), lambertian: bool = False, gaussian: bool = False, roughness=(0.0, 0.03, 0),
+         timing=(0.825e-6, 6.593e-3), lambertian: bool = False, gaussian: bool = False, pedestal=(0.0, 0.0, 0.0, 0.0), roughness=(0.0, 0.03, 0),
          mesh: dict | None = None) -> Shots:
     """A pseudo terrestrial scan of ``cloud`` from ``origin``.
 
@@ -322,13 +322,13 @@ def scan(cloud: PointCloud, origin=(10.0, 10.0, 1.5), resolution_deg: float = 0.
         0.0 if detection_threshold is None else float(detection_threshold), refl_map, 0.4, refl_attr,
         refl_const, float("inf") if max_range is None else float(max_range), int(seed),
         *_solids(solids), tuple(float(v) for v in azimuth_deg), tuple(float(v) for v in timing),
-        bool(lambertian), bool(gaussian), (float(roughness[0]), float(roughness[1]), int(roughness[2])), *_mesh(mesh))
+        bool(lambertian), bool(gaussian), tuple(float(v) for v in pedestal), (float(roughness[0]), float(roughness[1]), int(roughness[2])), *_mesh(mesh))
     return Shots._from_core(d)
 
 
 def export(shots: Shots, *, min_reflectance: float = float("-inf"), floor_slope: float = 0.0, floor_ref: float = 7.0,
            refl_noise: float = 0.0, range_a: float = 0.0, range_b: float = 0.0, yaw_mrad: float = 0.0, offset_sd: float = 0.0,
-           offset_length: float = 0.5, seed: int = 0) -> Shots:
+           offset_length: float = 0.5, seed: int = 0, trigger=(float("-inf"), 0.0, 0.0)) -> Shots:
     """What a scanner records of a beam scan from :func:`scan`.
 
     Every pulse is kept, with or without echoes. Echoes under the detection floor (``min_reflectance`` dB to
@@ -340,7 +340,7 @@ def export(shots: Shots, *, min_reflectance: float = float("-inf"), floor_slope:
     """
     d = _core.synthetic_export(shots._to_core(), float(min_reflectance), float(floor_slope), float(floor_ref),
                                float(refl_noise), float(range_a), float(range_b), float(yaw_mrad), float(offset_sd),
-                               float(offset_length), int(seed))
+                               float(offset_length), int(seed), tuple(float(v) for v in trigger))
     return Shots._from_core(d)
 
 

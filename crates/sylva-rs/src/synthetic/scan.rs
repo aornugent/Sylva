@@ -145,6 +145,10 @@ pub struct BeamScan {
     /// waist (the exit) and far out, so its 1/e² diameter at range ρ is `D₀ √(1 + (ρ/z_R)²)`, z_R = D₀/θ, and its
     /// sub-beams carry equal energy. Otherwise a cone of uniform energy (the sunflower disc).
     pub gaussian: bool,
+    /// A planted pedestal beside the beam's core: `[share, sd, along, across]` (m): that share of the sub-beams is a
+    /// 2-D normal of sd `sd` about a point `along` the scan line and `across` it from the axis, each parallel to the
+    /// pulse (its size the same at every range); a share of 0 for none.
+    pub pedestal: [f64; 4],
     /// Relief of the small solids' surfaces (m, standard deviation), its wavelength (m) and seed.
     pub roughness: f64,
     pub roughness_length: f64,
@@ -156,7 +160,7 @@ pub struct BeamScan {
 
 impl BeamScan {
     pub fn new(origin: Point) -> BeamScan {
-        BeamScan { origin, resolution_deg: 0.25, min_zenith_deg: 0.0, max_zenith_deg: 130.0, max_echoes: 2, echo_separation: 0.5, range_noise: 0.0, range_noise_slope: 0.0, divergence_mrad: 0.0, exit_diameter: 0.0, footprint_samples: 1, mixed_pixels: true, target_radius: None, oriented: true, detection_threshold: 0.0, reflectance: Reflectance::default(), max_range: f64::INFINITY, seed: 0, min_azimuth_deg: 0.0, max_azimuth_deg: 360.0, pulse_interval: 0.825e-6, line_period: 6.593e-3, solids: Vec::new(), lambertian: false, gaussian: false, roughness: 0.0, roughness_length: 0.03, roughness_seed: 0, mesh: Mesh::default() }
+        BeamScan { origin, resolution_deg: 0.25, min_zenith_deg: 0.0, max_zenith_deg: 130.0, max_echoes: 2, echo_separation: 0.5, range_noise: 0.0, range_noise_slope: 0.0, divergence_mrad: 0.0, exit_diameter: 0.0, footprint_samples: 1, mixed_pixels: true, target_radius: None, oriented: true, detection_threshold: 0.0, reflectance: Reflectance::default(), max_range: f64::INFINITY, seed: 0, min_azimuth_deg: 0.0, max_azimuth_deg: 360.0, pulse_interval: 0.825e-6, line_period: 6.593e-3, solids: Vec::new(), lambertian: false, gaussian: false, pedestal: [0.0; 4], roughness: 0.0, roughness_length: 0.03, roughness_seed: 0, mesh: Mesh::default() }
     }
 }
 
@@ -619,8 +623,19 @@ pub fn scan_beam(cloud: &PointCloud, p: &BeamScan) -> Result<Shots> {
     let n_az = ((p.max_azimuth_deg / res).ceil() as usize).min((360.0 / res).round().max(1.0) as usize).max(ia0 + 1) - ia0;
     let n_pulses = n_zen * n_az;
     limits::check_cells(n_pulses as u128, 64 + 8 * p.max_echoes as u64, &format!("a scan of {n_pulses} pulses"), "a coarser resolution_deg")?;
-    let offsets = if p.gaussian { gaussian_offsets(p.footprint_samples) } else { footprint_offsets(p.footprint_samples) };
-    let share = 1.0 / offsets.len() as f64;
+    let n_ped = (p.pedestal[0] * p.footprint_samples as f64).round() as usize;
+    let n_core = p.footprint_samples.saturating_sub(n_ped).max(1);
+    let offsets = if p.gaussian { gaussian_offsets(n_core) } else { footprint_offsets(n_core) };
+    // the pedestal's sub-beams (m from the axis, along the line and across it): a 2-D normal's radial quantiles
+    let pedestal: Vec<[f64; 2]> = {
+        let golden = PI * (3.0 - 5f64.sqrt());
+        (0..n_ped).map(|k| {
+            let r = p.pedestal[1] * (-2.0 * (1.0 - (k as f64 + 0.5) / n_ped as f64).ln()).sqrt();
+            let a = k as f64 * golden;
+            [p.pedestal[2] + r * a.cos(), p.pedestal[3] + r * a.sin()]
+        }).collect()
+    };
+    let share = 1.0 / (offsets.len() + pedestal.len()) as f64;
     let half_div = p.divergence_mrad * 1e-3 / 2.0;
     let half_exit = p.exit_diameter / 2.0;
     let o = p.origin;
@@ -656,12 +671,14 @@ pub fn scan_beam(cloud: &PointCloud, p: &BeamScan) -> Result<Shots> {
             // spreads as it goes, so it is sampled by several sub-rays, each
             // offset across the exit aperture and tilted within the
             // divergence. Each returns the first surface it meets, if any.
-            let mut hits: Vec<(f64, usize, f64, Point)> = offsets.iter().filter_map(|off| {
+            let rays = offsets.iter().map(|off| (*off, false)).chain(pedestal.iter().map(|off| (*off, true)));
+            let mut hits: Vec<(f64, usize, f64, Point)> = rays.filter_map(|(off, planted)| {
                 let lat: Point = std::array::from_fn(|k| off[0] * e1[k] + off[1] * e2[k]);
                 // a Gaussian beam's sub-ray leaves its waist offset across the beam and tilts at right angles to
-                // that offset, so its distance from the axis is |off| √(w₀² + (θρ/2)²): the profile's hyperboloid
-                let tilt: Point = if p.gaussian { std::array::from_fn(|k| -off[1] * e1[k] + off[0] * e2[k]) } else { lat };
-                let os: Point = std::array::from_fn(|k| o[k] + half_exit * lat[k]);
+                // that offset, so its distance from the axis is |off| √(w₀² + (θρ/2)²): the profile's hyperboloid;
+                // a pedestal's sub-ray is parallel to the pulse, `off` m from it (along e2, the line; across e1)
+                let tilt: Point = if planted { [0.0; 3] } else if p.gaussian { std::array::from_fn(|k| -off[1] * e1[k] + off[0] * e2[k]) } else { lat };
+                let os: Point = if planted { std::array::from_fn(|k| o[k] + off[0] * e2[k] + off[1] * e1[k]) } else { std::array::from_fn(|k| o[k] + half_exit * lat[k]) };
                 let ds: Point = std::array::from_fn(|k| d[k] + half_div * tilt[k]);
                 let nn = (ds[0] * ds[0] + ds[1] * ds[1] + ds[2] * ds[2]).sqrt();
                 let ds = [ds[0] / nn, ds[1] / nn, ds[2] / nn];
@@ -784,12 +801,18 @@ pub struct Export {
     pub offset_sd: f64,
     pub offset_length: f64,
     pub seed: u64,
+    /// A planted dynamic trigger: a later echo is kept only if its reflectance is at least the earlier kept echo's
+    /// plus `trigger_db` (dB, negative) within `trigger_hold` m behind it, the threshold relaxing by `trigger_relax`
+    /// dB a metre beyond; a `trigger_db` of minus infinity for none.
+    pub trigger_db: f64,
+    pub trigger_hold: f64,
+    pub trigger_relax: f64,
 }
 
 impl Default for Export {
     /// Keep everything, add nothing.
     fn default() -> Self {
-        Export { min_reflectance: f64::NEG_INFINITY, floor_slope: 0.0, floor_ref: 7.0, refl_noise: 0.0, range_a: 0.0, range_b: 0.0, yaw_mrad: 0.0, offset_sd: 0.0, offset_length: 0.5, seed: 0 }
+        Export { min_reflectance: f64::NEG_INFINITY, floor_slope: 0.0, floor_ref: 7.0, refl_noise: 0.0, range_a: 0.0, range_b: 0.0, yaw_mrad: 0.0, offset_sd: 0.0, offset_length: 0.5, seed: 0, trigger_db: f64::NEG_INFINITY, trigger_hold: 0.0, trigger_relax: 0.0 }
     }
 }
 
@@ -819,6 +842,7 @@ pub fn export(s: &Shots, p: &Export) -> Result<Shots> {
     let mut keep_echo = vec![false; s.echo_range.len()];
     let mut refl_out: Vec<f32> = vec![0.0; s.echo_range.len()];
     for i in 0..s.n_shots() {
+        let mut prev: Option<(f64, f64)> = None;   // the last kept echo's (range, reflectance)
         for k in 0..s.echo_count[i] as usize {
             let e = s.echo_start[i] + k;
             let mut r = refl.get_f64(e);
@@ -829,7 +853,14 @@ pub fn export(s: &Shots, p: &Export) -> Result<Shots> {
             }
             refl_out[e] = r as f32;
             let floor = p.min_reflectance + p.floor_slope * (f64::from(s.echo_range[e]).max(p.floor_ref) / p.floor_ref).log10();
-            keep_echo[e] = r >= floor;
+            let trigger = prev.map_or(f64::NEG_INFINITY, |(r0, x0)| {
+                let gap = f64::from(s.echo_range[e]) - r0;
+                x0 + p.trigger_db - p.trigger_relax * (gap - p.trigger_hold).max(0.0)
+            });
+            keep_echo[e] = r >= floor && r >= trigger;
+            if keep_echo[e] {
+                prev = Some((f64::from(s.echo_range[e]), r));
+            }
         }
     }
     const K: usize = 64;
