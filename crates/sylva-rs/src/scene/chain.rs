@@ -483,13 +483,14 @@ impl Scene {
                 let x = Vector2::new(a + own_sd[0] * y[0], own_sd[1] * y[1]);
                 let lv = if own_sd[1] > 0.0 { Dual2::var(x[1], 1) } else { Dual2::c(x[1]) };
                 let total = fresh_cells.iter().fold(sum.ll(x), |t, f| t + f.read(Dual2::var(x[0], 0), lv, em));
-                super::term::Local { ll: total.v, parts: [0.0; 4], g: -total.g, hess: clipped(-total.h), deposit: Vec::new() }
+                super::term::Local { ll: total.v, parts: [0.0; 4], g: -total.g, hess: clipped(-total.h), deposit: Vec::new(), occ_post: Vec::new() }
             });
             let el = eliminate(own_sd, &at, y);
             Term {
                 align, fit: -at.ll + 0.5 * (y[0] * y[0] + y[1] * y[1]), logdet: 0.5 * el.det.ln(), slope: el.slope, curv: el.curv, own: y, start, own_sd,
                 own_cov: el.pi, own_link: el.pl, ray: [0.0; 4], cells: (cs.cells.len() - gone.len() + fresh_cells.len()) as u32, cells_on: 0, arc: 0.0,
                 across: mean_of(&es, |x| 2.0 * x.r / em.footprint(norm(&sub(&x.mid(), &v.origin)))), spread: s_along, deposit: Vec::new(),
+                occ: None, occ_post: Vec::new(),
             }
         });
         // the deposits of the cells it reads, at the term's mode

@@ -73,7 +73,9 @@ use super::settings::Settings;
 use super::range_image::{Cell, RangeImage};
 use crate::Point;
 use rayon::prelude::*;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
+use crate::transform::{norm, sub};
 
 /// Where the field is estimated: a box `lo`-`hi` and its voxel (m).
 #[derive(Debug, Clone, Copy)]
@@ -196,18 +198,46 @@ pub struct Foliage {
     /// The grains' radius and the beam's exit width and divergence ([`grain_factor`]): σ is a point's extinction, and
     /// a pulse reads it times the grain factor at its range. A radius of 0: no grains.
     pub grains: [f64; 3],
+    /// Test 5: per scan the field was counted from, its origin and the voxels its pulses reached (the realization
+    /// read's counts at weight 1/m: a hit or path there). Empty unless the occlusion latent is on.
+    pub exposure: Vec<(Point, Arc<HashSet<[i32; 3]>>)>,
 }
 
 impl Foliage {
+    /// Test 5: the share of the sightline from `o` to `p` in front of `p` (a voxel short of it), inside the box,
+    /// through voxels another scan's pulses reached (scans whose origin is `o` left out); 0 without a box or path.
+    pub fn seen_fraction(&self, o: &Point, p: &Point) -> f64 {
+        let Some(sp) = self.spec else { return 0.0 };
+        let d = sub(p, o);
+        let t = norm(&d);
+        if t <= sp.voxel {
+            return 0.0;
+        }
+        let w = [d[0] / t, d[1] / t, d[2] / t];
+        let others: Vec<&HashSet<[i32; 3]>> = self.exposure.iter().filter(|(q, _)| norm(&sub(q, o)) > 0.01).map(|(_, s)| &**s).collect();
+        let (mut seen, mut all) = (0.0, 0.0);
+        for &(k, a, b) in Walk::new(&sp, o, &w).segments() {
+            let b = b.min(t - sp.voxel);
+            if b <= a {
+                continue;
+            }
+            all += b - a;
+            if others.iter().any(|s| s.contains(&k)) {
+                seen += b - a;
+            }
+        }
+        if all > 0.0 { seen / all } else { 0.0 }
+    }
+
     /// The background alone: κ everywhere.
     pub fn uniform(kappa: f64) -> Self {
-        Foliage { kappa, spec: None, post: HashMap::new(), grains: [0.0; 3] }
+        Foliage { kappa, spec: None, post: HashMap::new(), grains: [0.0; 3], exposure: Vec::new() }
     }
 
     /// The field's posterior from counts, under the prior (shape `a0`, rate `b0`).
     pub fn from_counts(kappa: f64, spec: FoliageBox, counts: &Counts, (a0, b0): (f64, f64)) -> Self {
         let post = counts.iter().map(|(&k, &(h, l))| (k, (h + a0, l + b0))).collect();
-        Foliage { kappa, spec: Some(spec), post, grains: [0.0; 3] }
+        Foliage { kappa, spec: Some(spec), post, grains: [0.0; 3], exposure: Vec::new() }
     }
 
     /// The grain factor at range `t` ([`grain_factor`]).
@@ -499,6 +529,8 @@ pub struct FieldCounts {
     /// slice-dgp; a rate of 0: the pulse reads the intensity).
     read: FixedCounts,
     read_prior: (f64, f64),
+    /// Test 5: [`Foliage`]'s `exposure`.
+    exposure: Vec<(Point, Arc<HashSet<[i32; 3]>>)>,
     /// Per voxel with echoes taken, their sums ([`Taken`]).
     taken: HashMap<[i32; 3], Taken, std::hash::BuildHasherDefault<VoxelHasher>>,
     /// In fixed point: the scene's gain over the empty scene, `Σ_v ln E[…]`.
@@ -551,14 +583,20 @@ impl FieldCounts {
     pub fn new(spec: FoliageBox, views: &[&RangeImage], em: &Settings, ground_z: f64) -> Self {
         let prior = (em.field_prior_mean * em.field_prior_path, em.field_prior_path);
         let both = |a: (FixedCounts, FixedCounts), b: (FixedCounts, FixedCounts)| (merged(a.0, b.0), merged(a.1, b.1));
-        let (counts, read) = views.iter().map(|v| {
+        let per: Vec<(FixedCounts, FixedCounts)> = views.iter().map(|v| {
             (0..v.cell.len()).into_par_iter().fold(Default::default, |mut acc, k| {
                 ray(v, &spec, em, ground_z, k, &mut acc);
                 acc
             }).reduce(Default::default, both)
-        }).fold(Default::default(), both);
+        }).collect();
+        let exposure = if em.occ_on() {
+            views.iter().zip(&per).map(|(v, c)| (v.origin, Arc::new(c.1.keys().copied().collect::<HashSet<_>>()))).collect()
+        } else {
+            Vec::new()
+        };
+        let (counts, read) = per.into_iter().fold(Default::default(), both);
         let read_prior = (em.read_prior_mean * em.read_prior_path, em.read_prior_path);
-        FieldCounts { spec, prior, grains: [em.grain_radius, em.beam_exit, em.beam_divergence], counts, read, read_prior, taken: Default::default(), term: 0 }
+        FieldCounts { spec, prior, grains: [em.grain_radius, em.beam_exit, em.beam_divergence], counts, read, read_prior, exposure, taken: Default::default(), term: 0 }
     }
 
     /// Voxel `k`'s empty counts (hits, path).
@@ -699,6 +737,7 @@ impl FieldCounts {
         let counts: Counts = src.iter().map(|(&k, &[h, l])| (k, (h as f64 / FIXED, l as f64 / FIXED))).collect();
         let mut f = Foliage::from_counts(kappa, self.spec, &counts, prior);
         f.grains = self.grains;
+        f.exposure = self.exposure.clone();
         f
     }
 }
@@ -715,7 +754,7 @@ mod tests {
     fn the_voxel_formula_is_the_posterior_moment() {
         let spec = FoliageBox { lo: [0.0; 3], hi: [1.0; 3], voxel: 1.0 };
         let (h, l, a0, b0) = (3.0, 4.0, 0.05, 0.5);
-        let mut f = FieldCounts { spec, prior: (a0, b0), grains: [0.0; 3], counts: Default::default(), read: Default::default(), read_prior: (0.0, 0.0),
+        let mut f = FieldCounts { spec, prior: (a0, b0), grains: [0.0; 3], counts: Default::default(), read: Default::default(), read_prior: (0.0, 0.0), exposure: Vec::new(),
                                   taken: Default::default(), term: 0 };
         f.counts.insert([0, 0, 0], [fx(h), fx(l)]);
         let (al, beta, w, sig) = (a0 + h, b0 + l, 0.7, 0.9);

@@ -157,7 +157,7 @@ pub(super) struct CellView<P = f64> {
 /// ([`cell_class`]), against the foliage field `ext` and the background's ground.
 pub(super) fn cell_view<P: Real>(v: &RangeImage, cell: usize, layers: Vec<Layer<P>>, em: &Settings, sc: &Background, ext: &Foliage) -> CellView<P> {
     let (obs, ground, w) = obs_ground(v, cell, sc);
-    let wt = em.cell_weight(P::c(weight_range(v, cell, obs, ground)), v.steps(cell));
+    let wt = em.elem_weight(P::c(weight_range(v, cell, obs, ground)), v.steps(cell));
     let (m, class, slots) = (ext.medium(&v.origin, &w), cell_class(v, cell, em), v.slots(cell));
     let pulses = mixture(&layers).into_iter()
         .map(|(p, ls)| (p, Pulse::on(occluders(ls, ground), class, &m, v.echoes(cell), v.echo_refls(cell), slots, &v.instrument, em))).collect();
@@ -547,6 +547,21 @@ impl<P: Real> Pulse<P> {
         Pulse { echoes: echoes.to_vec(), refls: refls.to_vec(), cap, tau_end: m.tau(Self::end(&occ)), occluders: occ, class, medium }
     }
 
+    /// Test 5: the pulse given it reaches range `t_e` through the field (optical depth `tau_e` there): the medium in
+    /// front of it taken away (no echo of it there, no extinction), the rest as it was.
+    pub(super) fn reached(&self, tau_e: f64, t_e: f64) -> Self {
+        let mut p = self.clone();
+        for x in p.occluders.iter_mut() {
+            x.tau = (x.tau - tau_e).max(0.0);
+        }
+        for (k, md) in p.medium.iter_mut().enumerate() {
+            let o = p.echoes[k] as f64;
+            *md = [(md[0] - tau_e).max(0.0), if o < t_e { 0.0 } else { md[1] }, (md[2] - tau_e).max(0.0)];
+        }
+        p.tau_end = (p.tau_end - tau_e).max(0.0);
+        p
+    }
+
     /// The range the beam of a pulse with occluders `occ` ends at: the ground's, else [`T_MAX`].
     pub(super) fn end(occ: &[Occluder<P>]) -> f64 {
         occ.last().filter(|o| matches!(o.surface, Surface::Ground(_))).map_or(T_MAX, |o| o.t.v())
@@ -900,7 +915,7 @@ mod tests {
     fn a_merge_with_the_medium_reads_the_pull() {
         let em = Settings { pull_a: 1.0, pull_b: 0.1, merge_a: -2.0, merge_field: 10.0, merge_range: 0.0, merge_fill: 0.0, ..Settings::default() };
         let spec = FoliageBox { lo: [-0.5, 4.0, -0.5], hi: [0.5, 5.0, 0.5], voxel: 1.0 };
-        let dense = Foliage { kappa: 0.05, spec: Some(spec), post: HashMap::from([([0, 0, 0], (5.0, 1.0))]), grains: [0.0; 3] };
+        let dense = Foliage { kappa: 0.05, spec: Some(spec), post: HashMap::from([([0, 0, 0], (5.0, 1.0))]), grains: [0.0; 3], exposure: Vec::new() };
         let merge = |f: f64, ext: &Foliage| pulse_in(&em, &[], &[], false, &[layer(4.0, f, 1.0)], None, ext).occluders[0].merge;
         let p = pulse_in(&em, &[], &[], false, &[layer(4.0, 0.3, 1.0)], None, &dense);
         let m = p.occluders[0].merge;
@@ -974,7 +989,7 @@ mod tests {
         let data = elem_data(&v, &KBuffer::of(&rendered).cells(), &es, &[0, 1], &[0, 1], 0, &em, &sc, &Foliage::uniform(sc.kappa), None);
         let mut out: Vec<Pulse> = data.into_iter().flat_map(|d| d.cells.into_iter().flat_map(|c| c.pulses.into_iter().map(|p| p.1))).collect();
         let spec = FoliageBox { lo: [-0.5, 4.0, -0.5], hi: [0.5, 5.0, 0.5], voxel: 1.0 };
-        let dense = Foliage { kappa: 0.05, spec: Some(spec), post: HashMap::from([([0, 0, 0], (5.0, 1.0))]), grains: [0.0; 3] };
+        let dense = Foliage { kappa: 0.05, spec: Some(spec), post: HashMap::from([([0, 0, 0], (5.0, 1.0))]), grains: [0.0; 3], exposure: Vec::new() };
         let (flat, wood) = (Foliage::uniform(0.05), em.refl_wood as f32);
         out.push(pulse_of(&[4.0, 4.3, 7.0], &[wood - 5.0, wood - 3.0, -20.0], false, &[layer(4.0, 0.5, 1.0), layer(4.3, 1.0, 1.0)], None, &flat));
         out.push(pulse_of(&[4.02, 4.4], &[wood - 5.0, -18.0], true, &[layer(4.0, 0.3, 1.0), layer(10.0, 1.0, 1.0)], None, &dense));

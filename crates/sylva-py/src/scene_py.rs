@@ -583,6 +583,12 @@ impl PyScene {
         Ok(PyScene { inner: py.detach(|| Scene::new(vs, &el, em, bg, spec, ref_epoch)), em })
     }
 
+    /// Test 5: the share of the sightline from `origin` to `target` in front of it, in the held field's box, through
+    /// voxels its other scans' pulses reached (0 without a box or without the occlusion latent on when it was counted).
+    fn seen_fraction(&self, origin: [f64; 3], target: [f64; 3]) -> f64 {
+        self.inner.foliage_field().seen_fraction(&origin, &target)
+    }
+
     /// Hold `other`'s foliage field fixed (estimated from its scans, e.g. the training scans): the cost change.
     fn hold_foliage(&mut self, py: Python<'_>, other: PyRef<'_, PyScene>) -> f64 {
         let ext = other.inner.foliage_field().clone();

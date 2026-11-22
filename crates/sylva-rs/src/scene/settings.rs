@@ -173,6 +173,12 @@ params! {
         /// far view's small radii are views through foliage, and the few pairs of clear views agree to about 3 %
         /// (3dtrees research 130 rca-field-range).
         pub discount: f64 = 10.0,
+        /// Test 5 (research 130 theory §8): the per-(element, scan) occlusion latent's Beta concentration where the
+        /// sightline in front of the element is seen by the other scans (0: no latent) and where it isn't, and the
+        /// evidence discount on elements' cells (0: `discount`).
+        pub occ_kappa_seen: f64 = 0.0,
+        pub occ_kappa_unseen: f64 = 1.8,
+        pub elem_discount: f64 = 0.0,
         /// The stem front shift (research 130 slice 14): a section's departure from round, as each view sees it, is
         /// an along-beam shift of its front per (element, scan), with prior sd
         /// `front_shift_base + front_shift_slope R` (m), marginalised with the alignment error. Chosen among three
@@ -281,6 +287,21 @@ impl Settings {
     /// has none: pulses through one object are one event for what is learnt.
     pub fn cell_weight<P: Real>(&self, range: P, steps: (f64, f64)) -> P {
         self.read_weight(range, steps) / self.discount
+    }
+
+    /// Test 5: the evidence discount on elements' cells.
+    pub fn elem_phi(&self) -> f64 {
+        if self.elem_discount > 0.0 { self.elem_discount } else { self.discount }
+    }
+
+    /// Test 5: the weight an element's cell counts with, `1 / (elem_phi m)`.
+    pub fn elem_weight<P: Real>(&self, range: P, steps: (f64, f64)) -> P {
+        self.read_weight(range, steps) / self.elem_phi()
+    }
+
+    /// Test 5: whether the occlusion latent is on.
+    pub fn occ_on(&self) -> bool {
+        self.occ_kappa_seen > 0.0
     }
 
     /// The weight a cell counts with in the field's realization read, what a pulse meets: `1 / m(ρ)`, each footprint's

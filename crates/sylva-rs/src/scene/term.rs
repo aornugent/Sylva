@@ -124,6 +124,68 @@ pub(super) struct CellData {
     pub(super) base: f64,
     pub(super) outcome: Outcome,
     pub(super) hits: Vec<(usize, [i32; 3], f64, f64, f64)>,
+    /// Test 5: the field's chance the pulse reaches the term's nearest layer here, and (where it is under 1 − 10⁻³)
+    /// the pulse per subset given it does ([`Pulse::reached`]).
+    pub(super) arrive: f64,
+    pub(super) reach: Option<Vec<(f64, Pulse)>>,
+}
+
+/// Test 5: a cell's log-likelihood ratio given the share `a` of its term reached: `ln(a L_reach + (1 − a) L_occ)`,
+/// from `lr` and `lf`, the reached and the field's own (arrival `t`) log-likelihoods less the base, with
+/// `L_occ = (L_full − t L_reach) / (1 − t)` (at least 10⁻⁹ L_full); a cell reached almost surely reads its own.
+pub(super) fn occ_ln<T: Real>(lr: T, lf: T, t: f64, a: f64) -> T {
+    if 1.0 - t < 1e-3 {
+        return lf;
+    }
+    let m = lr.v().max(lf.v());
+    let (r, f) = ((lr - m).exp(), (lf - m).exp());
+    let d = f - r * t;
+    let o = if d.v() > 1e-9 * f.v() { d * (1.0 / (1.0 - t)) } else { f * (1e-9 / (1.0 - t)) };
+    (r * a + o * (1.0 - a)).ln() + m
+}
+
+/// Test 5: the bins A is integrated on, from the cells' values (weight, lr, lf, t): about the peak of the
+/// likelihood in A (log-concave: each cell's is the log of a line), 32 bins over ± 8 of its sds and 6 over each rest
+/// of [0, 1], each at its prior mass under Beta(m κ, (1 − m) κ) and the prior's mean within it. Returns (node, mass).
+pub(super) fn occ_bins(cells: &[(f64, f64, f64, f64)], m: f64, kappa: f64) -> Vec<(f64, f64)> {
+    use crate::fusion::upscale::inc_beta;
+    let rc: Vec<(f64, f64, f64)> = cells.iter().filter(|c| 1.0 - c.3 >= 1e-3).map(|&(w, lr, lf, t)| {
+        let mx = lr.max(lf);
+        let (r, f) = ((lr - mx).exp(), (lf - mx).exp());
+        let d = f - r * t;
+        (w, r, if d > 1e-9 * f { d / (1.0 - t) } else { f * 1e-9 / (1.0 - t) })
+    }).collect();
+    let d1 = |a: f64| rc.iter().map(|&(w, r, o)| w * (r - o) / (a * r + (1.0 - a) * o)).sum::<f64>();
+    let d2 = |a: f64| rc.iter().map(|&(w, r, o)| { let q = (r - o) / (a * r + (1.0 - a) * o); w * q * q }).sum::<f64>();
+    let (e0, e1) = (1e-9, 1.0 - 1e-9);
+    let peak = if d1(e0) <= 0.0 { 0.0 } else if d1(e1) >= 0.0 { 1.0 } else {
+        let (mut lo, mut hi) = (e0, e1);
+        for _ in 0..60 {
+            let mid = 0.5 * (lo + hi);
+            if d1(mid) > 0.0 { lo = mid } else { hi = mid }
+        }
+        0.5 * (lo + hi)
+    };
+    let c = d2(peak.clamp(e0, e1));
+    let sd = if c > 0.0 { (1.0 / c.sqrt()).min(1.0) } else { 1.0 };
+    let (lo, hi) = ((peak - 8.0 * sd).max(0.0), (peak + 8.0 * sd).min(1.0));
+    let mut edges = Vec::new();
+    if lo > 0.0 {
+        edges.extend((0..6).map(|i| lo * i as f64 / 6.0));
+    }
+    edges.extend((0..32).map(|i| lo + (hi - lo) * i as f64 / 32.0));
+    if hi < 1.0 {
+        edges.extend((0..6).map(|i| hi + (1.0 - hi) * i as f64 / 6.0));
+    }
+    edges.push(1.0);
+    let m = m.clamp(1e-3, 1.0 - 1e-3);
+    let (al, be) = (m * kappa, (1.0 - m) * kappa);
+    let cdf = |x: f64| inc_beta(al, be, x);
+    let cdf1 = |x: f64| inc_beta(al + 1.0, be, x);
+    edges.windows(2).filter_map(|w| {
+        let mass = cdf(w[1]) - cdf(w[0]);
+        (mass > 0.0).then(|| (((m * (cdf1(w[1]) - cdf1(w[0])) / mass)).clamp(w[0], w[1]), mass))
+    }).collect()
 }
 
 /// One term's data in one scan (an element's, or a group's: [`ChainKey`]): the cells its members own (its evidence:
@@ -142,9 +204,49 @@ pub(super) struct ElemData {
     pub(super) across: f64,
     pub(super) align: Vec<([i64; 3], f64)>,
     pub(super) own_sd: Vector2<f64>,
+    /// Test 5: the share of its sightline in front of it seen by other scans ([`Foliage::seen_fraction`]), and its
+    /// occlusion latent's prior (mean, concentration), with the latent on.
+    pub(super) seen: f64,
+    pub(super) occ: Option<(f64, f64)>,
 }
 
 impl ElemData {
+    /// Test 5: [`ElemData::quad`] with the occlusion latent integrated out under its prior (`m`, `kappa`): per bin of
+    /// A ([`occ_bins`]) the cells' ratios at A ([`occ_ln`]), their log-mean-exp at the bins' masses; the posterior
+    /// over the bins kept (`occ_post`), and each outcome's part at A's peak.
+    fn quad_occ(&self, x: (f64, f64), em: &Settings, deposit: bool, (m, kappa): (f64, f64)) -> Local {
+        let level = if self.own_sd[1] > 0.0 { Dual2::var(x.1, 1) } else { Dual2::c(x.1) };
+        let shift = Dual2::var(x.0, 0);
+        let mut echoes = Vec::new();
+        let per: Vec<(f64, Dual2<2>, Dual2<2>, f64, usize)> = self.cells.iter().map(|c| {
+            let lf = if deposit && !c.hits.is_empty() {
+                let (ll, taken) = mixture_taken(&c.pulses, shift, level, em);
+                echoes.extend(c.take(&taken));
+                ll - c.base
+            } else {
+                mixture_ll(&c.pulses, shift, level, em) - c.base
+            };
+            let (lr, t) = match &c.reach {
+                Some(r) => (mixture_ll(r, shift, level, em) - c.base, c.arrive),
+                None => (lf, 1.0),
+            };
+            (c.wt, lr, lf, t, c.outcome as usize)
+        }).collect();
+        let vals: Vec<(f64, f64, f64, f64)> = per.iter().map(|p| (p.0, p.1.v, p.2.v, p.3)).collect();
+        let bins = occ_bins(&vals, m, kappa);
+        let s: Vec<Dual2<2>> = bins.iter().map(|&(a, _)| per.iter().fold(Dual2::<2>::c(0.0), |t, p| t + occ_ln(p.1, p.2, p.3, a) * p.0)).collect();
+        let mx = s.iter().map(|x| x.v).fold(f64::NEG_INFINITY, f64::max);
+        let total = s.iter().zip(&bins).fold(Dual2::<2>::c(0.0), |t, (x, &(_, w))| t + (*x - mx).exp() * w).ln() + mx;
+        let z: f64 = s.iter().zip(&bins).map(|(x, &(_, w))| (x.v - mx).exp() * w).sum();
+        let occ_post: Vec<(f64, f64)> = s.iter().zip(&bins).map(|(x, &(a, w))| (a, (x.v - mx).exp() * w / z)).collect();
+        let mean = occ_post.iter().map(|&(a, p)| a * p).sum::<f64>();
+        let mut parts = [0.0; 4];
+        for p in &per {
+            parts[p.4] += occ_ln(p.1.v, p.2.v, p.3, mean) * p.0;
+        }
+        Local { ll: total.v, parts, g: -total.g, hess: clipped(-total.h), deposit: foliage::deposit(echoes.into_iter()), occ_post }
+    }
+
     /// (δ, reflectance level) at alignment shift `a` and own nodes `y`.
     pub(super) fn at(&self, a: f64, y: Vector2<f64>) -> (f64, f64) {
         (a + self.own_sd[0] * y[0], self.own_sd[1] * y[1])
@@ -155,6 +257,9 @@ impl ElemData {
     /// one), the curvature's negative eigenvalues set to 0. Without a level node only δ's are filled. With `deposit`,
     /// from the same pass, the echoes its elements take a share of ([`Local`]'s `deposit`).
     pub(super) fn quad(&self, x: (f64, f64), em: &Settings, deposit: bool) -> Local {
+        if let Some(occ) = self.occ {
+            return self.quad_occ(x, em, deposit, occ);
+        }
         let level = if self.own_sd[1] > 0.0 { Dual2::var(x.1, 1) } else { Dual2::c(x.1) };
         let (mut total, mut parts, mut echoes) = (Dual2::<2>::c(0.0), [0.0; 4], Vec::new());
         for c in &self.cells {
@@ -168,7 +273,7 @@ impl ElemData {
             total += l;
             parts[c.outcome as usize] += l.v;
         }
-        Local { ll: total.v, parts, g: -total.g, hess: clipped(-total.h), deposit: foliage::deposit(echoes.into_iter()) }
+        Local { ll: total.v, parts, g: -total.g, hess: clipped(-total.h), deposit: foliage::deposit(echoes.into_iter()), occ_post: Vec::new() }
     }
 
     /// Its curvature with its own nodes `y` eliminated ([`eliminate`]).
@@ -202,6 +307,8 @@ impl ElemData {
             },
             across: self.across,
             spread: self.spread,
+            occ: self.occ,
+            occ_post: at.occ_post,
             deposit: at.deposit,
         }
     }
@@ -304,6 +411,8 @@ pub(super) struct Local {
     pub(super) g: Vector2<f64>,
     pub(super) hess: Matrix2<f64>,
     pub(super) deposit: Deposit,
+    /// Test 5: the occlusion latent's posterior over its bins (node, probability); empty without it.
+    pub(super) occ_post: Vec<(f64, f64)>,
 }
 
 /// One (element, scan)'s part of its scan's cost at an alignment shift, `fit + logdet`: `fit` its ray likelihood's
@@ -332,6 +441,9 @@ pub(super) struct Term {
     pub(super) arc: f64,
     pub(super) across: f64,
     pub(super) spread: f64,
+    /// Test 5: the occlusion latent's prior (mean, concentration) and its posterior at the term's nodes.
+    pub(super) occ: Option<(f64, f64)>,
+    pub(super) occ_post: Vec<(f64, f64)>,
     pub(super) deposit: Deposit,
 }
 
@@ -370,7 +482,8 @@ pub(super) fn elem_data(v: &RangeImage, cells: &[(usize, Vec<Layer>)], elems: &[
         let (s_along, (hs, front)) = (spreads[ms[0]], term_nodes(&es, em));
         ElemData { cells: Vec::new(), spread: s_along, cells_on: 0, on_across: [f64::INFINITY, f64::NEG_INFINITY],
                    across: mean_of(&es, |e| 2.0 * e.r / em.footprint(norm(&sub(&e.mid(), &v.origin)))),
-                   align: hs.into_iter().map(|(key, w)| (key, w * s_along)).collect(), own_sd: Vector2::new(front, level), members: ms }
+                   align: hs.into_iter().map(|(key, w)| (key, w * s_along)).collect(), own_sd: Vector2::new(front, level), members: ms,
+                   seen: if em.occ_on() { ext.seen_fraction(&v.origin, &middle(&es)) } else { 0.0 }, occ: None }
     }).collect();
     // cells in index order, so an element's sums run in the same order in every run
     for (cell, ls) in cells {
@@ -401,9 +514,30 @@ pub(super) fn elem_data(v: &RangeImage, cells: &[(usize, Vec<Layer>)], elems: &[
         }
         let base = cv.empty.read(0.0, 0.0, em).ll;
         let hits = field.map_or(Vec::new(), |sp| foliage::hits(v, sp, em, cell));
+        let medium = em.occ_on().then(|| ext.medium(&v.origin, &v.direction((cell / v.n_cols) as f64, (cell % v.n_cols) as f64)));
         for (d, s) in shares {
             let hits = hits.iter().map(|&(i, k, w, r)| (i, k, w * s, ext.hazard_at(&k, r), ext.factor(r))).collect();
-            data[d].cells.push(CellData { cell, pulses: cv.pulses.clone(), wt: cv.wt * s, base, outcome, hits });
+            // test 5: the field's arrival at the term's nearest layer, and the pulse given it arrives
+            let (arrive, reach) = match &medium {
+                Some(md) => {
+                    let t_e = ls.iter().find(|l| by_elem.get(&l.elem) == Some(&d)).map_or(ls[0].t, |l| l.t);
+                    let tau_e = md.tau(t_e);
+                    let arrive = (-tau_e).exp();
+                    (arrive, (1.0 - arrive >= 1e-3).then(|| cv.pulses.iter().map(|(q, p)| (*q, p.reached(tau_e, t_e))).collect()))
+                }
+                None => (1.0, None),
+            };
+            data[d].cells.push(CellData { cell, pulses: cv.pulses.clone(), wt: cv.wt * s, base, outcome, hits, arrive, reach });
+        }
+    }
+    if em.occ_on() {
+        for el in data.iter_mut() {
+            let w: f64 = el.cells.iter().map(|c| c.wt).sum();
+            if w > 0.0 {
+                let m = el.cells.iter().map(|c| c.wt * c.arrive).sum::<f64>() / w;
+                let kappa = ((1.0 - el.seen) * em.occ_kappa_unseen.ln() + el.seen * em.occ_kappa_seen.ln()).exp();
+                el.occ = Some((m.clamp(1e-3, 1.0 - 1e-3), kappa));
+            }
         }
     }
     data
@@ -520,6 +654,27 @@ mod tests {
         }
         let row = truth.1[0];
         assert!((row.refl_level - 3.0).abs() < 3.0 * row.refl_level_sd.max(0.3), "{row:?}");
+    }
+
+    /// Test 5: the occlusion latent under a prior concentrated at the field's arrival costs what the cells cost without
+    /// it (the pole's cells all read about one arrival); and a stick where nothing is, in front of the pole, its pulses
+    /// passing through it to the pole, reads its share reached above the prior's mean: an echo behind it can't be
+    /// occluded, so occlusion doesn't pay for it.
+    #[test]
+    fn the_occlusion_latent_is_the_field_at_its_arrival_and_cant_occlude_what_pulses_pass() {
+        let sc = Background { kappa: 0.05, ..Background::default() };
+        let plain = Settings { elem_discount: 1.0, ..Settings::default() };
+        let tight = Settings { occ_kappa_seen: 1e7, occ_kappa_unseen: 1e7, ..plain };
+        let v = pole_view();
+        let (a, b) = (cost(&v, &[stick(0.0, 4.0, 0.03)], &plain, &sc).0, cost(&v, &[stick(0.0, 4.0, 0.03)], &tight, &sc).0);
+        assert!((a - b).abs() < 0.02 * a.abs().max(1.0), "{a} against {b}");
+        let wide = Settings { occ_kappa_seen: 1.8, ..plain };
+        let ghost = stick(0.0, 3.0, 0.03);
+        let s = super::super::scene::Scene::new(vec![v.clone()], &[stick(0.0, 4.0, 0.03), ghost], wide, sc, None, 0);
+        let t = &s.fits[0].terms[&chain_key(1, &ghost)];
+        let (m, _) = t.occ.expect("the latent is on");
+        let mean: f64 = t.occ_post.iter().map(|&(a, p)| a * p).sum();
+        assert!(mean > m + 0.05, "posterior mean {mean} against the prior's {m}");
     }
 
     /// A group is one term per scan (slice 6): a group of one costs what the element alone does; a pole cut in two

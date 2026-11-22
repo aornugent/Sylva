@@ -112,6 +112,9 @@ pub(super) struct CellReading<P> {
     /// Its layers' front shares ([`front_shares`]).
     pub(super) shares: Vec<f64>,
     pub(super) echo: Option<([P; 3], f64)>,
+    /// Test 5: the chance the element's echo comes back given the pulse reaches it (the echo's chance less the field's
+    /// arrival): its slope in the occlusion latent.
+    pub(super) reach: f64,
 }
 
 /// One scan's evidence on n quantities from the cells of some elements, with the latents the cells share
@@ -143,8 +146,8 @@ impl Shared {
             nodes.entry(*k).or_insert(i);
         }
         let first = nodes.len();
-        let elems: Vec<_> = slot.iter().map(|&t| (tn[t].0.clone(), first + 2 * t, tn[t].1)).collect();
-        let size = n + first + 2 * terms;
+        let elems: Vec<_> = slot.iter().map(|&t| (tn[t].0.clone(), first + 3 * t, tn[t].1)).collect();
+        let size = n + first + 3 * terms;
         Shared { n, nodes, elems, m: nalgebra::DMatrix::zeros(size, size), j: nalgebra::DMatrix::zeros(size, size) }
     }
 
@@ -248,7 +251,7 @@ impl Scene {
     /// ([`Scene::predict`]). `shift` (m, per view; empty for none) is subtracted from the observed echoes first.
     pub fn counts(&self, e: Element, take_out: &[u32], shift: &[f64]) -> Vec<ElementCounts> {
         let with = |e: Element| Proposal { put_in: vec![e], take_out: take_out.to_vec() };
-        let phi = self.em.discount;
+        let phi = self.em.elem_phi();
         (0..self.views.len()).into_par_iter().map(|s| {
             let mut out = ElementCounts { scan: s as u32, ..ElementCounts::default() };
             let sh = shift.get(s).copied().unwrap_or(0.0);
@@ -350,7 +353,8 @@ impl Scene {
                 for (j, ly) in ls.iter().enumerate() {
                     let Some(k) = ids.iter().position(|&i| i == ly.elem) else { continue };
                     let th: Vec<Geometry> = (0..dims[k]).map(|i| Geometry::var(0.0, i)).collect();
-                    let r = self.read_cell(s, cell, &ls, j, &es[k], &th, &nodes);
+                    let posts: Vec<&[(f64, f64)]> = owners.iter().map(|(_, term, _)| term.occ_post.as_slice()).collect();
+                    let r = self.read_cell(s, cell, &ls, j, &es[k], &th, &nodes, &posts);
                     for i in 0..dims[k] {
                         slope[offset[k] + i] = r.cost.g[i];
                     }
@@ -358,20 +362,24 @@ impl Scene {
                         for (xo, q) in x.iter_mut().zip(q) {
                             xo[offset[k]..offset[k] + dims[k]].copy_from_slice(&q.g.as_slice()[..dims[k]]);
                         }
-                        echo = Some((q, sd, r.weight));
+                        echo = Some((q, sd, r.weight, r.reach));
                     }
                     shares = r.shares;
                 }
                 // the echo's observables, loaded on each owner's nodes at its front share of the cell's weight
                 let mut rows = Rows::new();
-                if let Some(([p, mu, rho], sd, w)) = echo {
+                if let Some(([p, mu, rho], sd, w, reach)) = echo {
                     let info = cell_information(em, p.v(), sd * sd, ls[0].f);
                     for &(i, term, _) in &owners {
                         let Some(k) = ids.iter().position(|&id| id == ls[i].elem) else { continue };
                         let align = term.spread;
                         let load = |d: &Geometry| shared.load(k, align, d.g[SHIFT], d.g[LEVEL], em.refl_level_sd);
                         let w = w * shares[i];
-                        rows.push((x[0].clone(), load(&p), info[0], w));
+                        let mut lp = load(&p);
+                        if let Some((m, kappa)) = term.occ {
+                            lp.push((shared.elems[k].1 + 2, (m * (1.0 - m) / (kappa + 1.0)).sqrt() * reach));
+                        }
+                        rows.push((x[0].clone(), lp, info[0], w));
                         rows.push((x[1].clone(), load(&mu), info[1], w));
                         if refl && rho.v() > -200.0 {
                             rows.push((x[2].clone(), load(&rho), info[2], w));
@@ -417,17 +425,32 @@ impl Scene {
     /// own nodes (`owners`: the layer's index and its shift along the beam and reflectance level), all in the numbers
     /// `P`.
     #[allow(clippy::too_many_arguments)]
-    pub(super) fn read_cell<P: Real>(&self, s: usize, cell: usize, ls: &[Layer], j: usize, e: &Element, th: &[P], owners: &[(usize, [P; 2])]) -> CellReading<P> {
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn read_cell<P: Real>(&self, s: usize, cell: usize, ls: &[Layer], j: usize, e: &Element, th: &[P], owners: &[(usize, [P; 2])], posts: &[&[(f64, f64)]]) -> CellReading<P> {
         let (v, em) = (&*self.views[s], &self.em);
         let w = v.direction((cell / v.n_cols) as f64, (cell % v.n_cols) as f64);
         let moved = layer(&placed(e, &v.origin, Some(th)), &w, e, ls[j].elem, em, v.step()).expect("a layer it fronts");
         let layers: Vec<Layer<P>> = ls.iter().enumerate().map(|(i, l)| if i == j { moved } else { l.lift() }).collect();
         let shares = front_shares(&layers);
+        let t_es: Vec<f64> = layers.iter().map(|l| l.t.v()).collect();
         let cv = cell_view(v, cell, layers, em, &self.sc, &self.ext);
         let base = cv.empty.read(P::c(0.0), P::c(0.0), em).ll;
         let mut cost = P::c(0.0);
-        for &(i, [shift, level]) in owners {
-            cost += -((mixture_ll(&cv.pulses, shift, level, em) - base) * cv.wt) * shares[i];
+        for (n, &(i, [shift, level])) in owners.iter().enumerate() {
+            let ll = mixture_ll(&cv.pulses, shift, level, em) - base;
+            // test 5: the slope of the term's marginal over its occlusion latent, the posterior's expectation of the
+            // cell's at A
+            let post = posts.get(n).copied().unwrap_or(&[]);
+            let ll = if post.is_empty() { ll } else {
+                let tau_e = self.ext.medium(&v.origin, &w).tau(t_es[i]);
+                let arrive = (-tau_e).exp();
+                if 1.0 - arrive < 1e-3 { ll } else {
+                    let reach: Vec<(P, Pulse<P>)> = cv.pulses.iter().map(|(q, p)| (*q, p.reached(tau_e, t_es[i]))).collect();
+                    let lr = mixture_ll(&reach, shift, level, em) - base;
+                    post.iter().fold(P::c(0.0), |t, &(a, pi)| t + super::term::occ_ln(lr, ll, arrive, a) * pi)
+                }
+            };
+            cost += -(ll * cv.wt) * shares[i];
         }
         // the element's echo, at the front owner's nodes: its chance over the mixture, its depth and reflectance with
         // every layer in
@@ -435,7 +458,8 @@ impl Scene {
         let front = |p: &Pulse<P>| p.receiver(shift, level, em).front().map(|f| ((-p.occluders[f.first].tau).exp() * f.s, f));
         let chance = cv.pulses.iter().map(|(w, p)| front(p).map_or(P::c(0.0), |(c, _)| c * *w)).sum::<P>();
         let echo = front(&cv.pulses[0].1).map(|(_, f)| ([chance, f.mu, f.reflectance()], f.sd.v()));
-        CellReading { cost, weight: cv.wt.v(), shares: shares.iter().map(|s| s.v()).collect(), echo }
+        let reach = cv.pulses.iter().map(|(w, p)| front(p).map_or(0.0, |(_, f)| f.s.v() * w.v())).sum::<f64>();
+        CellReading { cost, weight: cv.wt.v(), shares: shares.iter().map(|s| s.v()).collect(), echo, reach }
     }
 
     /// What hypothesis `q` is expected to cost against hypothesis `p` were `p` true, per scan (nats): `E_p[cost(q) −
@@ -595,13 +619,13 @@ mod tests {
             let cells: Vec<(usize, Vec<Layer>, Vec<(usize, [f64; 2])>)> = Scene::cells_of(&view, &[id]).into_iter()
                 .map(|(cell, ls, owners)| (cell, ls, owners.iter().map(|&(i, _, x)| (i, x)).collect())).collect();
             let cost = |th: &[f64]| -> f64 {
-                cells.iter().map(|(cell, ls, nodes)| c.read_cell(0, *cell, ls, ls.iter().position(|l| l.elem == id).unwrap(), &e, th, nodes).cost).sum()
+                cells.iter().map(|(cell, ls, nodes)| c.read_cell(0, *cell, ls, ls.iter().position(|l| l.elem == id).unwrap(), &e, th, nodes, &[]).cost).sum()
             };
             let th0: Vec<Geometry> = (0..n).map(|i| Geometry::var(0.0, i)).collect();
             for (cell, ls, nodes) in &cells {
                 let j = ls.iter().position(|l| l.elem == id).unwrap();
                 let lifted: Vec<(usize, [Geometry; 2])> = nodes.iter().map(|&(i, x)| (i, x.map(Geometry::c))).collect();
-                assert_eq!(c.read_cell(0, *cell, ls, j, &e, &th0, &lifted).cost.v, c.read_cell(0, *cell, ls, j, &e, &vec![0.0; n], nodes).cost);
+                assert_eq!(c.read_cell(0, *cell, ls, j, &e, &th0, &lifted, &[]).cost.v, c.read_cell(0, *cell, ls, j, &e, &vec![0.0; n], nodes, &[]).cost);
             }
             assert!(cells.iter().any(|(_, ls, _)| ls[0].elem != id) == (els.len() > 1 && id == 0));
             let th = [0.02, 0.001, -0.002, 0.003, 0.001];
