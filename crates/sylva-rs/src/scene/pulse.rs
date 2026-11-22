@@ -276,11 +276,16 @@ impl<P: Real, T: Over<P>> Return<P, T> {
         if !x.is_finite() || em.refl_noise <= 0.0 {
             return T::c(1.0);
         }
-        let w: [T; 3] = [0, 1, 2].map(|q| self.s_q[q] * [1.0, 4.0, 1.0][q]);
-        let total: T = w.iter().copied().sum();
-        if total.v() <= 0.0 {
+        // the radii's weights, scaled by a constant so their total is near 1 before the quotient: a chance of being
+        // recorded can be subnormal (a return far behind an opaque layer), and the quotient's slope squares its total,
+        // which then underflowed to 0 and made the slopes NaN (3dtrees research 130 slice-dgp)
+        let raw: T = (0..3).map(|q| self.s_q[q] * [1.0, 4.0, 1.0][q]).sum();
+        if raw.v() <= 0.0 {
             return T::c(1.0);
         }
+        let scale = 1.0 / raw.v().max(1e-300);
+        let w: [T; 3] = [0, 1, 2].map(|q| self.s_q[q] * ([1.0, 4.0, 1.0][q] * scale));
+        let total: T = w.iter().copied().sum();
         let db = self.db.map(|d| if add.v() > 0.0 { ((d / 10.0).exp10() + add).log10() * 10.0 } else { d });
         let gap = |a: T, b: T| if a.v() > -200.0 && b.v() > -200.0 { (if a.v() < b.v() { b - a } else { a - b }) / 2.0 } else { T::c(0.0) };
         let (g1, g2) = (gap(db[1], db[0]), gap(db[2], db[1]));
@@ -756,6 +761,28 @@ mod tests {
     use crate::scene::settings::{Background, Settings};
     use crate::scene::term::elem_data;
     use super::super::fixtures::{cost, pole_scan, pole_view, stick};
+
+    /// A return far behind an opaque layer, its chance of being recorded subnormal (about 1e-319 at its widest radius,
+    /// 0 at the others), reads its reflectance's density with finite slopes in the own nodes: normalising the radii's
+    /// weights by their subnormal total squared it to 0 in the quotient's slope, and the term's curvature went NaN
+    /// (3dtrees research 130 slice-dgp: three elements on the stand's scan 2 under the Gaussian beam, whose tails give
+    /// such a radius a fill of 3e-7 where the disc gave 0).
+    #[test]
+    fn a_return_almost_never_recorded_reads_its_reflectance_with_finite_slopes() {
+        use crate::scene::dual::Dual2;
+        let em = Settings::default();
+        let level = Dual2::<2>::var(0.0, 1);
+        let zero = Dual2::<2>::c(0.0);
+        let r: Return<f64, Dual2<2>> = Return {
+            first: 0, last: 0, mu: Dual2::c(27.13) + Dual2::var(0.0, 0), sd: Dual2::c(0.007), s: level * 7.09e-319 + 3.7e-320, q: Dual2::c(1.0),
+            s_q: [zero, zero, level * 4.26e-318 + 2.23e-319],
+            db: [Dual2::c(-315.5), Dual2::c(-315.5), level + (-108.05)],
+            fill: [0.0, 0.0, 3.1e-7], floor: -31.68,
+        };
+        let d = r.refl_density(-28.73, &em, 0.0);
+        let ok = |x: &Dual2<2>| x.v.is_finite() && x.g.iter().all(|v| v.is_finite()) && x.h.iter().all(|v| v.is_finite());
+        assert!(ok(&d), "{d:?}");
+    }
 
 
     #[test]
