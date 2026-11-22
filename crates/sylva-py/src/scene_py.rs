@@ -590,8 +590,9 @@ impl PyScene {
         py.detach(|| c.hold_foliage(&ext))
     }
 
-    /// The foliage field per voxel with counts: voxel (n, 3, its index in the box), centre (n, 3), sigma (1/m, as
-    /// held), the weighted counts it is fitted from, hits (less what the elements take of them) and path (m), as the
+    /// The foliage field per voxel with counts: voxel (n, 3, its index in the box), centre (n, 3), sigma (1/m: the
+    /// intensity, the field's density for the cost and the products), sigma_read (1/m: what a pulse meets, the
+    /// realization read; as held), the weighted counts it is fitted from, hits (less what the elements take of them) and path (m), as the
     /// scene is or, given a proposal (`put_in` an element dict, `take_out` ids), as it would leave them. Empty when the
     /// field is held from elsewhere.
     #[pyo3(signature = (put_in=None, take_out=None))]
@@ -607,8 +608,11 @@ impl PyScene {
                 .into_pyarray(py).reshape([n, 3])?)?;
         }
         d.set_item("sigma", rows.iter().map(|r| r.1).collect::<Vec<f64>>().into_pyarray(py))?;
-        d.set_item("hits", rows.iter().map(|r| r.2 .0).collect::<Vec<f64>>().into_pyarray(py))?;
-        d.set_item("path", rows.iter().map(|r| r.2 .1).collect::<Vec<f64>>().into_pyarray(py))?;
+        d.set_item("sigma_read", rows.iter().map(|r| r.2).collect::<Vec<f64>>().into_pyarray(py))?;
+        d.set_item("hits", rows.iter().map(|r| r.3 .0).collect::<Vec<f64>>().into_pyarray(py))?;
+        d.set_item("path", rows.iter().map(|r| r.3 .1).collect::<Vec<f64>>().into_pyarray(py))?;
+        d.set_item("hits_read", rows.iter().map(|r| r.4 .0).collect::<Vec<f64>>().into_pyarray(py))?;
+        d.set_item("path_read", rows.iter().map(|r| r.4 .1).collect::<Vec<f64>>().into_pyarray(py))?;
         Ok(d)
     }
 

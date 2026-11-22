@@ -427,10 +427,11 @@ pub fn hits(v: &RangeImage, sp: &FoliageBox, em: &Settings, k: usize) -> Vec<(us
 }
 
 /// One cell's ray through the box, walked once ([`Walk`]), counted whole into `acc` (the empty scene's reading; the
-/// module docs): each echo a hit ([`hits`]) and each stretch it shows clear its path ([`walked`]), each voxel's piece of
+/// module docs), into the intensity's counts and the realization read's (at weight 1/m, [`Settings::read_weight`],
+/// the path with the same grain factor): each echo a hit ([`hits`]) and each stretch it shows clear its path ([`walked`]), each voxel's piece of
 /// it weighted at its own range, as an echo there would be (3dtrees research 130 slice-path: the overlap of
 /// neighbouring beams is the voxel's, for its hits and its path alike).
-fn ray(v: &RangeImage, sp: &FoliageBox, em: &Settings, ground_z: f64, k: usize, acc: &mut FixedCounts) {
+fn ray(v: &RangeImage, sp: &FoliageBox, em: &Settings, ground_z: f64, k: usize, acc: &mut (FixedCounts, FixedCounts)) {
     let w = v.direction((k / v.n_cols) as f64, (k % v.n_cols) as f64);
     if clip(sp, &v.origin, &w).is_none() {
         return;
@@ -441,11 +442,14 @@ fn ray(v: &RangeImage, sp: &FoliageBox, em: &Settings, ground_z: f64, k: usize, 
     for &(from, to, beam) in &p.path {
         for (key, a, b) in walk.within(from, to) {
             let mid = 0.5 * (a + b);
-            accumulate(acc, key, 0.0, field_weight(em, mid, steps) * grain_factor(em, mid) * beam * (b - a));
+            let path = grain_factor(em, mid) * beam * (b - a);
+            accumulate(&mut acc.0, key, 0.0, field_weight(em, mid, steps) * path);
+            accumulate(&mut acc.1, key, 0.0, em.read_weight(mid, steps) * path);
         }
     }
-    for (_, key, h, _) in hits(v, sp, em, k) {
-        accumulate(acc, key, h, 0.0);
+    for (_, key, h, r) in hits(v, sp, em, k) {
+        accumulate(&mut acc.0, key, h, 0.0);
+        accumulate(&mut acc.1, key, em.read_weight(r, steps), 0.0);
     }
 }
 
@@ -491,6 +495,10 @@ pub struct FieldCounts {
     pub grains: [f64; 3],
     /// Per voxel, the empty scene's weighted counts (hits, path).
     counts: FixedCounts,
+    /// The same at the realization read's weight 1/m, and its prior's shape and rate (3dtrees research 130
+    /// slice-dgp; a rate of 0: the pulse reads the intensity).
+    read: FixedCounts,
+    read_prior: (f64, f64),
     /// Per voxel with echoes taken, their sums ([`Taken`]).
     taken: HashMap<[i32; 3], Taken, std::hash::BuildHasherDefault<VoxelHasher>>,
     /// In fixed point: the scene's gain over the empty scene, `Σ_v ln E[…]`.
@@ -542,13 +550,15 @@ impl FieldCounts {
     /// nothing taken yet.
     pub fn new(spec: FoliageBox, views: &[&RangeImage], em: &Settings, ground_z: f64) -> Self {
         let prior = (em.field_prior_mean * em.field_prior_path, em.field_prior_path);
-        let counts = views.iter().map(|v| {
-            (0..v.cell.len()).into_par_iter().fold(FixedCounts::default, |mut acc, k| {
+        let both = |a: (FixedCounts, FixedCounts), b: (FixedCounts, FixedCounts)| (merged(a.0, b.0), merged(a.1, b.1));
+        let (counts, read) = views.iter().map(|v| {
+            (0..v.cell.len()).into_par_iter().fold(Default::default, |mut acc, k| {
                 ray(v, &spec, em, ground_z, k, &mut acc);
                 acc
-            }).reduce(FixedCounts::default, merged)
-        }).fold(FixedCounts::default(), merged);
-        FieldCounts { spec, prior, grains: [em.grain_radius, em.beam_exit, em.beam_divergence], counts, taken: Default::default(), term: 0 }
+            }).reduce(Default::default, both)
+        }).fold(Default::default(), both);
+        let read_prior = (em.read_prior_mean * em.read_prior_path, em.read_prior_path);
+        FieldCounts { spec, prior, grains: [em.grain_radius, em.beam_exit, em.beam_divergence], counts, read, read_prior, taken: Default::default(), term: 0 }
     }
 
     /// Voxel `k`'s empty counts (hits, path).
@@ -670,10 +680,24 @@ impl FieldCounts {
         c.iter().map(|(&k, &[h, l])| (k, (h as f64 / FIXED, l as f64 / FIXED))).collect()
     }
 
-    /// The field a pulse reads: the posterior from the empty scene's counts (data alone, the same for every scene).
+    /// Voxel `k`'s empty counts at the realization read's weight (hits, path).
+    pub fn read_counts(&self, k: &[i32; 3]) -> (f64, f64) {
+        self.read.get(k).map_or((0.0, 0.0), |&[h, l]| (h as f64 / FIXED, l as f64 / FIXED))
+    }
+
+    /// The intensity's posterior mean in voxel `k` given the counts `(h, l)`: the field's density, for the cost and the
+    /// products.
+    pub fn intensity(&self, (h, l): (f64, f64)) -> f64 {
+        (self.prior.0 + h) / (self.prior.1 + l)
+    }
+
+    /// The field a pulse reads, what it meets: the realization read's posterior, the empty scene's counts at weight
+    /// 1/m under its own prior (data alone, the same for every scene; 3dtrees research 130 slice-dgp); the
+    /// intensity's where no realization prior is given.
     pub fn field(&self, kappa: f64) -> Foliage {
-        let counts: Counts = self.counts.iter().map(|(&k, &[h, l])| (k, (h as f64 / FIXED, l as f64 / FIXED))).collect();
-        let mut f = Foliage::from_counts(kappa, self.spec, &counts, self.prior);
+        let (src, prior) = if self.read_prior.1 > 0.0 { (&self.read, self.read_prior) } else { (&self.counts, self.prior) };
+        let counts: Counts = src.iter().map(|(&k, &[h, l])| (k, (h as f64 / FIXED, l as f64 / FIXED))).collect();
+        let mut f = Foliage::from_counts(kappa, self.spec, &counts, prior);
         f.grains = self.grains;
         f
     }
@@ -691,7 +715,8 @@ mod tests {
     fn the_voxel_formula_is_the_posterior_moment() {
         let spec = FoliageBox { lo: [0.0; 3], hi: [1.0; 3], voxel: 1.0 };
         let (h, l, a0, b0) = (3.0, 4.0, 0.05, 0.5);
-        let mut f = FieldCounts { spec, prior: (a0, b0), grains: [0.0; 3], counts: Default::default(), taken: Default::default(), term: 0 };
+        let mut f = FieldCounts { spec, prior: (a0, b0), grains: [0.0; 3], counts: Default::default(), read: Default::default(), read_prior: (0.0, 0.0),
+                                  taken: Default::default(), term: 0 };
         f.counts.insert([0, 0, 0], [fx(h), fx(l)]);
         let (al, beta, w, sig) = (a0 + h, b0 + l, 0.7, 0.9);
         let mut d = FixedHits::default();
@@ -775,11 +800,11 @@ mod tests {
         let (pole, wall) = (cell(&[0.0, 3.97, 0.0]), cell(&[0.28, 8.0, 0.0]));
         assert!(v.echoes(pole)[0] < 4.1 && v.echoes(wall)[0] > 7.9);
         let per_metre = |k: usize| {
-            let mut acc = FixedCounts::default();
+            let mut acc = <(FixedCounts, FixedCounts)>::default();
             ray(&v, &sp, &em, f64::NAN, k, &mut acc);
             let w = v.direction((k / v.n_cols) as f64, (k % v.n_cols) as f64);
             // the voxels from the box's face at 2.9 m to 3.8 m (rows 0..9 across the beam), over that length of ray
-            let path: i64 = acc.iter().filter(|(key, _)| key[1] < 9).map(|(_, c)| c[1]).sum();
+            let path: i64 = acc.0.iter().filter(|(key, _)| key[1] < 9).map(|(_, c)| c[1]).sum();
             path as f64 / FIXED / (0.9 / w[1])
         };
         let (a, b) = (per_metre(pole), per_metre(wall));

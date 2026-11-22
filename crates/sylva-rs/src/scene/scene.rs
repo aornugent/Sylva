@@ -269,10 +269,10 @@ impl Scene {
 
     /// The foliage field and its counts as proposal `p` would leave them ([`Scene::check_proposal`]): per voxel with
     /// counts, (voxel, σ as held, the counts). Empty when the field is held from elsewhere.
-    pub fn foliage(&self, p: &Proposal) -> (Option<FoliageBox>, Vec<([i32; 3], f64, (f64, f64))>) {
+    pub fn foliage(&self, p: &Proposal) -> (Option<FoliageBox>, Vec<([i32; 3], f64, f64, (f64, f64), (f64, f64))>) {
         let Some(f) = &self.field else { return (self.ext.spec, Vec::new()) };
         let (_, delta) = self.views_after(p);
-        let mut out: Vec<_> = f.counts_after(&delta).into_iter().map(|(k, c)| (k, self.ext.sigma(&k), c)).collect();
+        let mut out: Vec<_> = f.counts_after(&delta).into_iter().map(|(k, c)| (k, f.intensity(c), self.ext.sigma(&k), c, f.read_counts(&k))).collect();
         out.sort_by_key(|x| x.0);
         (self.ext.spec, out)
     }
@@ -647,8 +647,8 @@ mod tests {
         let v = pole_view();
         let (em, sc) = (Settings::default(), Background::default());
         let pole = stick(0.0, 4.0, 0.03);
-        let hits = |c: &Scene| c.foliage(&Proposal::default()).1.iter().find(|x| x.0 == [5, 10, 3]).map_or(f64::NAN, |x| x.2 .0);
-        let sigma = |c: &Scene| c.foliage(&Proposal::default()).1.iter().find(|x| x.0 == [5, 10, 3]).map_or(f64::NAN, |x| x.1);
+        let hits = |c: &Scene| c.foliage(&Proposal::default()).1.iter().find(|x| x.0 == [5, 10, 3]).map_or(f64::NAN, |x| x.3 .0);
+        let sigma = |c: &Scene| c.foliage(&Proposal::default()).1.iter().find(|x| x.0 == [5, 10, 3]).map_or(f64::NAN, |x| x.2);
         let mut c = Scene::new(vec![v.clone()], &[], em, sc, Some(field_box()), 0);
         assert_eq!(c.cost(), 0.0);
         let dense = sigma(&c);
@@ -666,6 +666,23 @@ mod tests {
         assert_eq!(c.cost(), 0.0);
     }
 
+    /// The field's two reads are one count at two weights (3dtrees research 130 slice-dgp): with φ 1 and the same prior
+    /// they agree in every voxel; at φ 10 the realization read is the counts' own evidence ten times over, so where a
+    /// voxel holds hits it reads nearer them than the intensity does, and the pulse reads the realization.
+    #[test]
+    fn the_two_reads_are_one_count_at_two_weights() {
+        let v = pole_view();
+        let sc = Background::default();
+        let rows = |em: Settings| Scene::new(vec![v.clone()], &[], em, sc, Some(field_box()), 0).foliage(&Proposal::default()).1;
+        let one = Settings { discount: 1.0, read_prior_mean: Settings::default().field_prior_mean, read_prior_path: Settings::default().field_prior_path, ..Settings::default() };
+        for r in rows(one) {
+            assert!((r.1 - r.2).abs() < 1e-9 * r.1.max(1e-9) && (r.3 .0 - r.4 .0).abs() < 1e-6 && (r.3 .1 - r.4 .1).abs() < 1e-6, "{r:?}");
+        }
+        let ten = Settings { discount: 10.0, read_prior_mean: Settings::default().field_prior_mean, read_prior_path: Settings::default().field_prior_path, ..Settings::default() };
+        let dense = rows(ten).into_iter().find(|r| r.0 == [5, 10, 3]).unwrap();
+        assert!((dense.4 .0 / dense.3 .0 - 10.0).abs() < 1e-6 && dense.2 > dense.1, "{dense:?}");
+    }
+
     /// Soft attribution (research 130 slice-soft): with the pole in (and a thin stick partly in front of its edge, two
     /// terms sharing cells), every voxel keeps the empty scene's path, since the likelihood reads the medium's path in
     /// every way it explains a pulse; and each voxel's hits are the empty scene's less what the elements take, between
@@ -676,7 +693,7 @@ mod tests {
         let v = pole_view();
         let (em, sc) = (Settings::default(), Background::default());
         let counts = |els: &[Element]| -> HashMap<[i32; 3], (f64, f64)> {
-            Scene::new(vec![v.clone()], els, em, sc, Some(field_box()), 0).foliage(&Proposal::default()).1.into_iter().map(|x| (x.0, x.2)).collect()
+            Scene::new(vec![v.clone()], els, em, sc, Some(field_box()), 0).foliage(&Proposal::default()).1.into_iter().map(|x| (x.0, x.3)).collect()
         };
         let (empty, pole) = (counts(&[]), counts(&[stick(0.0, 4.0, 0.03), stick(0.0365, 3.9, 0.008)]));
         let mut taken = 0.0;

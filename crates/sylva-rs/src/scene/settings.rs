@@ -186,6 +186,12 @@ params! {
         pub field_prior_mean: f64 = 0.11938,
         pub field_prior_path: f64 = 0.5177,
         pub field_prior_voxel: f64 = 0.125,
+        /// The field's realization read, what a pulse meets ([`super::foliage::FieldCounts::field`]; 3dtrees research
+        /// 130 slice-dgp): the counts at weight 1/m ([`Settings::read_weight`]) under a Gamma prior of this mean
+        /// (1/m) worth this much weighted path (m), fitted as a predictive (`collapsed.py read`). A path of 0 reads the
+        /// intensity's counts and prior instead.
+        pub read_prior_mean: f64 = 0.0,
+        pub read_prior_path: f64 = 0.0,
         /// The foliage field's grains (3dtrees research 130 field-slice, grain-field): the field is opaque grains, each a
         /// disc of this radius (m) across the ray, scattered at the field's density, so a pulse of footprint w touches a
         /// grain when its centre falls within the grain grown by w/2. Then a pulse meets `(1 + w/2s)²` times the
@@ -265,10 +271,17 @@ impl Settings {
         (f / steps.0).max(1.0) * (f / steps.1).max(1.0)
     }
 
-    /// The one weight a cell's evidence counts with everywhere (the ray likelihood, the foliage field, predictions):
-    /// `1 / (φ m(ρ))`, at ρ the cell's first echo's range, or its predicted range where it has none.
+    /// The weight a cell's evidence counts with in the cost (the ray likelihood, the field's intensity): its read
+    /// weight discounted by φ, `1 / (φ m(ρ))`, at ρ the cell's first echo's range, or its predicted range where it
+    /// has none: pulses through one object are one event for what is learnt.
     pub fn cell_weight<P: Real>(&self, range: P, steps: (f64, f64)) -> P {
-        P::c(1.0) / (self.multiplicity(range, steps) * self.discount)
+        self.read_weight(range, steps) / self.discount
+    }
+
+    /// The weight a cell counts with in the field's realization read, what a pulse meets: `1 / m(ρ)`, each footprint's
+    /// area once (3dtrees research 130 representation-dgp test F, slice-dgp; the one place 1/m is written).
+    pub fn read_weight<P: Real>(&self, range: P, steps: (f64, f64)) -> P {
+        P::c(1.0) / self.multiplicity(range, steps)
     }
 
     /// The per-echo noise sd (m) of class `k`.
