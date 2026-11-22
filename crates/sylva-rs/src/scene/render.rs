@@ -192,7 +192,7 @@ pub fn beam_fill(d: f64, r: f64, a: f64) -> (f64, f64) {
 }
 
 /// How far the beam reaches, in its 1/e² radii: its Gaussian profile is cut there (0.13 % of its energy past it).
-pub(super) const REACH: f64 = 1.5;
+pub(super) const REACH: f64 = 3.0;
 
 /// The share of a Gaussian beam's energy (1/e² radius 1) nearer than a line `z` radii from its centre: the CDF of its
 /// 1-D marginal, a normal of sd ½, truncated at ±[`REACH`] so it is exactly 0 and 1 there (3dtrees research 130
