@@ -143,7 +143,7 @@ def scan(cloud: PointCloud, origin=(10.0, 10.0, 1.5), resolution_deg: float = 0.
          reflectance=None, target_radius: float | None = None, oriented: bool | None = None,
          detection_threshold: float | None = None, max_range: float | None = None,
          seed: int = 0, solids: dict | None = None, azimuth_deg=(0.0, 360.0),
-         timing=(0.825e-6, 6.593e-3), lambertian: bool = False, roughness=(0.0, 0.03, 0),
+         timing=(0.825e-6, 6.593e-3), lambertian: bool = False, gaussian: bool = False, roughness=(0.0, 0.03, 0),
          mesh: dict | None = None) -> Shots:
     """A pseudo terrestrial scan of ``cloud`` from ``origin``.
 
@@ -256,6 +256,10 @@ def scan(cloud: PointCloud, origin=(10.0, 10.0, 1.5), resolution_deg: float = 0.
         :func:`sylva._core.shots_scan_lattice` rebuilds the lattice.
     lambertian
         Scale each sub-beam's energy by its cosine of incidence (beam model only).
+    gaussian
+        A Gaussian beam (beam model only): ``exit_diameter`` and ``beam_divergence`` are its 1/e² widths at the
+        waist (the exit) and far out, so its 1/e² diameter at range ρ is D₀ √(1 + (ρ/z_R)²), z_R = D₀/θ; the
+        sub-beams carry equal energy on its profile. Otherwise a cone of uniform energy.
     roughness
         ``(sd, wavelength, seed)`` (m, m, int): a smooth random relief on the
         small solids' surfaces, the same for every scan with the same seed
@@ -318,7 +322,7 @@ def scan(cloud: PointCloud, origin=(10.0, 10.0, 1.5), resolution_deg: float = 0.
         0.0 if detection_threshold is None else float(detection_threshold), refl_map, 0.4, refl_attr,
         refl_const, float("inf") if max_range is None else float(max_range), int(seed),
         *_solids(solids), tuple(float(v) for v in azimuth_deg), tuple(float(v) for v in timing),
-        bool(lambertian), (float(roughness[0]), float(roughness[1]), int(roughness[2])), *_mesh(mesh))
+        bool(lambertian), bool(gaussian), (float(roughness[0]), float(roughness[1]), int(roughness[2])), *_mesh(mesh))
     return Shots._from_core(d)
 
 

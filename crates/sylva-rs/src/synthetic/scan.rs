@@ -141,6 +141,10 @@ pub struct BeamScan {
     pub solids: Vec<Solid>,
     /// Scale each sub-beam's energy by its cosine of incidence.
     pub lambertian: bool,
+    /// A Gaussian beam ([`gaussian_offsets`]): `exit_diameter` and `divergence_mrad` are its 1/e² widths at the
+    /// waist (the exit) and far out, so its 1/e² diameter at range ρ is `D₀ √(1 + (ρ/z_R)²)`, z_R = D₀/θ, and its
+    /// sub-beams carry equal energy. Otherwise a cone of uniform energy (the sunflower disc).
+    pub gaussian: bool,
     /// Relief of the small solids' surfaces (m, standard deviation), its wavelength (m) and seed.
     pub roughness: f64,
     pub roughness_length: f64,
@@ -152,7 +156,7 @@ pub struct BeamScan {
 
 impl BeamScan {
     pub fn new(origin: Point) -> BeamScan {
-        BeamScan { origin, resolution_deg: 0.25, min_zenith_deg: 0.0, max_zenith_deg: 130.0, max_echoes: 2, echo_separation: 0.5, range_noise: 0.0, range_noise_slope: 0.0, divergence_mrad: 0.0, exit_diameter: 0.0, footprint_samples: 1, mixed_pixels: true, target_radius: None, oriented: true, detection_threshold: 0.0, reflectance: Reflectance::default(), max_range: f64::INFINITY, seed: 0, min_azimuth_deg: 0.0, max_azimuth_deg: 360.0, pulse_interval: 0.825e-6, line_period: 6.593e-3, solids: Vec::new(), lambertian: false, roughness: 0.0, roughness_length: 0.03, roughness_seed: 0, mesh: Mesh::default() }
+        BeamScan { origin, resolution_deg: 0.25, min_zenith_deg: 0.0, max_zenith_deg: 130.0, max_echoes: 2, echo_separation: 0.5, range_noise: 0.0, range_noise_slope: 0.0, divergence_mrad: 0.0, exit_diameter: 0.0, footprint_samples: 1, mixed_pixels: true, target_radius: None, oriented: true, detection_threshold: 0.0, reflectance: Reflectance::default(), max_range: f64::INFINITY, seed: 0, min_azimuth_deg: 0.0, max_azimuth_deg: 360.0, pulse_interval: 0.825e-6, line_period: 6.593e-3, solids: Vec::new(), lambertian: false, gaussian: false, roughness: 0.0, roughness_length: 0.03, roughness_seed: 0, mesh: Mesh::default() }
     }
 }
 
@@ -180,6 +184,20 @@ pub fn scanner_preset(name: &str) -> Result<ScannerPreset> {
         "vz2000i" => Ok(p(0.27)),
         _ => Err(Error::invalid(format!("unknown scanner {name:?}; expected one of {SCANNERS:?}"))),
     }
+}
+
+/// Sub-beam offsets of a Gaussian beam in units of its 1/e² radius: `n` parts of equal energy, their radii the
+/// profile's energy quantiles (`r = √(−ln(1 − P) / 2)`, P at the middle of each part), their angles a sunflower's.
+pub fn gaussian_offsets(n: usize) -> Vec<[f64; 2]> {
+    if n <= 1 {
+        return vec![[0.0, 0.0]];
+    }
+    let golden = PI * (3.0 - 5f64.sqrt());
+    (0..n).map(|k| {
+        let r = (-(1.0 - (k as f64 + 0.5) / n as f64).ln() / 2.0).sqrt();
+        let a = k as f64 * golden;
+        [r * a.cos(), r * a.sin()]
+    }).collect()
 }
 
 /// Sub-beam offsets in the unit disc: the centre for one sample, else a
@@ -601,7 +619,7 @@ pub fn scan_beam(cloud: &PointCloud, p: &BeamScan) -> Result<Shots> {
     let n_az = ((p.max_azimuth_deg / res).ceil() as usize).min((360.0 / res).round().max(1.0) as usize).max(ia0 + 1) - ia0;
     let n_pulses = n_zen * n_az;
     limits::check_cells(n_pulses as u128, 64 + 8 * p.max_echoes as u64, &format!("a scan of {n_pulses} pulses"), "a coarser resolution_deg")?;
-    let offsets = footprint_offsets(p.footprint_samples);
+    let offsets = if p.gaussian { gaussian_offsets(p.footprint_samples) } else { footprint_offsets(p.footprint_samples) };
     let share = 1.0 / offsets.len() as f64;
     let half_div = p.divergence_mrad * 1e-3 / 2.0;
     let half_exit = p.exit_diameter / 2.0;
@@ -640,8 +658,11 @@ pub fn scan_beam(cloud: &PointCloud, p: &BeamScan) -> Result<Shots> {
             // divergence. Each returns the first surface it meets, if any.
             let mut hits: Vec<(f64, usize, f64, Point)> = offsets.iter().filter_map(|off| {
                 let lat: Point = std::array::from_fn(|k| off[0] * e1[k] + off[1] * e2[k]);
+                // a Gaussian beam's sub-ray leaves its waist offset across the beam and tilts at right angles to
+                // that offset, so its distance from the axis is |off| √(w₀² + (θρ/2)²): the profile's hyperboloid
+                let tilt: Point = if p.gaussian { std::array::from_fn(|k| -off[1] * e1[k] + off[0] * e2[k]) } else { lat };
                 let os: Point = std::array::from_fn(|k| o[k] + half_exit * lat[k]);
-                let ds: Point = std::array::from_fn(|k| d[k] + half_div * lat[k]);
+                let ds: Point = std::array::from_fn(|k| d[k] + half_div * tilt[k]);
                 let nn = (ds[0] * ds[0] + ds[1] * ds[1] + ds[2] * ds[2]).sqrt();
                 let ds = [ds[0] / nn, ds[1] / nn, ds[2] / nn];
                 let dot = |n: &Point| (ds[0] * n[0] + ds[1] * n[1] + ds[2] * n[2]).abs();
@@ -1172,6 +1193,15 @@ mod tests {
         let d: Vec<f64> = a.iter().zip(&b).map(|(a, b)| f64::from(b - a)).collect();
         let sd = (d.iter().map(|v| v * v).sum::<f64>() / d.len() as f64).sqrt();
         assert!((sd - 2.0).abs() < 0.15, "{sd}");
+    }
+
+    /// A Gaussian beam's sub-beams carry equal energy on its profile: their mean squared radius is half the 1/e²
+    /// radius squared, as the profile's is (slice-dgp).
+    #[test]
+    fn gaussian_offsets_follow_the_profile() {
+        let o = gaussian_offsets(400);
+        let m: f64 = o.iter().map(|x| x[0] * x[0] + x[1] * x[1]).sum::<f64>() / o.len() as f64;
+        assert!((m - 0.5).abs() < 0.03, "{m}");
     }
 
     #[test]
