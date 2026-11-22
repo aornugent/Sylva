@@ -149,6 +149,8 @@ pub struct BeamScan {
     /// 2-D normal of sd `sd` about a point `along` the scan line and `across` it from the axis, each parallel to the
     /// pulse (its size the same at every range); a share of 0 for none.
     pub pedestal: [f64; 4],
+    /// Test 3: a symmetric angular blur (rad, sd): each sub-beam's direction tilted besides by a 2-D normal draw.
+    pub blur: f64,
     /// Relief of the small solids' surfaces (m, standard deviation), its wavelength (m) and seed.
     pub roughness: f64,
     pub roughness_length: f64,
@@ -160,7 +162,7 @@ pub struct BeamScan {
 
 impl BeamScan {
     pub fn new(origin: Point) -> BeamScan {
-        BeamScan { origin, resolution_deg: 0.25, min_zenith_deg: 0.0, max_zenith_deg: 130.0, max_echoes: 2, echo_separation: 0.5, range_noise: 0.0, range_noise_slope: 0.0, divergence_mrad: 0.0, exit_diameter: 0.0, footprint_samples: 1, mixed_pixels: true, target_radius: None, oriented: true, detection_threshold: 0.0, reflectance: Reflectance::default(), max_range: f64::INFINITY, seed: 0, min_azimuth_deg: 0.0, max_azimuth_deg: 360.0, pulse_interval: 0.825e-6, line_period: 6.593e-3, solids: Vec::new(), lambertian: false, gaussian: false, pedestal: [0.0; 4], roughness: 0.0, roughness_length: 0.03, roughness_seed: 0, mesh: Mesh::default() }
+        BeamScan { origin, resolution_deg: 0.25, min_zenith_deg: 0.0, max_zenith_deg: 130.0, max_echoes: 2, echo_separation: 0.5, range_noise: 0.0, range_noise_slope: 0.0, divergence_mrad: 0.0, exit_diameter: 0.0, footprint_samples: 1, mixed_pixels: true, target_radius: None, oriented: true, detection_threshold: 0.0, reflectance: Reflectance::default(), max_range: f64::INFINITY, seed: 0, min_azimuth_deg: 0.0, max_azimuth_deg: 360.0, pulse_interval: 0.825e-6, line_period: 6.593e-3, solids: Vec::new(), lambertian: false, gaussian: false, pedestal: [0.0; 4], blur: 0.0, roughness: 0.0, roughness_length: 0.03, roughness_seed: 0, mesh: Mesh::default() }
     }
 }
 
@@ -636,6 +638,17 @@ pub fn scan_beam(cloud: &PointCloud, p: &BeamScan) -> Result<Shots> {
         }).collect()
     };
     let share = 1.0 / (offsets.len() + pedestal.len()) as f64;
+    // test 3: each core sub-beam's blur, the 2-D normal's radial quantiles in a permuted order, at other angles
+    let blur: Vec<[f64; 2]> = {
+        let n = offsets.len();
+        let golden = PI * (3.0 - 5f64.sqrt());
+        (0..n).map(|k| {
+            let kk = (k * 37 + 11) % n;
+            let r = p.blur * (-2.0 * (1.0 - (kk as f64 + 0.5) / n as f64).ln()).sqrt();
+            let a = kk as f64 * golden + 1.0;
+            [r * a.cos(), r * a.sin()]
+        }).collect()
+    };
     let half_div = p.divergence_mrad * 1e-3 / 2.0;
     let half_exit = p.exit_diameter / 2.0;
     let o = p.origin;
@@ -671,15 +684,15 @@ pub fn scan_beam(cloud: &PointCloud, p: &BeamScan) -> Result<Shots> {
             // spreads as it goes, so it is sampled by several sub-rays, each
             // offset across the exit aperture and tilted within the
             // divergence. Each returns the first surface it meets, if any.
-            let rays = offsets.iter().map(|off| (*off, false)).chain(pedestal.iter().map(|off| (*off, true)));
-            let mut hits: Vec<(f64, usize, f64, Point)> = rays.filter_map(|(off, planted)| {
+            let rays = offsets.iter().enumerate().map(|(k, off)| (*off, false, blur[k])).chain(pedestal.iter().map(|off| (*off, true, [0.0; 2])));
+            let mut hits: Vec<(f64, usize, f64, Point)> = rays.filter_map(|(off, planted, bl)| {
                 let lat: Point = std::array::from_fn(|k| off[0] * e1[k] + off[1] * e2[k]);
                 // a Gaussian beam's sub-ray leaves its waist offset across the beam and tilts at right angles to
                 // that offset, so its distance from the axis is |off| √(w₀² + (θρ/2)²): the profile's hyperboloid;
                 // a pedestal's sub-ray is parallel to the pulse, `off` m from it (along e2, the line; across e1)
                 let tilt: Point = if planted { [0.0; 3] } else if p.gaussian { std::array::from_fn(|k| -off[1] * e1[k] + off[0] * e2[k]) } else { lat };
                 let os: Point = if planted { std::array::from_fn(|k| o[k] + off[0] * e2[k] + off[1] * e1[k]) } else { std::array::from_fn(|k| o[k] + half_exit * lat[k]) };
-                let ds: Point = std::array::from_fn(|k| d[k] + half_div * tilt[k]);
+                let ds: Point = std::array::from_fn(|k| d[k] + half_div * tilt[k] + bl[0] * e1[k] + bl[1] * e2[k]);
                 let nn = (ds[0] * ds[0] + ds[1] * ds[1] + ds[2] * ds[2]).sqrt();
                 let ds = [ds[0] / nn, ds[1] / nn, ds[2] / nn];
                 let dot = |n: &Point| (ds[0] * n[0] + ds[1] * n[1] + ds[2] * n[2]).abs();
