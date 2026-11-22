@@ -38,6 +38,11 @@ params! {
         /// instrument's record (the rdbx: 8.393 mm, 0.223 mrad).
         pub beam_exit: f64 = 0.008393,
         pub beam_divergence: f64 = 0.223e-3,
+        /// Test 1b: a pedestal beside the optics core: its share, sd (m), offset along the scan line and across lines (m).
+        pub ped_w: f64 = 0.0,
+        pub ped_sd: f64 = 0.004,
+        pub ped_along: f64 = 0.0,
+        pub ped_across: f64 = 0.0,
         /// Excess at the solid/mid and mid/fragmented boundaries of the surface class (`constants.py rca`: on raw
         /// scans they split alignment-rca's symptom, 1.1 / 2.8 / 4.4 mm between cells).
         pub class_edge_mid: f64 = 1.2,

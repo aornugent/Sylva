@@ -312,12 +312,41 @@ pub(super) fn layer<P: Real>(p: &Placed<P>, w: &Point, e: &Element, id: u32, em:
     let r = p.r;
     let a = em.footprint(tm) * 0.5;
     let wide = r + 3f64.sqrt() * e.mismatch;
-    if tm.v() <= 0.0 || d.v() > (wide + a * REACH + tm * (2.0 * step)).v() {
+    let ped_reach = if em.ped_w > 0.0 { 3.0 * em.ped_sd + em.ped_along.hypot(em.ped_across) } else { 0.0 };
+    if tm.v() <= 0.0 || d.v() > (wide + (a * REACH).larger(P::c(ped_reach)) + tm * (2.0 * step)).v() {
         return None;
     }
+    // test 1b: the pedestal's place across a stick's band, signed, in the beam's plane: the beam centre's (q along
+    // m = w × u) plus the pedestal's offset (along e2 = w × e1, across e1 ∝ w × z, the simulator's axes)
+    let ped = match &p.axis {
+        Some((u, _, _)) if em.ped_w > 0.0 => {
+            let wv = w.map(|x| x.v());
+            let uv = [u[0].v(), u[1].v(), u[2].v()];
+            let cross = |a: [f64; 3], b: [f64; 3]| [a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0]];
+            let unit = |a: [f64; 3]| { let n = (a[0] * a[0] + a[1] * a[1] + a[2] * a[2]).sqrt(); [a[0] / n, a[1] / n, a[2] / n] };
+            let _ = uv;
+            let h = if wv[2].abs() < 0.9 { [0.0, 0.0, 1.0] } else { [1.0, 0.0, 0.0] };
+            let e1 = unit(cross(wv, h));
+            let e2 = cross(wv, e1);
+            let delta = [0, 1, 2].map(|k| em.ped_along * e2[k] + em.ped_across * e1[k]);
+            // the beam centre's signed place across the band is x = q·n (n ⟂ the axis and the ray); the pedestal's is
+            // x + δ·n
+            let (_, _, n) = p.axis.as_ref().unwrap();
+            let shift = delta[0] * n[0].v() + delta[1] * n[1].v() + delta[2] * n[2].v();
+            Some(x + shift)
+        }
+        _ => None,
+    };
     let fq = [-1.0, 0.0, 1.0].map(|z: f64| {
         let r = (r + z * 3f64.sqrt() * e.mismatch).max(0.0);
-        beam_cdf((r - d) / a) - beam_cdf((-r - d) / a)
+        let core = beam_cdf((r - d) / a) - beam_cdf((-r - d) / a);
+        match ped {
+            Some(xp) => {
+                let phi = |y: P| (y * (-1.0 / (em.ped_sd * std::f64::consts::SQRT_2))).erfc() * 0.5;
+                core * (1.0 - em.ped_w) + (phi(r - xp) - phi(-r - xp)) * em.ped_w
+            }
+            None => core,
+        }
     });
     let f = (fq[0] + fq[1] * 4.0 + fq[2]) / 6.0;
     let (t, spread, cos) = footprint_depth(tm, d, r, sin, a);
