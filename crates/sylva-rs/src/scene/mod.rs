@@ -99,6 +99,7 @@ pub mod pulse;
 pub mod pyramid;
 pub mod query;
 pub mod range_image;
+pub mod reading;
 pub mod render;
 pub mod scene;
 pub mod settings;

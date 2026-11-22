@@ -63,6 +63,7 @@ use super::dual::{Over, Real};
 use super::instrument::Instrument;
 use super::foliage::{Foliage, Medium};
 use super::range_image::{Cell, RangeImage};
+use super::reading::{Reading as FillReading, ReadingModel};
 use super::render::{Layer, smooth, mixture};
 use super::settings::{Background, Settings, P_OUTLIER, T_MAX};
 
@@ -559,7 +560,7 @@ impl<P: Real> Pulse<P> {
         let rx = self.receiver(shift, level, em);
         let owners = rx.owners();
         let mut resp = vec![0.0; self.echoes.len() * owners];
-        let pass = Pass { pulse: self, rx: &rx, em, t_end: Self::end(&self.occluders), capped: self.capped(), owners };
+        let pass = Pass { pulse: self, rx: &rx, em, t_end: Self::end(&self.occluders), capped: self.capped(), owners, leaf: FillReading::of(&ReadingModel::leaf(em)) };
         let total = rx.patterns.iter().map(|(p, rets)| *p * pass.lik(rets, 0, 0, P::c(1.0), 1.0, 1.0, 0.0, p.v(), &mut resp)).sum::<T>();
         if total.v() > 0.0 {
             resp.iter_mut().for_each(|r| *r /= total.v());
@@ -585,6 +586,8 @@ pub(super) struct Pass<'a, P, T> {
     pub(super) t_end: f64,
     pub(super) capped: bool,
     pub(super) owners: usize,
+    /// The medium's echoes' reading of their objects' fills ([`Reading`]).
+    pub(super) leaf: std::sync::Arc<FillReading>,
 }
 
 impl<P: Real, T: Over<P>> Pass<'_, P, T> {
@@ -615,8 +618,8 @@ impl<P: Real, T: Over<P>> Pass<'_, P, T> {
     /// it not recorded; [`Return::density`], its merge with the medium behind inside it), an echo of the medium (the
     /// returns before it not recorded) or an outlier.
     /// - **The medium's echoes** are a Poisson process along the ray in the beam the echoes so far left, `seen`: each
-    ///   echo takes the share of the emitted beam its reflectance says ([`Settings::beam_after`]), as the field
-    ///   reads them ([`super::foliage`]).
+    ///   echo leaves the beam its reading says on average ([`FillReading::mean_left`]), as the field reads them
+    ///   ([`super::foliage`]).
     ///   That beam is read from the echoes alone, the same for every hypothesis, so how often a pulse echoes again
     ///   doesn't lean on the scene's beam (on the stand's checks the scene's beam there favoured a wider stick
     ///   wherever a pulse returned nothing more: research 130 step 3c). Its path restarts after each echo at the
@@ -624,6 +627,11 @@ impl<P: Real, T: Over<P>> Pass<'_, P, T> {
     /// - **The rest of the beam:** the medium's echo reads `10 log10` of the beam the scene leaves, `scene` (the share
     ///   the returns matched so far leave: the beam behind a return's last member) × `taken` (what the medium's own
     ///   echoes left), dimmer: behind an edge of fill f, `1 − f`, as a located edge reads f.
+    /// - **Its object's fill is a latent** ([`FillReading`]; 3dtrees research 130 slice-dgp): read against that beam, the
+    ///   echo's object either filled it, with chance π(u) (*stopped*: the beam is 0, and nothing behind records or says
+    ///   anything, the returns nor the medium's path), or took part of it (*partial*: the beam goes on at the partial
+    ///   fill's mean, [`FillReading::left`]). A later echo behind a stop can only be an outlier, so data with later echoes
+    ///   falls to the partial branch by itself.
     /// - **Behind the medium's echoes:** a return is always *met* (no chance of being blocked: a medium echo is not a
     ///   stop), and met *dimmed*, in the beam the echoes in front left, `taken` of what the scene left ([`Pass::dim`]):
     ///   its detection, its miss and its brightness all read there, the ground's alike. So `taken` enters once, as the
@@ -663,7 +671,7 @@ impl<P: Real, T: Over<P>> Pass<'_, P, T> {
             let d = none * ((occ[r.first].tau - tau0).max(0.0) * -seen).exp() * r.s * r.density(o, x, em, occ);
             if d.v() > 0.0 {
                 let f = d * (1.0 - P_OUTLIER);
-                let rest = self.lik(rets, i + 1, k + 1, self.rx.members[r.last].beam, taken, em.beam_after(seen, x), tau_after, prefix * f.v(), resp);
+                let rest = self.lik(rets, i + 1, k + 1, self.rx.members[r.last].beam, taken, self.leaf.beam_after(em, seen, x), tau_after, prefix * f.v(), resp);
                 resp[row + r.first] += prefix * f.v() * rest.v();
                 total += f * rest;
             }
@@ -676,9 +684,22 @@ impl<P: Real, T: Over<P>> Pass<'_, P, T> {
             let d = none * (seen * sig_o * (-seen * (tau_o - tau0).max(0.0)).exp()) * em.refl_background(P::c(x) - (scene * taken).max(1e-6).log10() * 10.0);
             if d.v() > 0.0 {
                 let f = d * (1.0 - P_OUTLIER);
-                let rest = self.lik(rets, i + 1, jn, scene, taken_after(scene.v(), taken, x, em), em.beam_after(seen, x), tau_after, prefix * f.v(), resp);
-                resp[row + self.owners - 2] += prefix * f.v() * rest.v();
-                total += f * rest;
+                // its object's fill: stopped, or partial (the beam on at the partial mean)
+                let (stop, left) = if x.is_finite() && (scene.v() * taken) > 0.0 {
+                    let u = FillReading::reading(em, scene.v() * taken, x);
+                    (self.leaf.stop(u), self.leaf.left(u))
+                } else {
+                    (0.0, 1.0)
+                };
+                let seen_on = self.leaf.beam_after(em, seen, x);
+                for (share, taken_on, seen_on) in [(1.0 - stop, taken * left, seen_on), (stop, 0.0, 0.0)] {
+                    if share > 0.0 {
+                        let fb = f * share;
+                        let rest = self.lik(rets, i + 1, jn, scene, taken_on, seen_on, tau_after, prefix * fb.v(), resp);
+                        resp[row + self.owners - 2] += prefix * fb.v() * rest.v();
+                        total += fb * rest;
+                    }
+                }
             }
         }
         // an outlier
@@ -687,14 +708,6 @@ impl<P: Real, T: Over<P>> Pass<'_, P, T> {
         resp[row + self.owners - 1] += prefix * f * rest.v();
         total + rest * f
     }
-}
-
-/// `taken` after a medium echo of reflectance `x` (dB), where the scene left `scene` of the emitted beam: the echo takes
-/// its share of the emitted beam ([`Settings::beam_after`]) from the beam there, `scene × taken`, as `seen` subtracts
-/// it, and what's left is read against `scene` again (3dtrees research 130 slice-defects D3: subtracted from `taken`
-/// alone, behind a return that left 0.6 a leaf echo of share 0.3 left 0.42 of the emitted beam, not 0.30).
-pub(super) fn taken_after(scene: f64, taken: f64, x: f64, em: &Settings) -> f64 {
-    if scene > 0.0 { em.beam_after(scene * taken, x) / scene } else { taken }
 }
 
 /// A cell's log-likelihood at shift `shift` and reflectance level `level` ([`mixture_ll`]) and, per echo, the share
@@ -725,16 +738,6 @@ mod tests {
     use crate::scene::term::elem_data;
     use super::super::fixtures::{cost, pole_scan, pole_view, stick};
 
-    #[test]
-    fn a_medium_echo_takes_its_share_of_the_emitted_beam() {
-        // slice-defects D3: behind a return that left 0.6, a leaf echo of share 0.3 leaves 0.30 of the emitted beam,
-        // half of what the return left; in front of every return it leaves 0.7, as `seen` reads it
-        let em = Settings::default();
-        let x = em.refl_full_hit() + 10.0 * 0.3f64.log10();
-        assert!((taken_after(0.6, 1.0, x, &em) * 0.6 - 0.3).abs() < 1e-9);
-        assert!((taken_after(1.0, 1.0, x, &em) - em.beam_after(1.0, x)).abs() < 1e-12);
-        assert_eq!(taken_after(0.6, 1.0, f64::NAN, &em), 1.0);
-    }
 
     #[test]
     fn a_miss_is_weighted_at_the_nearest_echo_beside_it() {
@@ -794,8 +797,11 @@ mod tests {
     fn a_return_behind_a_leaf_echo_is_met_in_the_beam_it_left() {
         let em = Settings::default();
         let flat = Foliage::uniform(0.05);
-        let leaf = (em.refl_full_hit() + 10.0 * 0.5f64.log10()) as f32;
-        assert!((em.beam_after(1.0, leaf as f64) - 0.5).abs() < 1e-6);
+        // a leaf echo whose reading leaves half the beam (slice-dgp: read through its fill, on its partial branch)
+        let r = FillReading::of(&ReadingModel::leaf(&em));
+        let u = (0..4000).map(|i| -30.0 + 0.01 * i as f64).find(|&u| r.left(u) <= 0.5).unwrap();
+        let leaf = (em.refl_full_hit() + u) as f32;
+        assert!(r.stop(u) < 0.05, "{}", r.stop(u));
         let best = |layers: &[Layer], ground: Option<(f64, f64)>, echoes: &[f32], front: &[f32]| -> f64 {
             (0..=1000).map(|i| -35.0 + 0.025 * i as f64).map(|x| {
                 let refls: Vec<f32> = front.iter().copied().chain([x as f32]).collect();

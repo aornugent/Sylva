@@ -802,8 +802,10 @@ mod tests {
         };
         let (one, many) = (at(1, 6.0), at(15, 6.0));
         let sum = |x: &[f64]| -> f64 { x.iter().sum() };
-        assert!((sum(&one) - sum(&many)).abs() < 0.05 && sum(&one).abs() > 1.0, "{one:?} {many:?}");
-        assert!(one[one.len() - 1] != 0.0 && (one[one.len() - 1] - many[many.len() - 1]).abs() < 1e-6, "{one:?} {many:?}");
+        // (within 0.2 %: the stick dims the wall's echo's beam, so its reading says "stopped" a little more often, and
+        // a stop frees the path past it that one target frees anyway: slice-dgp)
+        assert!((sum(&one) - sum(&many)).abs() < 2e-3 * sum(&one).abs() && sum(&one).abs() > 1.0, "{one:?} {many:?}");
+        assert!(one[one.len() - 1] != 0.0 && (one[one.len() - 1] - many[many.len() - 1]).abs() < 1e-4, "{one:?} {many:?}");
         let (one, many) = (at(1, 8.5), at(15, 8.5));
         assert!(sum(&one).abs() < 1e-6 && sum(&many) > 1.0, "{one:?} {many:?}");
     }

@@ -117,6 +117,18 @@ params! {
         pub refl_edge: f64 = 11.35,
         pub refl_incidence: f64 = 0.3,
         pub refl_level_sd: f64 = 0.76,
+        /// The medium's echoes' reading of their objects' fills ([`super::reading`]; 3dtrees research 130
+        /// slice-dgp): a full hit's noise (dB, t scale) and its dof, the object's level sd (dB), a partial fill's
+        /// darkening scale at fill 0 (dB, a half-t), the share of objects that fill the beam they meet, and the
+        /// partial fills' Beta(α, β). Until fitted on the closures (slice-dgp step 4): wood's spreads, test B's
+        /// share and a uniform prior.
+        pub leaf_noise: f64 = 0.37,
+        pub leaf_dof: f64 = 3.8,
+        pub leaf_level: f64 = 0.76,
+        pub leaf_edge: f64 = 11.35,
+        pub leaf_full: f64 = 0.2,
+        pub leaf_alpha: f64 = 1.0,
+        pub leaf_beta: f64 = 1.0,
         pub refl_background_mean: f64 = -21.29,
         pub refl_background_sd: f64 = 6.28,
         /// The scan alignment error (research 130 offset-field-design.md): an along-beam shift per (scan, place),
@@ -346,15 +358,6 @@ impl Settings {
     /// the declared leaf, −15.6 dB, is dimmer than the measured wood, −15.1: research 130 step 3a, slices 5b, 9).
     pub fn refl_full_hit(&self) -> f64 {
         self.refl_wood.min(self.refl_leaf)
-    }
-
-    /// The beam left after an echo of reflectance `x` (dB) where `beam` of the emitted beam reached it: an echo's
-    /// reflectance against a full hit ([`Settings::refl_full_hit`]) is its share of the *emitted* beam, so the shares
-    /// of a pulse's echoes subtract (multiplying them read the beam behind several echoes too wide: 3dtrees research
-    /// 130 vz2000i-echoes, observation); the beam goes on unchanged where the reflectance is unknown. The pulse's
-    /// medium, the foliage field's counts and the depth pyramid read an echo the same way.
-    pub fn beam_after(&self, beam: f64, x: f64) -> f64 {
-        if x.is_finite() { (beam - 10f64.powf((x - self.refl_full_hit()) / 10.0)).clamp(0.0, 1.0) } else { beam }
     }
 
     /// The stem front shift's prior sd (m) at radius r.
