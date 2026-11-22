@@ -89,13 +89,16 @@ pub(super) const SHIFT: usize = 5;
 pub(super) const LEVEL: usize = 6;
 
 /// What a cell's echo tells per unit of its slope (research 130 step 3a), the one reading of a cell [`Scene::information`]
-/// and [`Scene::divergence`] share: in its chance of an echo `p` (a Bernoulli, `p` kept within [1e-3, 1 − 1e-3]) and,
+/// and [`Scene::divergence`] share: in its chance of an echo `p` (a Bernoulli, read within [1e-3, 1 − 1e-3]: none past) and,
 /// given one, in its depth (of variance `var`, the return's own, without the shifts' spread) and in its reflectance (the
 /// per-echo noise, wider at fill `fill`), each of these two a t density's share `(ν + 1) / (ν + 3)` of a Gaussian's.
 pub(super) fn cell_information(em: &Settings, p: f64, var: f64, fill: f64) -> [f64; 3] {
+    // the chance is read within [1e-3, 1 − 1e-3]: past them it doesn't move, so it tells nothing (the Gaussian beam's
+    // tails put cells of tiny fill at the edge, whose clamped chance the divergence reads as fixed: slice-dgp)
+    let bernoulli = if p > 1e-3 && p < 1.0 - 1e-3 { 1.0 / (p * (1.0 - p)) } else { 0.0 };
     let p = p.clamp(1e-3, 1.0 - 1e-3);
     let (k_depth, k_refl) = ((em.noise_dof + 1.0) / (em.noise_dof + 3.0), (em.refl_dof + 1.0) / (em.refl_dof + 3.0));
-    [1.0 / (p * (1.0 - p)), p * k_depth / var.max(1e-12), p * k_refl / em.refl_noise.hypot(em.refl_edge * (1.0 - fill.clamp(0.0, 1.0))).powi(2)]
+    [bernoulli, p * k_depth / var.max(1e-12), p * k_refl / em.refl_noise.hypot(em.refl_edge * (1.0 - fill.clamp(0.0, 1.0))).powi(2)]
 }
 
 /// One cell as [`Scene::information`] reads it, in the numbers `P` of its pass: its share of the cost (its weighted log
@@ -712,7 +715,9 @@ mod tests {
     #[test]
     fn located_edges_pin_a_thin_sticks_radius() {
         let sc = Background::default();
-        for (r, y) in [(0.01, 6.0), (0.006, 6.0)] {
+        // a stick thinner than the beam (under the Gaussian beam a 1 cm stick at 6 m is wider than its 8.6 mm core, so
+        // its edges are sharp in the chance of an echo alone: slice-dgp)
+        for (r, y) in [(0.006, 6.0)] {
             let v = thin_pole_view(r, y);
             let info = |em: Settings| Scene::new(vec![v.clone()], &[stick(0.0, y, r)], em, sc, None, 0).information(&Proposal::default(), &[0])[0].expected[0];
             let (with, without) = (info(Settings::default()), info(Settings { refl_noise: 0.0, ..Settings::default() }));

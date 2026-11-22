@@ -52,7 +52,7 @@
 //! | `−log` likelihood ratio against the empty scene | cost | also of a proposal: `score`, `keep` |
 //! | elements put in and live elements taken out, scored or kept as one | proposal | `Proposal`: add, remove, swap and join in one shape; every read takes one and answers for the scene as it would leave it |
 //! | a cell's likelihood of its pulse | ray likelihood | the scene's data term |
-//! | an element's coverage of a cell's beam | fill | the beam (a uniform disc) convolved with the section |
+//! | an element's coverage of a cell's beam | fill | the beam (Gaussian optics, cut at 1.5 of its 1/e² radius) convolved with the section |
 //! | what a cell's first echo says about an element | outcome | on it, empty (none), in front, behind (passed through) |
 //! | the element's predicted echo in a cell | the element's echo | `front_echo`; [`scene::Outcome::of`] against it |
 //! | the cost from pulses that passed through | evidence against | `ray_behind` (and `ray_empty`, pulses with no echo) |

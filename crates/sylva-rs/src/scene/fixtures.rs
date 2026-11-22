@@ -32,8 +32,8 @@ pub(super) fn thin_pole_view(r_pole: f64, y_pole: f64) -> Arc<RangeImage> {
 }
 
 /// A scan of a vertical pole (radius `r`, `y` m away on the y axis) in front of a wall `gap` m behind it, with the
-/// measured beam (research 130 slice 11): a uniform disc of the footprint's diameter, sampled here across the
-/// pole by 401 lines (its 1-D marginal, a semicircle), each part's energy its cosine (Lambertian; to the default
+/// instrument's beam (research 130 beam-law, slice-dgp): Gaussian, its 1/e² diameter the footprint's, cut as the model cuts it, sampled here across the
+/// pole by 401 lines (its 1-D marginal, a normal), each part's energy its cosine (Lambertian; to the default
 /// incidence power for its reflectance and detection). The pole's echo sits at its parts' energy-weighted depth and is recorded where it clears the detection floor (wood at the
 /// default reflectance, 2 dB spread); the wall (−20 dB, face-on) takes the rest of the beam. Returns closer than the
 /// receiver's resolution (0.8 m) merge into one echo at the measured pull behind the pole's ([`Settings::pull`]); otherwise the first is the
@@ -58,9 +58,11 @@ pub(super) fn pole_scan_of(r_pole: f64, y_pole: f64, gap: f64, wood: f64) -> Ran
             let tm = y_pole * w[1] / (h * h);
             let a = 0.5 * em.footprint(tm);
             let (mut f, mut ec, mut ek, mut ez) = (0.0, 0.0, 0.0, 0.0);
+            // the Gaussian beam's 1-D marginal (sd ½ of its 1/e² radius), cut at its reach, as the model reads it
+            let norm: f64 = (0..401).map(|q| (-2.0 * (super::render::REACH * (-1.0 + 2.0 * (q as f64 + 0.5) / 401.0)).powi(2)).exp()).sum();
             for q in 0..401 {
-                let z = -1.0 + 2.0 * (q as f64 + 0.5) / 401.0;
-                let wt = (1.0 - z * z).sqrt() * 2.0 / 401.0 * 2.0 / std::f64::consts::PI;
+                let z = super::render::REACH * (-1.0 + 2.0 * (q as f64 + 0.5) / 401.0);
+                let wt = (-2.0 * z * z).exp() / norm;
                 let x = miss + z * a;
                 if x.abs() < r_pole {
                     let c = (1.0 - (x / r_pole).powi(2)).sqrt();

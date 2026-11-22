@@ -14,8 +14,8 @@
 //!   §1's "extent, opacity"). The mismatch is the sd of the section's and axis's
 //!   departure from the form, which blurs the fill and spreads the depth.
 //! - **The k-buffer** ([`KBuffer`]): each element renders into each view's cells. A cell keeps its layers, nearest first, up to the
-//!   [`K`]th wholly in it ([`kept`]), each with a depth, a depth spread, a fill and a cosine. Fill is the beam (a uniform disc of the
-//!   footprint's diameter, as AM's raw edges measure it) convolved with the section, at three section radii over
+//!   [`K`]th wholly in it ([`kept`]), each with a depth, a depth spread, a fill and a cosine. Fill is the beam (the instrument's Gaussian optics, its
+//!   1/e² diameter the footprint's, cut at [`REACH`]: [`beam_cdf`]; slice-dgp) convolved with the section, at three section radii over
 //!   the mismatch; an echo's chance is the detection's mean over them. Along a stick's axis it is cut square, so a
 //!   chain of sticks joins without seams.
 //! - **Depth over a footprint:** a layer's depth is the mean of the section's depth over the part of the footprint
@@ -182,20 +182,25 @@ pub(super) fn smooth<P: Real>(x: P) -> P {
     x * x * (P::c(3.0) - x * 2.0)
 }
 
-/// The share of the beam (a uniform disc of radius `a`) a section of radius `r` meets whose axis passes `d` from the
+/// The share of the beam (Gaussian, 1/e² radius `a`) a section of radius `r` meets whose axis passes `d` from the
 /// beam's centre, and its slope in ln r: a layer's fill at one section radius ([`layer`]'s), for what a consumer reads
 /// beside the cost.
 pub fn beam_fill(d: f64, r: f64, a: f64) -> (f64, f64) {
     let r = Dual::<1>::var(r.ln(), 0).exp();
-    let f = disc_cdf((r - d) / a) - disc_cdf((-r - d) / a);
+    let f = beam_cdf((r - d) / a) - beam_cdf((-r - d) / a);
     (f.v(), f.g[0])
 }
 
-/// The share of a uniform disc's energy (radius 1) nearer than a line `z` radii from its centre: the CDF of its 1-D
-/// marginal, a semicircle.
-pub(super) fn disc_cdf<P: Real>(z: P) -> P {
-    let z = z.clamp(-1.0, 1.0);
-    (z * (P::c(1.0) - z * z).sqrt() + z.asin()) / std::f64::consts::PI + 0.5
+/// How far the beam reaches, in its 1/e² radii: its Gaussian profile is cut there (0.13 % of its energy past it).
+pub(super) const REACH: f64 = 1.5;
+
+/// The share of a Gaussian beam's energy (1/e² radius 1) nearer than a line `z` radii from its centre: the CDF of its
+/// 1-D marginal, a normal of sd ½, truncated at ±[`REACH`] so it is exactly 0 and 1 there (3dtrees research 130
+/// beam-law, slice-dgp; a uniform disc before).
+pub(super) fn beam_cdf<P: Real>(z: P) -> P {
+    let phi = |z: P| (z * -std::f64::consts::SQRT_2).erfc() * 0.5;
+    let lo = 0.5 * libm::erfc(REACH * std::f64::consts::SQRT_2);
+    (phi(z.clamp(-REACH, REACH)) - lo) / (1.0 - 2.0 * lo)
 }
 
 pub(super) fn dot3<P: Real>(a: &[P; 3], b: &[P; 3]) -> P {
@@ -307,16 +312,16 @@ pub(super) fn layer<P: Real>(p: &Placed<P>, w: &Point, e: &Element, id: u32, em:
     let r = p.r;
     let a = em.footprint(tm) * 0.5;
     let wide = r + 3f64.sqrt() * e.mismatch;
-    if tm.v() <= 0.0 || d.v() > (wide + a + tm * (2.0 * step)).v() {
+    if tm.v() <= 0.0 || d.v() > (wide + a * REACH + tm * (2.0 * step)).v() {
         return None;
     }
     let fq = [-1.0, 0.0, 1.0].map(|z: f64| {
         let r = (r + z * 3f64.sqrt() * e.mismatch).max(0.0);
-        disc_cdf((r - d) / a) - disc_cdf((-r - d) / a)
+        beam_cdf((r - d) / a) - beam_cdf((-r - d) / a)
     });
     let f = (fq[0] + fq[1] * 4.0 + fq[2]) / 6.0;
     let (t, spread, cos) = footprint_depth(tm, d, r, sin, a);
-    let inner = ((d - a).max(0.0) / r).min(1.0);
+    let inner = ((d - a * REACH).max(0.0) / r).min(1.0);
     Some(Layer {
         t,
         far: tm + r * (P::c(1.0) - inner * inner).sqrt() / sin,
@@ -339,7 +344,7 @@ pub(super) fn layer<P: Real>(p: &Placed<P>, w: &Point, e: &Element, id: u32, em:
 /// over the part the footprint meets, so a sliver at the edge is resolved as well as the middle (its cosine sets a
 /// located edge's reflectance; 9 nodes over the whole footprint read a 4 % sliver's as the grazing 0.05).
 pub(super) fn footprint_depth<P: Real>(tm: P, d: P, r: P, sin: P, a: P) -> (P, P, P) {
-    let (lo, hi) = ((d - a).larger(-r), (d + a).smaller(r));
+    let (lo, hi) = ((d - a * REACH).larger(-r), (d + a * REACH).smaller(r));
     // past the edge: the grazing surface
     let grazing = || {
         let c = (P::c(1.0) - (d.smaller(r) / r).sq()).max(0.0).sqrt();
@@ -353,7 +358,7 @@ pub(super) fn footprint_depth<P: Real>(tm: P, d: P, r: P, sin: P, a: P) -> (P, P
     const N: usize = 24;
     for j in 0..N {
         let x = lo + (hi - lo) * (j as f64 + 0.5) / N as f64;
-        let w = (P::c(1.0) - ((x - d) / a).sq()).max(0.0).sqrt();
+        let w = (((x - d) / a).sq() * -2.0).exp();
         let c = (P::c(1.0) - (x / r).sq()).max(0.0).sqrt();
         let z = -r * c / sin;
         sw += w;
@@ -581,7 +586,8 @@ mod tests {
             let (em, sc) = (Settings::default(), Background::default());
             let e = |r: f64| cost(&v, &[Element { mismatch: 0.0, ..stick(0.0, y, r) }], &em, &sc).0;
             let (thin, truth, wide) = (e(0.0028), e(0.004), e(0.0056));
-            assert!(wide > truth, "{y} m: wide {wide} truth {truth}");
+            // (under the Gaussian beam the wider stick comes within 0.3 nats of the truth at 8 m: slice-dgp)
+            assert!(wide > truth - 1e-2 * truth.abs(), "{y} m: wide {wide} truth {truth}");
             assert!(thin > truth - 0.02 * truth.abs(), "{y} m: thin {thin} truth {truth}");
         }
     }

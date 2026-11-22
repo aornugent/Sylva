@@ -32,11 +32,12 @@ params! {
     /// (0 solid, 1 mid, 2 fragmented).
     #[derive(Debug, Clone, Copy)]
     pub struct Settings {
-        /// The beam: its diameter at the exit (m) and full divergence (rad); the footprint at range ρ is
-        /// `beam_exit + beam_divergence ρ`. The VZ-2000i's datasheet; a uniform disc, as AM's raw edges measure it
-        /// (research 130 slice 11, `edges.py`).
-        pub beam_exit: f64 = 0.007,
-        pub beam_divergence: f64 = 0.35e-3,
+        /// The beam, Gaussian optics: its 1/e² diameter at the exit, its waist (m), and its full 1/e² divergence (rad);
+        /// the footprint's 1/e² diameter at range ρ is `√(beam_exit² + (beam_divergence ρ)²)`, `D₀ √(1 + (ρ/z_R)²)`
+        /// with z_R = D₀/θ, at every range, no blur fitted (3dtrees research 130 beam-law; slice-dgp). The
+        /// instrument's record (the rdbx: 8.393 mm, 0.223 mrad).
+        pub beam_exit: f64 = 0.008393,
+        pub beam_divergence: f64 = 0.223e-3,
         /// Excess at the solid/mid and mid/fragmented boundaries of the surface class (`constants.py rca`: on raw
         /// scans they split alignment-rca's symptom, 1.1 / 2.8 / 4.4 mm between cells).
         pub class_edge_mid: f64 = 1.2,
@@ -256,9 +257,9 @@ pub fn t_log_norm(nu: f64) -> f64 {
 }
 
 impl Settings {
-    /// The beam's diameter (m) at a range.
+    /// The beam's 1/e² diameter (m) at a range: Gaussian optics from the exit's waist.
     pub fn footprint<P: Real>(&self, range: P) -> P {
-        range * self.beam_divergence + self.beam_exit
+        ((range * self.beam_divergence).sq() + self.beam_exit * self.beam_exit).sqrt()
     }
 
     /// Footprints per cell: how many cells see the same spot, on a lattice whose cells are `steps` (rad) apart along
