@@ -1,11 +1,9 @@
 # 3dtrees changes to Sylva
 
 What our `develop` adds over upstream (`git diff main...develop`), as it stands now, rewritten when `develop`
-changes. `main` mirrors upstream. Bench numbers and the history behind each rule are in 3dtrees' research notes and in
-the module documentation, not here. Work since deleted, such as the per-tree fit `joint_tree`, is at the tag
-`archive/sylva-develop-2026-11-12`; the evidence reduction `qsm.evidence` and the likelihood's binding
-`qsm_joint_loglik` at `develop`'s `dcd4034`; `qsm.rebase`, 3dtrees ticket 125's base stage, waits for review on the
-branch `3dtrees/125-rebase`.
+changes. `main` mirrors upstream; `develop` is merged up to upstream's 2.0.0. The rules behind each feature are in
+its module documentation, not here. Work since deleted, such as the per-tree fit `joint_tree`, is at the tag
+`archive/sylva-develop-2026-11-12`.
 
 - `qsm.support_tree` measures one tree's wood from the rays. Each row is cut into pieces of at most 30 cm. Each
   scan's pulses near a piece measure its circle from their silhouette and front. Where no circle is determined they
@@ -17,16 +15,18 @@ branch `3dtrees/125-rebase`.
   half a CPU-second per tree, where the refit and `joint_tree` took minutes. Its outputs are only those 3dtrees reads.
   A new function: changes no existing output. The rules are in `support_tree.rs`'s module documentation.
 - `qsm.ScanIndex` holds one scan's pulses binned by direction, with each echo's character and each pulse's row in its
-  Shots file. `qsm.pairs` returns the pulses near each cylinder. 3dtrees needs them because every fit above reads
-  pulses by cylinder, and the row joins a fit's echoes to the tile sidecars. Additive, with `ShotsFile::read_rays`.
-- `qsm.joint` is the joint model's per-pulse likelihood, with exact derivatives. `qsm.joint_table` gives its pair
-  table, and `joint_fit` (Rust) fits a routed piece's stems to a table under a Gaussian Markov prior. 3dtrees needs
-  them because they fit `support_tree`'s routed pieces. Additive, with a `libm` dependency for erfc.
+  Shots file, and finds the pulses near each cylinder (`qsm.pairs` in Python). 3dtrees needs the index because
+  `support_tree` reads pulses by cylinder, and the row joins a fit's echoes to the tile sidecars. Additive, with
+  `ShotsFile::read_rays`.
+- `qsm.joint` is the joint model's per-pulse likelihood, with exact derivatives, and `joint_fit` fits a routed piece's
+  stems to its pair table under a Gaussian Markov prior; 3dtrees reaches both only through `support_tree`'s routed
+  pieces. `qsm.joint_table` exposes the pair table to Python for the parity tests. Additive, with a `libm` dependency
+  for erfc.
 - `qsm.JointParams` holds the settings of `support_tree` a caller may set: the beam's footprint (`exit`,
   `divergence`), the echo character (`refl_*`) and the site's D/H cap (`dh`). Every other calibration is a constant of
   the core. Each field is a real, written once in Rust (`params!`), and Python makes a frozen dataclass from the core's
-  defaults. 3dtrees needs it because its recipes set `dh`, its fit cache keys on `dataclasses.asdict` of it and the
-  Sylva checkout, and `v1-landing`'s score reads the beam and the echo character. Additive.
+  defaults. 3dtrees needs it because its recipes set `dh` and its fit cache keys on `dataclasses.asdict` of it and
+  the Sylva checkout. Additive.
 - `qsm.tree_context` gives each tree its neighbours' cylinders within a reach, in parallel. 3dtrees needs it because
   it built these in numpy, 5x slower; the contexts are identical. Additive.
 - `qsm.contest` gives, of the points near each tree's cylinders, the share another tree holds and which tree holds

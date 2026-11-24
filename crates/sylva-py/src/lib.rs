@@ -782,11 +782,11 @@ fn planarity_linearity<'py>(py: Python<'py>, xyz: PyReadonlyArray2<f64>, k: usiz
 }
 
 #[pyfunction]
-#[pyo3(signature = (xyz, k=20, high_threshold=0.85, medium_threshold=0.75, scale_radius=0.0, graph_k=10, max_edge=1.0, base_height=0.25, target_res=0.2, min_passage=3, assign_dist=0.05, assign_scale=0.0, component_res=0.05, component_min=200, sor_k=50, sor_std=1.0, dilate_dist=0.03, passage=true))]
+#[pyo3(signature = (xyz, k=20, threshold=0.85, scale_radius=0.0, graph_k=8, max_edge=1.0, base_height=0.25, min_support=0.3, reach_scale=0.0, grow_reach=0.05, grow_hops=1, paths=true))]
 #[allow(clippy::too_many_arguments)]
-fn wood_mask<'py>(py: Python<'py>, xyz: PyReadonlyArray2<f64>, k: usize, high_threshold: f64, medium_threshold: f64, scale_radius: f64, graph_k: usize, max_edge: f64, base_height: f64, target_res: f64, min_passage: usize, assign_dist: f64, assign_scale: f64, component_res: f64, component_min: usize, sor_k: usize, sor_std: f64, dilate_dist: f64, passage: bool) -> PyResult<Bound<'py, PyArray1<bool>>> {
+fn wood_mask<'py>(py: Python<'py>, xyz: PyReadonlyArray2<f64>, k: usize, threshold: f64, scale_radius: f64, graph_k: usize, max_edge: f64, base_height: f64, min_support: f64, reach_scale: f64, grow_reach: f64, grow_hops: usize, paths: bool) -> PyResult<Bound<'py, PyArray1<bool>>> {
     let p = xyz_from_py(xyz)?;
-    let params = qsm::wood::WoodParams { k, high_threshold, medium_threshold, scale_radius, graph_k, max_edge, base_height, target_res, min_passage, assign_dist, assign_scale, component_res, component_min, sor_k, sor_std, dilate_dist, passage };
+    let params = qsm::wood::WoodParams { k, threshold, scale_radius, graph_k, max_edge, base_height, min_support, reach_scale, grow_reach, grow_hops, paths };
     Ok(py.detach(|| qsm::wood::wood_mask(&p, &params)).into_pyarray(py))
 }
 
@@ -1573,9 +1573,9 @@ fn dbh_profile<'py>(py: Python<'py>, xyz: PyReadonlyArray2<f64>, heights: PyRead
 }
 
 #[pyfunction]
-#[pyo3(signature = (xyz, heights, trees_list, k=6, max_edge=1.0, voxel_size=0.03, seed_height=1.5, seed_radius=0.25, seed_ring=true, power=6.0, angle_penalty=true, gravity=0.0, cut_above_ground=0.1, height_prior=true, height_prior_radius=1.5, height_prior_power=1.0, low_height=0.5, low_radius=1.0, wood_costs=false, wood_k=20, wood_threshold=0.9, understorey_height=0.0, understorey_band=0.5, voxel_origin=None, exclude=None, bridge=true))]
+#[pyo3(signature = (xyz, heights, trees_list, k=6, max_edge=1.0, voxel_size=0.03, seed_height=1.5, seed_radius=0.25, seed_ring=true, power=6.0, bend_cost=true, gravity=0.0, ground_clearance=0.1, height_prior=true, height_prior_radius=1.5, height_prior_power=1.0, low_height=0.5, low_radius=1.0, understorey_height=0.0, understorey_band=0.5, voxel_origin=None, exclude=None, bridge=true, bend_power=4.0, bend_floor=0.4, path_weight=0.3, max_reach=0.0))]
 #[allow(clippy::too_many_arguments)]
-fn segment_trees<'py>(py: Python<'py>, xyz: PyReadonlyArray2<f64>, heights: PyReadonlyArray1<f64>, trees_list: &Bound<'_, PyList>, k: usize, max_edge: f64, voxel_size: f64, seed_height: f64, seed_radius: f64, seed_ring: bool, power: f64, angle_penalty: bool, gravity: f64, cut_above_ground: f64, height_prior: bool, height_prior_radius: f64, height_prior_power: f64, low_height: f64, low_radius: f64, wood_costs: bool, wood_k: usize, wood_threshold: f64, understorey_height: f64, understorey_band: f64, voxel_origin: Option<(f64, f64, f64)>, exclude: Option<PyReadonlyArray1<bool>>, bridge: bool) -> PyResult<Bound<'py, PyArray1<i64>>> {
+fn segment_trees<'py>(py: Python<'py>, xyz: PyReadonlyArray2<f64>, heights: PyReadonlyArray1<f64>, trees_list: &Bound<'_, PyList>, k: usize, max_edge: f64, voxel_size: f64, seed_height: f64, seed_radius: f64, seed_ring: bool, power: f64, bend_cost: bool, gravity: f64, ground_clearance: f64, height_prior: bool, height_prior_radius: f64, height_prior_power: f64, low_height: f64, low_radius: f64, understorey_height: f64, understorey_band: f64, voxel_origin: Option<(f64, f64, f64)>, exclude: Option<PyReadonlyArray1<bool>>, bridge: bool, bend_power: f64, bend_floor: f64, path_weight: f64, max_reach: f64) -> PyResult<Bound<'py, PyArray1<i64>>> {
     let p = xyz_ref_from_py(&xyz)?;
     let h = slice_from_py(&heights);
     let (p, h) = (&*p, &*h);
@@ -1586,20 +1586,20 @@ fn segment_trees<'py>(py: Python<'py>, xyz: PyReadonlyArray2<f64>, heights: PyRe
         return Err(PyValueError::new_err("exclude must have one value per point"));
     }
     let t = trees_from_py(trees_list)?;
-    let params = trees::SegmentParams { k, max_edge, voxel_size, seed_height, seed_radius, seed_ring, power, angle_penalty, gravity, cut_above_ground, height_prior, height_prior_radius, height_prior_power, low_height, low_radius, wood_costs, wood_k, wood_threshold, understorey_height, understorey_band, voxel_origin: voxel_origin.map(|o| [o.0, o.1, o.2]), bridge };
+    let params = trees::SegmentParams { k, max_edge, voxel_size, seed_height, seed_radius, seed_ring, power, bend_cost, bend_power, bend_floor, path_weight, gravity, ground_clearance, height_prior, height_prior_radius, height_prior_power, low_height, low_radius, understorey_height, understorey_band, voxel_origin: voxel_origin.map(|o| [o.0, o.1, o.2]), bridge, max_reach };
     Ok(detach_interruptible(py, || trees::segment_trees_masked(p, h, &t, &params, ex))?.into_pyarray(py))
 }
 
 #[pyfunction]
-#[pyo3(signature = (xyz, heights, trees_list, k=10, max_edge=1.0, voxel_size=0.1, seed_height=1.5, seed_radius=0.5, seed_ring=true, power=3.0, angle_penalty=true, cut_above_ground=0.1, ground_height=0.5, trunk_scale=1.5, trunk_min=0.15, search_radius=6.0, voxel_origin=None))]
+#[pyo3(signature = (xyz, heights, trees_list, k=10, max_edge=1.0, voxel_size=0.1, seed_height=1.5, seed_radius=0.5, seed_ring=true, power=3.0, bend_cost=true, ground_clearance=0.1, ground_height=0.5, trunk_scale=1.5, trunk_min=0.15, search_radius=6.0, voxel_origin=None))]
 #[allow(clippy::too_many_arguments)]
-fn merge_branches<'py>(py: Python<'py>, xyz: PyReadonlyArray2<f64>, heights: PyReadonlyArray1<f64>, trees_list: &Bound<'_, PyList>, k: usize, max_edge: f64, voxel_size: f64, seed_height: f64, seed_radius: f64, seed_ring: bool, power: f64, angle_penalty: bool, cut_above_ground: f64, ground_height: f64, trunk_scale: f64, trunk_min: f64, search_radius: f64, voxel_origin: Option<(f64, f64, f64)>) -> PyResult<(Bound<'py, PyList>, Bound<'py, PyArray1<i64>>)> {
+fn merge_branches<'py>(py: Python<'py>, xyz: PyReadonlyArray2<f64>, heights: PyReadonlyArray1<f64>, trees_list: &Bound<'_, PyList>, k: usize, max_edge: f64, voxel_size: f64, seed_height: f64, seed_radius: f64, seed_ring: bool, power: f64, bend_cost: bool, ground_clearance: f64, ground_height: f64, trunk_scale: f64, trunk_min: f64, search_radius: f64, voxel_origin: Option<(f64, f64, f64)>) -> PyResult<(Bound<'py, PyList>, Bound<'py, PyArray1<i64>>)> {
     let p = xyz_ref_from_py(&xyz)?;
     let h = slice_from_py(&heights);
     let (p, h) = (&*p, &*h);
     same_len("heights", h.len(), p.len())?;
     let t = trees_from_py(trees_list)?;
-    let params = trees::SegmentParams { k, max_edge, voxel_size, seed_height, seed_radius, seed_ring, power, angle_penalty, gravity: 0.0, cut_above_ground, height_prior: false, height_prior_radius: 1.5, low_height: 0.5, low_radius: 1.0, wood_costs: false, wood_k: 20, wood_threshold: 0.9, voxel_origin: voxel_origin.map(|o| [o.0, o.1, o.2]), ..Default::default() };
+    let params = trees::SegmentParams { k, max_edge, voxel_size, seed_height, seed_radius, seed_ring, power, bend_cost, gravity: 0.0, ground_clearance, height_prior: false, height_prior_radius: 1.5, low_height: 0.5, low_radius: 1.0, voxel_origin: voxel_origin.map(|o| [o.0, o.1, o.2]), ..Default::default() };
     let (kept, merged) = py.detach(|| trees::merge_branches(p, h, &t, &params, ground_height, trunk_scale, trunk_min, search_radius));
     let list = PyList::empty(py);
     for tr in &kept {
@@ -1738,11 +1738,11 @@ fn qsm_from_rows(rows: PyReadonlyArray2<f64>) -> PyResult<qsm::Qsm> {
 }
 
 #[pyfunction]
-#[pyo3(signature = (xyz, base_xy=None, k=15, max_edge=1.0, bin_length=0.1, min_points=1, ransac_threshold=0.02, max_radius=1.0, taper_limit=1.1, max_rmse=0.03, smooth_steps=10, apex_radius=0.0025, min_arc_deg=90.0, min_inlier_fraction=0.05, prune_points=5, fit_min_points=50, crop_length=0.0, butt_height=0.6, relative_tolerance=0.08, base_radius=0.0, allometry_tolerance=0.3, stem_radius_cap=0.0, buttress_equivalent_area=true, buttress_max_inlier_fraction=0.3, pipe_slack=1.2, branch_min_inlier_fraction=0.3, spacing_scale=1.5, radius_power=0.0, power_above_spacing=0.025, sensor_noise=0.02, cluster_eps=0.1, centre_fit_points=100, radius_smooth_steps=15, butt_swell=1.1, butt_vertical_run=4, butt_max_lean_deg=50.0, chain_max_d=0.1, fourier_min_radius=0.15, min_weight=0.0, min_mean_weight=0.5, weights=None))]
+#[pyo3(signature = (xyz, base_xy=None, k=15, max_edge=1.0, bin_length=0.125, min_points=1, ransac_threshold=0.02, max_radius=1.0, taper_limit=1.1, max_rmse=0.03, centre_passes=4, twig_radius=0.002, min_arc_deg=180.0, min_inlier_fraction=0.05, prune_points=5, fit_min_points=30, crop_length=0.0, relative_tolerance=0.08, base_radius=0.0, outlier_sigma=3.0, stem_radius_cap=0.0, pipe_slack=1.2, spacing_scale=1.5, radius_power=0.0, power_above_spacing=0.025, sensor_noise=0.02, butt_swell=1.1, min_weight=0.0, min_mean_weight=0.5, weights=None))]
 #[allow(clippy::too_many_arguments)]
-fn build_qsm<'py>(py: Python<'py>, xyz: PyReadonlyArray2<f64>, base_xy: Option<(f64, f64)>, k: usize, max_edge: f64, bin_length: f64, min_points: usize, ransac_threshold: f64, max_radius: f64, taper_limit: f64, max_rmse: f64, smooth_steps: usize, apex_radius: f64, min_arc_deg: f64, min_inlier_fraction: f64, prune_points: usize, fit_min_points: usize, crop_length: f64, butt_height: f64, relative_tolerance: f64, base_radius: f64, allometry_tolerance: f64, stem_radius_cap: f64, buttress_equivalent_area: bool, buttress_max_inlier_fraction: f64, pipe_slack: f64, branch_min_inlier_fraction: f64, spacing_scale: f64, radius_power: f64, power_above_spacing: f64, sensor_noise: f64, cluster_eps: f64, centre_fit_points: usize, radius_smooth_steps: usize, butt_swell: f64, butt_vertical_run: usize, butt_max_lean_deg: f64, chain_max_d: f64, fourier_min_radius: f64, min_weight: f64, min_mean_weight: f64, weights: Option<PyReadonlyArray1<f64>>) -> PyResult<Bound<'py, PyDict>> {
+fn build_qsm<'py>(py: Python<'py>, xyz: PyReadonlyArray2<f64>, base_xy: Option<(f64, f64)>, k: usize, max_edge: f64, bin_length: f64, min_points: usize, ransac_threshold: f64, max_radius: f64, taper_limit: f64, max_rmse: f64, centre_passes: usize, twig_radius: f64, min_arc_deg: f64, min_inlier_fraction: f64, prune_points: usize, fit_min_points: usize, crop_length: f64, relative_tolerance: f64, base_radius: f64, outlier_sigma: f64, stem_radius_cap: f64, pipe_slack: f64, spacing_scale: f64, radius_power: f64, power_above_spacing: f64, sensor_noise: f64, butt_swell: f64, min_weight: f64, min_mean_weight: f64, weights: Option<PyReadonlyArray1<f64>>) -> PyResult<Bound<'py, PyDict>> {
     let p = xyz_from_py(xyz)?;
-    let params = qsm::QsmParams { k, max_edge, bin_length, min_points, ransac_threshold, max_radius, taper_limit, max_rmse, smooth_steps, apex_radius, min_arc_deg, min_inlier_fraction, prune_points, fit_min_points, crop_length, butt_height, relative_tolerance, base_radius, allometry_tolerance, stem_radius_cap, buttress_equivalent_area, buttress_max_inlier_fraction, pipe_slack, branch_min_inlier_fraction, spacing_scale, radius_power, power_above_spacing, sensor_noise, cluster_eps, centre_fit_points, radius_smooth_steps, butt_swell, butt_vertical_run, butt_max_lean_deg, chain_max_d, fourier_min_radius, min_weight, min_mean_weight };
+    let params = qsm::QsmParams { k, max_edge, bin_length, min_points, ransac_threshold, max_radius, taper_limit, max_rmse, centre_passes, twig_radius, min_arc_deg, min_inlier_fraction, prune_points, fit_min_points, crop_length, relative_tolerance, base_radius, outlier_sigma, stem_radius_cap, pipe_slack, spacing_scale, radius_power, power_above_spacing, sensor_noise, butt_swell, min_weight, min_mean_weight };
     let weights = weights.map(|w| w.as_array().to_vec());
     let base_xy = base_xy.map(|b| [b.0, b.1]);
     let q = detach_interruptible(py, || match &weights { Some(w) => qsm::build_qsm_weighted(&p, base_xy, &params, w), None => qsm::build_qsm(&p, base_xy, &params) })?.map_err(err)?;

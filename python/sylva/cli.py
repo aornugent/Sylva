@@ -166,6 +166,9 @@ def _cmd_trees(args):
     _heights_warning(cloud, args.input)
     found = trees.detect_stems(cloud, min_radius=args.min_dbh / 2)
     labels = trees.segment_trees(cloud, found, voxel_size=args.voxel)
+    if args.merge_touching > 0:
+        found, labels, _ = trees.merge_touching(cloud, labels, found, threshold=args.merge_touching,
+                                                min_top=args.min_height)
     trees.tree_heights(cloud, labels, found)
     found, labels = trees.prune_trees(found, labels, min_height=args.min_height,
                                       min_slenderness=args.min_slenderness,
@@ -549,6 +552,10 @@ def main(argv=None):
                         "beside the input)")
     s.add_argument("--voxel", type=float, default=0.03,
                    help="voxel size of the segmentation graph (m); 0.05 halves a 2 cm plot's graph")
+    s.add_argument("--merge-touching", type=float, default=0.1, metavar="SHARE",
+                   help="after segmenting, merge a tree into a larger neighbour when at least this share of "
+                        "its points lies within 10 cm of it (a stem that is part of another tree holds a "
+                        "piece of that tree's crown); 0 turns the step off")
     s.set_defaults(func=_cmd_trees)
 
     s = sub.add_parser("chm", help="canopy height model from a height-normalised cloud", **fmt)
@@ -571,7 +578,7 @@ def main(argv=None):
     s.add_argument("input", help="one tree's wood points")
     s.add_argument("output", nargs="?", default=None,
                    help="CSV of cylinders (default: <input>_qsm.csv beside the input)")
-    s.add_argument("--bin-length", type=float, default=0.1, help="geodesic shell width (m)")
+    s.add_argument("--bin-length", type=float, default=0.125, help="geodesic shell width (m)")
     s.set_defaults(func=_cmd_qsm)
 
     s = sub.add_parser("qsm-plot", help="build a QSM for every tree of a segmented cloud", **fmt)
@@ -588,7 +595,7 @@ def main(argv=None):
     s.add_argument("--mesh-format", choices=("ply", "obj"), default="ply",
                    help="format for --meshes")
     s.add_argument("--voxel", type=float, default=0.01, help="thin each tree to this spacing (m)")
-    s.add_argument("--bin-length", type=float, default=0.1, help="geodesic shell width (m)")
+    s.add_argument("--bin-length", type=float, default=0.125, help="geodesic shell width (m)")
     s.add_argument("--min-points", type=int, default=2000, help="skip trees with fewer points")
     s.add_argument("--buttress", action="store_true",
                    help="mesh a buttressed base and count it in the volume")

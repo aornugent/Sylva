@@ -38,9 +38,9 @@ use crate::qsm::joint::{frames, joint_blocks, joint_loglik, JointParams, Owner, 
 use crate::Point;
 
 // The prior's widths and anchors (all sds; see the module documentation): the calibration for TERN's Alice Mulga
-// exports (3dtrees research 100 §14): real axes and scans are freer than a synthetic bench's, and RCT's taper is no
-// guide to the rays' radii there (§21: rows fitted alone disagree with its steps by ~1 in log R, which a taper sd of
-// 0.05 priced at ~10^6 log units).
+// exports: real axes and scans are freer than a synthetic bench's, and RCT's taper is no guide to the rays' radii
+// there (rows fitted alone disagree with its steps by ~1 in log R, which a taper sd of 0.05 priced at ~10^6 log
+// units).
 /// Foliage: prior median (1/m) and log sd; its random walk along the tree.
 const LAM_PRIOR: f64 = 1.0;
 const LAM_SD: f64 = 2.0;
@@ -103,7 +103,7 @@ pub type Frame = (Point, Point, Point, f64);
 pub enum ForkShare {
     /// Its prior radius squared ([`joint_fit`]).
     Area,
-    /// Its subtree's wood length (3dtrees research 103 §11.8: [`crate::qsm::support_tree`]).
+    /// Its subtree's wood length ([`crate::qsm::support_tree`]).
     WoodLength,
 }
 
