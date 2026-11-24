@@ -131,7 +131,7 @@ def segment_trees(catalog: Catalog, stems: list[Tree], out: str | Path, height_a
     ``attribute`` (-1 for none). Tree ids are those the whole-plot sequence
     gives, unique over the plot.
 
-    The graph is built on the points above ``cut_above_ground`` thinned to
+    The graph is built on the points above ``ground_clearance`` thinned to
     one per voxel of a grid with a corner at ``voxel_origin``, found tile by
     tile exactly as in the whole cloud. With a buffer wider than the largest
     crown (every tree that competes with a tile's trees for points then has
@@ -142,6 +142,14 @@ def segment_trees(catalog: Catalog, stems: list[Tree], out: str | Path, height_a
     of it, where the plot goes on) is read again with a buffer twice as wide,
     up to ``max_buffer``; trees still at the edge are named in a warning and
     flagged ``crown_at_edge`` in their ``extra``.
+
+    With ``max_reach`` (a keyword of :func:`sylva.trees.segment_trees`) no
+    tree reaches farther than that from its stem, so a buffer of twice the
+    reach plus ``edge_margin`` holds a tile's trees and every stem that can
+    contest their points: the buffer widens no further than that. Without
+    it a tree takes all the vegetation joined to it, and on an open plot,
+    or one with vegetation past its outermost stems, tiles are read again
+    up to ``max_buffer`` for crowns no tree has.
 
     Parameters
     ----------
@@ -158,7 +166,8 @@ def segment_trees(catalog: Catalog, stems: list[Tree], out: str | Path, height_a
         Band of neighbouring nodes read around each tile (m); wider than the
         largest crown.
     max_buffer
-        Widest band a tile is read again with (m).
+        Widest band a tile is read again with (m); with ``max_reach``, at
+        most twice the reach plus ``edge_margin``.
     merge
         Merge branches into their stems first (:func:`sylva.trees.merge_branches`):
         True with its defaults, False to skip, or a dict of its keywords
@@ -183,7 +192,7 @@ def segment_trees(catalog: Catalog, stems: list[Tree], out: str | Path, height_a
         ``"las"`` or ``"laz"``; that of each input tile if None.
     **params
         Keywords of :func:`sylva.trees.segment_trees` (``voxel_size``,
-        ``k``, ``power``, ...).
+        ``k``, ``power``, ``max_reach``, ...).
 
     Returns
     -------

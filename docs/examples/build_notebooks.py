@@ -446,7 +446,9 @@ for t in stems[:12]:
 `merge_branches` folds limbs back into their own tree, `segment_trees` grows
 each tree from its stem by least-cost paths over a kNN graph, `tree_heights`
 measures the result, and `prune_trees` drops what is too short and merges
-duplicate stems."""),
+duplicate stems. `merge_branches` is optional: it suits trees with low limbs,
+and in coppice or multi-stemmed stands it also folds neighbouring stems
+into one tree (see the guide)."""),
     """\
 stems, merged_into = trees.merge_branches(cloud, stems)
 labels = trees.segment_trees(cloud, stems)
@@ -945,7 +947,7 @@ NOTEBOOKS["09_voxels"] = [
 
 `sylva.voxels` traces every pulse through a voxel grid and estimates the
 attenuation coefficient λ of each voxel from how far pulses got, then plant area
-density as λ / G. It follows [Vincent et al. 2017](../references.md) and the rayvoxel tool; see the
+density as λ / G. It follows [Vincent et al. 2017](../references.md) and AMAPVox; see the
 [guide](../guide/voxels.md) for the estimators."""),
     SETUP + "\nfrom sylva import Shots, voxels",
     md("""## Tracing a real tile

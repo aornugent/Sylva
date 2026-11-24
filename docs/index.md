@@ -35,7 +35,7 @@ labels = trees.segment_trees(cloud, stems)         # tree_id per point
 | [`sylva.geo.masks`](api/masks.md) | masks and crops by polygons, rasters, attribute expressions and distance to another cloud |
 | [`sylva.trees`](api/trees.md) | RANSAC circle fitting, stem detection & DBH, basal area, taper profiles, graph-based tree segmentation, tree heights, crown metrics |
 | [`sylva.canopy`](api/canopy.md) | voxel grids, contact-frequency PAD profiles, zenith-ring gap fraction, hinge/Miller LAI, ray-traced density grids from pulse data, synthetic hemispherical photographs from pulses or points |
-| [`sylva.voxels`](api/voxels.md) | ray-traced voxels (port of raycloudtools `rayvoxel`): echo-weighted free / potential path lengths, FPL / PPL / transmittance / Bailey attenuation, analytic or estimated leaf-angle `G`, PAD / LAD / WAD, occlusion, sub-voxel exploration, QSM wood volume, `.vox` export |
+| [`sylva.voxels`](api/voxels.md) | ray-traced voxels (after AMAPVox): echo-weighted free / potential path lengths, FPL / PPL / transmittance / Bailey attenuation, analytic or estimated leaf-angle `G`, PAD / LAD / WAD, occlusion, sub-voxel exploration, QSM wood volume, `.vox` export |
 | [`sylva.registration`](api/registration.md) | Kabsch, point-to-point / point-to-plane (trimmed) ICP, scan merging, overlay and stem cross-section plots to check a registration by eye |
 | [`sylva.registration_report`](api/registration_report.md) | a self-contained HTML report on how well a set of scans agree: pair residuals, a map of the survey, the worst pairs up close |
 | [`sylva.coreg`](api/coreg.md) | marker-free coregistration of scan positions from the trees and the ground, with reflectors where present, and a report of the stem agreement |
@@ -106,7 +106,7 @@ it carries the same licence. See the LICENSE file in the repository.
 
 Cite it as: Devereux, T., Rivory, J., Woodgate, W., Aryal, R. R., Eaton, G.,
 & Phinn, S. (2026). *Sylva: terrestrial and airborne laser
-scanning processing for forest ecology* (version 1.0.0) [Computer software].
+scanning processing for forest ecology* (version 2.0.0) [Computer software].
 The University of Queensland. <https://doi.org/10.5281/zenodo.23718985>
 
 ```bibtex
@@ -116,7 +116,7 @@ The University of Queensland. <https://doi.org/10.5281/zenodo.23718985>
   title        = {Sylva: terrestrial and airborne laser scanning processing
                   for forest ecology},
   year         = {2026},
-  version      = {1.0.0},
+  version      = {2.0.0},
   organization = {The University of Queensland},
   doi          = {10.5281/zenodo.23718985},
   url          = {https://github.com/UQ-EORC/Sylva}

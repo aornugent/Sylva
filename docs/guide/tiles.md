@@ -194,7 +194,7 @@ print([(t.tree_id, t.height) for t in same] == [(t.tree_id, t.height) for t in t
 (`whole_h` is `heights.read()`.) How it works:
 
 1. **Graph nodes.** The segmentation builds its graph on the points above
-   `cut_above_ground`, thinned to the first point of each `voxel_size`
+   `ground_clearance`, thinned to the first point of each `voxel_size`
    voxel. Tiled, the voxels are those of one grid with a corner at
    `voxel_origin` (`(0, 0, 0)` by default), and the first point of each is
    found tile by tile in catalogue order, as the tiled voxel thinning finds
@@ -215,7 +215,10 @@ print([(t.tree_id, t.height) for t in same] == [(t.tree_id, t.height) for t in t
    trees' nodes come within `edge_margin` (2 m) of the edge of its buffer,
    where the plot goes on, is segmented again with a buffer twice as wide,
    up to `max_buffer`; trees still at the edge are named in a warning and
-   flagged `crown_at_edge` in `Tree.extra`.
+   flagged `crown_at_edge` in `Tree.extra`. With `max_reach` (the farthest
+   a tree reaches from its stem) the buffer widens no further than twice
+   the reach plus `edge_margin`: that band holds the tile's trees and every
+   stem that can contest their nodes.
 4. **Points.** Every point takes the label of its nearest node, tile by
    tile. The nearest node of a point is its own voxel's or closer, so the
    nodes within one voxel diagonal of the tile hold it.
@@ -300,6 +303,14 @@ the plot protocol rather than the Python defaults: `--riscan` and
 `--sor-k` 6 and `--sor-std-ratio` 1.0, `--ground csf|pmf`, `--min-arc` 130,
 `--min-height` 2, `--buffer` 20 and `--stem-radius-cap` 1.5;
 `sylva tiles-plot --help` lists them all.
+
+`--min-arc 130` suits a savanna plot scanned on a 20 m grid, where it
+removes thousands of mounds and tussocks fitted as stems. It also removes
+the stems seen from one side only, which in a closed stand is many of them
+(a quarter of the trees found without it on a rainforest reference plot;
+see [Trees](trees.md) and *Benchmarks > Tree detection*). Count the stems
+both ways before keeping it: `sylva tiles-stems` on the run's
+height-normalised tiles, with `--min-arc 130` and with its default of 0.
 
 The stages, each in its own directory of `out` with a `.done` marker
 written when it is complete:
@@ -513,7 +524,13 @@ the whole cloud whatever the tile holds.
   lowest point unless given `voxel_origin`. Its labels also depend on the
   buffer being wider than the largest crown; a crown that reaches the
   buffer's edge is read again wider, and reported when `max_buffer` is not
-  enough. Nearest-neighbour ties in the graph (a node's neighbours, a
+  enough. Without `max_reach` a tree takes all the vegetation joined to it:
+  on an open plot (shrubs with no stem of their own) or a plot cut from a
+  larger scan (vegetation past the outermost stems) its labels can run tens
+  of metres from the stem, and tiles are read again out to `max_buffer` for
+  crowns no tree has. On a 1 ha mulga plot of trees under 9 m, labels ran
+  up to 62 m from their stems. Set `max_reach` to the widest crown radius
+  the stand can have; what lies farther from every stem stays unassigned. Nearest-neighbour ties in the graph (a node's neighbours, a
   point's nearest node) could in principle go another way than in the
   whole cloud; none did on the 223 million points of the Tumbarumba plot.
 - Tiled segmentation is slower than on one cloud (about four times on

@@ -5,8 +5,11 @@
 """Individual trees from airborne lidar: tree tops, crowns and labelled points.
 
 The functions are re-exported from :mod:`sylva.als` and follow the
-algorithms collected by Roussel et al. (2020), whose implementations are
-reproduced where the papers leave a detail open:
+algorithms collected in lidR (Roussel et al. 2020). The region growing of
+Dalponte and Coomes and the logic of the Li et al. segmentation are
+translated from lidR's source, and lidR's rules, parameter names and
+defaults are kept where the papers leave a detail open (see
+``THIRD_PARTY_NOTICES.md``):
 
 - :func:`locate_trees`: tree tops by the local maximum filter (``lmf``;
   Popescu and Wynne 2004) on a canopy height model or on points, with a
@@ -194,6 +197,8 @@ def locate_trees(source, window=5.0, hmin: float = 2.0, shape: str = "circular",
                  heights=None) -> TreeTops:
     """Tree tops by the local maximum filter (Popescu and Wynne 2004).
 
+    The rules of the filter follow lidR's ``lmf`` (Roussel et al. 2020; GPL-3).
+
     A CHM cell (its centre, with the cell's value) or a point is a tree top
     when it is at least ``hmin`` high and nothing within its window is
     higher. The window is a disc of diameter ``ws`` (or a square of side
@@ -287,6 +292,9 @@ def segment_crowns(chm: Raster, tops, method: str = "dalponte2016", th_tree: flo
                    th_seed: float = 0.45, th_cr: float = 0.55, max_cr: float = 10.0) -> Raster:
     """Crowns on a canopy height model, grown from tree tops.
 
+    The ``"dalponte2016"`` method is a translation of lidR's C++
+    (``C_dalponte2016.cpp``; Roussel et al. 2020; GPL-3).
+
     ``"dalponte2016"`` is the region growing of Dalponte and Coomes (2016)
     (``th_tree``, ``th_seed``, ``th_cr``, ``max_cr``): each crown adds, sweep after sweep, the 4-neighbours
     of its cells that are higher than ``th_tree``, higher than ``th_seed``
@@ -342,6 +350,9 @@ def li2012(cloud: PointCloud, dt1: float = 1.5, dt2: float = 2.0, R: float = 2.0
            Zu: float = 15.0, hmin: float = 2.0, speed_up: float = 10.0,
            heights=None) -> np.ndarray:
     """Point-based tree segmentation of Li et al. (2012).
+
+    The decision logic and the ``hmin`` and ``speed_up`` options are
+    translated from lidR's implementation (Roussel et al. 2020; GPL-3).
 
     Points are taken from the highest down. The highest point left starts
     a tree (its set P, with an empty set N); every point left within

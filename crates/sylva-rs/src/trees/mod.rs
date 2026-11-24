@@ -6,12 +6,13 @@
 
 pub mod prune;
 pub mod stems;
+pub mod touch;
 
 use std::collections::HashMap;
 
 use rayon::prelude::*;
 
-use crate::cluster::{dijkstra_gravity, dijkstra_scaled, directed_knn_graph, directed_knn_graph_bridged, directed_knn_graph_wood};
+use crate::cluster::{dijkstra_gravity, dijkstra_reach, directed_knn_graph, directed_knn_graph_bridged, Bend};
 use crate::error::{Error, Result};
 use crate::filters::Rng;
 use crate::util::spatial::first_in_voxel;
@@ -223,8 +224,20 @@ pub struct SegmentParams {
     pub seed_radius: f64,
     /// Edge cost exponent on distance.
     pub power: f64,
-    /// Penalise edges by their angle from vertical (up free, down x100).
-    pub angle_penalty: bool,
+    /// Penalise edges by the angle they make with the vertical and with the
+    /// path that arrives at them (see [`Bend`]); without it an edge costs
+    /// its length term alone.
+    pub bend_cost: bool,
+    /// Exponent on the cosine of that angle: an edge costs its length term
+    /// over `max(bend_floor, cos)^bend_power`.
+    pub bend_power: f64,
+    /// Smallest cosine counted, which caps the factor at
+    /// `1 / bend_floor^bend_power` (39 at the defaults) for sideways and
+    /// downward edges.
+    pub bend_floor: f64,
+    /// Share of the arriving path's direction in the direction the angle is
+    /// measured from; the rest is the vertical.
+    pub path_weight: f64,
     /// raycloudtools gravity factor: cost x (1 + g * lateral^2 from the seed); 0 disables.
     pub gravity: f64,
     /// Points below this height are left unassigned (-1) and kept out of
@@ -232,11 +245,13 @@ pub struct SegmentParams {
     /// ground surface is not in the graph while a stem is labelled to within
     /// a hand of the ground. With the ground given as a mask instead
     /// (`segment_trees_masked`) it can be 0.
-    pub cut_above_ground: f64,
+    pub ground_clearance: f64,
     /// Scale each tree's path costs by `1 / max(height_estimate, 2)`, the
     /// height estimate being the 95th-percentile point height within
     /// `height_prior_radius` of the stem (raycloudtools' per-root scaling), so
-    /// tall trees win contested crown points over understorey stems.
+    /// tall trees win contested crown points over understorey stems. The
+    /// estimate is the height of the vegetation over the stem, not of the
+    /// tree: under a closed canopy every stem competes at canopy height.
     pub height_prior: bool,
     /// Horizontal radius about the stem (m) within which graph nodes supply the tree's height estimate.
     pub height_prior_radius: f64,
@@ -254,25 +269,18 @@ pub struct SegmentParams {
     pub low_height: f64,
     /// Horizontal radius from the tree's base (m) within which points below `low_height` keep their label; 1.5 DBH if that is larger.
     pub low_radius: f64,
-    /// Classify graph nodes as wood by local anisotropy (`1 - l_min / l_max`
-    /// over `wood_k` neighbours) above `wood_threshold`, and
-    /// apply wood / leaf cost factors so foliage cannot bridge trees.
-    pub wood_costs: bool,
-    /// Neighbours per node for the local PCA that classifies wood (count).
-    pub wood_k: usize,
-    /// Anisotropy `1 - l_min / l_max` above which a node counts as wood (fraction 0-1).
-    pub wood_threshold: f64,
     /// Understorey competes for points (after raycloudtools, where every
     /// point's path runs to the ground and small plants keep their own).
-    /// Graph nodes up to `understorey_band` above `cut_above_ground`, and
+    /// Graph nodes up to `understorey_band` above `ground_clearance`, and
     /// further than `max(low_radius, 1.5 DBH)` from every stem, become extra
     /// sources whose path costs are scaled as for a tree this tall (with
     /// `height_prior`); what they claim is left unassigned. 0, the default,
-    /// disables: on the four CHERLET reference plots the sources gained no
-    /// tree and lost up to four, and what they take from a crown they take
-    /// through foliage regardless of how they are costed.
+    /// disables. On the four CHERLET reference plots a value of 10 keeps
+    /// another 7 to 17 % of the off-tree points below 2 m out of the trees
+    /// and loses about two small trees in a hundred on two of the plots,
+    /// whose crowns the sources reach through foliage from below.
     pub understorey_height: f64,
-    /// Height band above `cut_above_ground` (m) in which graph nodes clear of every stem become understorey sources.
+    /// Height band above `ground_clearance` (m) in which graph nodes clear of every stem become understorey sources.
     pub understorey_band: f64,
     /// Corner of the voxel grid of the graph; None anchors it at the
     /// cloud's minimum corner rounded down to whole metres, so that nothing
@@ -285,16 +293,40 @@ pub struct SegmentParams {
     /// sampled branches whatever points the thinning kept
     /// (`crate::cluster::directed_knn_graph_bridged`).
     pub bridge: bool,
+    /// Farthest a tree reaches from its stem (m, horizontal): its paths do
+    /// not enter nodes beyond it, so what lies farther from every stem stays
+    /// unassigned. Without it a tree claims all the vegetation connected to
+    /// it, however far: on open plots shrubs with no stem of their own and,
+    /// on a plot cut from a larger scan, the vegetation past the outermost
+    /// stems, which then make crowns of tens of metres. Set it to the
+    /// widest crown radius the stand can have; 0 (the default) is no limit.
+    pub max_reach: f64,
+}
+
+impl SegmentParams {
+    /// The bend cost the graph is built with; None without `bend_cost`.
+    fn bend(&self) -> Option<Bend> {
+        self.bend_cost.then_some(Bend { power: self.bend_power, floor: self.bend_floor, path_weight: self.path_weight })
+    }
+
+    /// The directed graph over the nodes `work`, bridged or not.
+    fn graph<'a>(&self, work: &'a [Point]) -> crate::cluster::Graph<'a> {
+        if self.bridge {
+            directed_knn_graph_bridged(work, self.k, self.max_edge, self.power, self.bend())
+        } else {
+            directed_knn_graph(work, self.k, self.max_edge, self.power, self.bend())
+        }
+    }
 }
 
 impl Default for SegmentParams {
     fn default() -> Self {
-        SegmentParams { k: 6, max_edge: 1.0, voxel_size: 0.03, seed_height: 1.5, seed_radius: 0.25, power: 6.0, angle_penalty: true, gravity: 0.0, cut_above_ground: 0.1, seed_ring: true, height_prior: true, height_prior_radius: 1.5, height_prior_power: 1.0, low_height: 0.5, low_radius: 1.0, wood_costs: false, wood_k: 20, wood_threshold: 0.9, understorey_height: 0.0, understorey_band: 0.5, voxel_origin: None, bridge: true }
+        SegmentParams { k: 6, max_edge: 1.0, voxel_size: 0.03, seed_height: 1.5, seed_radius: 0.25, power: 6.0, bend_cost: true, bend_power: 4.0, bend_floor: 0.4, path_weight: 0.3, gravity: 0.0, ground_clearance: 0.1, seed_ring: true, height_prior: true, height_prior_radius: 1.5, height_prior_power: 1.0, low_height: 0.5, low_radius: 1.0, understorey_height: 0.0, understorey_band: 0.5, voxel_origin: None, bridge: true, max_reach: 0.0 }
     }
 }
 
 /// The points that become graph nodes: those at or above
-/// `cut_above_ground`, thinned to the first of each `voxel_size` voxel.
+/// `ground_clearance`, thinned to the first of each `voxel_size` voxel.
 pub fn graph_nodes(points: &[Point], heights: &[f64], p: &SegmentParams) -> Vec<usize> {
     graph_nodes_masked(points, heights, p, None)
 }
@@ -303,7 +335,7 @@ pub fn graph_nodes(points: &[Point], heights: &[f64], p: &SegmentParams) -> Vec<
 /// ground as a classifier found it, so that the surface is out of the graph
 /// whatever its height, and the cut can sit at the ground itself.
 pub fn graph_nodes_masked(points: &[Point], heights: &[f64], p: &SegmentParams, exclude: Option<&[bool]>) -> Vec<usize> {
-    let above: Vec<usize> = (0..points.len()).filter(|&i| heights[i] >= p.cut_above_ground && exclude.is_none_or(|e| !e[i])).collect();
+    let above: Vec<usize> = (0..points.len()).filter(|&i| heights[i] >= p.ground_clearance && exclude.is_none_or(|e| !e[i])).collect();
     if p.voxel_size.is_nan() || p.voxel_size <= 0.0 {
         return above;
     }
@@ -318,15 +350,20 @@ pub fn graph_nodes_masked(points: &[Point], heights: &[f64], p: &SegmentParams, 
 
 /// Assign points to the nearest stem by shortest path through a kNN graph
 /// (multi-source Dijkstra from stem seeds), after raycloudtools' `rayextract
-/// trees` (Devereux et al. 2026). Unreachable points get `-1`.
+/// trees` (Devereux et al. 2026), whose bend cost the edges carry (see
+/// [`Bend`]). Unreachable points get `-1`.
 pub fn segment_trees(points: &[Point], heights: &[f64], trees: &[Tree], p: &SegmentParams) -> Vec<i64> {
     segment_trees_masked(points, heights, trees, p, None)
 }
 
 /// [`segment_trees`] with the points flagged in `exclude` kept out of the
 /// graph and left unassigned (-1): pass the ground classification, and set
-/// `cut_above_ground` to 0, to label stems down to the last point above the
+/// `ground_clearance` to 0, to label stems down to the last point above the
 /// ground rather than to a fixed height above it.
+///
+/// The steps (cut above the ground, thin, directed graph, multi-source
+/// shortest paths, nearest-node label transfer) are those of graph
+/// segmentations generally, raycloudtools' and Arbor's among them.
 pub fn segment_trees_masked(points: &[Point], heights: &[f64], trees: &[Tree], p: &SegmentParams, exclude: Option<&[bool]>) -> Vec<i64> {
     let task = crate::util::progress::start("segmenting trees", 3);
     let work_idx = graph_nodes_masked(points, heights, p, exclude);
@@ -409,6 +446,10 @@ impl FlatGrid {
 /// (at least 2 m). The seed nodes are those on the bark ring: distance from
 /// the stem axis within `seed_radius` of half the DBH (of the axis itself
 /// without `seed_ring`), at any height below `seed_height + 0.5`.
+///
+/// Seeding the trunk surface rather than its axis is the idea of the seed cage
+/// of Arbor (J.-R. Roussel, r-lidar; GPL-3.0-or-later), `src/seed/SeedDetector_cage.cpp`; the
+/// implementation here (real nodes on the bark shell as free sources) is Sylva's.
 pub fn collect_seeds(work: &[Point], hw: &[f64], trees: &[Tree], p: &SegmentParams) -> Seeds {
     let mut out = Seeds { seeds: Vec::new(), seed_tree: Vec::new(), seed_xy: Vec::new(), seed_scale: Vec::new() };
     if trees.is_empty() || work.is_empty() {
@@ -431,8 +472,8 @@ pub fn collect_seeds(work: &[Point], hw: &[f64], trees: &[Tree], p: &SegmentPara
         };
         // Seed the bark, not the axis: on a stem wider than `seed_radius` a
         // disc around the centre lies inside the trunk, where a scan has no
-        // points at all, and the tree starts with nothing (r-lidar's arbor seeds
-        // a whole synthetic trunk shell for the same reason).
+        // points at all, and the tree starts with nothing (Arbor seeds a
+        // whole synthetic trunk shell for the same reason).
         let inner = if p.seed_ring { 0.5 * t.dbh } else { 0.0 };
         // The whole shell from the ground (every node is above the cut) up
         // to half a metre above `seed_height`: the trunk belongs to its tree
@@ -459,13 +500,7 @@ pub fn collect_seeds(work: &[Point], hw: &[f64], trees: &[Tree], p: &SegmentPara
 /// each node most cheaply, -1 for nodes no seed reaches and for those the
 /// understorey claims. Nothing is thinned here.
 pub fn segment_nodes(work: &[Point], hw: &[f64], trees: &[Tree], p: &SegmentParams) -> Vec<i64> {
-    let wood: Option<Vec<bool>> = if p.wood_costs {
-        let (_, vals) = crate::filters::local_pca(work, p.wood_k);
-        Some(vals.iter().map(|[l1, _, l3]| *l3 > 1e-14 && (l3 - l1) / l3 > p.wood_threshold).collect())
-    } else {
-        None
-    };
-    let graph = if p.bridge { directed_knn_graph_bridged(work, p.k, p.max_edge, p.power, p.angle_penalty, wood.as_deref()) } else { directed_knn_graph_wood(work, p.k, p.max_edge, p.power, p.angle_penalty, wood.as_deref()) };
+    let graph = p.graph(work);
     let Seeds { mut seeds, mut seed_tree, mut seed_xy, mut seed_scale } = collect_seeds(work, hw, trees, p);
     if seeds.is_empty() {
         return vec![-1; work.len()];
@@ -477,7 +512,7 @@ pub fn segment_nodes(work: &[Point], hw: &[f64], trees: &[Tree], p: &SegmentPara
         let reach = clear.iter().cloned().fold(0.0, f64::max);
         let scale = if p.height_prior { 1.0 / p.understorey_height } else { 1.0 };
         for (i, q) in work.iter().enumerate() {
-            if hw[i] > p.cut_above_ground + p.understorey_band {
+            if hw[i] > p.ground_clearance + p.understorey_band {
                 continue;
             }
             let flat = [q[0], q[1], 0.0];
@@ -490,13 +525,15 @@ pub fn segment_nodes(work: &[Point], hw: &[f64], trees: &[Tree], p: &SegmentPara
             }
         }
     }
-    let (dist, src, _) = dijkstra_scaled(&graph, &seeds, Some(&seed_xy), p.gravity, if p.height_prior { Some(&seed_scale) } else { None });
+    // The stems' reach; the understorey sources have none.
+    let reach: Option<Vec<f64>> = (p.max_reach > 0.0).then(|| seed_tree.iter().map(|&t| if t >= 0 { p.max_reach } else { f64::INFINITY }).collect());
+    let (dist, src, _) = dijkstra_reach(&graph, &seeds, Some(&seed_xy), p.gravity, if p.height_prior { Some(&seed_scale) } else { None }, reach.as_deref());
     (0..work.len()).map(|i| if dist[i].is_finite() { seed_tree[src[i]] } else { -1 }).collect()
 }
 
 /// The last step of [`segment_trees`]: each point takes the label of its
 /// nearest graph node (`work`, labelled by [`segment_nodes`]); points below
-/// `cut_above_ground` or with a NaN height, and those below `low_height` farther than
+/// `ground_clearance` or with a NaN height, and those below `low_height` farther than
 /// `max(low_radius, 1.5 DBH)` from their tree's stem, get -1.
 pub fn label_points(points: &[Point], heights: &[f64], work: &[Point], labels_work: &[i64], trees: &[Tree], p: &SegmentParams) -> Vec<i64> {
     label_points_masked(points, heights, work, labels_work, trees, p, None)
@@ -512,7 +549,7 @@ pub fn label_points_masked(points: &[Point], heights: &[f64], work: &[Point], la
             let (q, h) = (&points[i], heights[i]);
             // `!(h >= cut)` rather than `h < cut`: a NaN height (a point
             // over a hole in the terrain model) is not a graph node either.
-            if !(h >= p.cut_above_ground) || exclude.is_some_and(|e| e[i]) {
+            if !(h >= p.ground_clearance) || exclude.is_some_and(|e| e[i]) {
                 return -1;
             }
             let l = tree.nearest(q).map(|(j, _)| labels_work[j]).unwrap_or(-1);
@@ -554,7 +591,7 @@ pub fn branch_parents(points: &[Point], heights: &[f64], trees: &[Tree], p: &Seg
     let work_idx = graph_nodes(points, heights, p);
     let work: Vec<Point> = work_idx.iter().map(|&i| points[i]).collect();
     let hw: Vec<f64> = work_idx.iter().map(|&i| heights[i]).collect();
-    let graph = if p.bridge { directed_knn_graph_bridged(&work, p.k, p.max_edge, p.power, p.angle_penalty, None) } else { directed_knn_graph(&work, p.k, p.max_edge, p.power, p.angle_penalty) };
+    let graph = p.graph(&work);
     let sources: Vec<usize> = (0..work.len()).filter(|&i| hw[i] < ground_height).collect();
     if sources.is_empty() {
         return parent;
@@ -600,7 +637,7 @@ pub fn branch_parents(points: &[Point], heights: &[f64], trees: &[Tree], p: &Seg
             for &oi in &near {
                 let o = &trees[oi];
                 let r = (trunk_scale * o.dbh / 2.0).max(trunk_min);
-                if h >= p.cut_above_ground && h <= p.seed_height + 0.5 && (q[0] - o.x).hypot(q[1] - o.y) <= r {
+                if h >= p.ground_clearance && h <= p.seed_height + 0.5 && (q[0] - o.x).hypot(q[1] - o.y) <= r {
                     parent[ci] = Some(oi);
                 }
             }
@@ -897,7 +934,7 @@ mod graph_node_tests {
 
     /// `graph_nodes` as it was: copy the points above the cut, thin the copy.
     fn reference(points: &[Point], heights: &[f64], p: &SegmentParams) -> Vec<usize> {
-        let above: Vec<usize> = (0..points.len()).filter(|&i| heights[i] >= p.cut_above_ground).collect();
+        let above: Vec<usize> = (0..points.len()).filter(|&i| heights[i] >= p.ground_clearance).collect();
         if p.voxel_size.is_nan() || p.voxel_size <= 0.0 {
             return above;
         }
@@ -922,7 +959,7 @@ mod graph_node_tests {
             let p = SegmentParams { voxel_size: voxel, voxel_origin: origin, ..Default::default() };
             assert_eq!(graph_nodes(&pts, &heights, &p), reference(&pts, &heights, &p));
         }
-        let none = SegmentParams { cut_above_ground: 100.0, ..Default::default() };
+        let none = SegmentParams { ground_clearance: 100.0, ..Default::default() };
         assert!(graph_nodes(&pts, &heights, &none).is_empty());
     }
 }
@@ -1011,12 +1048,32 @@ mod seed_and_height_tests {
         assert!(labels.iter().zip(&mask).all(|(&l, &m)| !m || l == -1));
         assert!(labels.iter().any(|&l| l >= 0));
         // With the cut at the ground and the mask doing its job, the stems reach lower.
-        let low = SegmentParams { cut_above_ground: 0.0, voxel_size: 0.05, ..Default::default() };
+        let low = SegmentParams { ground_clearance: 0.0, voxel_size: 0.05, ..Default::default() };
         let ground: Vec<bool> = pts.iter().map(|q| q[2] < 0.05).collect();
         let labels_low = segment_trees_masked(&pts, &hw, &trees, &low, Some(&ground));
         let labelled_below_cut = labels_low.iter().zip(&pts).filter(|(&l, q)| l >= 0 && q[2] < 0.25).count();
         assert!(labelled_below_cut > 0);
         assert!(labels_low.iter().zip(&ground).all(|(&l, &g)| !g || l == -1));
+    }
+
+    #[test]
+    fn a_reach_keeps_every_tree_within_it() {
+        // A cube of points joined everywhere: without a reach the nine trees
+        // share all of it, with one each keeps to its disc.
+        let (pts, hw, trees) = forest(20_000, 31);
+        let p = SegmentParams { voxel_size: 0.05, ..Default::default() };
+        let free = segment_trees(&pts, &hw, &trees, &p);
+        let at: std::collections::HashMap<i64, (f64, f64)> = trees.iter().map(|t| (t.tree_id, (t.x, t.y))).collect();
+        let far = |labels: &[i64]| labels.iter().zip(&pts).filter(|(l, _)| **l >= 0).map(|(l, q)| { let (x, y) = at[l]; (q[0] - x).hypot(q[1] - y) }).fold(0.0, f64::max);
+        assert!(far(&free) > 4.0, "{}", far(&free));
+        let reach = 2.5;
+        let held = segment_trees(&pts, &hw, &trees, &SegmentParams { max_reach: reach, ..p.clone() });
+        // A point takes its nearest node's label: it lies at most a voxel diagonal past the node.
+        assert!(far(&held) <= reach + 0.05 * 3f64.sqrt() + 1e-9, "{}", far(&held));
+        assert!(held.iter().filter(|&&l| l >= 0).count() > 1000);
+        assert!(held.iter().filter(|&&l| l < 0).count() > free.iter().filter(|&&l| l < 0).count());
+        // A reach no tree comes near is no limit.
+        assert_eq!(segment_trees(&pts, &hw, &trees, &SegmentParams { max_reach: 1e6, ..p.clone() }), free);
     }
 
     #[test]
@@ -1160,7 +1217,7 @@ mod review_regression_tests {
         let work_idx = graph_nodes(points, heights, p);
         let work: Vec<Point> = work_idx.iter().map(|&i| points[i]).collect();
         let hw: Vec<f64> = work_idx.iter().map(|&i| heights[i]).collect();
-        let graph = if p.bridge { directed_knn_graph_bridged(&work, p.k, p.max_edge, p.power, p.angle_penalty, None) } else { directed_knn_graph(&work, p.k, p.max_edge, p.power, p.angle_penalty) };
+        let graph = p.graph(&work);
         let sources: Vec<usize> = (0..work.len()).filter(|&i| hw[i] < ground_height).collect();
         if sources.is_empty() {
             return parent;
@@ -1184,7 +1241,7 @@ mod review_regression_tests {
                         continue;
                     }
                     let r = (trunk_scale * o.dbh / 2.0).max(trunk_min);
-                    if hw[node] >= p.cut_above_ground && hw[node] <= p.seed_height + 0.5 && (work[node][0] - o.x).hypot(work[node][1] - o.y) <= r {
+                    if hw[node] >= p.ground_clearance && hw[node] <= p.seed_height + 0.5 && (work[node][0] - o.x).hypot(work[node][1] - o.y) <= r {
                         parent[ci] = Some(oi);
                     }
                 }
