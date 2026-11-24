@@ -351,13 +351,13 @@ params! {
     /// The settings of [`crate::qsm::support_tree`] a caller may set; every other calibration is a constant (here,
     /// in [`crate::qsm::joint_fit`] and in [`crate::qsm::support_tree`]).
     ///
-    /// The defaults are the calibration for TERN's RIEGL VZ-400i exports (3dtrees research 100 §§13-19 and 93 §§11.2, 17: Alice Mulga).
+    /// The defaults are the calibration for TERN's RIEGL VZ-400i exports (Alice Mulga).
     #[derive(Debug, Clone, Copy, PartialEq)]
     pub struct JointParams {
         /// Beam diameter at the aperture (m) and full divergence (rad).
         pub exit: f64 = 0.007,
         pub divergence: f64 = 0.35e-3,
-        /// Echo character (3dtrees research 103 §11.2): the reflectance (dB) of a single return from bark that fills
+        /// Echo character: the reflectance (dB) of a single return from bark that fills
         /// the footprint and from leaf, mean and sd; a return that shares its pulse is `refl_multi` dB brighter (it
         /// is negative) with `refl_multi_sd` more spread, in quadrature. Read by [`crate::qsm::support_tree`] only.
         pub refl_wood: f64 = -15.45,
@@ -366,12 +366,12 @@ params! {
         pub refl_leaf_sd: f64 = 1.4,
         pub refl_multi: f64 = -3.0,
         pub refl_multi_sd: f64 = 1.2,
-        /// Thin wood reads darker than bark that fills the footprint even above the footprint's width (3dtrees
-        /// research 103 §16: rows under 2 cm at -17.8 dB p50 against -15.9): wood's mean shifts by `refl_thin` dB at
-        /// R <= 1 cm, by none from 3 cm, linearly in log R between. Read by [`crate::qsm::support_tree`] only.
+        /// Thin wood reads darker than bark that fills the footprint even above the footprint's width (rows
+        /// under 2 cm at -17.8 dB p50 against -15.9): wood's mean shifts by `refl_thin` dB at R <= 1 cm, by none from
+        /// 3 cm, linearly in log R between. Read by [`crate::qsm::support_tree`] only.
         pub refl_thin: f64 = -3.0,
         /// The site's largest stem D/H: no radius the rays don't measure is wider than `dh` times its reach to the tips
-        /// over 2 (0: no cap; Alice Mulga's census 0.035, 3dtrees research 62). Read by [`crate::qsm::support_tree`] only.
+        /// over 2 (0: no cap; Alice Mulga's census 0.035). Read by [`crate::qsm::support_tree`] only.
         pub dh: f64 = 0.0,
     }
 }
@@ -447,13 +447,13 @@ fn h_int(y: D, r: D) -> D {
 /// The width (a share of the footprint's) below which a sliver of the footprint
 /// on the circle is averaged as if that wide: the centroid depth is then smooth
 /// at the silhouette. Wider (a quarter of the footprint) moved the bench's
-/// trunks 0.8 % fatter (research 100 §18).
+/// trunks 0.8 % fatter.
 const SLIVER: f64 = 0.02;
 
 /// The softness (a share of the footprint) of the wood's capacity to make an
 /// echo: wood of width 2 R gives at most the share 2 R / w, and needs tau.
-/// Without it a radius near 0 still detects pulses near its axis (research
-/// 100 §20), so "no wood" wasn't.
+/// Without it a radius near 0 still detects pulses near its axis, so "no
+/// wood" wasn't.
 pub(crate) const CAPACITY_SD: f64 = 0.02;
 
 /// One pair's log likelihood at state `[offset1, offset2, eta, ell]`, in
@@ -473,7 +473,7 @@ fn pair_terms<N: Num>(pu: &Pulse, s: [N; 4], p: &JointParams) -> (N, Option<(N, 
     let tp = N::c(pu.t) + (d1 * pu.jt[0] + d2 * pu.jt[1]);
     let w = p.footprint(pu.t);
     // the footprint on the circle: its share f, and the surface's centroid depth hbar. A sliver's centroid
-    // goes as the root of its width, an infinite slope at the silhouette that traps Newton (research 100 §18):
+    // goes as the root of its width, an infinite slope at the silhouette that traps Newton:
     // slivers narrower than SLIVER w are averaged over a width that doesn't vanish
     let y1 = (bp + (-w / 2.0)).max(-r);
     let y2 = (bp + w / 2.0).min(r);
@@ -554,8 +554,8 @@ pub fn joint_loglik(pulses: &[Pulse], owners: &[Owner], theta: &[[f64; 4]], nu: 
 }
 
 /// Each pair's chance that its stop is the wood's echo rather than foliage's, at row states `theta` and nuisances
-/// `nu`: the softmax of the stop's wood and leaf terms (3dtrees research 103 §18: the classification on the exact
-/// likelihood's path); NaN for a pass.
+/// `nu`: the softmax of the stop's wood and leaf terms (the classification on the exact likelihood's path); NaN for
+/// a pass.
 pub fn joint_wood_share(pulses: &[Pulse], owners: &[Owner], theta: &[[f64; 4]], nu: &[[f64; 2]], p: &JointParams, threads: usize) -> Result<Vec<f64>> {
     check(pulses, owners, theta, nu)?;
     pool(threads)?.install(|| Ok(pulses.par_iter().zip(owners).map(|(pu, o)| match pair_terms(pu, state(o, theta, nu), p).1 {
@@ -629,10 +629,9 @@ pub struct JointPairs {
     pub echo: Vec<u8>,
 }
 
-/// A tree's echoes classified (3dtrees research 103 §18), one record per echo, keyed as the tile sidecars are
-/// (research 104, win 1): the scan (an index into the fit's scans), the pulse's row in its Shots file and the echo's
-/// place in its pulse. Each with the chance it is wood's echo, the node it belongs to and how far it lies from that
-/// node's fitted surface (m), sorted by key.
+/// A tree's echoes classified, one record per echo, keyed as the tile sidecars are: the scan (an index into the fit's
+/// scans), the pulse's row in its Shots file and the echo's place in its pulse. Each with the chance it is wood's
+/// echo, the node it belongs to and how far it lies from that node's fitted surface (m), sorted by key.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Echoes {
     pub scan: Vec<u32>,

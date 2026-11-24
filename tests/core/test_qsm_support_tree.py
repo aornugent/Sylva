@@ -27,7 +27,7 @@ def scanned(tmp_path, a, b, r, scanners, zenith=(80.0, 100.0)):
 
 def inside_own_bounds(f):
     """Each row of a fit lies inside the bounds it reports (those that entered the tree), but where PINNED says the
-    rays contradict themselves (3dtrees research 127)."""
+    rays contradict themselves."""
     lo, hi = np.nan_to_num(f["r_lo"]), np.nan_to_num(f["r_hi"], nan=np.inf)
     ok = (f["r"] >= lo * (1 - 1e-9)) & (f["r"] <= hi * (1 + 1e-9)) | ((f["diag"] & SupportDiag.PINNED) > 0)
     assert ok.all(), (f["r"], f["r_lo"], f["r_hi"], f["diag"])
