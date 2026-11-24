@@ -9,7 +9,7 @@ foliage density; each pulse near it is a censored survival event along its
 line, where opaque wood (an echo at the footprint's centroid depth) and
 foliage (Beer-Lambert) compete to stop it. A Gaussian Markov prior over the
 tree ties the rows together: the taper's steps, soft Leonardo at forks, a
-random walk of the centre and of foliage (3dtrees research 100).
+random walk of the centre and of foliage.
 
 :func:`support_tree` fits one tree: each row's pieces' support function per
 scan, bounds and existence where a circle isn't determined, the pieces with
@@ -20,12 +20,12 @@ The settings a caller may set are a :class:`JointParams`, whose fields are:
 
 - the beam: ``exit`` and ``divergence`` (its diameter at the aperture, m, and
   full divergence, rad);
-- echo character (3dtrees research 103 §11.2): ``refl_wood``, ``refl_wood_sd``,
-  ``refl_leaf`` and ``refl_leaf_sd`` (the reflectance, dB, of a single return
-  from bark that fills the footprint and from leaf, mean and sd),
-  ``refl_multi`` and ``refl_multi_sd`` (a return that shares its pulse is
-  ``refl_multi`` dB brighter, negative, with ``refl_multi_sd`` more spread in
-  quadrature), ``refl_thin`` (thin wood's shift, dB, in full at R <= 1 cm and
+- echo character: ``refl_wood``, ``refl_wood_sd``, ``refl_leaf`` and
+  ``refl_leaf_sd`` (the reflectance, dB, of a single return from bark that
+  fills the footprint and from leaf, mean and sd), ``refl_multi`` and
+  ``refl_multi_sd`` (a return that shares its pulse is ``refl_multi`` dB
+  brighter, negative, with ``refl_multi_sd`` more spread in quadrature),
+  ``refl_thin`` (thin wood's shift, dB, in full at R <= 1 cm and
   none from 3 cm);
 - ``dh``: the site's largest stem D/H: no radius the rays don't measure is
   wider than ``dh`` times its reach to the tips over 2 (0 for no cap).
@@ -48,7 +48,8 @@ from .scan_index import ScanIndex
 # written once, in the core: its fields, their types and their defaults
 JointParams = dataclasses.make_dataclass(
     "JointParams", [(k, type(v), dataclasses.field(default=v)) for k, v in _core.qsm_joint_defaults().items()],
-    frozen=True, module=__name__)
+    frozen=True)
+JointParams.__module__ = __name__  # make_dataclass takes module= only from Python 3.12
 JointParams.__doc__ = """The settings of :func:`support_tree`, with the core's defaults.
 
 Calibrated on TERN's RIEGL VZ-400i exports (Alice Mulga). The fields are described in
@@ -68,7 +69,7 @@ SupportFlag = IntFlag("SupportFlag", _core.qsm_support_flags())
 #: reason, and isn't restated here:
 #:
 #: - ``ONE_SIDED``: one scan supplies almost all its informative pulses, or every pair of the views that carry a share
-#:   of them looks from nearly one direction: no other view checks it (3dtrees research 103 §10, §11.1);
+#:   of them looks from nearly one direction: no other view checks it;
 #: - ``SHADOWED``: an exact stem a side of whose silhouette is unseen (no pulse reaches the circle's neighbourhood
 #:   there from a scan that would decide R, as a crossing branch's shadow), so the sides seen leave its radius trading
 #:   against its centre: its message says nothing along what they leave free, and its own bounds (the span of its
@@ -79,12 +80,11 @@ SupportFlag = IntFlag("SupportFlag", _core.qsm_support_flags())
 #:   circle spans (the captor's; another scan's run keeps its bound);
 #: - ``CONTESTED``: most of its stops are claimed by context or a neighbouring node (``contested``);
 #: - ``REFUTED``: the ray veto refutes its fitted circle: at least 10 pulses pass through it, and passes are at least a
-#:   quarter of its stops and passes (3dtrees research 106; a row's: of its pieces' counts summed);
+#:   quarter of its stops and passes (a row's: of its pieces' counts summed);
 #: - ``PINNED``: its radius sits on its own bounds (the tree without them would put it past one, or the posterior did
 #:   and was held inside them): what its rays say is a bound, not a value;
 #: - ``CAPPED``: its posterior median reached the site's D/H cap (``dh``), applied after the solve: served at the cap;
-#: - ``MOVED``: the veto moved its circle onto its own wood beside the claim's axis, refuted or not (3dtrees research
-#:   127).
+#: - ``MOVED``: the veto moved its circle onto its own wood beside the claim's axis, refuted or not.
 SupportDiag = IntFlag("SupportDiag", _core.qsm_support_diags())
 
 #: How a node's radius is known (:func:`support_tree`'s ``basis``; a row's: most of its pieces', the less known on a
