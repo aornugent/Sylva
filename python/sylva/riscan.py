@@ -187,6 +187,49 @@ class ScanPosition:
         shots = read_rxp_shots(self.rxp, fill_missing=limits, **options)
         return shots.transform(self.transform(pop))
 
+    def save_shots(self, path: str | Path, pop: np.ndarray | None = None, fill_missing: bool = False,
+                   double: bool = False, row_group_size: int = 1 << 20, zstd_level: int = 3,
+                   origin_tolerance: float = 1e-3, **options) -> tuple[int, int]:
+        """``read_shots(pop, fill_missing, **options).save(path, ...)`` without the pulses passing through
+        Python: the file is the same, but the scan is held in memory once rather than copied between
+        steps, which cuts a whole-scan read's peak memory to about two fifths.
+
+        Parameters
+        ----------
+        path
+            Output ``.parquet`` file (see :meth:`sylva.shots.Shots.save`).
+        pop, fill_missing, **options
+            As for :meth:`read_shots`.
+        double, row_group_size, zstd_level, origin_tolerance
+            As for :meth:`sylva.shots.Shots.save`.
+
+        Returns
+        -------
+        tuple of int
+            Pulses and echoes written.
+
+        Raises
+        ------
+        FileNotFoundError
+            If the position has no ``.rxp``.
+        ValueError
+            If ``fill_missing`` is set but ``project.rsp`` has no scan pattern.
+        """
+        if self.rxp is None:
+            raise FileNotFoundError(f"scan position {self.name} has no .rxp")
+        limits: bool | tuple[float, float] = False
+        if fill_missing:
+            if self.pattern is None:
+                raise ValueError(f"scan position {self.name} has no scan pattern in project.rsp")
+            p = self.pattern
+            limits = (p["theta_start"], p["theta_start"] + p["theta_delta"] * p["theta_count"])
+        m = np.ascontiguousarray(self.transform(pop), dtype=np.float64)
+        n_shots, n_echoes, _ = _core.save_rxp_shots(str(self.rxp), str(path), m, fill_missing=limits,
+                                                    double=double, row_group_size=row_group_size,
+                                                    zstd_level=zstd_level, origin_tolerance=origin_tolerance,
+                                                    **options)
+        return n_shots, n_echoes
+
 
 @dataclass
 class RiscanProject:

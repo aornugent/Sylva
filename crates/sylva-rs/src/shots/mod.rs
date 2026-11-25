@@ -98,13 +98,18 @@ impl Shots {
     /// Apply a rigid transform to origins and directions.
     pub fn transformed(&self, t: &Transform) -> Shots {
         let mut out = self.clone();
-        for o in &mut out.origin {
+        out.transform(t);
+        out
+    }
+
+    /// [`Self::transformed`] in place, for pulses too many to hold twice.
+    pub fn transform(&mut self, t: &Transform) {
+        for o in &mut self.origin {
             *o = t.apply(o);
         }
-        for d in &mut out.direction {
+        for d in &mut self.direction {
             *d = normalize(&t.apply_dir(d));
         }
-        out
     }
 
     /// Keep a subset of shots (echo arrays are re-packed).
@@ -135,7 +140,40 @@ impl Shots {
     /// with a coordinate that is not finite has no range and is left out, and
     /// a pulse of only such points with it.
     pub fn from_pointcloud(cloud: &PointCloud, origin: Point) -> Shots {
-        let times = cloud.attr_f64("gps_time");
+        let (mut shots, echo_idx) = Self::pulses_of(cloud, origin);
+        shots.echo_attrs = cloud
+            .attrs
+            .iter()
+            .filter(|(k, _)| !matches!(k.as_str(), "return_number" | "number_of_returns" | "range"))
+            .map(|(k, v)| (k.clone(), v.take(&echo_idx)))
+            .collect();
+        shots
+    }
+
+    /// [`Self::from_pointcloud`] taking the cloud: its coordinates are freed as soon as the pulses are built,
+    /// and where every point is an echo in the order the pulses keep them, as a scan read usually gives
+    /// them, its attribute columns become the echo attributes without a copy.
+    pub fn from_owned_pointcloud(cloud: PointCloud, origin: Point) -> Shots {
+        let (mut shots, echo_idx) = Self::pulses_of(&cloud, origin);
+        let PointCloud { xyz, attrs } = cloud;
+        drop(xyz);
+        let in_order = echo_idx.len() == attrs.values().next().map_or(0, Attr::len) && echo_idx.iter().enumerate().all(|(i, &k)| i == k);
+        shots.echo_attrs = attrs
+            .into_iter()
+            .filter(|(k, _)| !matches!(k.as_str(), "return_number" | "number_of_returns" | "range"))
+            .map(|(k, v)| if in_order { (k, v) } else { let t = v.take(&echo_idx); (k, t) })
+            .collect();
+        shots
+    }
+
+    /// The pulses of [`Self::from_pointcloud`] without their echo attributes, and the point behind each echo.
+    fn pulses_of(cloud: &PointCloud, origin: Point) -> (Shots, Vec<usize>) {
+        // borrowed where it is already f64, as a scan's is
+        let times: Option<std::borrow::Cow<[f64]>> = match cloud.attr("gps_time") {
+            Some(Attr::F64(t)) => Some(t.as_slice().into()),
+            Some(a) => Some(a.to_f64().into()),
+            None => None,
+        };
         let mut shots = Shots::default();
         let mut i = 0;
         let n = cloud.len();
@@ -167,13 +205,7 @@ impl Shots {
             }
             i = j;
         }
-        shots.echo_attrs = cloud
-            .attrs
-            .iter()
-            .filter(|(k, _)| !matches!(k.as_str(), "return_number" | "number_of_returns" | "range"))
-            .map(|(k, v)| (k.clone(), v.take(&echo_idx)))
-            .collect();
-        shots
+        (shots, echo_idx)
     }
 
     /// Build from a raycloudtools-style ray cloud: per point `xyz` and the
@@ -277,5 +309,30 @@ mod tests {
         }
         let s = Shots::from_ray_cloud(&rays).unwrap();
         assert_eq!((s.n_shots(), s.echo_range.clone()), (1, vec![5.0]));
+    }
+
+    #[test]
+    fn an_owned_cloud_gives_the_same_shots() {
+        // In pulse order (the columns move), out of range order within a pulse, and with a point left out.
+        let xyz = vec![[0.0, 0.0, 1.0], [0.0, 0.0, 2.0], [0.0, 3.0, 0.0], [0.0, 0.0, 5.0], [0.0, 0.0, 4.0], [f64::NAN, 0.0, 1.0]];
+        for n in [3, 6] {
+            let mut cloud = PointCloud::new(xyz[..n].to_vec());
+            cloud.attrs.insert("gps_time".into(), Attr::F64(vec![1.0, 1.0, 2.0, 3.0, 3.0, 4.0][..n].to_vec()));
+            cloud.attrs.insert("amplitude".into(), Attr::F32(vec![10.0, 11.0, 12.0, 13.0, 14.0, 15.0][..n].to_vec()));
+            cloud.attrs.insert("return_number".into(), Attr::U8(vec![1; n]));
+            let s = Shots::from_pointcloud(&cloud, [0.0; 3]);
+            assert_eq!(Shots::from_owned_pointcloud(cloud, [0.0; 3]), s);
+        }
+    }
+
+    #[test]
+    fn transform_in_place_is_transformed() {
+        let mut cloud = PointCloud::new(vec![[0.0, 0.0, 1.0], [1.0, 2.0, 3.0]]);
+        cloud.attrs.insert("gps_time".into(), Attr::F64(vec![1.0, 2.0]));
+        let mut s = Shots::from_pointcloud(&cloud, [0.5, 0.0, 0.0]);
+        let t = Transform::from_row_major(&[0.0, -1.0, 0.0, 1.0, 1.0, 0.0, 0.0, 2.0, 0.0, 0.0, 1.0, 3.0, 0.0, 0.0, 0.0, 1.0]).unwrap();
+        let moved = s.transformed(&t);
+        s.transform(&t);
+        assert_eq!(s, moved);
     }
 }

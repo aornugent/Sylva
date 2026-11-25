@@ -160,27 +160,28 @@ pub fn write_shots(shots: &Shots, path: impl AsRef<Path>, opts: &ShotsWriteOptio
     let per_shot_origin = scan_of.len() < n;
     let scans: Vec<Point> = sums.iter().zip(&first).map(|((s, c), (o, same))| if *same { *o } else { [s[0] / c, s[1] / c, s[2] / c] }).collect();
 
-    // Beams re-aimed from their scanner position at the unchanged echoes.
-    let snapped;
-    let shots = if per_shot_origin || tol == 0.0 {
-        shots
-    } else {
-        let mut out = shots.clone();
-        for s in 0..n {
-            let (o, d, scan) = (shots.origin[s], shots.direction[s], scans[scan_of[s] as usize]);
-            let (e0, c) = (shots.echo_start[s], shots.echo_count[s] as usize);
-            out.origin[s] = scan;
-            for e in e0..e0 + c {
-                let r = shots.echo_range[e];
-                let v = [o[0] + d[0] * r - scan[0], o[1] + d[1] * r - scan[1], o[2] + d[2] * r - scan[2]];
-                out.echo_range[e] = (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt();
-                if e + 1 == e0 + c && out.echo_range[e] > 0.0 {
-                    out.direction[s] = [v[0] / out.echo_range[e], v[1] / out.echo_range[e], v[2] / out.echo_range[e]];
-                }
+    // Beams re-aimed from their scanner position at the unchanged echoes, a pulse at a time as it is
+    // written (`aim` gives its origin and direction and puts its ranges in `ranges`), rather than on a copy.
+    let reaim = !(per_shot_origin || tol == 0.0);
+    let aim = |s: usize, ranges: &mut Vec<f64>| -> (Point, Point) {
+        let (o, d) = (shots.origin[s], shots.direction[s]);
+        let (e0, c) = (shots.echo_start[s], shots.echo_count[s] as usize);
+        if !reaim {
+            ranges.extend_from_slice(&shots.echo_range[e0..e0 + c]);
+            return (o, d);
+        }
+        let scan = scans[scan_of[s] as usize];
+        let mut dir = d;
+        for e in e0..e0 + c {
+            let r = shots.echo_range[e];
+            let v = [o[0] + d[0] * r - scan[0], o[1] + d[1] * r - scan[1], o[2] + d[2] * r - scan[2]];
+            let r = (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt();
+            ranges.push(r);
+            if e + 1 == e0 + c && r > 0.0 {
+                dir = [v[0] / r, v[1] / r, v[2] / r];
             }
         }
-        snapped = out;
-        &snapped
+        (scan, dir)
     };
 
     let real = if opts.double { "double" } else { "float" };
@@ -198,15 +199,33 @@ pub fn write_shots(shots: &Shots, path: impl AsRef<Path>, opts: &ShotsWriteOptio
     schema += "}\n";
     let schema = Arc::new(parse_message_type(&schema)?);
 
+    // The echoes' bounding box, as `echo_xyz` of the re-aimed pulses would give it.
     let xyz_bounds = {
-        let xyz = shots.echo_xyz();
-        (crate::util::spatial::min_corner(&xyz), crate::util::spatial::max_corner(&xyz))
+        let (mut lo, mut hi) = ([f64::INFINITY; 3], [f64::NEG_INFINITY; 3]);
+        let mut ranges = Vec::new();
+        for s in 0..n {
+            ranges.clear();
+            let (o, d) = aim(s, &mut ranges);
+            for &r in &ranges {
+                let p = crate::transform::add(&o, &crate::transform::scale(&d, r));
+                for k in 0..3 {
+                    lo[k] = lo[k].min(p[k]);
+                    hi[k] = hi[k].max(p[k]);
+                }
+            }
+        }
+        if shots.n_echoes() == 0 {
+            ([0.0; 3], [0.0; 3])
+        } else {
+            (lo, hi)
+        }
     };
     let join = |p: &Point| format!("{} {} {}", p[0], p[1], p[2]);
     // Per-pulse origins are integers in units of `origin_scale` from the first
     // origin: along a trajectory they change slowly, so their deltas pack into a few bits.
-    let origin_offset = shots.origin.first().copied().unwrap_or([0.0; 3]);
-    let reach = shots.origin.iter().flat_map(|o| (0..3).map(move |k| (o[k] - origin_offset[k]).abs())).fold(0.0f64, f64::max);
+    let origin_at = |s: usize| if reaim { scans[scan_of[s] as usize] } else { shots.origin[s] };
+    let origin_offset = if n > 0 { origin_at(0) } else { [0.0; 3] };
+    let reach = (0..n).flat_map(|s| (0..3).map(move |k| (origin_at(s)[k] - origin_offset[k]).abs())).fold(0.0f64, f64::max);
     let origin_scale = (reach / 2.0e9).max(if opts.double { 1e-6 } else { 1e-4 });
     let kv = vec![
         KeyValue::new("sylva.origin_offset".into(), join(&origin_offset)),
@@ -241,17 +260,19 @@ pub fn write_shots(shots: &Shots, path: impl AsRef<Path>, opts: &ShotsWriteOptio
     let group = opts.row_group_size.max(1);
     for s0 in (0..n.max(1)).step_by(group) {
         let s1 = (s0 + group).min(n);
+        let mut ranges = Vec::new();
+        let (origin, dirs): (Vec<Point>, Vec<Point>) = (s0..s1).map(|s| aim(s, &mut ranges)).unzip();
         let mut rg = writer.next_row_group()?;
         if per_shot_origin {
             for k in 0..3 {
-                let v: Vec<i32> = shots.origin[s0..s1].iter().map(|o| ((o[k] - origin_offset[k]) / origin_scale).round() as i32).collect();
+                let v: Vec<i32> = origin.iter().map(|o| ((o[k] - origin_offset[k]) / origin_scale).round() as i32).collect();
                 write_col::<Int32Type>(&mut rg, &v, None)?;
             }
         } else {
             write_col::<Int32Type>(&mut rg, &scan_of[s0..s1], None)?;
         }
         for k in 0..2 {
-            let v: Vec<f64> = shots.direction[s0..s1].iter().map(|d| if k == 0 { angles(d).0 } else { angles(d).1 }).collect();
+            let v: Vec<f64> = dirs.iter().map(|d| if k == 0 { angles(d).0 } else { angles(d).1 }).collect();
             if opts.double {
                 write_col::<DoubleType>(&mut rg, &v, None)?;
             } else {
@@ -275,9 +296,9 @@ pub fn write_shots(shots: &Shots, path: impl AsRef<Path>, opts: &ShotsWriteOptio
         }
         let lv = Some((&def[..], &rep[..]));
         if opts.double {
-            write_col::<DoubleType>(&mut rg, &shots.echo_range[e0..e1], lv)?;
+            write_col::<DoubleType>(&mut rg, &ranges, lv)?;
         } else {
-            write_col::<FloatType>(&mut rg, &shots.echo_range[e0..e1].iter().map(|&x| x as f32).collect::<Vec<_>>(), lv)?;
+            write_col::<FloatType>(&mut rg, &ranges.iter().map(|&x| x as f32).collect::<Vec<_>>(), lv)?;
         }
         for a in shots.echo_attrs.values() {
             let as_i32 = |it: &mut dyn Iterator<Item = i32>| it.collect::<Vec<i32>>();

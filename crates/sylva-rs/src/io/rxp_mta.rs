@@ -834,26 +834,36 @@ fn finish(o: Out, opts: &RxpOptions, m: &MtaOptions) -> PointCloud {
             total += 1;
         }
     }
-    fn sel<T: Copy>(v: &[T], keep: &[bool]) -> Vec<T> {
-        v.iter().zip(keep).filter(|(_, &k)| k).map(|(x, _)| *x).collect()
-    }
-    let mut cloud = PointCloud::new(sel(&o.xyz, &keep));
+    drop((order, pulse_ord));
+    let Out { xyz, amplitude, reflectance, deviation, echo_type, time, zone, line, shot, facet, uncertain, range, pulse } = o;
+    drop((range, pulse));
+    // every echo kept, as when the whole scan is read: the columns move into the cloud
+    let all = total == np;
+    let mut cloud = PointCloud::new(sel_of(xyz, &keep, all));
     let a = &mut cloud.attrs;
-    a.insert("amplitude".into(), Attr::F32(sel(&o.amplitude, &keep)));
-    a.insert("reflectance".into(), Attr::F32(sel(&o.reflectance, &keep)));
-    a.insert("deviation".into(), Attr::U16(sel(&o.deviation, &keep)));
-    a.insert("echo_type".into(), Attr::U8(sel(&o.echo_type, &keep)));
-    a.insert("gps_time".into(), Attr::F64(sel(&o.time, &keep)));
-    a.insert("mta_zone".into(), Attr::U8(sel(&o.zone, &keep)));
-    a.insert("return_number".into(), Attr::U8(sel(&ret, &keep)));
-    a.insert("number_of_returns".into(), Attr::U8(sel(&cnt, &keep)));
-    a.insert("scan_line_index".into(), Attr::I32(sel(&o.line, &keep)));
-    a.insert("shot_index_line".into(), Attr::I32(sel(&o.shot, &keep)));
-    a.insert("mirror_facet".into(), Attr::U8(sel(&o.facet, &keep)));
+    a.insert("amplitude".into(), Attr::F32(sel_of(amplitude, &keep, all)));
+    a.insert("reflectance".into(), Attr::F32(sel_of(reflectance, &keep, all)));
+    a.insert("deviation".into(), Attr::U16(sel_of(deviation, &keep, all)));
+    a.insert("echo_type".into(), Attr::U8(sel_of(echo_type, &keep, all)));
+    a.insert("gps_time".into(), Attr::F64(sel_of(time, &keep, all)));
+    a.insert("mta_zone".into(), Attr::U8(sel_of(zone, &keep, all)));
+    a.insert("return_number".into(), Attr::U8(sel_of(ret, &keep, all)));
+    a.insert("number_of_returns".into(), Attr::U8(sel_of(cnt, &keep, all)));
+    a.insert("scan_line_index".into(), Attr::I32(sel_of(line, &keep, all)));
+    a.insert("shot_index_line".into(), Attr::I32(sel_of(shot, &keep, all)));
+    a.insert("mirror_facet".into(), Attr::U8(sel_of(facet, &keep, all)));
     if m.keep_uncertain {
-        a.insert("mta_uncertain_point".into(), Attr::U8(sel(&o.uncertain, &keep)));
+        a.insert("mta_uncertain_point".into(), Attr::U8(sel_of(uncertain, &keep, all)));
     }
     cloud
+}
+
+/// The kept entries of `v` (all of them, moved, when `all`).
+fn sel_of<T>(v: Vec<T>, keep: &[bool], all: bool) -> Vec<T> {
+    if all {
+        return v;
+    }
+    v.into_iter().zip(keep).filter(|(_, &k)| k).map(|(x, _)| x).collect()
 }
 
 #[cfg(test)]

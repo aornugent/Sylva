@@ -456,7 +456,7 @@ pub fn read_rxp_shots_with_report(path: impl AsRef<Path>, opts: &RxpOptions) -> 
     if mta_active(opts) {
         if !opts.fill_missing {
             let cloud = pulse_contiguous(read_rxp(path, opts)?);
-            return Ok((Shots::from_pointcloud(&cloud, [0.0, 0.0, 0.0]), None));
+            return Ok((Shots::from_owned_pointcloud(cloud, [0.0, 0.0, 0.0]), None));
         }
         // The echoes assigned to their pulses by the MTA resolution first:
         // on the raw stream an echo filed under the wrong pulse leaves a
@@ -469,36 +469,31 @@ pub fn read_rxp_shots_with_report(path: impl AsRef<Path>, opts: &RxpOptions) -> 
         all.max_points = None;
         all.echoes = "all".into();
         let cloud = pulse_contiguous(super::rxp_mta::read_rxp_mta(path.as_ref(), &all, &all.mta)?);
-        let shots = Shots::from_pointcloud(&cloud, [0.0, 0.0, 0.0]);
+        let shots = Shots::from_owned_pointcloud(cloud, [0.0, 0.0, 0.0]);
         let times = shots.echo_attrs.get("gps_time").map(|a| a.to_f64()).ok_or_else(|| Error::invalid("the MTA stream carries no gps_time"))?;
         let time_ns: Vec<u64> = shots.echo_start.iter().map(|&s| (times[s] * 1e9).round().max(0.0) as u64).collect();
+        drop(times);
         let rec = reconstruct_misses(&time_ns, &shots.direction, opts.zenith_range, opts.shot_stride);
+        drop(time_ns);
         let kept = if opts.shot_stride > 1 { shots.subset(&rec.keep) } else { shots };
         return with_misses(kept, rec.misses).map(|s| (s, Some(rec.report)));
     }
     let mut raw = read_raw(path.as_ref(), opts)?;
     let misses = std::mem::take(&mut raw.misses);
     let report = raw.report.take();
-    let cloud = cloud_from_raw(raw);
-    let shots = Shots::from_pointcloud(&cloud, [0.0, 0.0, 0.0]);
+    let shots = Shots::from_owned_pointcloud(cloud_from_raw(raw), [0.0, 0.0, 0.0]);
     with_misses(shots, misses).map(|s| (s, report))
 }
 
-/// The recovered misses appended to the recorded pulses as echo-less shots.
-fn with_misses(shots: Shots, misses: Vec<Point>) -> Result<Shots> {
-    if misses.is_empty() {
-        return Ok(shots);
-    }
-    let n = misses.len();
-    let empty = Shots {
-        origin: vec![[0.0, 0.0, 0.0]; n],
-        direction: misses,
-        echo_start: vec![0; n],
-        echo_count: vec![0; n],
-        echo_range: Vec::new(),
-        echo_attrs: shots.echo_attrs.iter().map(|(k, v)| (k.clone(), v.take(&[]))).collect(),
-    };
-    Shots::concatenate(&[&shots, &empty])
+/// The recovered misses appended to the recorded pulses as echo-less shots, in place: the pulses are
+/// packed (each shot's echoes follow the previous shot's), so a miss starts after the last echo.
+fn with_misses(mut shots: Shots, misses: Vec<Point>) -> Result<Shots> {
+    let (n, n_echoes) = (misses.len(), shots.n_echoes());
+    shots.origin.extend(std::iter::repeat_n([0.0, 0.0, 0.0], n));
+    shots.direction.extend(misses);
+    shots.echo_start.extend(std::iter::repeat_n(n_echoes, n));
+    shots.echo_count.extend(std::iter::repeat_n(0, n));
+    Ok(shots)
 }
 
 /// Read an `.rxp` file as pulses (see [`read_rxp_shots_with_report`]).
@@ -509,6 +504,24 @@ pub fn read_rxp_shots(path: impl AsRef<Path>, opts: &RxpOptions) -> Result<Shots
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn misses_are_appended_as_concatenate_would() {
+        let mut cloud = PointCloud::new(vec![[0.0, 0.0, 1.0], [0.0, 0.0, 2.0], [0.0, 3.0, 0.0]]);
+        cloud.attrs.insert("gps_time".into(), Attr::F64(vec![1.0, 1.0, 2.0]));
+        let shots = Shots::from_pointcloud(&cloud, [0.0; 3]);
+        let misses = vec![[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]];
+        let empty = Shots {
+            origin: vec![[0.0; 3]; 2],
+            direction: misses.clone(),
+            echo_start: vec![0; 2],
+            echo_count: vec![0; 2],
+            echo_range: Vec::new(),
+            echo_attrs: shots.echo_attrs.iter().map(|(k, v)| (k.clone(), v.take(&[]))).collect(),
+        };
+        let joined = Shots::concatenate(&[&shots, &empty]).unwrap();
+        assert_eq!(with_misses(shots, misses).unwrap(), joined);
+    }
 
     #[test]
     fn mta_echoes_are_gathered_into_their_pulses() {

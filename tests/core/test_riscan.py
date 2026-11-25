@@ -91,3 +91,21 @@ def test_robson_creek_project():
     pc = shots.to_pointcloud()
     assert pc.z.min() > pos.sop[2, 3] - 5
     assert pc.z.max() > pos.sop[2, 3] + 5
+
+
+@needs_data
+def test_save_shots_writes_what_read_shots_saves(tmp_path):
+    pos = riscan.read_riscan_project(ROBSON).with_scans()[0]
+    opts = dict(fill_missing=True, max_lines=100, max_zone=1, keep_uncertain=True)
+    shots = pos.read_shots(**opts)
+    shots.save(tmp_path / "a.parquet")
+    assert pos.save_shots(tmp_path / "b.parquet", **opts) == (shots.n_shots, shots.n_echoes)
+    a, b = Shots.load(tmp_path / "a.parquet"), Shots.load(tmp_path / "b.parquet")
+    for k in ("origin", "direction", "echo_start", "echo_count", "echo_range"):
+        np.testing.assert_array_equal(getattr(a, k), getattr(b, k))
+    assert a.echo_attrs.keys() == b.echo_attrs.keys()
+    for k in a.echo_attrs:
+        np.testing.assert_array_equal(a.echo_attrs[k], b.echo_attrs[k])
+    ia, ib = Shots.file_info(tmp_path / "a.parquet"), Shots.file_info(tmp_path / "b.parquet")
+    np.testing.assert_array_equal(ia.pop("scans"), ib.pop("scans"))
+    assert ia == ib
