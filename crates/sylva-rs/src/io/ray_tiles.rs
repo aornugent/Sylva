@@ -91,15 +91,21 @@ impl Budget {
         Budget { total, free: Mutex::new(total), freed: Condvar::new() }
     }
 
+    /// Run `f` holding `need` bytes, returned however `f` ends (a panic too, so no other tile waits forever).
     fn hold<T>(&self, need: u64, f: impl FnOnce() -> T) -> T {
+        struct Held<'a>(&'a Budget, u64);
+        impl Drop for Held<'_> {
+            fn drop(&mut self) {
+                *self.0.free.lock().unwrap_or_else(|e| e.into_inner()) += self.1;
+                self.0.freed.notify_all();
+            }
+        }
         let need = need.min(self.total);
         let mut free = self.freed.wait_while(self.free.lock().unwrap(), |free| *free < need).unwrap();
         *free -= need;
         drop(free);
-        let out = f();
-        *self.free.lock().unwrap() += need;
-        self.freed.notify_all();
-        out
+        let _held = Held(self, need);
+        f()
     }
 }
 

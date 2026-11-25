@@ -21,8 +21,9 @@ the tag `archive/sylva-joint-2026-11-25`; earlier work such as `joint_tree` at `
   threshold, and skips echoes the amplitude filters drop anyway. 3dtrees reads every scan this way; it cuts a read's
   CPU time by about an eighth. No output change.
 - The RXP reader with MTA resolution decodes on a thread of its own, handing the passes each scan line as it
-  completes, so RiVLib's single-threaded decoding overlaps the MTA passes. About 5 % off a whole-scan read; the
-  same lines in the same order, so no output change.
+  completes, so RiVLib's single-threaded decoding overlaps the MTA passes. 3dtrees needs it because it reads every
+  scan of a plot this way, about 3 minutes each: about 5 % off a read; the same lines in the same order, so no output
+  change.
 - `ScanPosition.save_shots` reads a scan, moves it into the project frame and writes its Shots file without the
   pulses passing through Python, and the RXP-to-Shots path along the way stops copying whole scans (columns move
   rather than copy, misses are appended and the pulses transformed in place, the writer re-aims beams a row group at
