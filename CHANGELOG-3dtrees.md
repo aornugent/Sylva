@@ -28,7 +28,5 @@ the tag `archive/sylva-joint-2026-11-25`; earlier work such as `joint_tree` at `
   rather than copy, misses are appended and the pulses transformed in place, the writer re-aims beams a row group at
   a time). 3dtrees needs it to read more scans at once: a 40 M-pulse scan peaks at 5.3 GB instead of 13.2 GB. No
   output change.
-- The Shots writer encodes and compresses a row group's columns side by side on Sylva's thread pool, then splices
-  them into the file in order. Writing a 40 M-pulse scan takes 5 s instead of 14 s. The same data; no output change.
 - Our bindings live in `crates/sylva-py/src/fork_py.rs`, reached from upstream's `lib.rs` by one `mod` line and one
   `register` line, so a merge from upstream meets them nowhere else. No outputs.

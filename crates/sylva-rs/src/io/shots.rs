@@ -32,18 +32,14 @@ use std::fs::File;
 use std::path::Path;
 use std::sync::Arc;
 
-use bytes::Bytes;
 use parquet::basic::{Compression, Encoding, ZstdLevel};
 use parquet::column::reader::ColumnReader;
-use parquet::column::writer::{get_column_writer, get_typed_column_writer, ColumnCloseResult};
 use parquet::data_type::{BoolType, DataType, DoubleType, FloatType, Int32Type, Int64Type};
 use parquet::file::metadata::KeyValue;
-use parquet::file::properties::{WriterProperties, WriterPropertiesPtr};
+use parquet::file::properties::WriterProperties;
 use parquet::file::reader::{FileReader, SerializedFileReader};
-use parquet::file::writer::{SerializedFileWriter, SerializedPageWriter, TrackedWrite};
+use parquet::file::writer::{SerializedFileWriter, SerializedRowGroupWriter};
 use parquet::schema::parser::parse_message_type;
-use parquet::schema::types::ColumnDescPtr;
-use rayon::prelude::*;
 
 use crate::error::{Error, Result};
 use crate::pointcloud::Attr;
@@ -111,18 +107,11 @@ fn direction(zenith: f64, azimuth: f64) -> Point {
     [sz * sa, sz * ca, cz]
 }
 
-/// One column chunk of a row group, encoded and compressed on its own.
-type Encoded = (Bytes, ColumnCloseResult);
-type Job<'a> = Box<dyn Fn() -> Result<Encoded> + Send + Sync + 'a>;
-
-fn encode<T: DataType>(descr: ColumnDescPtr, props: &WriterPropertiesPtr, values: &[T::T], levels: Option<(&[i16], &[i16])>) -> Result<Encoded> {
-    let mut sink = TrackedWrite::new(Vec::new());
-    let close = {
-        let mut col = get_typed_column_writer::<T>(get_column_writer(descr, props.clone(), Box::new(SerializedPageWriter::new(&mut sink))));
-        col.write_batch(values, levels.map(|l| l.0), levels.map(|l| l.1))?;
-        col.close()?
-    };
-    Ok((Bytes::from(sink.into_inner()?), close))
+fn write_col<T: DataType>(rg: &mut SerializedRowGroupWriter<'_, File>, values: &[T::T], levels: Option<(&[i16], &[i16])>) -> Result<()> {
+    let mut col = rg.next_column()?.ok_or_else(|| Error::invalid("parquet: schema has fewer columns than the data"))?;
+    col.typed::<T>().write_batch(values, levels.map(|l| l.0), levels.map(|l| l.1))?;
+    col.close()?;
+    Ok(())
 }
 
 /// Write `shots` to a Parquet file (see the module docs for the layout).
@@ -212,27 +201,19 @@ pub fn write_shots(shots: &Shots, path: impl AsRef<Path>, opts: &ShotsWriteOptio
 
     // The echoes' bounding box, as `echo_xyz` of the re-aimed pulses would give it.
     let xyz_bounds = {
-        // a minimum and maximum don't depend on the order they are taken in, so the pulses are split up
-        let corner = || ([f64::INFINITY; 3], [f64::NEG_INFINITY; 3]);
-        let (lo, hi) = (0..n)
-            .into_par_iter()
-            .fold(
-                || (corner(), Vec::new()),
-                |((mut lo, mut hi), mut ranges), s| {
-                    ranges.clear();
-                    let (o, d) = aim(s, &mut ranges);
-                    for &r in &ranges {
-                        let p = crate::transform::add(&o, &crate::transform::scale(&d, r));
-                        for k in 0..3 {
-                            lo[k] = lo[k].min(p[k]);
-                            hi[k] = hi[k].max(p[k]);
-                        }
-                    }
-                    ((lo, hi), ranges)
-                },
-            )
-            .map(|(c, _)| c)
-            .reduce(corner, |(a0, a1), (b0, b1)| ([0, 1, 2].map(|k| a0[k].min(b0[k])), [0, 1, 2].map(|k| a1[k].max(b1[k]))));
+        let (mut lo, mut hi) = ([f64::INFINITY; 3], [f64::NEG_INFINITY; 3]);
+        let mut ranges = Vec::new();
+        for s in 0..n {
+            ranges.clear();
+            let (o, d) = aim(s, &mut ranges);
+            for &r in &ranges {
+                let p = crate::transform::add(&o, &crate::transform::scale(&d, r));
+                for k in 0..3 {
+                    lo[k] = lo[k].min(p[k]);
+                    hi[k] = hi[k].max(p[k]);
+                }
+            }
+        }
         if shots.n_echoes() == 0 {
             ([0.0; 3], [0.0; 3])
         } else {
@@ -274,17 +255,30 @@ pub fn write_shots(shots: &Shots, path: impl AsRef<Path>, opts: &ShotsWriteOptio
         .set_column_dictionary_enabled("range.list.element".into(), false)
         .build();
     let file = File::create(path).map_err(|e| Error::file(path, e.to_string()))?;
-    let props = Arc::new(props);
-    let mut writer = SerializedFileWriter::new(file, schema, props.clone())?;
-    let cols: Vec<ColumnDescPtr> = writer.schema_descr().columns().to_vec();
-    let props = &props;
+    let mut writer = SerializedFileWriter::new(file, schema, Arc::new(props))?;
 
-    // Each row group's columns are encoded and compressed side by side, then spliced into the file in order.
     let group = opts.row_group_size.max(1);
     for s0 in (0..n.max(1)).step_by(group) {
         let s1 = (s0 + group).min(n);
         let mut ranges = Vec::new();
         let (origin, dirs): (Vec<Point>, Vec<Point>) = (s0..s1).map(|s| aim(s, &mut ranges)).unzip();
+        let mut rg = writer.next_row_group()?;
+        if per_shot_origin {
+            for k in 0..3 {
+                let v: Vec<i32> = origin.iter().map(|o| ((o[k] - origin_offset[k]) / origin_scale).round() as i32).collect();
+                write_col::<Int32Type>(&mut rg, &v, None)?;
+            }
+        } else {
+            write_col::<Int32Type>(&mut rg, &scan_of[s0..s1], None)?;
+        }
+        for k in 0..2 {
+            let v: Vec<f64> = dirs.iter().map(|d| if k == 0 { angles(d).0 } else { angles(d).1 }).collect();
+            if opts.double {
+                write_col::<DoubleType>(&mut rg, &v, None)?;
+            } else {
+                write_col::<FloatType>(&mut rg, &v.iter().map(|&x| x as f32).collect::<Vec<_>>(), None)?;
+            }
+        }
         // List levels, shared by every echo column: an empty list is one
         // entry at definition level 0; elements are at level 1, repeating after the first.
         let (e0, e1) = if s0 < n { (shots.echo_start[s0], shots.echo_start[s1 - 1] + shots.echo_count[s1 - 1] as usize) } else { (0, 0) };
@@ -300,63 +294,25 @@ pub fn write_shots(shots: &Shots, path: impl AsRef<Path>, opts: &ShotsWriteOptio
                 rep.push((j > 0) as i16);
             }
         }
-        let mut jobs: Vec<Job> = Vec::new();
-        let mut col = cols.iter().cloned();
-        let mut next = || col.next().ok_or_else(|| Error::invalid("parquet: schema has fewer columns than the data"));
-        if per_shot_origin {
-            for k in 0..3 {
-                let (d, origin) = (next()?, &origin);
-                jobs.push(Box::new(move || {
-                    let v: Vec<i32> = origin.iter().map(|o| ((o[k] - origin_offset[k]) / origin_scale).round() as i32).collect();
-                    encode::<Int32Type>(d.clone(), props, &v, None)
-                }));
-            }
-        } else {
-            let (d, ids) = (next()?, &scan_of[s0..s1]);
-            jobs.push(Box::new(move || encode::<Int32Type>(d.clone(), props, ids, None)));
-        }
-        for k in 0..2 {
-            let (d, dirs) = (next()?, &dirs);
-            jobs.push(Box::new(move || {
-                let v = dirs.iter().map(|d| if k == 0 { angles(d).0 } else { angles(d).1 });
-                if opts.double {
-                    encode::<DoubleType>(d.clone(), props, &v.collect::<Vec<_>>(), None)
-                } else {
-                    encode::<FloatType>(d.clone(), props, &v.map(|x| x as f32).collect::<Vec<_>>(), None)
-                }
-            }));
-        }
         let lv = Some((&def[..], &rep[..]));
-        let (d, ranges) = (next()?, &ranges);
-        jobs.push(Box::new(move || {
-            if opts.double {
-                encode::<DoubleType>(d.clone(), props, ranges, lv)
-            } else {
-                encode::<FloatType>(d.clone(), props, &ranges.iter().map(|&x| x as f32).collect::<Vec<_>>(), lv)
-            }
-        }));
-        fn ints<T: Copy>(v: &[T], f: impl Fn(T) -> i32) -> Vec<i32> {
-            v.iter().map(|&x| f(x)).collect()
+        if opts.double {
+            write_col::<DoubleType>(&mut rg, &ranges, lv)?;
+        } else {
+            write_col::<FloatType>(&mut rg, &ranges.iter().map(|&x| x as f32).collect::<Vec<_>>(), lv)?;
         }
         for a in shots.echo_attrs.values() {
-            let d = next()?;
-            let job: Job = match a {
-                Attr::F64(v) => Box::new(move || encode::<DoubleType>(d.clone(), props, &v[e0..e1], lv)),
-                Attr::F32(v) => Box::new(move || encode::<FloatType>(d.clone(), props, &v[e0..e1], lv)),
-                Attr::I64(v) => Box::new(move || encode::<Int64Type>(d.clone(), props, &v[e0..e1], lv)),
-                Attr::I32(v) => Box::new(move || encode::<Int32Type>(d.clone(), props, &v[e0..e1], lv)),
-                Attr::U32(v) => Box::new(move || encode::<Int32Type>(d.clone(), props, &ints(&v[e0..e1], |x| x as i32), lv)),
-                Attr::U16(v) => Box::new(move || encode::<Int32Type>(d.clone(), props, &ints(&v[e0..e1], |x| x as i32), lv)),
-                Attr::U8(v) => Box::new(move || encode::<Int32Type>(d.clone(), props, &ints(&v[e0..e1], |x| x as i32), lv)),
-                Attr::I8(v) => Box::new(move || encode::<Int32Type>(d.clone(), props, &ints(&v[e0..e1], |x| x as i32), lv)),
-                Attr::Bool(v) => Box::new(move || encode::<BoolType>(d.clone(), props, &v[e0..e1], lv)),
-            };
-            jobs.push(job);
-        }
-        let encoded: Vec<Encoded> = jobs.par_iter().map(|j| j()).collect::<Result<_>>()?;
-        let mut rg = writer.next_row_group()?;
-        for (bytes, close) in encoded {
-            rg.append_column(&bytes, close)?;
+            let as_i32 = |it: &mut dyn Iterator<Item = i32>| it.collect::<Vec<i32>>();
+            match a {
+                Attr::F64(v) => write_col::<DoubleType>(&mut rg, &v[e0..e1], lv)?,
+                Attr::F32(v) => write_col::<FloatType>(&mut rg, &v[e0..e1], lv)?,
+                Attr::I64(v) => write_col::<Int64Type>(&mut rg, &v[e0..e1], lv)?,
+                Attr::I32(v) => write_col::<Int32Type>(&mut rg, &v[e0..e1], lv)?,
+                Attr::U32(v) => write_col::<Int32Type>(&mut rg, &as_i32(&mut v[e0..e1].iter().map(|&x| x as i32)), lv)?,
+                Attr::U16(v) => write_col::<Int32Type>(&mut rg, &as_i32(&mut v[e0..e1].iter().map(|&x| x as i32)), lv)?,
+                Attr::U8(v) => write_col::<Int32Type>(&mut rg, &as_i32(&mut v[e0..e1].iter().map(|&x| x as i32)), lv)?,
+                Attr::I8(v) => write_col::<Int32Type>(&mut rg, &as_i32(&mut v[e0..e1].iter().map(|&x| x as i32)), lv)?,
+                Attr::Bool(v) => write_col::<BoolType>(&mut rg, &v[e0..e1], lv)?,
+            }
         }
         rg.close()?;
     }

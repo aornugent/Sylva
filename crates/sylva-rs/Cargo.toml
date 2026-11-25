@@ -21,7 +21,6 @@ thiserror.workspace = true
 byteorder.workspace = true
 libloading.workspace = true
 parquet.workspace = true
-bytes.workspace = true
 roxmltree.workspace = true
 serde_json.workspace = true
 spade.workspace = true
