@@ -141,7 +141,8 @@ fn bin_file(path: &Path, file_idx: u16, bins: &Path, opts: &TileOptions) -> Resu
     rec[24..26].copy_from_slice(&file_idx.to_le_bytes());
     let mut row0: usize = 0; // pulses in the groups before this one
     for g in 0..f.n_groups() {
-        let shots = f.read_group(g)?;
+        // the geometry and the one attribute the tiles carry
+        let shots = f.read_group_with(g, |a| a == "mta_uncertain_point")?;
         let uncertain = match shots.echo_attrs.get("mta_uncertain_point") {
             Some(Attr::U8(v)) => Some(v),
             _ => None,

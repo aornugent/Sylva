@@ -473,6 +473,11 @@ impl ShotsFile {
 
     /// Read one row group.
     pub fn read_group(&self, group: usize) -> Result<Shots> {
+        self.read_group_with(group, |_| true)
+    }
+
+    /// [`Self::read_group`] with only the echo attributes `want` accepts: the other columns are not decoded.
+    pub fn read_group_with(&self, group: usize, want: impl Fn(&str) -> bool) -> Result<Shots> {
         let rg = self.reader.get_row_group(group)?;
         let rows = rg.metadata().num_rows() as usize;
         let mut col = 0;
@@ -518,8 +523,12 @@ impl ShotsFile {
             }
             at += (l > 0) as usize;
         }
-        for (name, dtype) in &self.attrs {
-            let c = next()?;
+        let first_attr = col;
+        for (i, (name, dtype)) in self.attrs.iter().enumerate() {
+            if !want(name) {
+                continue;
+            }
+            let c = rg.get_column_reader(first_attr + i)?;
             let ints = |c| read_values::<Int32Type>(c, rows, true, reader_of!(Int32ColumnReader)).map(|v| v.0);
             let attr = match dtype.as_str() {
                 "float64" => Attr::F64(read_values::<DoubleType>(c, rows, true, reader_of!(DoubleColumnReader))?.0),
@@ -594,4 +603,26 @@ pub(crate) fn append(out: &mut Shots, part: Shots) -> Result<()> {
 /// Read a whole shots file.
 pub fn read_shots(path: impl AsRef<Path>) -> Result<Shots> {
     ShotsFile::open(path)?.read_all()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_group_read_with_some_attributes_is_the_full_read_without_the_others() {
+        let mut cloud = crate::PointCloud::new(vec![[0.0, 0.0, 1.0], [0.0, 0.0, 2.0], [0.0, 3.0, 0.0]]);
+        cloud.attrs.insert("gps_time".into(), Attr::F64(vec![1.0, 1.0, 2.0]));
+        cloud.attrs.insert("mta_uncertain_point".into(), Attr::U8(vec![0, 1, 0]));
+        let shots = Shots::from_pointcloud(&cloud, [0.0; 3]);
+        let path = std::env::temp_dir().join(format!("sylva-shots-attrs-{}.parquet", std::process::id()));
+        write_shots(&shots, &path, &ShotsWriteOptions::default()).unwrap();
+        let f = ShotsFile::open(&path).unwrap();
+        let mut full = f.read_group(0).unwrap();
+        let some = f.read_group_with(0, |a| a == "mta_uncertain_point").unwrap();
+        full.echo_attrs.remove("gps_time");
+        assert_eq!(some, full);
+        assert!(f.read_group_with(0, |_| false).unwrap().echo_attrs.is_empty());
+        std::fs::remove_file(&path).unwrap();
+    }
 }
