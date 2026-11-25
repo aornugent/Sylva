@@ -345,7 +345,8 @@ def read_rxp(path: str | Path, **options) -> PointCloud:
         - ``mta`` (``"auto"``): ``"auto"`` resolves MTA when the shim is
           found, ``"on"`` requires it, ``"off"`` reads plainly.
         - ``max_zone`` (6): MTA zones considered (1..8).
-        - ``keep_uncertain`` (False): keep MTA-uncertain echoes, flagged in
+        - ``keep_uncertain`` (False): keep MTA-uncertain echoes in zone 1,
+          on the pulse they were recorded after, flagged in
           ``mta_uncertain_point``, instead of dropping them as RiSCAN does.
         - ``mta_model`` (None): how the zone and keep/drop are decided from
           the evidence. ``None`` or ``"default"`` uses the learned model
