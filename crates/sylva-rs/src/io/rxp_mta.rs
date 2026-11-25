@@ -268,6 +268,16 @@ impl Line {
     }
 }
 
+/// What the decoding thread hands the MTA passes, in scan order.
+enum Decoded {
+    /// The RXP's notch window (range from, range to, amplitude below), before any line.
+    Notch((f64, f64, f32)),
+    /// A scan line, complete: the passes run on every line they can.
+    Line(Line),
+    /// The last line, cut off by the end of the file: the passes then finish every line.
+    Last(Line),
+}
+
 /// Output columns, grown line by line.
 #[derive(Default)]
 struct Out {
@@ -679,111 +689,136 @@ pub fn read_rxp_mta_with_stats(path: &Path, opts: &RxpOptions, m: &MtaOptions) -
             let version: Symbol<VersionFn> = lib.get(b"sylva_rxp_api_version\0").map_err(|e| Error::Riegl(e.to_string()))?;
             (open, read, meta, last_error, close, version)
         };
+        // plain function pointers, for the decoding thread
+        let (open, read, meta, last_error, close): (OpenFn, ReadFn, MetaFn, ErrFn, CloseFn) = (*open, *read, *meta, *last_error, *close);
         // SAFETY: plain call.
         let v = unsafe { version() };
         if v != API_VERSION {
             return Err(Error::Riegl(format!("libsylva_rivlib API version {v}, Sylva expects {API_VERSION}: rebuild the shim")));
         }
         let uri = CString::new(format!("file:{}", path.canonicalize().unwrap_or(path.to_path_buf()).display())).map_err(|e| Error::Riegl(e.to_string()))?;
-        let mut handle: Handle = std::ptr::null_mut();
         let max_zone = m.max_zone.clamp(1, MAXZ) as i32;
-        // SAFETY: valid C string and out-pointer; the notch is applied by us afterwards.
-        let rc = unsafe { open(uri.as_ptr(), max_zone, 0, &mut handle) };
-        let describe = |what: &str| -> Error {
-            // SAFETY: handle is valid until close.
-            let msg = unsafe { CStr::from_ptr(last_error(handle)) }.to_string_lossy().into_owned();
-            Error::Riegl(format!("{}: {what}: {msg}", path.display()))
-        };
-        if rc != 0 {
-            let e = describe("cannot open");
-            // SAFETY: handle was allocated by open even on failure.
-            unsafe { close(handle) };
-            return Err(e);
-        }
-        const SHOTS: usize = 4096;
-        const ECHOES: usize = SHOTS * 8 + 256;
-        let zero_shot = ShimShot { time: 0.0, line: 0, shot: 0, facet: 0, flags: 0, n_echo: 0, pad: 0, ox: 0.0, oy: 0.0, oz: 0.0, dx: 0.0, dy: 0.0, dz: 0.0 };
-        let zero_echo = ShimEcho { range: 0.0, amplitude: 0.0, reflectance: 0.0, deviation: 0.0, background: 0.0, flags: 0, nzone: 0, zone_range: [0.0; 8], zone_reflectance: [0.0; 8] };
-        let mut shot_buf = vec![zero_shot; SHOTS];
-        let mut echo_buf = vec![zero_echo; ECHOES];
         let features = std::env::var_os("SYLVA_MTA_FEATURES").and_then(|f| std::fs::File::create(f).ok()).map(std::io::BufWriter::new);
         let model = load_decision(&m.decision)?;
         let mut pipe = Pipeline { opts, m, lines: VecDeque::new(), out: Out::default(), n: MtaStats::default(), notch: None, features, model };
-        let mut cur: Option<Line> = None;
-        let mut meta_read = false;
         let nzone = max_zone as usize;
-        let mut stop = false;
-        loop {
-            let (mut ns, mut ne, mut eof) = (0u32, 0u32, 0i32);
-            // SAFETY: buffers sized as declared.
-            let rc = unsafe { read(handle, SHOTS as u32, shot_buf.as_mut_ptr(), &mut ns, echo_buf.as_mut_ptr(), ECHOES as u32, &mut ne, &mut eof) };
+
+        // RiVLib decodes on a thread of its own, handing over each scan line as it completes, while this
+        // thread runs the passes on the lines already decoded: the same lines in the same order, so the
+        // same result as one thread doing both.
+        let (tx, rx) = std::sync::mpsc::sync_channel::<Decoded>(64);
+        let decode = move || -> Result<()> {
+            let mut handle: Handle = std::ptr::null_mut();
+            // SAFETY: valid C string and out-pointer; the notch is applied by us afterwards.
+            let rc = unsafe { open(uri.as_ptr(), max_zone, 0, &mut handle) };
+            let describe = |what: &str| -> Error {
+                // SAFETY: handle is valid until close.
+                let msg = unsafe { CStr::from_ptr(last_error(handle)) }.to_string_lossy().into_owned();
+                Error::Riegl(format!("{}: {what}: {msg}", path.display()))
+            };
             if rc != 0 {
-                let e = describe("read error");
-                // SAFETY: handle valid.
+                let e = describe("cannot open");
+                // SAFETY: handle was allocated by open even on failure.
                 unsafe { close(handle) };
                 return Err(e);
             }
-            if !meta_read && ns > 0 {
-                meta_read = true;
-                let mut buf = vec![0u8; 1 << 16];
-                // SAFETY: buffer size passed.
-                let need = unsafe { meta(handle, buf.as_mut_ptr() as *mut c_char, buf.len() as u32) } as usize;
-                if need > buf.len() {
-                    buf = vec![0u8; need];
-                    // SAFETY: as above.
-                    unsafe { meta(handle, buf.as_mut_ptr() as *mut c_char, buf.len() as u32) };
+            const SHOTS: usize = 4096;
+            const ECHOES: usize = SHOTS * 8 + 256;
+            let zero_shot = ShimShot { time: 0.0, line: 0, shot: 0, facet: 0, flags: 0, n_echo: 0, pad: 0, ox: 0.0, oy: 0.0, oz: 0.0, dx: 0.0, dy: 0.0, dz: 0.0 };
+            let zero_echo = ShimEcho { range: 0.0, amplitude: 0.0, reflectance: 0.0, deviation: 0.0, background: 0.0, flags: 0, nzone: 0, zone_range: [0.0; 8], zone_reflectance: [0.0; 8] };
+            let mut shot_buf = vec![zero_shot; SHOTS];
+            let mut echo_buf = vec![zero_echo; ECHOES];
+            let mut cur: Option<Line> = None;
+            let mut meta_read = false;
+            let mut stop = false;
+            // a send fails only when the passes have stopped listening, which they don't before the end
+            let send = |d: Decoded| tx.send(d).map_err(|_| Error::Riegl("the MTA passes stopped before the scan was decoded".into()));
+            loop {
+                let (mut ns, mut ne, mut eof) = (0u32, 0u32, 0i32);
+                // SAFETY: buffers sized as declared.
+                let rc = unsafe { read(handle, SHOTS as u32, shot_buf.as_mut_ptr(), &mut ns, echo_buf.as_mut_ptr(), ECHOES as u32, &mut ne, &mut eof) };
+                if rc != 0 {
+                    let e = describe("read error");
+                    // SAFETY: handle valid.
+                    unsafe { close(handle) };
+                    return Err(e);
                 }
-                let js = String::from_utf8_lossy(&buf).trim_end_matches('\0').to_string();
-                if let (Some(a), Some(b), Some(c)) = (json_f64(&js, "range_min"), json_f64(&js, "range_max"), json_f64(&js, "amplitude_max")) {
-                    pipe.notch = Some((a, b, c as f32));
+                if !meta_read && ns > 0 {
+                    meta_read = true;
+                    let mut buf = vec![0u8; 1 << 16];
+                    // SAFETY: buffer size passed.
+                    let need = unsafe { meta(handle, buf.as_mut_ptr() as *mut c_char, buf.len() as u32) } as usize;
+                    if need > buf.len() {
+                        buf = vec![0u8; need];
+                        // SAFETY: as above.
+                        unsafe { meta(handle, buf.as_mut_ptr() as *mut c_char, buf.len() as u32) };
+                    }
+                    let js = String::from_utf8_lossy(&buf).trim_end_matches('\0').to_string();
+                    if let (Some(a), Some(b), Some(c)) = (json_f64(&js, "range_min"), json_f64(&js, "range_max"), json_f64(&js, "amplitude_max")) {
+                        send(Decoded::Notch((a, b, c as f32)))?;
+                    }
                 }
-            }
-            let mut ei = 0usize;
-            for si in 0..ns as usize {
-                let s = shot_buf[si];
-                let (line_no, shot_no, n_echo) = (s.line, s.shot, s.n_echo as usize);
-                if cur.as_ref().map(|l| l.index != line_no).unwrap_or(true) {
-                    if let Some(mut l) = cur.take() {
-                        l.finish(nzone, &m.params);
-                        pipe.lines.push_back(l);
-                        pipe.advance(false);
-                        if let Some(max) = m.max_lines {
-                            if line_no as usize >= max {
-                                stop = true;
+                let mut ei = 0usize;
+                for si in 0..ns as usize {
+                    let s = shot_buf[si];
+                    let (line_no, shot_no, n_echo) = (s.line, s.shot, s.n_echo as usize);
+                    if cur.as_ref().map(|l| l.index != line_no).unwrap_or(true) {
+                        if let Some(mut l) = cur.take() {
+                            l.finish(nzone, &m.params);
+                            send(Decoded::Line(l))?;
+                            if let Some(max) = m.max_lines {
+                                if line_no as usize >= max {
+                                    stop = true;
+                                }
                             }
                         }
+                        if stop {
+                            break;
+                        }
+                        cur = Some(Line::new(line_no));
                     }
-                    if stop {
-                        break;
+                    let l = cur.as_mut().unwrap();
+                    debug_assert_eq!(shot_no as usize, l.shots.len());
+                    let (time, ox, oy, oz, dx, dy, dz, facet) = (s.time, s.ox, s.oy, s.oz, s.dx, s.dy, s.dz, s.facet);
+                    l.shots.push(ShotRec { time, o: [ox, oy, oz], d: [dx, dy, dz], facet });
+                    for _ in 0..n_echo {
+                        let e = echo_buf[ei];
+                        ei += 1;
+                        let (r1, amp, dev, flags, zr, zrefl) = (e.range, e.amplitude, e.deviation, e.flags, e.zone_range, e.zone_reflectance);
+                        if opts.drop_pseudo_echoes && flags & super::riegl::FLAG_PSEUDO_ECHO != 0 {
+                            continue;
+                        }
+                        l.echoes.push(EchoRec { shot: shot_no, r1, amp, dev, flags, zr, zrefl });
                     }
-                    cur = Some(Line::new(line_no));
                 }
-                let l = cur.as_mut().unwrap();
-                debug_assert_eq!(shot_no as usize, l.shots.len());
-                let (time, ox, oy, oz, dx, dy, dz, facet) = (s.time, s.ox, s.oy, s.oz, s.dx, s.dy, s.dz, s.facet);
-                l.shots.push(ShotRec { time, o: [ox, oy, oz], d: [dx, dy, dz], facet });
-                for _ in 0..n_echo {
-                    let e = echo_buf[ei];
-                    ei += 1;
-                    let (r1, amp, dev, flags, zr, zrefl) = (e.range, e.amplitude, e.deviation, e.flags, e.zone_range, e.zone_reflectance);
-                    if opts.drop_pseudo_echoes && flags & super::riegl::FLAG_PSEUDO_ECHO != 0 {
-                        continue;
-                    }
-                    l.echoes.push(EchoRec { shot: shot_no, r1, amp, dev, flags, zr, zrefl });
+                if stop || eof != 0 {
+                    break;
                 }
             }
-            if stop || eof != 0 {
-                break;
+            // SAFETY: handle valid.
+            unsafe { close(handle) };
+            if !stop {
+                if let Some(mut l) = cur.take() {
+                    l.finish(nzone, &m.params);
+                    send(Decoded::Last(l))?;
+                }
             }
-        }
-        // SAFETY: handle valid.
-        unsafe { close(handle) };
-        if !stop {
-            if let Some(mut l) = cur.take() {
-                l.finish(nzone, &m.params);
-                pipe.lines.push_back(l);
+            Ok(())
+        };
+        std::thread::scope(|scope| -> Result<()> {
+            let decoder = scope.spawn(decode);
+            for d in rx {
+                match d {
+                    Decoded::Notch(n) => pipe.notch = Some(n),
+                    Decoded::Line(l) => {
+                        pipe.lines.push_back(l);
+                        pipe.advance(false);
+                    }
+                    Decoded::Last(l) => pipe.lines.push_back(l),
+                }
             }
-        }
+            decoder.join().map_err(|_| Error::Riegl(format!("{}: the RXP decoding thread panicked", path.display())))?
+        })?;
         pipe.advance(true);
         let stats = pipe.n;
         Ok((finish(pipe.out, opts, m), stats))

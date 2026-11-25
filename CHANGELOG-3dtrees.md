@@ -20,6 +20,9 @@ the tag `archive/sylva-joint-2026-11-25`; earlier work such as `joint_tree` at `
   hypothesis, as with `max_zone=1`): it stops once the remaining trees' leaf bounds can't carry the score across the
   threshold, and skips echoes the amplitude filters drop anyway. 3dtrees reads every scan this way; it cuts a read's
   CPU time by about an eighth. No output change.
+- The RXP reader with MTA resolution decodes on a thread of its own, handing the passes each scan line as it
+  completes, so RiVLib's single-threaded decoding overlaps the MTA passes. About 5 % off a whole-scan read; the
+  same lines in the same order, so no output change.
 - `ScanPosition.save_shots` reads a scan, moves it into the project frame and writes its Shots file without the
   pulses passing through Python, and the RXP-to-Shots path along the way stops copying whole scans (columns move
   rather than copy, misses are appended and the pulses transformed in place, the writer re-aims beams a row group at
