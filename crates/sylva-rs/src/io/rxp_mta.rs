@@ -476,6 +476,8 @@ impl Pipeline<'_> {
             starts.push(echoes.len());
             let mut v = dec.to_vec();
             let n_shots = self.lines[i].shots.len().max(1) as f32;
+            // echoes the filters below drop before looking at their decision need none, unless it is dumped
+            let dumped = self.features.is_some();
             let out: Vec<(usize, Decision)> = starts
                 .par_windows(2)
                 .flat_map_iter(|w| {
@@ -510,10 +512,13 @@ impl Pipeline<'_> {
                             shot_frac: e.shot as f32 / n_shots,
                         };
                         let mut d = dec[e_i];
-                        match model.decide(&e.zr, &e.zrefl, &d.evidence, info) {
-                            Some((zone, p)) => {
+                        if !dumped && (e.amp <= 0.0 || (e.amp < weak_a && e.r1 < weak_r)) {
+                            return (e_i, d);
+                        }
+                        match model.decide_keep(&e.zr, &e.zrefl, &d.evidence, info) {
+                            Some((zone, keep, p)) => {
                                 d.zone = zone;
-                                d.stage = if p >= model.threshold() { 4 } else { 0 };
+                                d.stage = if keep { 4 } else { 0 };
                                 d.score = p;
                             }
                             None => {

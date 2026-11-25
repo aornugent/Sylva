@@ -14,6 +14,15 @@
 //! `threshold`, `missing_left`, `left`, `right`, `leaf` (scikit-learn's
 //! `HistGradientBoostingClassifier` node table), plus `baseline` (log-odds)
 //! and the `features` list in the order [`row_features`] produces them.
+//!
+//! Where only the keep/drop call matters ([`MtaModel::decide_keep`] with a
+//! single zone hypothesis), the sum stops as soon as the trees still to come
+//! cannot carry it across the threshold, whatever leaves they reach: each
+//! tree's lowest and highest leaf bound what it can add. The trees are summed
+//! widest leaf range first, so the bounds close early, and a sum that ends
+//! too near the threshold to be sure of its rounding is redone exactly as
+//! [`MtaModel::score`] does it, so the call is always the one the full score
+//! makes.
 
 use std::path::Path;
 
@@ -44,12 +53,47 @@ struct Tree {
     nodes: Vec<Node>,
 }
 
+impl Tree {
+    /// The leaf value `x` reaches.
+    fn leaf(&self, x: &[f32; FEATURE_NAMES.len()]) -> f64 {
+        let mut i = 0usize;
+        loop {
+            let n = &self.nodes[i];
+            if n.leaf {
+                return n.value as f64;
+            }
+            let v = x[n.feature as usize];
+            let go_left = if v.is_nan() { n.missing_left } else { v <= n.threshold };
+            i = if go_left { n.left as usize } else { n.right as usize };
+        }
+    }
+
+    /// Lowest and highest leaf value.
+    fn leaf_range(&self) -> (f64, f64) {
+        self.nodes.iter().filter(|n| n.leaf).fold((f64::INFINITY, f64::NEG_INFINITY), |(lo, hi), n| (lo.min(n.value as f64), hi.max(n.value as f64)))
+    }
+}
+
 /// A boosted-tree decision rule loaded from JSON.
 pub struct MtaModel {
     kmax: usize,
     baseline: f64,
     threshold: f32,
     trees: Vec<Tree>,
+    /// Tree indices, widest leaf range first: the order [`Self::keeps`] sums them in.
+    order: Vec<u32>,
+    /// Sums of the lowest (`rest_lo`) and highest (`rest_hi`) leaves of the trees from each position of `order` on.
+    rest_lo: Vec<f64>,
+    rest_hi: Vec<f64>,
+    /// A raw score (log-odds) at or above `sure_keep` keeps and one at or below `sure_drop` drops, with room to
+    /// spare for the rounding of a sum taken in another order; both infinite where no such margin is safe.
+    sure_keep: f64,
+    sure_drop: f64,
+}
+
+/// The probability of a raw score, as [`MtaModel::score`] rounds it.
+fn probability(raw: f64) -> f32 {
+    (1.0 / (1.0 + (-raw).exp())) as f32
 }
 
 /// What the model needs to know about one echo besides the per-zone evidence.
@@ -116,7 +160,32 @@ impl MtaModel {
                 .collect();
             trees.push(Tree { nodes });
         }
-        Ok(MtaModel { kmax: kmax.clamp(1, MAXZ), baseline, threshold, trees })
+        Ok(MtaModel::new(kmax.clamp(1, MAXZ), baseline, threshold, trees))
+    }
+
+    fn new(kmax: usize, baseline: f64, threshold: f32, trees: Vec<Tree>) -> MtaModel {
+        let ranges: Vec<(f64, f64)> = trees.iter().map(Tree::leaf_range).collect();
+        let mut order: Vec<u32> = (0..trees.len() as u32).collect();
+        order.sort_by(|&a, &b| {
+            let w = |t: u32| ranges[t as usize].1 - ranges[t as usize].0;
+            w(b).total_cmp(&w(a))
+        });
+        let (mut rest_lo, mut rest_hi) = (vec![0.0; trees.len() + 1], vec![0.0; trees.len() + 1]);
+        for i in (0..trees.len()).rev() {
+            let (lo, hi) = ranges[order[i] as usize];
+            rest_lo[i] = rest_lo[i + 1] + lo;
+            rest_hi[i] = rest_hi[i + 1] + hi;
+        }
+        // The threshold's log-odds with a margin far above the rounding of 500 sums, kept only if the
+        // probabilities on either side of it do round to the two sides of the threshold.
+        let t = threshold as f64;
+        let raw_t = (t / (1.0 - t)).ln();
+        let margin = 1e-3 * (1.0 + raw_t.abs());
+        let (mut sure_keep, mut sure_drop) = (raw_t + margin, raw_t - margin);
+        if !(raw_t.is_finite() && probability(sure_keep) >= threshold && probability(sure_drop) < threshold) {
+            (sure_keep, sure_drop) = (f64::INFINITY, f64::NEG_INFINITY);
+        }
+        MtaModel { kmax, baseline, threshold, trees, order, rest_lo, rest_hi, sure_keep, sure_drop }
     }
 
     /// Load from a file.
@@ -139,19 +208,24 @@ impl MtaModel {
     pub fn score(&self, x: &[f32; FEATURE_NAMES.len()]) -> f32 {
         let mut raw = self.baseline;
         for t in &self.trees {
-            let mut i = 0usize;
-            loop {
-                let n = &t.nodes[i];
-                if n.leaf {
-                    raw += n.value as f64;
-                    break;
-                }
-                let v = x[n.feature as usize];
-                let go_left = if v.is_nan() { n.missing_left } else { v <= n.threshold };
-                i = if go_left { n.left as usize } else { n.right as usize };
+            raw += t.leaf(x);
+        }
+        probability(raw)
+    }
+
+    /// Whether `score(x) >= threshold()`, summing only as many trees as the answer needs (module docs).
+    pub fn keeps(&self, x: &[f32; FEATURE_NAMES.len()]) -> bool {
+        let mut raw = self.baseline;
+        for (i, &t) in self.order.iter().enumerate() {
+            raw += self.trees[t as usize].leaf(x);
+            if raw + self.rest_lo[i + 1] >= self.sure_keep {
+                return true;
+            }
+            if raw + self.rest_hi[i + 1] <= self.sure_drop {
+                return false;
             }
         }
-        (1.0 / (1.0 + (-raw).exp())) as f32
+        self.score(x) >= self.threshold
     }
 
     /// Best zone and its score for one echo (`zr`: hypothesis ranges, NaN = none).
@@ -168,6 +242,18 @@ impl MtaModel {
             }
         }
         best
+    }
+
+    /// [`Self::decide`] for a caller that needs only the zone and whether its score reaches the threshold:
+    /// `(zone, keep, score)`, the score NaN where a single hypothesis let [`Self::keeps`] stop early. The
+    /// zone and keep are always the ones `decide` gives.
+    pub fn decide_keep(&self, zr: &[f32; MAXZ], zrefl: &[f32; MAXZ], ev: &Evidence, info: EchoInfo) -> Option<(u8, bool, f32)> {
+        let mut finite = (0..self.kmax).filter(|&k| zr[k].is_finite());
+        match (finite.next(), finite.next()) {
+            (None, _) => None,
+            (Some(k), None) => Some((k as u8 + 1, self.keeps(&row_features(k, zr, zrefl, ev, info, self.kmax)), f32::NAN)),
+            _ => self.decide(zr, zrefl, ev, info).map(|(zone, p)| (zone, p >= self.threshold, p)),
+        }
     }
 }
 
@@ -243,6 +329,54 @@ mod tests {
         let (zone, p) = m.decide(&zr, &zr, &ev, info).unwrap();
         assert_eq!(zone, 2);
         assert!(p > m.threshold());
+    }
+
+    #[test]
+    fn the_early_exit_makes_the_full_scores_call() {
+        let tiny = MtaModel::from_json(TINY).unwrap();
+        let mut x = [0f32; FEATURE_NAMES.len()];
+        for v in [3.0, 9.0, f32::NAN] {
+            x[3] = v;
+            assert_eq!(tiny.keeps(&x), tiny.score(&x) >= tiny.threshold());
+        }
+        let Some(js) = super::super::rxp_mta::DEFAULT_MODEL_JSON else { return };
+        let m = MtaModel::from_json(js).unwrap();
+        // Rows of plausible magnitudes, some features missing, from a fixed generator.
+        let mut seed = 0x9e3779b97f4a7c15u64;
+        let mut next = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            (seed >> 11) as f32 / (1u64 << 53) as f32
+        };
+        let (mut kept, mut n) = (0, 20_000);
+        for _ in 0..n {
+            for v in x.iter_mut() {
+                let u = next();
+                *v = if u < 0.05 { f32::NAN } else if u < 0.2 { -1.0 } else { next() * 60.0 - 5.0 };
+            }
+            x[0] = 1.0;
+            let full = m.score(&x) >= m.threshold();
+            assert_eq!(m.keeps(&x), full, "{x:?}");
+            kept += full as usize;
+        }
+        // Both answers occur, so both exits were exercised.
+        n -= kept;
+        assert!(kept > 0 && n > 0, "kept {kept}, dropped {n}");
+
+        let mut zr = [f32::NAN; MAXZ];
+        zr[0] = 20.0;
+        let ev = Evidence::default();
+        let info = EchoInfo { amplitude: 10.0, deviation: 1.0, r1: 20.0, late: false, n_echoes: 1, idx_in_shot: 1, prev_amp: -1.0, prev_gap: -1.0, next_amp: -1.0, shot_frac: 0.5 };
+        for zones in [1, 2, 3] {
+            for k in 1..zones {
+                zr[k] = 20.0 + 60.0 * k as f32;
+            }
+            let (zone, p) = m.decide(&zr, &zr, &ev, info).unwrap();
+            let (z2, keep, _) = m.decide_keep(&zr, &zr, &ev, info).unwrap();
+            assert_eq!((zone, p >= m.threshold()), (z2, keep));
+        }
+        assert!(m.decide_keep(&[f32::NAN; MAXZ], &zr, &ev, info).is_none());
     }
 
     #[test]

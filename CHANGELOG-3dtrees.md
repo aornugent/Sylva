@@ -15,5 +15,9 @@ the tag `archive/sylva-joint-2026-11-25`; earlier work such as `joint_tree` at `
   (trained on a VZ-600i) marks about a quarter of Alice Mulga's VZ-2000i echoes uncertain: dropped they leave false
   misses, kept at the model's zone they put 5-7 % of a scan's echoes in zone 2, on the wrong pulse. Changes the output
   only with `keep_uncertain=True`.
+- The learned MTA model makes its keep/drop call without summing every tree where only that call matters (one zone
+  hypothesis, as with `max_zone=1`): it stops once the remaining trees' leaf bounds can't carry the score across the
+  threshold, and skips echoes the amplitude filters drop anyway. 3dtrees reads every scan this way; it cuts a read's
+  CPU time by about an eighth. No output change.
 - Our bindings live in `crates/sylva-py/src/fork_py.rs`, reached from upstream's `lib.rs` by one `mod` line and one
   `register` line, so a merge from upstream meets them nowhere else. No outputs.
