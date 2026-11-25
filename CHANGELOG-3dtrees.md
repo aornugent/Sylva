@@ -1,10 +1,10 @@
 # 3dtrees changes to Sylva
 
-What our `develop` adds over upstream (`git diff main...develop`), as it stands now, rewritten when `develop`
-changes. `main` mirrors upstream; `develop` is merged up to upstream's 2.0.0. The rules behind each feature are in
-its module documentation, not here. Work since deleted, the joint fit (`support_tree`, `ScanIndex`, `JointParams`,
-`contest`, `tree_context`) and the beam scan with solids, is at the tag `archive/sylva-joint-2026-11-25`; earlier work
-such as `joint_tree` at `archive/sylva-develop-2026-11-12`.
+What our trunk adds over upstream (`git diff main...3dtrees/rebuild`), as it stands now, rewritten when it changes.
+The trunk is `3dtrees/rebuild` until it is merged into `develop`. `main` mirrors upstream; the trunk is merged up to
+upstream's 2.0.0. The rules behind each feature are in its module documentation, not here. Work since deleted, the
+joint fit (`support_tree`, `ScanIndex`, `JointParams`, `contest`, `tree_context`) and the beam scan with solids, is at
+the tag `archive/sylva-joint-2026-11-25`; earlier work such as `joint_tree` at `archive/sylva-develop-2026-11-12`.
 
 - `io.tile_ray_clouds` cuts Shots files into buffered raycloudtools tiles, with bounded memory. Beside each cloud,
   sidecars name every ray's scan, pulse row and echo. 3dtrees needs it because `rayextract` can't take a whole plot.
