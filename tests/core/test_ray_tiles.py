@@ -57,3 +57,20 @@ def test_sidecars_name_each_rays_echo(tmp_path, voxel):
         checked += len(cloud)
     n_echoes = sum(s.n_echoes for s in scans)
     assert checked == n_echoes if voxel == 0 else 0 < checked < n_echoes
+
+
+def test_the_terrain_leaves_out_mta_uncertain_echoes_and_the_tiles_keep_them(tmp_path):
+    # one scanner, every echo below it; the uncertain ones 40 m further down the same rays: ghosts underground
+    n = 200
+    d = np.tile([0.0, 0.6, -0.8], (n, 1))
+    d[:, 0] = np.linspace(-0.2, 0.2, n)
+    d /= np.linalg.norm(d, axis=1, keepdims=True)
+    count = np.full(n, 2)
+    rng_ = np.tile([2.0, 50.0], n)
+    flag = np.tile([0, 1], n).astype(np.uint8)
+    s = Shots(np.tile([0.0, 0.0, 1.5], (n, 1)), d, np.arange(n) * 2, count, rng_, {"mta_uncertain_point": flag})
+    s.save(tmp_path / "s.parquet", double=True)
+    tiles, n_terrain = tile_ray_clouds([tmp_path / "s.parquet"], tmp_path / "out", width=200.0, buffer=1.0, voxel=0.0,
+                                       terrain_voxel=0.0, min_rays=1, threads=1)
+    assert sum(t["rays"] for t in tiles) == 2 * n  # the tiles keep both echoes of every pulse
+    assert n_terrain == n and _cloud(tmp_path / "out" / "terrain.ply")["z"].min() > -2  # no ghost in the terrain

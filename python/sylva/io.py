@@ -456,7 +456,7 @@ def read_rxp_shots(path: str | Path, fill_missing: bool | tuple[float, float] | 
 
 def tile_ray_clouds(files, out, width: float = 25.0, buffer: float = 5.0, voxel: float = 0.01,
                     terrain_voxel: float = 0.03, extent=None, min_rays: int = 100_000,
-                    threads: int = 4) -> tuple[list[dict], int]:
+                    threads: int = 4, memory: int | None = None) -> tuple[list[dict], int]:
     """Cut Shots files into raycloudtools ray-cloud tiles, streamed.
 
     Each file must hold one scan position (e.g. one :meth:`Shots.from_scan`
@@ -470,8 +470,8 @@ def tile_ray_clouds(files, out, width: float = 25.0, buffer: float = 5.0, voxel:
     cloud order that name each ray's echo exactly: ``scan.u16`` (its index into
     ``files``), ``pulse.u32`` (its pulse's row in that file) and ``echo.u8``
     (its place in the pulse, from 0); and ``out/terrain.ply`` (each tile's own
-    cell at ``terrain_voxel``). Memory is one row group per file and
-    ``threads`` tiles at a time.
+    cell at ``terrain_voxel``). Memory is one row group per file and the
+    tiles being thinned: at most ``threads`` at once, within ``memory``.
 
     Parameters
     ----------
@@ -488,7 +488,10 @@ def tile_ray_clouds(files, out, width: float = 25.0, buffer: float = 5.0, voxel:
     min_rays
         Tiles with fewer rays after thinning are not written.
     threads
-        Tiles thinned at once.
+        Tiles thinned at once, at most.
+    memory
+        Bytes the tiles being thinned may hold (about 100 per binned echo; None: no bound), so the largest are
+        thinned alone and small ones side by side.
 
     Returns
     -------
@@ -496,7 +499,8 @@ def tile_ray_clouds(files, out, width: float = 25.0, buffer: float = 5.0, voxel:
         One dict per tile binned (``tile``, ``raw``, ``rays``, ``written``) and the terrain ray count.
     """
     return _core.tile_ray_clouds([str(f) for f in files], str(out), width, buffer, voxel, terrain_voxel,
-                                 None if extent is None else tuple(extent), min_rays, threads)
+                                 None if extent is None else tuple(extent), min_rays, threads,
+                                 2 ** 64 - 1 if memory is None else int(memory))
 
 
 def find_rivlib_shim(hint: str | Path | None = None) -> Path:

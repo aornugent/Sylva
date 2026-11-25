@@ -15,12 +15,12 @@ use sylva_rs::io;
 use crate::err;
 
 #[pyfunction]
-#[pyo3(signature = (files, out, width, buffer, voxel, terrain_voxel, extent=None, min_rays=100_000, threads=4))]
+#[pyo3(signature = (files, out, width, buffer, voxel, terrain_voxel, extent=None, min_rays=100_000, threads=4, memory=u64::MAX))]
 #[allow(clippy::too_many_arguments)]
 fn tile_ray_clouds<'py>(py: Python<'py>, files: Vec<PathBuf>, out: PathBuf, width: f64, buffer: f64, voxel: f64, terrain_voxel: f64,
-                        extent: Option<(f64, f64, f64, f64)>, min_rays: usize, threads: usize) -> PyResult<(Vec<Bound<'py, PyDict>>, usize)> {
+                        extent: Option<(f64, f64, f64, f64)>, min_rays: usize, threads: usize, memory: u64) -> PyResult<(Vec<Bound<'py, PyDict>>, usize)> {
     let opts = io::ray_tiles::TileOptions { width, buffer, voxel, terrain_voxel, extent: extent.map(|e| [e.0, e.1, e.2, e.3]), min_rays };
-    let (tiles, n_terrain) = py.detach(|| io::ray_tiles::tile_ray_clouds(&files, &out, &opts, threads)).map_err(err)?;
+    let (tiles, n_terrain) = py.detach(|| io::ray_tiles::tile_ray_clouds(&files, &out, &opts, threads, memory)).map_err(err)?;
     let tiles = tiles
         .into_iter()
         .map(|t| {

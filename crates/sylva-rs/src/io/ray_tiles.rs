@@ -16,8 +16,16 @@
 //! end (float), grey RGB, alpha 255. Misses are not written: `rayextract`
 //! ignores unbounded rays.
 //!
-//! Memory is bounded by one row group per file being read and one tile
-//! being thinned; the binned echoes wait on disk.
+//! Memory is bounded by one row group per file being read and the tiles
+//! being thinned: each holds about THIN_BYTES per binned echo, so tiles are
+//! thinned side by side within a memory budget, the largest alone (`Budget`);
+//! the binned echoes wait on disk.
+//!
+//! The terrain cloud (`terrain.ply`, each tile's own cell) leaves out echoes
+//! flagged MTA-uncertain (`mta_uncertain_point`): kept in zone 1 they can be
+//! ghosts of another pulse, and a few land tens of metres underground, which
+//! drags `rayextract terrain`'s lowest surface down with them. The tiles keep
+//! every echo.
 //!
 //! Beside each cloud, sidecars name every ray's echo exactly, in cloud order:
 //! `scan.u16` (the file), `pulse.u32` (the pulse's row in that file) and
@@ -28,10 +36,12 @@ use std::collections::{BTreeMap, HashSet};
 use std::fs::{self, File};
 use std::io::{BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::{Condvar, Mutex};
 
 use rayon::prelude::*;
 
 use crate::error::{Error, Result};
+use crate::pointcloud::Attr;
 use crate::io::shots::ShotsFile;
 use crate::Point;
 
@@ -63,10 +73,47 @@ pub struct TileInfo {
     pub rays: usize,
 }
 
-const REC: usize = 31; // x, y, z f64 + file index u16 + pulse row u32 + echo in pulse u8
+const REC: usize = 32; // x, y, z f64 + file index u16 + pulse row u32 + echo in pulse u8 + MTA-uncertain u8
+/// What thinning a tile holds per binned echo: the point and its file (32 B), its echo id (8 B), the voxel set and
+/// the kept rows (about 60 B).
+const THIN_BYTES: u64 = 100;
+
+/// A budget of bytes the tiles being thinned share: each holds its own need while it runs, at most the whole
+/// budget, so the largest runs alone and small ones side by side.
+struct Budget {
+    total: u64,
+    free: Mutex<u64>,
+    freed: Condvar,
+}
+
+impl Budget {
+    fn new(total: u64) -> Self {
+        Budget { total, free: Mutex::new(total), freed: Condvar::new() }
+    }
+
+    fn hold<T>(&self, need: u64, f: impl FnOnce() -> T) -> T {
+        let need = need.min(self.total);
+        let mut free = self.freed.wait_while(self.free.lock().unwrap(), |free| *free < need).unwrap();
+        *free -= need;
+        drop(free);
+        let out = f();
+        *self.free.lock().unwrap() += need;
+        self.freed.notify_all();
+        out
+    }
+}
+
+/// The bytes of a tile's bins on disk.
+fn binned_bytes(dir: &Path) -> Result<u64> {
+    let mut n = 0;
+    for e in fs::read_dir(dir)? {
+        n += e?.metadata()?.len();
+    }
+    Ok(n)
+}
 
 /// Which echo a binned point is: its pulse's row in the file and its place in that pulse.
-type EchoId = (u32, u8);
+type EchoId = (u32, u8, bool); // pulse row, echo in pulse, MTA-uncertain
 
 fn tile_name(kx: i64, ky: i64) -> String {
     format!("{kx}_{ky}")
@@ -95,6 +142,10 @@ fn bin_file(path: &Path, file_idx: u16, bins: &Path, opts: &TileOptions) -> Resu
     let mut row0: usize = 0; // pulses in the groups before this one
     for g in 0..f.n_groups() {
         let shots = f.read_group(g)?;
+        let uncertain = match shots.echo_attrs.get("mta_uncertain_point") {
+            Some(Attr::U8(v)) => Some(v),
+            _ => None,
+        };
         if row0 + shots.n_shots() > u32::MAX as usize {
             return Err(Error::File { path: path.into(), msg: "ray tiles: more than 2^32 pulses in one file".into() });
         }
@@ -112,6 +163,7 @@ fn bin_file(path: &Path, file_idx: u16, bins: &Path, opts: &TileOptions) -> Resu
             rec[26..30].copy_from_slice(&((row0 + s) as u32).to_le_bytes());
             for e in e0..e0 + shots.echo_count[s] as usize {
                 rec[30] = u8::try_from(e - e0).map_err(|_| Error::File { path: path.into(), msg: "ray tiles: more than 255 echoes in a pulse".into() })?;
+                rec[31] = uncertain.map_or(0, |u| u[e]);
                 let r = shots.echo_range[e];
                 let p = [o[0] + d[0] * r, o[1] + d[1] * r, o[2] + d[2] * r];
                 if let Some([x0, y0, x1, y1]) = opts.extent {
@@ -197,7 +249,7 @@ fn read_bins(dir: &Path) -> Result<(Vec<(Point, u16)>, Vec<EchoId>)> {
         for r in buf.chunks_exact(REC) {
             let f = |k: usize| f64::from_le_bytes(r[k * 8..k * 8 + 8].try_into().unwrap());
             out.push(([f(0), f(1), f(2)], u16::from_le_bytes([r[24], r[25]])));
-            ids.push((u32::from_le_bytes(r[26..30].try_into().unwrap()), r[30]));
+            ids.push((u32::from_le_bytes(r[26..30].try_into().unwrap()), r[30], r[31] != 0));
         }
     }
     Ok((out, ids))
@@ -232,6 +284,7 @@ fn finish_tile(bin_dir: &Path, out: &Path, origins: &[Point], opts: &TileOptions
     let (w, cx, cy) = (opts.width, kx as f64 * opts.width, ky as f64 * opts.width);
     let cell: Vec<(Point, u16)> = keep
         .iter()
+        .filter(|&&i| !ids[i].2) // confident echoes only (module docs)
         .map(|&i| pts[i])
         .filter(|(p, _)| p[0] >= cx - w / 2.0 && p[0] < cx + w / 2.0 && p[1] >= cy - w / 2.0 && p[1] < cy + w / 2.0)
         .collect();
@@ -242,8 +295,9 @@ fn finish_tile(bin_dir: &Path, out: &Path, origins: &[Point], opts: &TileOptions
 /// Cut `files` (one scan position each) into ray-cloud tiles under `out`:
 /// `tiles/<kx>_<ky>/{cloud.ply, scan.u16, pulse.u32, echo.u8}` and `terrain.ply`. Returns every
 /// tile binned, written or not (`rays < min_rays` are skipped), in name order.
-/// `threads` bounds how many tiles are thinned at once (each holds its echoes in memory).
-pub fn tile_ray_clouds(files: &[PathBuf], out: &Path, opts: &TileOptions, threads: usize) -> Result<(Vec<TileInfo>, usize)> {
+/// At most `threads` tiles are thinned at once, and only as many as `memory` bytes hold (each holds its
+/// echoes in memory, about THIN_BYTES each).
+pub fn tile_ray_clouds(files: &[PathBuf], out: &Path, opts: &TileOptions, threads: usize, memory: u64) -> Result<(Vec<TileInfo>, usize)> {
     if !(opts.buffer >= 0.0 && opts.buffer < opts.width / 2.0) {
         return Err(Error::invalid("ray tiles: buffer must be in [0, width / 2)"));
     }
@@ -257,10 +311,19 @@ pub fn tile_ray_clouds(files: &[PathBuf], out: &Path, opts: &TileOptions, thread
         .enumerate()
         .map(|(i, p)| bin_file(p, i as u16, &bins, opts))
         .collect::<Result<_>>()?;
-    let mut dirs: Vec<PathBuf> = fs::read_dir(&bins)?.map(|e| e.map(|e| e.path())).collect::<std::io::Result<_>>()?;
-    dirs.sort();
+    let mut dirs: Vec<(PathBuf, u64)> = Vec::new();
+    for e in fs::read_dir(&bins)? {
+        let d = e?.path();
+        let need = binned_bytes(&d)? / REC as u64 * THIN_BYTES;
+        dirs.push((d, need));
+    }
+    dirs.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0))); // largest first, so the last to finish are small
+    let budget = Budget::new(memory);
     let pool = rayon::ThreadPoolBuilder::new().num_threads(threads.max(1)).build().map_err(|e| Error::invalid(e.to_string()))?;
-    let done: Vec<(TileInfo, Vec<(Point, u16)>)> = pool.install(|| dirs.par_iter().map(|d| finish_tile(d, out, &origins, opts)).collect::<Result<_>>())?;
+    let mut done: Vec<(TileInfo, Vec<(Point, u16)>)> = pool.install(|| {
+        dirs.par_iter().with_max_len(1).map(|(d, need)| budget.hold(*need, || finish_tile(d, out, &origins, opts))).collect::<Result<_>>()
+    })?;
+    done.sort_by_key(|(i, _)| tile_name(i.kx, i.ky)); // name order, as before: the terrain cloud keeps its order
     fs::remove_dir(&bins)?;
     let terrain: Vec<(Point, u16)> = done.iter().flat_map(|(_, t)| t.iter().copied()).collect();
     let all: Vec<usize> = (0..terrain.len()).collect();
@@ -281,6 +344,28 @@ mod tests {
         assert_eq!(out, vec![(0, 0), (0, 1), (1, 0), (1, 1)]);
         cells(&[-12.6, 0.0, 0.0], 25.0, 5.0, &mut out);
         assert_eq!(out, vec![(-1, 0), (0, 0)]);
+    }
+
+    #[test]
+    fn the_budget_holds_the_largest_alone_and_small_ones_together() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        let budget = Budget::new(10);
+        let (running, peak) = (AtomicU64::new(0), AtomicU64::new(0));
+        let run = |need: u64| {
+            budget.hold(need, || {
+                let now = running.fetch_add(need.min(10), Ordering::SeqCst) + need.min(10);
+                peak.fetch_max(now, Ordering::SeqCst);
+                std::thread::sleep(std::time::Duration::from_millis(30));
+                running.fetch_sub(need.min(10), Ordering::SeqCst);
+            })
+        };
+        std::thread::scope(|s| {
+            for need in [30, 4, 4, 4] {
+                s.spawn(move || run(need));
+            }
+        });
+        assert!(peak.load(Ordering::SeqCst) <= 10);
+        assert_eq!(*budget.free.lock().unwrap(), 10);
     }
 
     #[test]
