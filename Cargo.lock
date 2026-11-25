@@ -1201,7 +1201,6 @@ dependencies = [
  "kiddo",
  "las",
  "libloading",
- "libm",
  "nalgebra",
  "parquet",
  "proj4rs",
