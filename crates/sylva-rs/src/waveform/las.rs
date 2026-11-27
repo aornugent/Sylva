@@ -48,12 +48,17 @@ const WDP_RECORD_ID: u16 = 65535;
 /// A wave packet descriptor (LAS VLR record id 100..=354).
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct WavePacketDescriptor {
+    /// Bits per sample (8, 16 or 32).
     pub bits_per_sample: u8,
+    /// Waveform compression type; 0 for none (the only kind read).
     pub compression: u8,
+    /// Samples per waveform packet.
     pub n_samples: u32,
     /// Temporal sample spacing (ps).
     pub spacing_ps: u32,
+    /// Gain of the conversion of a sample to physical units: `offset + gain * value`.
     pub gain: f64,
+    /// Offset of the same conversion (in the physical units).
     pub offset: f64,
 }
 
@@ -71,19 +76,29 @@ pub enum PacketStore {
 /// What a LAS/LAZ header says about its waveforms.
 #[derive(Debug, Clone)]
 pub struct LasWaveInfo {
+    /// LAS version as `(major, minor)`.
     pub version: (u8, u8),
+    /// LAS point data record format (4, 5, 9 or 10 carry waveforms).
     pub point_format: u8,
+    /// Bytes per point record.
     pub record_length: u16,
+    /// Point records in the file.
     pub n_points: u64,
+    /// Byte offset of the first point record.
     pub offset_to_points: u64,
+    /// Coordinate quantisation per axis (m per stored unit).
     pub scale: [f64; 3],
+    /// Coordinate offset per axis (m): a stored integer `i` is `i * scale + offset`.
     pub offset: [f64; 3],
     /// `[min_x, min_y, min_z, max_x, max_y, max_z]`.
     pub bounds: [f64; 6],
+    /// Header global encoding bits (bit 2 set: packets in an external `.wdp` file).
     pub global_encoding: u16,
+    /// Whether the points are LAZ-compressed.
     pub compressed: bool,
     /// Descriptor by packet index (1..=255); index 0 means no waveform.
     pub descriptors: BTreeMap<u8, WavePacketDescriptor>,
+    /// Where the waveform packets are.
     pub store: PacketStore,
 }
 
@@ -142,9 +157,17 @@ pub fn read_info(path: impl AsRef<Path>) -> Result<LasWaveInfo> {
     } else {
         (0, 0, legacy_n)
     };
-    if waveform_field_offset(point_format).is_none() {
+    let Some(wave_at) = waveform_field_offset(point_format) else {
         return Err(file_err(path, format!("point format {point_format} has no waveform data (waveform formats are 4, 5, 9 and 10)")));
+    };
+    // The wave packet fields are 29 bytes from `wave_at`; a record shorter
+    // than that is not this point format, whatever the header says.
+    if (record_length as usize) < wave_at + 29 {
+        return Err(file_err(path, format!("point records of {record_length} bytes are too short for point format {point_format} ({} bytes at least)", wave_at + 29)));
     }
+    // The header's count, held to the records the file has room for: an
+    // uncompressed file cannot hold more, and the count sizes the read.
+    let n_points = if compressed { n_points } else { n_points.min(file_len.saturating_sub(offset_to_points) / record_length as u64) };
 
     let mut descriptors = BTreeMap::new();
     f.seek(SeekFrom::Start(header_size))?;
@@ -889,5 +912,26 @@ mod tests {
         let cloud = crate::PointCloud::new(vec![[0.0, 0.0, 0.0]]);
         crate::io::las::write_las(&cloud, &p, &Default::default()).unwrap();
         assert!(read_info(&p).is_err());
+    }
+
+    #[test]
+    fn a_corrupt_header_is_an_error() {
+        let p = tmp("corrupt");
+        write_waveforms(&sample(), &p, &LasWriteWaveOptions { external: true, ..Default::default() }).unwrap();
+        let good = std::fs::read(&p).unwrap();
+        // Records too short for the point format (0 used to divide by zero).
+        for rl in [0u16, 20, 58] {
+            let mut b = good.clone();
+            LE::write_u16(&mut b[105..], rl);
+            std::fs::write(&p, &b).unwrap();
+            let e = read_waveforms(&p, &LasReadOptions::default()).unwrap_err().to_string();
+            assert!(e.contains("too short for point format 9"), "{rl}: {e}");
+        }
+        // A point count far beyond the file reads the records that are there.
+        let mut b = good.clone();
+        LE::write_u64(&mut b[247..], 1 << 50);
+        std::fs::write(&p, &b).unwrap();
+        assert_eq!(read_info(&p).unwrap().n_points, 5);
+        assert_eq!(read_waveforms(&p, &LasReadOptions::default()).unwrap().0.len(), 5);
     }
 }

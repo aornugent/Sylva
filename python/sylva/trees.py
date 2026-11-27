@@ -16,7 +16,7 @@ from .pointcloud import PointCloud
 __all__ = [
     "Tree", "fit_circle", "fit_circle_ransac", "detect_stems", "prune_trees", "basal_area",
     "dbh_profile",
-    "merge_branches", "segment_trees", "tree_heights", "crown_metrics", "crown_metrics_all",
+    "merge_branches", "segment_trees", "merge_touching", "tree_heights", "crown_metrics", "crown_metrics_all",
     "convex_hull_area", "crown_shape", "detect_buttress",
 ]
 
@@ -163,7 +163,11 @@ def detect_stems(cloud: PointCloud, height_attr: str = "height", **params) -> li
     ``ransac_tolerance`` [0.02], ``max_circles_per_cluster`` [3],
     ``min_circle_inliers`` [10], ``min_coverage`` [0.12] (fraction of
     circumference seen; ~0.5 for single scans), ``min_arc_deg`` [0]
-    (longest contiguous arc; 130+ suits merged multi-scan plots),
+    (longest arc over which a circle's points lie within 15 degrees of
+    each other, or within the wider gap a sparsely sampled circle's point
+    count explains; a high value rejects short arcs on merged multi-scan plots,
+    and with them the stems seen from one side only: see *Benchmarks > Tree
+    detection* for what it costs on thinned clouds),
     ``max_circle_rmse`` [0.02], ``link_radius`` [0.2],
     ``link_radius_ratio`` [0.45], ``link_radius_abs`` [0.02], ``min_slices`` [3],
     ``max_lean_deg`` [25], ``prefilter`` [True] (keep only locally planar points
@@ -269,6 +273,99 @@ def prune_trees(trees: list[Tree], labels: np.ndarray, min_height: float = 3.0,
     return out, out_labels
 
 
+def merge_touching(cloud: PointCloud, labels: np.ndarray, trees: list[Tree], threshold: float = 0.1,
+                   voxel_size: float = 0.05, reach: float = 0.1, min_height: float = 0.5,
+                   min_top: float = 3.0, neighbours: int = 8,
+                   height_attr: str = "height") -> tuple[list[Tree], np.ndarray, np.ndarray]:
+    """Merge segmented trees that lie against a larger neighbour.
+
+    :func:`detect_stems` favours recall, so some candidates are not trees of
+    their own: a second circle on a wide trunk, a low fork, a whorl of
+    branches fitted as a stem. :func:`segment_trees` grows each like any
+    other stem and it comes away holding a piece of its parent's crown.
+    Such a piece lies against the parent along much of its extent, whereas
+    two separate trees touch only where their crowns meet.
+
+    The labelled points at or above ``min_height`` are thinned to one node
+    per ``voxel_size`` voxel. A node of one tree *touches* another tree when
+    one of its ``neighbours`` nearest nodes, no farther than ``reach``,
+    belongs to that tree. Of all pairs of trees, the one in which the largest
+    share of the smaller tree's nodes touch the larger is merged first, if
+    that share is at least ``threshold``; the merged tree keeps the larger
+    one's id, and its contacts with the other trees are those of both. This
+    repeats until no pair reaches the threshold.
+
+    Call it after :func:`segment_trees` and before :func:`tree_heights` and
+    :func:`prune_trees`, so that a merged piece adds to its tree's height
+    and point count:
+
+    >>> labels = trees.segment_trees(cloud, stems)                    # doctest: +SKIP
+    >>> stems, labels, _ = trees.merge_touching(cloud, labels, stems)  # doctest: +SKIP
+    >>> trees.tree_heights(cloud, labels, stems)                      # doctest: +SKIP
+    >>> stems, labels = trees.prune_trees(stems, labels)              # doctest: +SKIP
+
+    Measured as paired runs against the same pipeline without it, a
+    threshold of 0.1 removed spurious trees and lost none in any run on the
+    four reference plots of the tree benchmark, on two plots held out of all
+    tuning, on eight simulated plots and on the reference plots thinned to
+    5 cm; lower thresholds remove more and begin to merge real neighbours
+    (*Benchmarks > Tree detection*). On the coppiced reference plot, where
+    stems that share a stool are separate trees, none was merged at 0.1.
+
+    Parameters
+    ----------
+    cloud
+        The height-normalised cloud that was segmented.
+    labels
+        ``tree_id`` per point from :func:`segment_trees` (-1 unassigned).
+    trees
+        The stems the labels refer to.
+    threshold
+        Share (0 to 1) of the smaller tree's nodes that must touch the larger
+        for the two to be merged. 0 merges nothing.
+    voxel_size
+        Spacing of the thinned cloud the contact is measured on (m), so that
+        the share does not depend on the point density.
+    reach
+        Greatest distance (m) between two nodes that touch.
+    min_height
+        Points below this height above ground (m) are left out: near the
+        ground every tree keeps a disc of litter and grass about its stem
+        (``low_radius`` of :func:`segment_trees`), and neighbouring discs
+        touch whatever the trees do.
+    min_top
+        Two trees are merged only if the highest point of each is at least
+        this high (m above ground). Low clumps that touch a trunk are mostly
+        shrubs and saplings: left alone they are dropped by
+        :func:`prune_trees`, merged they would add understorey to the tree.
+        Keep it at the ``min_height`` you prune with.
+    neighbours
+        Nearest nodes examined about each node (count).
+    height_attr
+        Attribute holding heights.
+
+    Returns
+    -------
+    trees : list of Tree
+        The trees that remain, in their input order and otherwise unchanged
+        (the same objects; run :func:`tree_heights` to update ``height`` and
+        ``n_points``).
+    labels : numpy.ndarray
+        Labels with the points of every merged tree given the id of the
+        tree it joined.
+    merged_into : numpy.ndarray
+        For every input tree, the id it now belongs to (its own if it
+        remains).
+    """
+    h = np.ascontiguousarray(cloud.heights(height_attr), dtype=np.float64)
+    _, out, merged = _core.merge_touching(cloud.xyz, h, np.ascontiguousarray(labels, dtype=np.int64),
+                                          [t._to_core() for t in trees], float(threshold), float(voxel_size),
+                                          float(reach), float(min_height), int(neighbours), float(min_top))
+    merged = np.asarray(merged)
+    kept = [t for t, m in zip(trees, merged) if int(m) == t.tree_id]
+    return kept, out, merged
+
+
 def basal_area(trees, area: float, min_dbh: float = 0.0) -> float:
     """Basal area of a plot (m²/ha): the stems' cross-sections at breast height.
 
@@ -347,29 +444,36 @@ def segment_trees(cloud: PointCloud, trees: list[Tree], height_attr: str = "heig
                   k: int = 6, max_edge: float = 1.0, voxel_size: float = 0.03,
                   seed_height: float = 1.5, seed_radius: float = 0.25, seed_ring: bool = True,
                   power: float = 6.0,
-                  angle_penalty: bool = True, gravity: float = 0.0,
-                  cut_above_ground: float | None = None, height_prior: bool = True,
+                  bend_cost: bool = True, gravity: float = 0.0,
+                  ground_clearance: float | None = None, height_prior: bool = True,
                   height_prior_radius: float = 1.5, height_prior_power: float = 1.0,
                   low_height: float = 0.5,
-                  low_radius: float = 1.0, wood_costs: bool = False,
-                  wood_k: int = 20, wood_threshold: float = 0.9, understorey_height: float = 0.0,
+                  low_radius: float = 1.0, understorey_height: float = 0.0,
                   understorey_band: float = 0.5, voxel_origin=None,
-                  ground: str | np.ndarray | None = None, bridge: bool = True) -> np.ndarray:
+                  ground: str | np.ndarray | None = None, bridge: bool = True,
+                  bend_power: float = 4.0, bend_floor: float = 0.4,
+                  path_weight: float = 0.3, max_reach: float = 0.0) -> np.ndarray:
     """Assign each point to a stem by least-cost path through a directed kNN
     graph (multi-source Dijkstra from stem seeds), after raycloudtools'
-    ``rayextract trees`` (Devereux et al. 2026).
+    ``rayextract trees`` (Devereux et al. 2026), whose bend cost the edges
+    carry.
 
-    The edge cost is ``d ** power`` times an angle penalty
-    ``min(exp(0.046 * deg_from_vertical), 100)`` -- climbing is free,
-    horizontal edges cost x63 and downward ones x100 -- so paths run up
+    An edge of length ``d`` costs ``d ** power / max(bend_floor, cos) **
+    bend_power``, ``cos`` being the cosine of the angle between the edge and
+    a reference direction: the vertical, turned by ``path_weight`` towards
+    the direction the path arrived in. Going on upward, or on along a branch
+    the path already follows, is cheap; turning across or back costs up to
+    ``1 / bend_floor ** bend_power`` times as much (39 at the defaults) --
+    so paths run up
     through a tree instead of leaking across the ground or understorey.
     ``gravity`` adds raycloudtools' term ``1 + g * lateral**2`` from the seed
     (0.3 favours vertical trees). ``height_prior`` scales each tree's costs
     by ``1 / height`` (raycloudtools' per-root scaling) so tall trees win
-    contested crown points over understorey stems. ``wood_costs`` classifies
-    graph nodes as wood by local anisotropy and applies class factors
-    (wood->wood x0.1, leaf->leaf x20, wood->leaf x1000) so foliage cannot
-    bridge neighbouring trees. Points below ``cut_above_ground`` and
+    contested crown points over understorey stems. The height is that of the
+    vegetation over the stem (the 95th percentile of the node heights within
+    ``height_prior_radius``), not of the tree itself, which is not known
+    until the plot is segmented: under a closed canopy every stem, however
+    small, competes as a tree of canopy height. Points below ``ground_clearance`` and
     unreachable points get ``-1``, and so do points below ``low_height``
     further than ``low_radius`` (or 1.5 DBH) from their tree's base: ground
     remnants, litter and understorey reached along the surface would
@@ -384,7 +488,7 @@ def segment_trees(cloud: PointCloud, trees: list[Tree], height_attr: str = "heig
     cloud
         A height-normalised cloud of the plot.
     trees
-        Stems from :func:`detect_stems` (after :func:`merge_branches`).
+        Stems from :func:`detect_stems` (optionally after :func:`merge_branches`).
     height_attr
         Attribute holding heights.
     k
@@ -394,46 +498,64 @@ def segment_trees(cloud: PointCloud, trees: list[Tree], height_attr: str = "heig
     voxel_size
         Graph resolution (m); 0 uses every point (slow on plots).
     seed_height, seed_radius
-        Graph nodes within ``seed_radius`` of a stem and below
-        ``seed_height`` start that tree's search.
+        Graph nodes within ``seed_radius`` of a stem's bark shell (with
+        ``seed_ring``) or of its axis, from the ground cut to half a metre
+        above ``seed_height``, start that tree's search.
+    seed_ring
+        Seed along the bark shell (a ring of half-width ``seed_radius`` about
+        the fitted radius) rather than a disc about the axis, so a trunk is
+        labelled to within a hand of the ground.
     power
         Exponent on edge length; higher prefers many short steps, so paths
         stay inside a crown rather than jumping the gaps between neighbouring
         crowns. 6 was chosen on the validation areas of the Cherlet et al.
         (2026) benchmark, where it raised F1 over the earlier 4 on every plot
         with interlocking crowns (see *Benchmarks > Tree detection*).
-    angle_penalty
-        Apply the angle factor above.
+    bend_cost
+        Apply the bend factor above; without it an edge costs its length
+        term alone.
+    bend_power, bend_floor, path_weight
+        The bend factor, ``1 / max(bend_floor, cos) ** bend_power``, and the
+        share of the arriving path's direction in the direction ``cos`` is
+        measured from (0 is the vertical alone; 1 the path alone, as in
+        raycloudtools). The defaults segment dense, thinned and simulated
+        plots alike. On plots scanned densely from many positions a gentler
+        factor divides crowns better: ``bend_power=2, bend_floor=0.3``
+        raised F1 on the reference plots by 0.02 and on their 5 cm
+        thinnings by 0.014, and lowered it by 0.017 on simulated plots
+        scanned from five positions and by 0.005 on 8 cm thinnings (see
+        *Benchmarks > Tree detection*).
     gravity
         Lateral-distance term; 0 disables it.
-    cut_above_ground
+    ground_clearance
         Points below this height (m) are left unassigned and kept out of
         the graph. None is 0.1 m, the noise band of a terrain model, so the
         ground surface stays out while a stem is labelled to within a hand
         of the ground; or 0 when ``ground`` is given, the ground then being
         what the classifier found.
     height_prior, height_prior_radius
-        Scale costs by 1 / tree height; tree height is estimated from points
-        within ``height_prior_radius`` of the stem.
+        Scale each tree's costs by 1 / height, the height being the 95th
+        percentile of the heights of the graph nodes within
+        ``height_prior_radius`` (m, horizontally) of the stem, and at least
+        2 m. This is the height of whatever stands over the stem: the tree's
+        own where it stands free, the canopy's where it is overtopped.
     low_height, low_radius
         Near-ground points farther than ``low_radius`` from their stem are
         unassigned.
-    wood_costs, wood_k, wood_threshold
-        Enable wood/leaf edge factors; ``wood_k`` neighbours and
-        ``wood_threshold`` anisotropy classify nodes.
     understorey_height, understorey_band
         Let the understorey compete, after raycloudtools, where every point's
         path runs to the ground and small plants keep their own. Graph nodes
-        up to ``understorey_band`` above ``cut_above_ground`` and more than
+        up to ``understorey_band`` above ``ground_clearance`` and more than
         ``max(low_radius, 1.5 DBH)`` from every stem become extra sources,
         with path costs scaled as for a tree ``understorey_height`` tall
         (with ``height_prior``). Grass, shrubs and saplings around a stem go
         to them and are left unassigned instead of joining the tree. 0, the
-        default, disables: on the four CHERLET reference plots the sources
-        found no tree and lost up to four (see *Benchmarks > Tree
-        detection*), and what they take from a crown they take through
-        foliage whatever they are costed, so they are left to the
-        ``low_height`` rule. 10 is the value they were tuned at.
+        default, disables. At 10, on the four CHERLET reference plots, the
+        share of the points below 2 m on no reference tree that a tree
+        takes falls from 26-71 % to 9-64 %, and about two small trees in a
+        hundred are lost on two of the plots, their crowns reached by the
+        sources from below (see *Benchmarks > Tree detection*): use it when
+        the lower two metres of each tree matter more than the tree list.
     voxel_origin
         ``(x, y, z)`` of a corner of the graph's voxel grid; None anchors it
         at the cloud's minimum corner rounded down to whole metres, so that
@@ -445,13 +567,21 @@ def segment_trees(cloud: PointCloud, trees: list[Tree], height_attr: str = "heig
         height: ``"classification"`` takes the points classified as ground
         (ASPRS class 2, as :func:`sylva.ground.classify_ground_csf` writes
         them), or give a boolean mask with one value per point. None leaves
-        the ground to ``cut_above_ground`` alone.
+        the ground to ``ground_clearance`` alone.
     bridge
         Join the graph's components wherever two come within ``max_edge`` of
         each other, so that a crown reaches its trunk through sparsely
         sampled branches whatever points the thinning kept. Off, the labels
         of trees of 5 to 10 m depended on which point survived each voxel
         (see *Benchmarks > Tree detection*).
+    max_reach
+        Farthest a tree reaches from its stem (m, horizontal): its paths do
+        not enter graph nodes beyond it, and what lies farther from every
+        stem is left unassigned. Without it a tree takes all the vegetation
+        joined to it, however far: shrubs with no stem of their own on open
+        plots and, on a plot cut from a larger scan, the vegetation past the
+        outermost stems, which make crowns of tens of metres. Set it to the
+        widest crown radius the stand can have. 0, the default, is no limit.
 
     Returns
     -------
@@ -481,16 +611,20 @@ def segment_trees(cloud: PointCloud, trees: list[Tree], height_attr: str = "heig
         exclude = np.ascontiguousarray(np.asarray(ground, dtype=bool))
         if exclude.shape != (len(cloud),):
             raise ValueError(f"ground mask has shape {exclude.shape}, expected ({len(cloud)},)")
-    if cut_above_ground is None:
-        cut_above_ground = 0.0 if exclude is not None else 0.1
+    if ground_clearance is None:
+        ground_clearance = 0.0 if exclude is not None else 0.1
+    max_reach = float(max_reach)
+    if not (np.isfinite(max_reach) and max_reach >= 0):
+        raise ValueError(f"max_reach must be a non-negative number of metres (0 for no limit), got {max_reach}")
     return _core.segment_trees(cloud.xyz, h, [t._to_core() for t in trees], k, max_edge,
-                               voxel_size, seed_height, seed_radius, seed_ring, power, angle_penalty,
-                               gravity, cut_above_ground, height_prior, height_prior_radius,
+                               voxel_size, seed_height, seed_radius, seed_ring, power, bend_cost,
+                               gravity, ground_clearance, height_prior, height_prior_radius,
                                height_prior_power,
-                               low_height, low_radius, wood_costs, wood_k, wood_threshold,
+                               low_height, low_radius,
                                understorey_height, understorey_band,
                                None if voxel_origin is None else tuple(float(v) for v in voxel_origin),
-                               exclude, bool(bridge))
+                               exclude, bool(bridge), float(bend_power), float(bend_floor), float(path_weight),
+                               max_reach)
 
 
 def merge_branches(cloud: PointCloud, trees: list[Tree], height_attr: str = "height",
@@ -505,6 +639,11 @@ def merge_branches(cloud: PointCloud, trees: list[Tree], height_attr: str = "hei
     ``graph_params`` are the :func:`segment_trees` graph settings. Returns
     ``(surviving trees, merged_into)`` where ``merged_into[i]`` is the id the
     i-th input tree now belongs to. Call before :func:`segment_trees`.
+
+    The step is optional. It removes limbs and forks fitted as stems, and
+    where stems share a base (coppice stools, multi-stemmed trees) it merges
+    real trees as well: on a coppiced reference plot it cost 15 % of the
+    trees found without it (see *Benchmarks > Tree detection*).
 
     Parameters
     ----------

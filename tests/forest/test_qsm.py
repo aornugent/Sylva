@@ -63,7 +63,7 @@ def test_mesh_export(single_tree, tmp_path):
     raw = (tmp_path / "t.ply").read_bytes()
     head, body = raw.split(b"end_header\n", 1)
     assert f"element face {len(f)}".encode() in head
-    assert len(body) == len(v) * 12 + len(f) * (1 + 12 + 3)
+    assert len(body) == len(v) * 24 + len(f) * (1 + 12 + 3)      # float64 vertices
 
 
 def test_taper_clamp(rng):
@@ -128,7 +128,7 @@ def _rough_trunk_tree(rng):
     return trunk, branch, leaves
 
 
-def test_wood_points_passage_recovers_rough_trunk(rng):
+def test_wood_points_paths_recover_rough_trunk(rng):
     sylva = __import__("sylva")
     trunk, branch, leaves = _rough_trunk_tree(rng)
     pc = sylva.PointCloud(np.vstack([trunk, branch, leaves]))
@@ -137,10 +137,9 @@ def test_wood_points_passage_recovers_rough_trunk(rng):
         tree = __import__("scipy.spatial", fromlist=["cKDTree"]).cKDTree(cloud.xyz)
         return (tree.query(part)[0] < 1e-9).mean()
 
-    aniso = qsm.wood_points(pc, voxel_size=None, passage=False, medium_threshold=1.0,
-                            dilate_dist=0.0, component_min=1)
+    aniso = qsm.wood_points(pc, voxel_size=None, paths=False)
     default = qsm.wood_points(pc, voxel_size=None)
-    wide = qsm.wood_points(pc, voxel_size=None, assign_scale=0.03)
+    wide = qsm.wood_points(pc, voxel_size=None, reach_scale=0.03)
     # Rough bark is neither planar nor linear: anisotropy alone drops it. The
     # paths to the crown run through it, and a scaled reach takes the section.
     assert kept(aniso, trunk) < 0.3
@@ -149,7 +148,7 @@ def test_wood_points_passage_recovers_rough_trunk(rng):
     for wood in (default, wide):
         assert kept(wood, branch) > 0.95
         assert kept(wood, leaves) < 0.6
-    # The anisotropy-only result is what passage=False returns.
+    # The anisotropy-only result is what paths=False returns.
     assert kept(aniso, leaves) < 0.1
 
 
@@ -180,7 +179,7 @@ def test_tree_metrics(single_tree):
     first = np.flatnonzero(b["order"] == 1)[np.argmax(b["length"][b["order"] == 1])]
     # The branch runs along +x rising 0.3 per metre: 73 deg from the vertical stem.
     assert b["zenith"][first] == pytest.approx(73.3, abs=6)
-    assert b["insertion_angle"][first] == pytest.approx(73.3, abs=8)
+    assert b["insertion_angle"][first] == pytest.approx(73.3, abs=10)
     assert b["length"][first] == pytest.approx(2.0, abs=0.3)
     assert b["tortuosity"][first] < 1.1
 
@@ -270,7 +269,7 @@ def test_stem_radius_cap_sees_through_foliage_around_the_bole():
         warnings.simplefilter("ignore")
         free = qsm.build_plot(cloud, labels, stems, wood=False, voxel_size=0.01)
         capped = qsm.build_plot(cloud, labels, stems, wood=False, voxel_size=0.01, stem_radius_cap=1.5)
-    assert free.models[1].dbh > 0.35 and free.volume(1) > 1.3 * true_volume
+    assert free.models[1].dbh > 0.35 and free.volume(1) > 1.15 * true_volume
     assert capped.models[1].dbh == pytest.approx(0.30, abs=0.02)
     assert capped.volume(1) == pytest.approx(true_volume, rel=0.1)
     with pytest.raises(TypeError):

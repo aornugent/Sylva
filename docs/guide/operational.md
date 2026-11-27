@@ -13,7 +13,7 @@ has been validated.
 | Check the scan | `quality.stem_noise(...).summary()` | noise and per-scan registration |
 | Thin and clean | `filters.voxel_downsample`, `filters.statistical_outlier_removal` | working cloud |
 | Ground | `ground.classify_ground_csf`, `make_dtm`, `normalize_height`, `make_chm` | `classification`, `height`, DTM, CHM |
-| Trees | `trees.detect_stems`, `merge_branches`, `segment_trees`, `tree_heights`, `prune_trees`, `crown_metrics_all`, `basal_area` | tree table, `tree_id` per point |
+| Trees | `trees.detect_stems`, `merge_branches`, `segment_trees`, `merge_touching`, `tree_heights`, `prune_trees`, `crown_metrics_all`, `basal_area` | tree table, `tree_id` per point |
 | Wood models | `qsm.wood_points`, `qsm.build_qsm`, `QSM.metrics` | cylinders and tree architecture per tree |
 | Canopy (pulses) | `canopy.GapProfile`, `voxels.ray_voxelize` | PAI, PAVD profiles, clumping, voxel PAD |
 | Coverage | `RayVoxelGrid.occlusion_profile`, `voxels.tree_sampling` | what was and was not seen |
@@ -108,7 +108,7 @@ See [Command line](cli.md) for every command and option.
 ## Reproducibility
 
 - **Seeds.** Every function with a random element takes a `seed` (default
-  0), including RANSAC fits, random thinning and the azimuths of
+  0, except `leaves.add_leaves`, which uses 1), including RANSAC fits, random thinning and the azimuths of
   reconstructed misses.
 - **Repeat runs.** With the same inputs, parameters and version, stem
   detection, segmentation, QSMs and ray-traced voxels repeat exactly; this
@@ -205,7 +205,8 @@ with progress.task("fitting QSMs", len(trees)) as t:
 ```
 
 Reported by the core: tree segmentation, QSM building, pulse tracing, buttress
-meshing and leaf placement; from Python: scan pair registration.
+meshing and leaf placement; from Python: reading scans, tiling, and the
+chunks of the airborne commands.
 
 
 ## When it will not fit in memory

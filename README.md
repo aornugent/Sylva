@@ -1,7 +1,5 @@
 # Sylva
 
-NOTE: This software is still in ALPHA and is not yet thoroughly tested, if you notice anything strange please raise an issue [here](https://github.com/UQ-EORC/Sylva/issues).
-
 [![PyPI](https://img.shields.io/pypi/v/sylva-rs)](https://pypi.org/project/sylva-rs/)
 [![crates.io](https://img.shields.io/crates/v/sylva-rs)](https://crates.io/crates/sylva-rs)
 [![Documentation](https://img.shields.io/badge/docs-uq--eorc.github.io%2FSylva-blue)](https://uq-eorc.github.io/Sylva/)
@@ -11,6 +9,11 @@ Terrestrial and airborne laser scanning processing for forest ecology and
 remote sensing. A Rust core (the `sylva-rs` crate) holds every computation and file
 format; Python gets a numpy-friendly API (`import sylva`) and a `sylva`
 command over it.
+
+Parts of Sylva are ports of existing open-source software into Rust, not new
+methods: see
+[THIRD_PARTY_NOTICES.md](https://github.com/UQ-EORC/Sylva/blob/main/THIRD_PARTY_NOTICES.md)
+for what was ported and from where.
 
 | Module | What it does |
 |---|---|
@@ -22,7 +25,7 @@ command over it.
 | `sylva.geo.masks` | point masks and crops by polygons (shapefile, GeoJSON, with holes), rasters, attribute expressions (`cloud.where("height > 2 & classification != 2")`) and distance to another cloud |
 | `sylva.trees` | RANSAC circle fitting, stem detection & DBH, basal area, taper profiles, graph-based tree segmentation, tree heights, crown metrics, crown shape (stacked-hull volume, asymmetry) |
 | `sylva.canopy` | voxel grids, contact-frequency PAD profiles, zenith-ring gap fraction, hinge/Miller LAI, ray-traced density grids from pulse data, Jupp gap-probability profiles with hinge / linear / weighted PAI, clumping index and canopy height, synthetic hemispherical photographs from pulses or points |
-| `sylva.voxels` | ray-traced voxels (port of raycloudtools `rayvoxel`): echo-weighted free / potential path lengths, FPL / PPL / transmittance / Bailey attenuation, analytic or estimated leaf-angle `G`, PAD / LAD / WAD, occlusion, sub-voxel exploration, QSM wood volume, `.vox` export, occlusion profiles and per-tree sampling (is the top real?) |
+| `sylva.voxels` | ray-traced voxels (after AMAPVox): echo-weighted free / potential path lengths, FPL / PPL / transmittance / Bailey attenuation, analytic or estimated leaf-angle `G`, PAD / LAD / WAD, occlusion, sub-voxel exploration, QSM wood volume, `.vox` export, occlusion profiles and per-tree sampling (is the top real?) |
 | `sylva.registration` | Kabsch, point-to-point / point-to-plane (trimmed) ICP, scan merging, overlay and stem cross-section plots to check a registration by eye |
 | `sylva.registration_report` | a self-contained HTML report on how well a set of scans agree: pair residuals, a map of the survey, the worst pairs up close |
 | `sylva.coreg` | marker-free coregistration of scan positions from the trees: terrain model, stem maps, global stem-map and reflector matching, robust point-to-plane ICP, pose graph with outlier rejection, recovery of stragglers, joint multi-view refinement, stem agreement report; tilted scans levelled with the scanner attitude; scanner `.PROJ` projects |
@@ -41,6 +44,8 @@ command over it.
 
 ## Contributing
 
+If you notice anything strange, please raise an issue [here](https://github.com/UQ-EORC/Sylva/issues).
+
 Feedback, issues, and PRs all welcome. For issues please use [GitHub issues](https://github.com/UQ-EORC/Sylva/issues) (not a personal message) so the community can benefit.
 
 ## Citation
@@ -49,19 +54,21 @@ If Sylva contributed to your work, please cite it. Every release is archived
 on Zenodo, which gives it a DOI: https://doi.org/10.5281/zenodo.23718985
 always resolves to the latest version, and each version has its own.
 
-> Devereux, T. (2026). *Sylva: terrestrial and airborne laser scanning
-> processing for forest ecology* (version 0.3.2) [Computer software].
-> The University of Queensland. https://doi.org/10.5281/zenodo.23936915
+> Devereux, T., Rivory, J., Woodgate, W., Aryal, R. R., Eaton, G., & Phinn, S.
+> (2026). *Sylva: terrestrial and airborne laser scanning
+> processing for forest ecology* (version 2.0.0) [Computer software].
+> The University of Queensland. https://doi.org/10.5281/zenodo.23718985
 
 ```bibtex
 @software{sylva,
-  author       = {Devereux, Tim},
+  author       = {Devereux, Tim and Rivory, Josh and Woodgate, Will and
+                  Aryal, Raja Ram and Eaton, Glen and Phinn, Stuart},
   title        = {Sylva: terrestrial and airborne laser scanning processing
                   for forest ecology},
   year         = {2026},
-  version      = {0.3.2},
+  version      = {2.0.0},
   organization = {The University of Queensland},
-  doi          = {10.5281/zenodo.23936915},
+  doi          = {10.5281/zenodo.23718985},
   url          = {https://github.com/UQ-EORC/Sylva}
 }
 ```
@@ -106,26 +113,27 @@ cargo install sylva-cli          # the sylva command
 
 ### From source
 
-For development, or to build the extension yourself. A conda environment keeps
-the Python, the Rust toolchain and the C linker together:
+For development, or to build the extension yourself. The Python side is
+managed by [uv](https://docs.astral.sh/uv/); a conda environment only
+supplies what uv cannot install, the Rust toolchain and the C linker:
 
 ```bash
 git clone https://github.com/UQ-EORC/Sylva.git
 cd Sylva
-conda create -n sylva -c conda-forge python=3.12 rust maturin c-compiler
+conda create -n sylva -c conda-forge rust c-compiler
 conda activate sylva
-maturin develop --release        # builds the Rust core into the environment
+uv sync --extra dev              # venv + Sylva + the dev extras (pytest, ruff, ...)
 ```
 
 `c-compiler` matters: `rustc` links through a program called `cc`, which
 conda's `rust` package does not provide, so without it the build stops at
-``error: linker `cc` not found``. The repository's `environment.yml` has the
-same list plus the test and notebook extras (`conda env create -f
+``error: linker `cc` not found``. The repository's `environment.yml` has
+the same toolchain plus Python and maturin (`conda env create -f
 environment.yml`).
 
-Without conda, any Python >= 3.10 with a Rust toolchain (`rustup`), a system
-C compiler (`gcc`, `build-essential`, or Xcode's command line tools) and
-`pip install maturin` does the same job.
+Without conda, uv provides the Python too; a Rust toolchain (`rustup`) and a
+system C compiler (`gcc`, `build-essential`, or Xcode's command line tools)
+are all the build needs, and `uv sync --extra dev` does the rest.
 
 ## A first look
 
@@ -193,6 +201,25 @@ The documentation is at [uq-eorc.github.io/Sylva](https://uq-eorc.github.io/Sylv
   [references](https://github.com/UQ-EORC/Sylva/blob/main/docs/references.md)
 
 Build the site with `pip install -e '.[docs]' && mkdocs serve`.
+
+## Acknowledgements
+
+Sylva builds on other people's software, and parts of it are adaptations of
+their code. The airborne tree segmentation and area-based metrics are
+adapted from [lidR](https://github.com/r-lidar/lidR) by Jean-Romain Roussel
+(r-lidar), and the terrestrial tree segmentation takes the idea of seeding
+a tree from the surface of its trunk from his
+[Arbor](https://github.com/r-lidar/arbor). The voxel module follows
+[AMAPVox](https://github.com/umr-amap/AMAPVox); other parts
+follow [raycloudtools](https://github.com/csiro-robotics/raycloudtools)
+(Lowe and Stepanas 2021; Devereux et al. 2026),
+GBSeparation, the CSF reference implementation, the Point Cloud Library and
+SciPy.
+[THIRD_PARTY_NOTICES.md](https://github.com/UQ-EORC/Sylva/blob/main/THIRD_PARTY_NOTICES.md)
+lists what was adapted from each, with their copyright and licence notices,
+and the
+[references](https://github.com/UQ-EORC/Sylva/blob/main/docs/references.md)
+give the methods to cite.
 
 ## Licence
 

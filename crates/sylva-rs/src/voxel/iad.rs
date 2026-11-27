@@ -1,7 +1,6 @@
 // Sylva: LiDAR processing for forest ecology and remote sensing research.
 // Copyright (C) 2026 Tim Devereux, The University of Queensland.
-// Adapted from rayvoxel (Josh Rivory, unpublished), a port of AMAPVox (UMR AMAP);
-// see THIRD_PARTY_NOTICES.md.
+// Follows AMAPVox (UMR AMAP); see THIRD_PARTY_NOTICES.md.
 // Free software under the GNU General Public License v3.0 or later;
 // see the LICENSE file. There is no warranty, to the extent permitted by law.
 //! Inclination angle distributions from echo normals, per tree.
@@ -33,22 +32,35 @@ pub struct TreeIad {
     pub bin_centres: Vec<f64>,
     /// Normalised leaf / wood / plant inclination histograms.
     pub liad: Vec<f64>,
+    /// Normalised wood inclination histogram (sums to 1; all zero without wood echoes).
     pub wiad: Vec<f64>,
+    /// Normalised inclination histogram of every echo of the tree.
     pub piad: Vec<f64>,
     /// Triangle-facet histograms (Bailey only, otherwise empty).
     pub liad_bailey: Vec<f64>,
+    /// Area-weighted wood facet histogram (Bailey only, otherwise empty).
     pub wiad_bailey: Vec<f64>,
+    /// Area-weighted facet histogram of leaf and wood together (Bailey only, otherwise empty).
     pub piad_bailey: Vec<f64>,
+    /// Projection coefficient `G` of the leaf histogram, averaged over the tree's beam zeniths (Vicari et al. 2019); 0 without leaf echoes.
     pub g_leaf: f64,
+    /// `G` of the wood histogram over the tree's beam zeniths; 0 without wood echoes.
     pub g_wood: f64,
+    /// `G` of the all-echo histogram over the tree's beam zeniths.
     pub g_plant: f64,
+    /// Area-weighted mean `|n_z|` of the leaf facets (`G` for a vertical beam, Bailey & Mahaffee 2017); 0 without facets.
     pub bailey_g_leaf: f64,
+    /// Area-weighted mean `|n_z|` of the wood facets; 0 without facets.
     pub bailey_g_wood: f64,
+    /// Leaf echoes of the tree that received a normal.
     pub leaf_hits: u32,
+    /// Wood echoes of the tree that received a normal.
     pub wood_hits: u32,
     /// Closest de Wit type of each histogram.
     pub liad_de_wit: Option<&'static str>,
+    /// Closest de Wit type of the wood histogram; `None` when it is empty.
     pub wiad_de_wit: Option<&'static str>,
+    /// Closest de Wit type of the all-echo histogram; `None` when it is empty.
     pub piad_de_wit: Option<&'static str>,
 }
 
@@ -92,7 +104,8 @@ impl EchoPoints {
                     continue;
                 }
                 let p = add(&o, &scale(&d, shots.echo_range[e]));
-                let Some(idx) = geom.flat(geom.cell_of(&p)) else { continue };
+                // The voxel the hit was counted in (see `Geom::hit_cell`).
+                let Some(idx) = geom.flat(geom.hit_cell(&p, Some(&d))) else { continue };
                 self.pts.push(p);
                 self.meta.push((idx, inputs.foliage.map_or(foliage::PLANT, |f| f[e]), inputs.tree_id.map_or(0, |t| t[e]), beam));
             }
@@ -255,7 +268,7 @@ pub(crate) fn build(vox: &mut RayVoxels, echoes: EchoPoints) {
 /// Triangles between each echo and pairs of its same-class neighbours with
 /// all edges under `l_max`, binned by facet inclination with weight
 /// `area · sin θ`; `G` per facet is `|n_z|` (vertical mean beam direction,
-/// as in rayvoxel). Facets belong to the voxel of their first vertex.
+/// as in the voxel output). Facets belong to the voxel of their first vertex.
 /// Build the triangles the Bailey method measures, per tree.
 ///
 /// Every triple of mutually close points of the same class (all leaf or all

@@ -1,7 +1,6 @@
 // Sylva: LiDAR processing for forest ecology and remote sensing research.
 // Copyright (C) 2026 Tim Devereux, The University of Queensland.
-// Adapted from rayvoxel (Josh Rivory, unpublished), a port of AMAPVox (UMR AMAP);
-// see THIRD_PARTY_NOTICES.md.
+// Follows AMAPVox (UMR AMAP); see THIRD_PARTY_NOTICES.md.
 // Free software under the GNU General Public License v3.0 or later;
 // see the LICENSE file. There is no warranty, to the extent permitted by law.
 //! Per-voxel estimators: attenuation, projection functions, area densities.
@@ -16,11 +15,17 @@ const EPS: f64 = 1e-10;
 /// Analytic leaf angle distribution (de Wit 1965 types and parametric ones).
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Lad {
+    /// Leaf normals spread evenly over the sphere (density `sin θ`); `G = 0.5` at every zenith.
     Spherical,
+    /// Every inclination equally likely.
     Uniform,
+    /// Mostly horizontal leaves (de Wit 1965).
     Planophile,
+    /// Mostly vertical leaves.
     Erectophile,
+    /// Mostly oblique leaves, around 45 degrees.
     Plagiophile,
+    /// Horizontal and vertical leaves, few oblique.
     Extremophile,
     /// Campbell's (1990) ellipsoidal distribution with axis ratio `chi`.
     Ellipsoidal(f64),
@@ -33,7 +38,7 @@ pub enum Lad {
 }
 
 impl Lad {
-    /// From a name and up to two parameters, as rayvoxel's `--lad` / `--lad_params`.
+    /// From a name and up to two parameters (`--lad` / `--lad_params`).
     pub fn parse(name: &str, p: &[f64]) -> Result<Self> {
         let need = |n: usize| if p.len() < n { Err(Error::invalid(format!("LAD {name:?} needs {n} parameter(s)"))) } else { Ok(()) };
         Ok(match name {
@@ -58,6 +63,7 @@ impl Lad {
         })
     }
 
+    /// The `--lad` name.
     pub fn name(&self) -> &'static str {
         match self {
             Lad::Spherical => "spherical",
@@ -270,7 +276,9 @@ impl RayVoxels {
     /// * FPL: intercepted beam section over the effective free path
     ///   (hits over free path without beam metrics) — the biased MLE of
     ///   Pimont et al. (2018), with the beam footprint of Pimont et al. (2019).
-    /// * Transmittance: `−ln(1 − intercepted / entering)`.
+    /// * Transmittance: `−ln(1 − intercepted / entering) / mean chord`, the mean chord (m)
+    ///   being `path_length / num_beams`; without beam metrics, the weighted hits over the
+    ///   weighted beams take the place of the beam sections.
     /// * PPL: the exact solve where available, otherwise the mean-chord form
     ///   (Pimont et al. 2018).
     pub fn attenuation(&self, idx: usize, method: Attenuation) -> f64 {
@@ -278,9 +286,15 @@ impl RayVoxels {
         // Share-weighted: the free path and beam counts below carry each
         // segment's share of the pulse, so the hits must too.
         let hits_w = self.get_f(F::HitsWeighted, idx) as f64;
+        // −ln of a transmittance is an optical depth (dimensionless); over the
+        // mean length of the pulses' paths across the voxel it is an
+        // attenuation coefficient, which does not depend on the voxel size.
+        let beams = self.get_i(I::NumBeams, idx) as f64;
+        let mean_chord = if beams > 0.0 { f(F::PathLength) / beams } else { 0.0 };
+        let per_metre = |depth: f64| if mean_chord > EPS { depth / mean_chord } else { 0.0 };
         let transmittance = || {
             if f(F::BsEntering) > EPS {
-                return Some(-((f(F::BsEntering) - f(F::BsIntercepted)) / f(F::BsEntering)).max(EPS).ln());
+                return Some(per_metre(-((f(F::BsEntering) - f(F::BsIntercepted)) / f(F::BsEntering)).max(EPS).ln()));
             }
             None
         };
@@ -296,7 +310,7 @@ impl RayVoxels {
             }
             Attenuation::Transmittance => transmittance().unwrap_or_else(|| {
                 if f(F::NumBeamsWeighted) > EPS {
-                    -(1.0 - (hits_w / f(F::NumBeamsWeighted)).min(1.0 - EPS)).ln()
+                    per_metre(-(1.0 - (hits_w / f(F::NumBeamsWeighted)).min(1.0 - EPS)).ln())
                 } else {
                     0.0
                 }
@@ -374,6 +388,13 @@ impl RayVoxels {
         2.0 * (n - 1.0) * self.get_f(F::HitsWeighted, idx) as f64 / (EPS + n * self.get_f(F::PathLength, idx) as f64)
     }
 
+    /// Beam-section transmittance over one metre of path (0–1), as AMAPVox normalises it:
+    /// `exp(−bs_intercepted / bs_free_path)`, the gap probability of a 1 m path through
+    /// vegetation like the voxel's. It is not the gap probability of the voxel itself, which
+    /// is this to the power of the path length across it (m), so values compare between grids
+    /// of different voxel sizes. Where the beams have no free path to divide by, the share of
+    /// the entering section that was not intercepted; 1 where no beam entered or beam metrics
+    /// are off.
     pub fn transmittance(&self, idx: usize) -> f64 {
         let f = |fld: F| self.get_f(fld, idx) as f64;
         if f(F::BsFreePath) > EPS {
@@ -385,7 +406,9 @@ impl RayVoxels {
         }
     }
 
-    /// Weighted mean beam zenith (rad).
+    /// Weighted mean angle of the beams from the vertical (rad, 0 to π/2): beams travelling
+    /// down count as the upward beams along the same line, so beams from above and below do
+    /// not average to a horizontal one. 0 where no beam entered.
     pub fn mean_zenith(&self, idx: usize) -> f64 {
         let n = self.get_f(F::NumBeamsWeighted, idx);
         if n > 0.0 { (self.get_f(F::SumOfAngles, idx) / n) as f64 } else { 0.0 }
@@ -402,6 +425,7 @@ impl RayVoxels {
         (s.atan2(c).rem_euclid(2.0 * PI), s.hypot(c))
     }
 
+    /// Weighted mean distance from the scanner to the voxel centre (m); 0 where no beam entered.
     pub fn mean_laser_distance(&self, idx: usize) -> f64 {
         let n = self.get_f(F::NumBeamsWeighted, idx);
         if n > 0.0 { (self.get_f(F::SumOfLaserDistances, idx) / n) as f64 } else { 0.0 }
@@ -509,8 +533,8 @@ impl RayVoxels {
                 // path); the beam-section bias term does not apply to it.
                 let class = |n: i32, fp: f32, g: f64| if g > 0.0 && fp as f64 > EPS { n as f64 / (fp as f64 * g) } else { 0.0 };
                 // Plant hits count every vegetation echo, so pair them with the free
-                // path of every vegetation segment (rayvoxel uses the unclassified
-                // ones only, which gives 0 for a fully leaf / wood labelled cloud).
+                // path of every vegetation segment (the unclassified ones alone would
+                // give 0 for a fully leaf / wood labelled cloud).
                 let plant_path = self.get_f(F::FreePathLengthPlant, idx) + self.get_f(F::FreePathLengthLeaf, idx) + self.get_f(F::FreePathLengthWood, idx);
                 out.pad = class(self.get_i(I::NumHitPlant, idx), plant_path, iad.g_plant);
                 out.lad = class(self.get_i(I::NumHitLeaf, idx), self.get_f(F::FreePathLengthLeaf, idx), iad.g_leaf);
@@ -577,6 +601,7 @@ impl RayVoxels {
         }
     }
 
+    /// Names [`RayVoxels::metric`] accepts besides `pad_`, `lad_`, `wad_` and `attenuation_<method>`.
     pub const METRICS: [&'static str; 19] = [
         "state", "pad_g0_5", "surface_area", "pad_g_corrected", "transmittance", "mean_zenith_angle",
         "mean_azimuth_angle", "azimuth_concentration", "mean_laser_dist", "sd_path_length", "distance_from_ground",

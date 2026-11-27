@@ -30,11 +30,17 @@ pub type Matrix4 = [f64; 16];
 /// from up) and azimuth `phi` start, increment and count.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct ScanPattern {
+    /// First zenith angle of the pattern (degrees from up).
     pub theta_start: f64,
+    /// Zenith angle increment (degrees).
     pub theta_delta: f64,
+    /// Number of zenith angles in the pattern.
     pub theta_count: i64,
+    /// First azimuth angle of the pattern (degrees).
     pub phi_start: f64,
+    /// Azimuth increment (degrees).
     pub phi_delta: f64,
+    /// Number of azimuth angles in the pattern.
     pub phi_count: i64,
 }
 
@@ -71,10 +77,13 @@ impl ScanPosition {
 /// A parsed project.
 #[derive(Debug, Clone, PartialEq)]
 pub struct RiscanProject {
+    /// The project directory (`.RiSCAN` or scanner `.PROJ`) it was read from.
     pub path: PathBuf,
+    /// Every scan position, in project order.
     pub positions: Vec<ScanPosition>,
     /// Project -> global matrix (often geocentric).
     pub pop: Option<Matrix4>,
+    /// Project name: the directory's name without its extension.
     pub name: String,
 }
 
@@ -1059,10 +1068,15 @@ pub fn read_project(path: impl AsRef<Path>) -> Result<RiscanProject> {
 /// A target of a RIEGL `.tpl` tie-point list, in the scanner's frame.
 #[derive(Debug, Clone, PartialEq)]
 pub struct TiePoint {
+    /// Centre of the target (m) in the scanner's frame.
     pub position: Point,
+    /// Reflectance of the target (dB); NaN when the entry records none.
     pub reflectance: f64,
+    /// Diameter of the target as the list records it; NaN when the entry records none.
     pub diameter: f64,
+    /// Number of returns the scanner measured on the target; 0 when the entry records none.
     pub point_count: i64,
+    /// Target name as recorded; empty when the entry has none.
     pub name: String,
 }
 
@@ -1324,9 +1338,13 @@ pub fn angular_steps(xyz: &[[f32; 3]], sample: usize) -> Result<(f64, f64)> {
 /// Settings of [`riscan_like_mask`]'s `"legacy"` mode.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct LegacyFilter {
+    /// Half-width of the neighbourhood window in scan increments, in both zenith and azimuth.
     pub window_steps: f64,
+    /// Half-width of the neighbourhood window in range (m).
     pub window_range: f64,
+    /// A weak echo with fewer than this many other echoes in its window is dropped.
     pub min_neighbours: usize,
+    /// Amplitude (dB) below which an echo counts as weak and faces the neighbour test.
     pub weak_db: f64,
     /// `(theta_step, phi_step)` of the scan pattern (degrees); estimated by
     /// [`angular_steps`] if None.
@@ -1346,7 +1364,8 @@ impl Default for LegacyFilter {
 /// `"none"` keeps everything; `"current"` drops `range < min_range`;
 /// `"legacy"` also drops an echo weaker than `weak_db` with fewer than
 /// `min_neighbours` other echoes within `window_steps` scan increments in
-/// either angle and `window_range` metres of range.
+/// either angle and `window_range` metres of range. Azimuth is circular: an
+/// echo at 359.99 degrees is a neighbour of one at 0.01 degrees.
 ///
 /// # Errors
 /// An unknown mode or an amplitude of another length; see [`angular_steps`].
@@ -1381,7 +1400,22 @@ pub fn riscan_like_mask(xyz: &[[f32; 3]], amplitude: &[f32], mode: &str, min_ran
         let zenith = degrees_f32((p[2] / safe).clamp(-1.0, 1.0).acos());
         [(mod360_f32(degrees_f32(p[1].atan2(p[0]))) / phi_scale) as f64, (zenith / theta_scale) as f64, (r / range_scale) as f64]
     }).collect();
-    let neighbours = filters::count_within(&q, 1.0);
+    // Azimuth wraps at 360 degrees, which the neighbour search does not know:
+    // echoes within a window of the seam are repeated a full turn away, so
+    // those on the other side count them. Only the real echoes are judged.
+    let period = 360.0 / phi_scale as f64;
+    let mut searched = q;
+    if period.is_finite() && period > 2.0 {
+        for k in 0..n {
+            let p = searched[k];
+            if p[0] < 1.0 {
+                searched.push([p[0] + period, p[1], p[2]]);
+            } else if p[0] > period - 1.0 {
+                searched.push([p[0] - period, p[1], p[2]]);
+            }
+        }
+    }
+    let neighbours = filters::count_within(&searched, 1.0);
     let weak_db = legacy.weak_db as f32;
     for ((k, &c), &a) in keep.iter_mut().zip(&neighbours).zip(amplitude) {
         if a < weak_db && c.saturating_sub(1) < legacy.min_neighbours {
@@ -1394,6 +1428,28 @@ pub fn riscan_like_mask(xyz: &[[f32; 3]], amplitude: &[f32], mode: &str, min_ran
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_legacy_filter_counts_neighbours_across_the_azimuth_seam() {
+        // Eight weak echoes on one zenith at 10 m, four either side of azimuth
+        // 0 and all within one window (1.5 x 0.03 degrees) of each other: seven
+        // neighbours each. Without the wrap each saw only the three on its own
+        // side and all eight were dropped.
+        let at = |azimuth_deg: f64| {
+            let a = azimuth_deg.to_radians();
+            [(10.0 * a.cos()) as f32, (10.0 * a.sin()) as f32, 0.0f32]
+        };
+        let offsets = [0.004, 0.008, 0.012, 0.016];
+        let seam: Vec<[f32; 3]> = offsets.iter().flat_map(|&d| [at(d), at(-d)]).collect();
+        let away: Vec<[f32; 3]> = offsets.iter().flat_map(|&d| [at(90.0 + d), at(90.0 - d)]).collect();
+        let legacy = LegacyFilter { steps: Some((0.03, 0.03)), ..LegacyFilter::default() };
+        let weak = vec![5.0f32; 8];
+        assert_eq!(riscan_like_mask(&away, &weak, "legacy", 0.5, &legacy).unwrap(), vec![true; 8]);
+        assert_eq!(riscan_like_mask(&seam, &weak, "legacy", 0.5, &legacy).unwrap(), vec![true; 8]);
+        // One side alone is still too few, wrap or no wrap.
+        let half: Vec<[f32; 3]> = offsets.iter().map(|&d| at(d)).collect();
+        assert_eq!(riscan_like_mask(&half, &weak[..4], "legacy", 0.5, &legacy).unwrap(), vec![false; 4]);
+    }
 
     fn tmp(name: &str) -> PathBuf {
         let d = std::env::temp_dir().join(format!("sylva-riscan-{}-{name}", std::process::id()));

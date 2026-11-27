@@ -1,7 +1,7 @@
 # Ray-traced voxels
 
-`sylva.voxels` is a port of `rayvoxel`, J. Rivory's unpublished
-ray-traced voxeliser built on raycloudtools, which follows the attenuation
+`sylva.voxels` is a ray-traced voxeliser following
+[AMAPVox](../references.md), built on raycloudtools, with the attenuation
 estimators of [Vincent et al. 2017](../references.md). Each pulse is traced through the grid voxel by
 voxel ([Amanatides & Woo 1987](../references.md)), twice: once whole, for
 beam counts and the potential path length (the full chord of every voxel it
@@ -41,7 +41,7 @@ the fallback and the beam-section estimate agree within 3 % in PAI.
 |---|---|
 | `fpl` | intercepted beam section / effective free path length, minus the [Pimont et al. (2018)](../references.md) bias term, with the beam footprint of [Pimont et al. (2019)](../references.md) |
 | `ppl` | exact maximum-likelihood solve of `Σ_hits s L / (e^{λL} − 1) = Σ_misses s L` over the beams of each voxel (capped at 20) |
-| `transmittance` | `−ln(1 − intercepted / entering)` beam section |
+| `transmittance` | `−ln(1 − intercepted / entering) / mean chord`: the optical depth of the voxel from its beam-section transmittance, over the mean length of the pulses' paths across it (`path_length / num_beams`, m) |
 | `bailey` | [Bailey & Mahaffee (2017)](../references.md) eq. 10 per class, with `G` from triangle facets between neighbouring echoes |
 
 Area density is `λ / G`, with the same bias-corrected λ as `attenuation_fpl`
@@ -71,21 +71,21 @@ only where a float32 result rounds the other way (last printed digit); neighbour
 before any top-up and leave the outer voxel layer alone instead of padding;
 without `tree_id` all echoes share one inclination distribution; echoes under
 the DTM surface are ground, not vegetation; `pad_fpl` pairs the plant hits with
-the free path of every vegetation segment (rayvoxel uses only the segments
-ending in an echo that is neither leaf nor wood); there is no NetCDF output
+the free path of every vegetation segment (not only the segments ending in
+an echo that is neither leaf nor wood); there is no NetCDF output
 or per-voxel class histogram, and grids too large for memory are traced block
-by block (below) rather than in rayvoxel's shards. Memory is about 0.25 kB per
+by block (below). Memory is about 0.25 kB per
 voxel while tracing.
 
 ## What the scan saw
 
 With `occlusion=True` every voxel is observed (a pulse went through or ended
 in it), occluded (only pulses that had already stopped reached it) or
-unreached.
+unobserved (no pulse was aimed at it).
 
 ```python
 g = voxels.ray_voxelize(shots, 0.25, bounds, dtm=dtm, occlusion=True)
-prof = g.occlusion_profile(min_height=0.5)   # per layer: observed / occluded / unreached, mean pulses
+prof = g.occlusion_profile(min_height=0.5)   # per layer: observed / occluded / unobserved, mean pulses
 prof["total"]                                # the whole canopy space
 m = g.observed_map()                         # (ny, nx): observed share of each column
 t = voxels.tree_sampling(g, cloud, labels)   # per tree
@@ -110,7 +110,7 @@ below, not of the scan. `Shots.from_ray_cloud` warns about this case.
 
 ## Block tracing
 
-A whole-grid trace holds about 0.23 kB of accumulators per voxel, so the
+A whole-grid trace holds about 0.25 kB of accumulators per voxel, so the
 grid, not the number of pulses, sets the memory: a 100 x 100 x 108 m plot at
 0.1 m is 1.08 billion voxels, some 240 GB. With `block_size` the grid is cut
 into blocks of that many voxels and traced a few blocks at a time, in passes

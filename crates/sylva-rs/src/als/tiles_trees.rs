@@ -12,7 +12,7 @@
 //! catalogue of height-normalised tiles, holding a few tiles at a time:
 //!
 //! 1. The graph nodes of the whole plot (the points above
-//!    `cut_above_ground`, thinned to the first point of each voxel of one
+//!    `ground_clearance`, thinned to the first point of each voxel of one
 //!    global grid, in catalogue order) are found tile by tile and kept in
 //!    scratch files. They are the nodes [`trees::segment_trees`] builds its
 //!    graph on for the whole cloud when its grid has the same corner
@@ -26,7 +26,9 @@
 //!    nodes come within `edge_margin` of the buffer's edge may have been cut
 //!    short or lost a contest it would win in the whole plot; the tile is run
 //!    again with a buffer twice as wide, up to `max_buffer`, and trees still
-//!    at the edge are reported.
+//!    at the edge are reported. With [`SegmentParams::max_reach`] the buffer
+//!    widens no further than twice the reach plus `edge_margin`, which holds
+//!    the tile's trees and every stem that can contest their nodes.
 //! 4. Every point takes the label of its nearest node ([`trees::label_points`]),
 //!    tile by tile: the nearest node lies in the point's own voxel or closer,
 //!    so a buffer of one voxel diagonal holds it.
@@ -270,10 +272,15 @@ fn build_nodes(cat: &Catalog, dir: &Path, height_attr: &str, voxel: f64, cut: f6
 /// The branch merging of [`trees::merge_branches`] with its own graph.
 #[derive(Debug, Clone)]
 pub struct MergeSettings {
+    /// Graph settings of the merging's own least-cost-path graph (`k`, `voxel_size`, ...).
     pub graph: SegmentParams,
+    /// Graph nodes below this height (m) count as ground.
     pub ground_height: f64,
+    /// Half-width of a candidate's trunk zone in stem radii (`trunk_scale * dbh / 2`).
     pub trunk_scale: f64,
+    /// Smallest half-width (m) of the trunk zone.
     pub trunk_min: f64,
+    /// Only candidates within this horizontal distance (m) are compared.
     pub search_radius: f64,
 }
 
@@ -292,7 +299,8 @@ pub struct TreeTiling {
     pub prune: Option<PruneParams>,
     /// Band read around each tile (m); wider than the largest crown.
     pub buffer: f64,
-    /// Widest band a tile is read again with when a crown reaches the edge.
+    /// Widest band a tile is read again with when a crown reaches the edge
+    /// (with `segment.max_reach`, at most twice the reach plus `edge_margin`).
     pub max_buffer: f64,
     /// A tree whose nodes come this close (m) to the edge of the band, where
     /// the catalogue goes on, counts as reaching it.
@@ -320,6 +328,7 @@ pub struct Segmented {
     /// Graph nodes claimed by two tiles for different trees (0 when every
     /// tile's crowns lie within its buffer).
     pub conflicts: u64,
+    /// Chunks processed and points held, for checking that memory stayed bounded.
     pub info: RunInfo,
 }
 
@@ -339,6 +348,9 @@ fn check_settings(s: &TreeTiling) -> Result<()> {
     for g in grids {
         if g.voxel_origin.is_none_or(|o| o.iter().any(|v| !v.is_finite())) {
             return Err(Error::invalid("tiled segmentation needs a finite voxel_origin, shared by the tiles"));
+        }
+        if !(g.max_reach.is_finite() && g.max_reach >= 0.0) {
+            return Err(Error::invalid(format!("max_reach must be a non-negative number of metres (0 for no limit), got {}", g.max_reach)));
         }
         if g.voxel_size.is_nan() || g.voxel_size < 0.0 || g.k == 0 {
             return Err(Error::invalid(format!("voxel_size must be non-negative and k positive, got {} and {}", g.voxel_size, g.k)));
@@ -402,6 +414,11 @@ fn segment_tile(cat: &Catalog, nodes: &Nodes, ci: usize, cores: &[[f64; 4]], ste
     let g = on_nodes(&s.segment);
     let reach = stem_reach(stems, &s.segment);
     let own: HashSet<i64> = (0..stems.len()).filter(|&i| owners[i] == ci).map(|i| stems[i].tree_id).collect();
+    // With a reach, the tile's trees lie within it of the core, and every
+    // stem that can claim one of their nodes within twice it: a band of
+    // twice the reach (and the edge margin) holds them all, and nothing at
+    // its edge, labelled or not, can belong to the tile's trees.
+    let widest = if g.max_reach > 0.0 { s.max_buffer.min((2.0 * g.max_reach + s.edge_margin).max(s.buffer)) } else { s.max_buffer };
     let mut b = s.buffer;
     loop {
         let outer = grow(&cores[ci], b);
@@ -422,8 +439,8 @@ fn segment_tile(cat: &Catalog, nodes: &Nodes, ci: usize, cores: &[[f64; 4]], ste
         // bridge to the rest of its tree, leaves the buffer: in the whole
         // plot it would be labelled and compete, so the tile is not settled.
         let loose_edge = labels.iter().zip(&pts).zip(&h).any(|((&l, p), &hh)| l < 0 && hh > g.low_height && margin(&outer, &open, p) < s.edge_margin);
-        if (!edge.is_empty() || loose_edge) && b < s.max_buffer {
-            b = (b.max(s.edge_margin) * 2.0).min(s.max_buffer);
+        if (!edge.is_empty() || loose_edge) && b < widest {
+            b = (b.max(s.edge_margin) * 2.0).min(widest);
             counts.rereads.fetch_add(1, Ordering::Relaxed);
             continue;
         }
@@ -519,6 +536,10 @@ pub fn segment_trees(cat: &Catalog, stems: &[Tree], out_dir: &Path, format: Opti
         if t.tree_id < 0 || !ids.insert(t.tree_id) {
             return Err(Error::invalid(format!("stem ids must be unique and non-negative; {} is not", t.tree_id)));
         }
+        // The tiles carry the id as a 32-bit integer; a larger one would wrap to another tree's.
+        if t.tree_id > i32::MAX as i64 {
+            return Err(Error::invalid(format!("stem id {} does not fit the 32-bit label written to the tiles (at most {}); renumber the stems", t.tree_id, i32::MAX)));
+        }
         if !(t.x.is_finite() && t.y.is_finite()) {
             return Err(Error::invalid(format!("stem {} has no position", t.tree_id)));
         }
@@ -532,17 +553,17 @@ pub fn segment_trees(cat: &Catalog, stems: &[Tree], out_dir: &Path, format: Opti
     }
     let scratch = Scratch::new(out_dir, ".sylva-segment")?;
     let seg_origin = s.segment.voxel_origin.expect("checked");
-    let nodes = build_nodes(cat, &scratch.0.join("nodes"), &s.height_attr, s.segment.voxel_size.max(0.0), s.segment.cut_above_ground, seg_origin, workers, &counts)?;
+    let nodes = build_nodes(cat, &scratch.0.join("nodes"), &s.height_attr, s.segment.voxel_size.max(0.0), s.segment.ground_clearance, seg_origin, workers, &counts)?;
 
     // Branches, on their own graph (its own voxel size and cut).
     let (survivors, input_index): (Vec<Tree>, Vec<usize>) = match &s.merge {
         Some(m) if !stems.is_empty() => {
-            let same = m.graph.voxel_size == s.segment.voxel_size && m.graph.cut_above_ground == s.segment.cut_above_ground && m.graph.voxel_origin == s.segment.voxel_origin;
+            let same = m.graph.voxel_size == s.segment.voxel_size && m.graph.ground_clearance == s.segment.ground_clearance && m.graph.voxel_origin == s.segment.voxel_origin;
             let own_nodes;
             let mn = if same {
                 &nodes
             } else {
-                own_nodes = build_nodes(cat, &scratch.0.join("merge_nodes"), &s.height_attr, m.graph.voxel_size.max(0.0), m.graph.cut_above_ground, m.graph.voxel_origin.expect("checked"), workers, &counts)?;
+                own_nodes = build_nodes(cat, &scratch.0.join("merge_nodes"), &s.height_attr, m.graph.voxel_size.max(0.0), m.graph.ground_clearance, m.graph.voxel_origin.expect("checked"), workers, &counts)?;
                 &own_nodes
             };
             let parent = merge_parents(cat, mn, stems, m, &cores, s.buffer, workers, &counts)?;
@@ -638,14 +659,16 @@ pub fn segment_trees(cat: &Catalog, stems: &[Tree], out_dir: &Path, format: Opti
     }
 
     // Pruning over the tree list: the ids each old id becomes.
-    let max_id = trees_out.iter().map(|t| t.tree_id).max().unwrap_or(0).max(0);
-    let (final_trees, lut): (Vec<(usize, Tree)>, Vec<i64>) = match &s.prune {
+    // Old id to final id, held per tree and not per possible id, so that
+    // sparse ids (a plot numbered from a million) cost nothing.
+    let (final_trees, lut): (Vec<(usize, Tree)>, HashMap<i64, i64>) = match &s.prune {
         Some(p) if !trees_out.is_empty() => {
-            let all: Vec<i64> = (0..=max_id).collect();
-            let (kept, lut) = prune_trees(&trees_out, &all, p)?;
+            let old: Vec<i64> = trees_out.iter().map(|t| t.tree_id).collect();
+            let (kept, new) = prune_trees(&trees_out, &old, p)?;
+            let lut: HashMap<i64, i64> = old.iter().copied().zip(new).collect();
             let mut n_new: HashMap<i64, usize> = HashMap::new();
             for t in &trees_out {
-                let new = lut[t.tree_id as usize];
+                let new = lut[&t.tree_id];
                 if new >= 0 {
                     *n_new.entry(new).or_default() += t.n_points;
                 }
@@ -656,15 +679,9 @@ pub fn segment_trees(cat: &Catalog, stems: &[Tree], out_dir: &Path, format: Opti
             }).collect();
             (kept, lut)
         }
-        _ => {
-            let mut lut = vec![-1i64; max_id as usize + 1];
-            for t in &trees_out {
-                lut[t.tree_id as usize] = t.tree_id;
-            }
-            (trees_out.iter().enumerate().map(|(i, t)| (input_index[i], t.clone())).collect(), lut)
-        }
+        _ => (trees_out.iter().enumerate().map(|(i, t)| (input_index[i], t.clone())).collect(), trees_out.iter().map(|t| (t.tree_id, t.tree_id)).collect()),
     };
-    let map = |l: i64| if l >= 0 && (l as usize) < lut.len() { lut[l as usize] } else { -1 };
+    let map = |l: i64| lut.get(&l).copied().unwrap_or(-1);
 
     // The tiles, with the final ids.
     let (chunks_w, ww) = tiles::prepare(cat, Some(out_dir), format, 0.0, workers)?;
@@ -691,7 +708,9 @@ pub fn segment_trees(cat: &Catalog, stems: &[Tree], out_dir: &Path, format: Opti
 /// One tree of a store: its points per tile, in catalogue order.
 #[derive(Debug, Clone, PartialEq)]
 pub struct TreeEntry {
+    /// Label of the tree in the store's tiles.
     pub tree_id: i64,
+    /// Points of the tree over every tile.
     pub n_points: usize,
     /// `[xmin, ymin, zmin, xmax, ymax, zmax]` of its points.
     pub bounds: [f64; 6],
@@ -1047,6 +1066,78 @@ mod tests {
                 assert_eq!(t.len(), e.n_points);
             }
         }
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn a_reach_bounds_the_buffer_and_keeps_the_whole_cloud_labels() {
+        let d = tmp("reach");
+        let (mut cloud, stems) = forest();
+        // A shrub layer with no stems, joined across the plot: its nodes stay
+        // unlabelled at every buffer's edge.
+        let mut rng = crate::util::nprandom::Generator::new(11);
+        let u = rng.uniform_n(0.0, 1.0, 60_000);
+        let n0 = cloud.len();
+        let shrub: Vec<Point> = (0..20_000).map(|i| [30.0 * u[3 * i], 30.0 * u[3 * i + 1], 0.6 + 1.4 * u[3 * i + 2]]).collect();
+        let mut c = PointCloud::new(cloud.xyz.iter().copied().chain(shrub).collect());
+        c.attrs.insert("height".into(), Attr::F64(c.xyz.iter().map(|p| p[2]).collect()));
+        c.attrs.insert("pid".into(), Attr::I64((0..c.len() as i64).collect()));
+        assert!(c.len() > n0);
+        cloud = c;
+        let (cat, whole) = tiled(&cloud, &d.join("in"), 10.0);
+        let h = whole.heights("height");
+        let free = SegmentParams { voxel_size: 0.1, voxel_origin: Some([0.0; 3]), ..Default::default() };
+        let held = SegmentParams { max_reach: 4.0, ..free.clone() };
+        let run = |seg: &SegmentParams, max_buffer: f64, name: &str| {
+            let s = TreeTiling { segment: seg.clone(), buffer: 8.0, max_buffer, ..Default::default() };
+            segment_trees(&cat, &stems, &d.join(name), None, &s, 2).unwrap()
+        };
+        // Without a reach the shrubs send tiles out to max_buffer; with one,
+        // no further than twice the reach and the margin (10 m here).
+        let a = run(&free, 40.0, "free");
+        assert!(a.info.rereads > 0);
+        let b = run(&held, 40.0, "held");
+        let capped = run(&free, 10.0, "capped");
+        assert!(b.info.max_points < a.info.max_points, "{} {}", b.info.max_points, a.info.max_points);
+        assert!(b.info.max_points <= capped.info.max_points, "{} {}", b.info.max_points, capped.info.max_points);
+        assert!(b.at_edge.is_empty(), "{:?}", b.at_edge);
+        // The labels are those of the whole cloud with the same reach.
+        let labels = trees::segment_trees(&whole.xyz, &h, &stems, &held);
+        let back = merge_clouds(b.paths.iter().map(|p| crate::io::read(p).unwrap()).collect());
+        let mut want = whole.clone();
+        want.attrs.insert("tree_id".into(), Attr::I64(labels));
+        assert_eq!(by_pid(&back, "tree_id"), by_pid(&want, "tree_id"));
+        // A reach must be a number of metres.
+        let bad = TreeTiling { segment: SegmentParams { max_reach: -1.0, ..free.clone() }, ..Default::default() };
+        assert!(segment_trees(&cat, &stems, &d.join("bad"), None, &bad, 1).is_err());
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn sparse_ids_are_kept_and_ids_too_large_for_the_tiles_refused() {
+        let d = tmp("ids");
+        let (cloud, stems) = forest();
+        let (cat, _) = tiled(&cloud, &d.join("in"), 15.0);
+        let seg = SegmentParams { voxel_size: 0.1, voxel_origin: Some([0.0; 3]), understorey_height: 0.0, ..Default::default() };
+        let s = TreeTiling { segment: seg, percentile: 99.0, buffer: 20.0, max_buffer: 40.0, ..Default::default() };
+        let dense = segment_trees(&cat, &stems, &d.join("dense"), None, &s, 2).unwrap();
+        // The same stems numbered from seven million in steps of a thousand.
+        let renumber = |id: i64| 7_000_000 + 1000 * id;
+        let sparse_stems: Vec<Tree> = stems.iter().map(|t| Tree { tree_id: renumber(t.tree_id), ..t.clone() }).collect();
+        let sparse = segment_trees(&cat, &sparse_stems, &d.join("sparse"), None, &s, 2).unwrap();
+        let labels = |paths: &[PathBuf]| by_pid(&merge_clouds(paths.iter().map(|p| crate::io::read(p).unwrap()).collect()), "tree_id");
+        let (a, b) = (labels(&dense.paths), labels(&sparse.paths));
+        assert!(a.values().any(|&l| l >= 0.0));
+        assert_eq!(a.len(), b.len());
+        for (pid, &l) in &a {
+            assert_eq!(b[pid], if l >= 0.0 { renumber(l as i64) as f64 } else { -1.0 }, "point {pid}");
+        }
+        assert_eq!(sparse.trees.iter().map(|(_, t)| t.tree_id).collect::<Vec<_>>(), dense.trees.iter().map(|(_, t)| renumber(t.tree_id)).collect::<Vec<_>>());
+        // An id the 32-bit label cannot hold would be written as another number.
+        let mut big = stems.clone();
+        big[0].tree_id = i32::MAX as i64 + 5;
+        let e = segment_trees(&cat, &big, &d.join("big"), None, &s, 2).unwrap_err().to_string();
+        assert!(e.contains("32-bit"), "{e}");
         let _ = fs::remove_dir_all(&d);
     }
 

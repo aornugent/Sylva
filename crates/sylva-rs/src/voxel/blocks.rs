@@ -32,7 +32,7 @@ use rayon::prelude::*;
 
 use super::blocked::{BlockWriter, BlockedGrid};
 use super::traverse::{pulse_extent, Engine, Geom, Scratch, Window};
-use super::{check_len, column_ground, for_each_file_batch, foliage, grid_shape, iad, pad_bounds, refine, Attenuation, EchoLabels, RayVoxels, VoxelInputs, VoxelParams, WeightMethod};
+use super::{check_len, check_ranges, column_ground, for_each_file_batch, foliage, grid_shape, iad, pad_bounds, refine, Attenuation, EchoLabels, RayVoxels, VoxelInputs, VoxelParams, WeightMethod};
 use crate::error::{Error, Result};
 use crate::io::shots::ShotsFile;
 use crate::{Raster, Shots};
@@ -43,7 +43,12 @@ pub enum Pulses<'a> {
     Memory(VoxelInputs<'a>),
     /// A shots file, streamed a few row groups at a time on every pass, with
     /// the echo labels taken from its attributes.
-    File { file: &'a ShotsFile, labels: &'a EchoLabels },
+    File {
+        /// The file whose row groups are streamed on every pass.
+        file: &'a ShotsFile,
+        /// How ground, foliage class, tree id and intensity are read from its echo attributes.
+        labels: &'a EchoLabels,
+    },
 }
 
 /// How a grid is cut into blocks and how many are traced at once.
@@ -117,6 +122,7 @@ fn check_inputs(inputs: &VoxelInputs, params: &VoxelParams) -> Result<()> {
     check_len("foliage", inputs.foliage, ne)?;
     check_len("intensity", inputs.intensity, ne)?;
     check_len("tree_id", inputs.tree_id, ne)?;
+    check_ranges(inputs.shots)?;
     if matches!(params.weighting, WeightMethod::Relative | WeightMethod::Strongest) && inputs.intensity.is_none() {
         return Err(Error::invalid("relative / strongest weighting needs echo intensities"));
     }

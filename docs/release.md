@@ -15,6 +15,15 @@ The PyPI *distribution* is `sylva-rs` but the *import* is `sylva`. An unrelated
 project already owns the name `sylva` on PyPI; it also installs a top-level
 `sylva` package, so the two cannot share an environment.
 
+## Before every release
+
+- Regenerate the licences of the compiled dependencies and commit the
+  result if it changed: `python scripts/third_party_licenses.py` (writes
+  `THIRD_PARTY_LICENSES.md`, which the wheels carry).
+- If code was written with another project's source as the reference since
+  the last release, check that `THIRD_PARTY_NOTICES.md` and the header of
+  the file say so, with that project's copyright and licence.
+
 ## One-time setup
 
 Both registries use trusted publishing (OpenID Connect from GitHub Actions), so
@@ -47,24 +56,33 @@ replaced, and the name is claimed for good. PyPI is the same in practice.
 ## Cutting a release
 
 1. Set the version in `Cargo.toml` (`[workspace.package]`), in `pyproject.toml`,
-   and in the `sylva-rs` dependency of `crates/sylva-cli/Cargo.toml`; run
-   `cargo check` so `Cargo.lock` follows.
+   in the `sylva-rs` dependency of `crates/sylva-cli/Cargo.toml` and in
+   `CITATION.cff` (version and date); run `cargo check` so `Cargo.lock`
+   follows.
 2. Check locally:
 
     ```bash
     cargo test --release -p sylva-rs && pytest
     cargo publish --dry-run -p sylva-rs
-    maturin sdist -o dist && maturin build --release -o dist && twine check dist/*
+    maturin sdist -o dist && maturin build --release -o dist && twine check dist/*   # pip install twine
     ```
 
-3. Commit, tag and push: `git tag v0.2.0 && git push origin main v0.2.0`.
+3. Commit, tag and push: `git tag vX.Y.Z && git push origin main vX.Y.Z`.
+4. When the `release` workflow has published, create the GitHub release
+   (`gh release create vX.Y.Z --title "Sylva X.Y.Z" --notes-file NOTES.md`,
+   with the changes since the last release as in the earlier ones). Zenodo
+   archives GitHub releases, not tags, and mints the version DOI within
+   minutes; `.zenodo.json` supplies the metadata.
+5. Record that DOI in `CITATION.cff` (`doi` and the `identifiers` list), and
+   bump the version and DOI of the citation in `README.md` and `docs/index.md`.
 
 The `release` workflow then tests, checks that the tag matches both version
 numbers, builds abi3 wheels (one per platform serves every Python ≥ 3.10) for
 Linux x86-64 / aarch64 (manylinux2014), macOS x86-64 / arm64 and Windows x86-64
 plus an sdist, and publishes to PyPI and crates.io. Running the workflow by
 hand (*Run workflow*) builds everything without publishing, which is the way
-to try a platform before tagging.
+to try a platform before tagging. The same tag also runs the `container`
+workflow, which pushes `ghcr.io/uq-eorc/sylva:X.Y.Z`.
 
 ## Notes
 

@@ -4,8 +4,9 @@
 # see the LICENSE file. There is no warranty, to the extent permitted by law.
 """Area-based metrics of airborne lidar: grids, plots and single clouds.
 
-The standard set follows the area-based metrics of Roussel et al. (2020):
-height statistics, quantiles, cumulative deciles and the normalised
+The standard set is that of lidR's ``stdmetrics`` (Roussel et al. 2020),
+whose names, formulas and binning rules are adapted from its source (see
+``THIRD_PARTY_NOTICES.md``): height statistics, quantiles, cumulative deciles and the normalised
 Shannon entropy of the heights, with intensity and return metrics, plus
 canopy cover and gap fraction from first returns. :func:`grid_metrics`
 computes them on a raster over a whole catalogue, chunk by chunk, so that
@@ -133,6 +134,9 @@ def cloud_metrics(cloud: PointCloud, height=None, threshold: float = 2.0,
                   min_height: float | None = None, drop_noise: bool = True,
                   clamp_negative: bool = False) -> dict[str, float]:
     """The standard metrics of one cloud.
+
+    The set, its names and its formulas are adapted from lidR's
+    ``stdmetrics`` (Roussel et al. 2020; GPL-3).
 
     Parameters
     ----------
@@ -629,7 +633,9 @@ def _cmd_metrics(args, write_raster) -> None:
 def _read_plot_csv(path: str, radius, id_field):
     import csv
 
-    with open(path, newline="") as f:
+    # utf-8-sig drops the byte order mark that spreadsheets put before the
+    # first column name ("CSV UTF-8"), which would otherwise hide that column.
+    with open(path, newline="", encoding="utf-8-sig") as f:
         rows = list(csv.DictReader(f))
     if not rows:
         raise ValueError(f"{path} has no plots")

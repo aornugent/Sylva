@@ -3,6 +3,12 @@
 // Free software under the GNU General Public License v3.0 or later;
 // see the LICENSE file. There is no warranty, to the extent permitted by law.
 //! Bindings for the realistic synthetic trees, plots and beam scanner.
+//!
+//! Backs sylva.synthetic.model (and the beam scanner used by
+//! sylva.synthetic) with sylva_rs::synthetic::{tree, plot, scan}. Scalar
+//! parameters come in as Python numbers and strings, clouds as `(N, 3)`
+//! arrays plus a dict of attribute arrays; results are dicts of new arrays
+//! and numbers. Unknown archetype, LAD or preset names raise ValueError.
 #![allow(clippy::type_complexity, clippy::too_many_arguments)]
 
 use numpy::{IntoPyArray, PyArray1, PyArray2, PyArrayMethods, PyReadonlyArray1, PyReadonlyArray2};
@@ -11,12 +17,12 @@ use pyo3::prelude::*;
 use pyo3::types::PyDict;
 use sylva_rs::qsm::Qsm;
 use sylva_rs::synthetic::plot::{self as plot_rs, DbhDistribution, PlotSpec, Terrain};
-use sylva_rs::synthetic::scan::{self, BeamScan, Reflectance, Solid};
+use sylva_rs::synthetic::scan::{self, BeamScan, Reflectance};
 use sylva_rs::synthetic::tree::{self, Archetype, Leaf, TreeSpec};
 use sylva_rs::voxel::Lad;
 use sylva_rs::Point;
 
-use crate::{cloud_from_py, cloud_to_py, err, shots_to_py};
+use crate::{cloud_from_py, cloud_to_py, err};
 
 fn rows<'py, const N: usize>(py: Python<'py>, r: &[[f64; N]]) -> Bound<'py, PyArray2<f64>> {
     let flat: Vec<f64> = r.iter().flat_map(|v| v.iter().copied()).collect();
@@ -202,16 +208,9 @@ fn synthetic_plot_terrain<'py>(py: Python<'py>, modes: PyReadonlyArray2<f64>, sl
 }
 
 #[pyfunction]
-fn synthetic_scan_beam<'py>(py: Python<'py>, xyz: PyReadonlyArray2<f64>, attrs: Option<&Bound<'_, PyDict>>, origin: (f64, f64, f64), resolution_deg: f64, min_zenith_deg: f64, max_zenith_deg: f64, max_echoes: usize, echo_separation: f64, range_noise: f64, range_noise_slope: f64, beam_divergence: f64, exit_diameter: f64, footprint_samples: usize, mixed_pixels: bool, target_radius: Option<f64>, oriented: bool, detection_threshold: f64, reflectance_map: Vec<(i64, f64)>, reflectance_default: f64, reflectance_attr: Option<String>, reflectance_constant: Option<f64>, max_range: f64, seed: u64, solid_a: Option<PyReadonlyArray2<f64>>, solid_b: Option<PyReadonlyArray2<f64>>, solid_r: Option<PyReadonlyArray1<f64>>, solid_point: Option<PyReadonlyArray1<i64>>) -> PyResult<Bound<'py, PyDict>> {
+fn synthetic_scan_beam<'py>(py: Python<'py>, xyz: PyReadonlyArray2<f64>, attrs: Option<&Bound<'_, PyDict>>, origin: (f64, f64, f64), resolution_deg: f64, min_zenith_deg: f64, max_zenith_deg: f64, max_echoes: usize, echo_separation: f64, range_noise: f64, range_noise_slope: f64, beam_divergence: f64, exit_diameter: f64, footprint_samples: usize, mixed_pixels: bool, target_radius: Option<f64>, oriented: bool, detection_threshold: f64, reflectance_map: Vec<(i64, f64)>, reflectance_default: f64, reflectance_attr: Option<String>, reflectance_constant: Option<f64>, max_range: f64, seed: u64) -> PyResult<Bound<'py, PyDict>> {
     let cloud = cloud_from_py(xyz, attrs)?;
     let mut p = BeamScan::new([origin.0, origin.1, origin.2]);
-    if let (Some(sa), Some(sb), Some(sr), Some(sp)) = (solid_a, solid_b, solid_r, solid_point) {
-        let (sa, sb, sr, sp) = (sa.as_array(), sb.as_array(), sr.as_array(), sp.as_array());
-        if sa.ncols() != 3 || sb.ncols() != 3 || sb.nrows() != sa.nrows() || sr.len() != sa.nrows() || sp.len() != sa.nrows() || sp.iter().any(|&i| i < 0) {
-            return Err(PyValueError::new_err("solids: a and b (n, 3), r and point (n,), point indices of the cloud"));
-        }
-        p.solids = (0..sa.nrows()).map(|i| Solid { a: [sa[[i, 0]], sa[[i, 1]], sa[[i, 2]]], b: [sb[[i, 0]], sb[[i, 1]], sb[[i, 2]]], r: sr[i], point: sp[i] as usize }).collect();
-    }
     p.resolution_deg = resolution_deg;
     p.min_zenith_deg = min_zenith_deg;
     p.max_zenith_deg = max_zenith_deg;
@@ -234,7 +233,7 @@ fn synthetic_scan_beam<'py>(py: Python<'py>, xyz: PyReadonlyArray2<f64>, attrs: 
     p.max_range = max_range;
     p.seed = seed;
     let s = py.detach(|| scan::scan_beam(&cloud, &p)).map_err(err)?;
-    shots_to_py(py, &s)
+    crate::shots_into_py(py, s)
 }
 
 #[pyfunction]
@@ -249,6 +248,7 @@ fn synthetic_scanner_preset<'py>(py: Python<'py>, name: &str) -> PyResult<Bound<
     Ok(d)
 }
 
+/// Adds this file's functions to the `_core` module.
 pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     for f in [
         wrap_pyfunction!(synthetic_tree_model, m)?,

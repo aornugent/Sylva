@@ -56,9 +56,11 @@ use crate::{Point, PointCloud};
 /// One LAS/LAZ file of a catalogue, as its header describes it.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Tile {
+    /// Path of the LAS/LAZ file.
     pub path: PathBuf,
     /// `[xmin, ymin, zmin, xmax, ymax, zmax]` from the header.
     pub bounds: [f64; 6],
+    /// Point records in the file, from the header.
     pub n_points: u64,
     /// LAS point data record format (0-10).
     pub point_format: u8,
@@ -68,10 +70,12 @@ pub struct Tile {
     pub crs: Option<String>,
     /// Coordinate quantisation per axis.
     pub scale: [f64; 3],
+    /// Coordinate offset per axis (m): a stored integer `i` is `i * scale + offset`.
     pub offset: [f64; 3],
     /// A LAStools `.lax` index beside the file, or a COPC file (which is
     /// organised as an octree).
     pub spatial_index: bool,
+    /// Size of the file on disk (bytes); 0 when it could not be read.
     pub file_size: u64,
 }
 
@@ -164,12 +168,14 @@ pub struct Issue {
     /// `mixed_point_format`, `mixed_scale`, `overlap`, `unindexed_overlap`
     /// or `gap`.
     pub kind: String,
+    /// A sentence describing the problem, naming the files concerned.
     pub message: String,
 }
 
 /// Tiles of an airborne survey, known from their headers alone.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Catalog {
+    /// The readable tiles, in the order their paths were given.
     pub tiles: Vec<Tile>,
     /// Paths that were asked for but do not exist.
     pub missing: Vec<PathBuf>,
@@ -237,6 +243,7 @@ impl Catalog {
         self.tiles.len()
     }
 
+    /// True when no tile could be read.
     pub fn is_empty(&self) -> bool {
         self.tiles.is_empty()
     }
@@ -246,11 +253,21 @@ impl Catalog {
         self.tiles.iter().map(|t| t.n_points).sum()
     }
 
-    /// `[xmin, ymin, zmin, xmax, ymax, zmax]` over all tiles; None if there are none.
+    /// `[xmin, ymin, zmin, xmax, ymax, zmax]` (m) over the tiles that hold
+    /// points; None if there are no tiles.
+    ///
+    /// A tile without points has no extent, and its header usually says
+    /// zeros: counting it would stretch a survey in projected coordinates
+    /// all the way to the origin, and every grid laid over the catalogue
+    /// with it. Such tiles are left out; only when no tile holds a point
+    /// are the header extents of all of them used.
     pub fn bounds(&self) -> Option<[f64; 6]> {
-        let first = self.tiles.first()?;
+        let mut held = self.tiles.iter().filter(|t| t.n_points > 0).peekable();
+        let mut all = self.tiles.iter();
+        let tiles: &mut dyn Iterator<Item = &Tile> = if held.peek().is_some() { &mut held } else { &mut all };
+        let first = tiles.next()?;
         let mut b = first.bounds;
-        for t in &self.tiles[1..] {
+        for t in tiles {
             for k in 0..3 {
                 b[k] = b[k].min(t.bounds[k]);
                 b[k + 3] = b[k + 3].max(t.bounds[k + 3]);
@@ -550,12 +567,19 @@ pub enum Layout {
     /// A regular grid of `size` m squares anchored at `origin` (by default
     /// the catalogue's minimum snapped down to a multiple of `size`). A
     /// point is core in the chunk whose half-open square holds it.
-    Grid { size: f64, origin: Option<(f64, f64)> },
+    Grid {
+        /// Side of the squares (m).
+        size: f64,
+        /// `(x, y)` of the grid's south-west corner; None snaps the
+        /// catalogue's minimum down to a multiple of `size`.
+        origin: Option<(f64, f64)>,
+    },
 }
 
 /// A piece of the catalogue to process.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Chunk {
+    /// Position of the chunk in the plan (0-based), which is also the order results are returned in.
     pub index: usize,
     /// `[xmin, ymin, xmax, ymax]` of the area the chunk is responsible for.
     pub core: [f64; 4],
@@ -659,7 +683,9 @@ pub fn plan(cat: &Catalog, layout: Layout, buffer: f64) -> Result<Vec<Chunk>> {
 /// `buffer[i]` is true for the points outside the core.
 #[derive(Debug, Clone, Default)]
 pub struct ChunkData {
+    /// Every point read for the chunk: core and buffer together.
     pub cloud: PointCloud,
+    /// One flag per point of `cloud`: true for a buffer point (outside the core).
     pub buffer: Vec<bool>,
 }
 
@@ -1006,6 +1032,28 @@ mod tests {
     }
 
     #[test]
+    fn an_empty_tile_does_not_stretch_the_extent() {
+        // A survey in UTM coordinates with one tile that holds no points
+        // and whose header extent is all zeros, as most writers leave it.
+        let mut cat = Catalog::default();
+        for (i, (x, y)) in [(512_000.0, 6_234_000.0), (512_100.0, 6_234_000.0)].iter().enumerate() {
+            cat.tiles.push(tile(&format!("t{i}.laz"), [*x, *y, x + 99.99, y + 99.99], 1000, Some("EPSG:28355"), 6));
+        }
+        let full = cat.bounds().unwrap();
+        cat.tiles.insert(0, tile("empty.laz", [0.0, 0.0, 0.0, 0.0], 0, Some("EPSG:28355"), 6));
+        assert_eq!(cat.bounds().unwrap(), full);
+        assert_eq!(cat.xy_bounds().unwrap(), [512_000.0, 6_234_000.0, 512_199.99, 6_234_099.99]);
+        let grid = catalog_grid(&cat, 1.0).unwrap();
+        assert_eq!((grid.nrows, grid.ncols, grid.xmin, grid.ymin), (100, 200, 512_000.0, 6_234_000.0));
+        assert_eq!(plan(&cat, Layout::Grid { size: 100.0, origin: None }, 10.0).unwrap().len(), 2);
+        assert!(cat.gaps(1.0).is_empty());
+        // With nothing but empty tiles the headers are all there is.
+        let mut none = Catalog::default();
+        none.tiles.push(tile("a.laz", [1.0, 2.0, 3.0, 4.0], 0, None, 6));
+        assert_eq!(none.xy_bounds().unwrap(), [1.0, 2.0, 3.0, 4.0]);
+    }
+
+    #[test]
     fn missing_files_stop_processing() {
         let cat = Catalog::open(&[PathBuf::from("/nonexistent/a.laz")]);
         assert_eq!(cat.missing.len(), 1);
@@ -1065,11 +1113,11 @@ mod tests {
         let cat = grid2x2();
         let chunks = plan(&cat, Layout::Tiles, 20.0).unwrap();
         let need = chunks.iter().map(|c| c.est_points).max().unwrap() * 100;
-        limits::set_budget(3 * need + 1);
+        limits::set_test_budget(3 * need + 1);
         let w = workers_for(&chunks, 8, 100);
-        limits::set_budget(1000);
+        limits::set_test_budget(1000);
         let refused = workers_for(&chunks, 8, 100);
-        limits::set_budget(0);
+        limits::set_test_budget(0);
         assert_eq!(w.unwrap(), 3);
         assert!(refused.unwrap_err().to_string().contains("smaller chunk_size"));
     }

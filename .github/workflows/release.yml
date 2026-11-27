@@ -25,9 +25,11 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-      - uses: actions/setup-python@v5
+      - uses: astral-sh/setup-uv@v10.4.0
         with:
-          python-version: "3.12"
+          version: "0.13"
+          enable-cache: true
+          cache-dependency-glob: "uv.lock"
       - name: Versions agree with the tag
         if: startsWith(github.ref, 'refs/tags/v')
         run: |
@@ -37,14 +39,12 @@ jobs:
           test "$tag" = "$cargo_v" && test "$tag" = "$py_v" || { echo "tag $tag, Cargo $cargo_v, pyproject $py_v"; exit 1; }
       - run: cargo test --release -p sylva-rs
       - run: |
-          python -m venv .venv && . .venv/bin/activate
-          pip install maturin pytest numpy scipy matplotlib   # what the tests import
-          maturin develop --release
+          uv sync --python 3.12 --extra dev
           # The parity recordings are bit-level guards for the machine that made
           # them: another CPU or C library shifts the last digits, and the
           # coregistration's accept/reject decisions can follow. Every other
           # test runs.
-          pytest -q --ignore=tests/test_parity.py
+          uv run pytest -q --ignore=tests/test_parity.py
 
   wheels:
     needs: test
@@ -55,7 +55,7 @@ jobs:
           - {os: ubuntu-latest, target: x86_64-unknown-linux-gnu, manylinux: "2014"}
           - {os: ubuntu-24.04-arm, target: aarch64-unknown-linux-gnu, manylinux: "2014"}
           - {os: macos-15-intel, target: x86_64-apple-darwin}
-          - {os: macos-14, target: aarch64-apple-darwin}
+          - {os: macos-15, target: aarch64-apple-darwin}
           - {os: windows-latest, target: x86_64-pc-windows-msvc}
     runs-on: ${{ matrix.os }}
     steps:
@@ -67,6 +67,39 @@ jobs:
           target: ${{ matrix.target }}
           manylinux: ${{ matrix.manylinux || 'auto' }}
           args: --release --out dist
+      # The wheel itself is what users get, so it is installed and run here,
+      # on the platform it was built for, at both ends of the Python range
+      # the abi3 tag claims. Every runner in the matrix is native; uv
+      # downloads a standalone CPython for each end.
+      - uses: astral-sh/setup-uv@v10.4.0
+        with:
+          version: "0.13"
+          enable-cache: true
+      - name: Wheel on the oldest Python (3.10)
+        shell: bash
+        run: |
+          uv venv --python 3.10 "$RUNNER_TEMP/venv-oldest"
+          py="$RUNNER_TEMP/venv-oldest/bin/python"; [ -x "$py" ] || py="$RUNNER_TEMP/venv-oldest/Scripts/python.exe"
+          uv pip install --python "$py" --quiet dist/*.whl
+          (cd "$RUNNER_TEMP" && "$py" "$GITHUB_WORKSPACE/.github/scripts/wheel_smoke.py")
+      - name: Wheel on the newest Python (3.14)
+        shell: bash
+        run: |
+          uv venv --python 3.14 "$RUNNER_TEMP/venv-newest"
+          py="$RUNNER_TEMP/venv-newest/bin/python"; [ -x "$py" ] || py="$RUNNER_TEMP/venv-newest/Scripts/python.exe"
+          uv pip install --python "$py" --quiet dist/*.whl
+          (cd "$RUNNER_TEMP" && "$py" "$GITHUB_WORKSPACE/.github/scripts/wheel_smoke.py")
+      # The whole suite against the installed wheel. It gates the release on
+      # x86-64 Linux, where it is known to pass; on the other platforms it
+      # has not run before, so until it has been seen green there a failure
+      # is reported without stopping the release (the smoke test above does).
+      - name: Test suite against the wheel
+        shell: bash
+        continue-on-error: ${{ matrix.target != 'x86_64-unknown-linux-gnu' }}
+        run: |
+          py="$RUNNER_TEMP/venv-newest/bin/python"; [ -x "$py" ] || py="$RUNNER_TEMP/venv-newest/Scripts/python.exe"
+          uv pip install --python "$py" --quiet pytest scipy matplotlib
+          "$py" -m pytest -q --ignore=tests/test_parity.py
       - uses: actions/upload-artifact@v4
         with:
           name: wheel-${{ matrix.target }}
@@ -100,9 +133,11 @@ jobs:
           merge-multiple: true
       - uses: pypa/gh-action-pypi-publish@release/v1
 
+  # A crates.io version cannot be withdrawn, so it waits for everything PyPI
+  # needs: a tag whose wheels do not build publishes to neither registry.
   crates:
     if: startsWith(github.ref, 'refs/tags/v')
-    needs: test
+    needs: [wheels, sdist]
     runs-on: ubuntu-latest
     environment: crates-io
     permissions:

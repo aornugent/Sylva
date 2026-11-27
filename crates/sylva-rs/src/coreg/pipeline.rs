@@ -39,6 +39,7 @@ use crate::util::pyformat::{fixed, percent, signed, thousands};
 use crate::trees::stems::{detect_stems_full, StemParams};
 use crate::Point;
 
+/// Result of a pipeline function, failing with the crate's [`Error`].
 pub type Result<T> = std::result::Result<T, Error>;
 
 // ----------------------------------------------------------------- arithmetic
@@ -124,10 +125,16 @@ fn f32_point(p: &Point) -> Point {
 /// Reading bounds and RiVLib options (`CoregConfig.riegl_options`).
 #[derive(Debug, Clone)]
 pub struct ReadingOptions {
+    /// RiVLib directory or library file to load for `.rxp`; `None` finds it
+    /// the usual way.
     pub library: Option<PathBuf>,
+    /// Drop RiVLib's pseudo echoes (flag bit 4) when reading `.rxp`.
     pub drop_pseudo_echoes: bool,
+    /// Echo selection for `.rxp`: `"all"`, `"first"`, `"last"` or `"single"`.
     pub echoes: String,
+    /// Keep every `stride`-th point (1 = all); splits multi-echo pulses.
     pub stride: usize,
+    /// Keep every `shot_stride`-th laser pulse with all its echoes (1 = all).
     pub shot_stride: usize,
     /// `(min, max)` of range (m, from the scanner), deviation, reflectance
     /// and amplitude, in that order; `None` leaves a side open.
@@ -148,67 +155,170 @@ pub const GATES: [&str; 4] = ["range", "deviation", "reflectance", "amplitude"];
 /// Settings of the whole pipeline (`sylva.coreg.CoregConfig`).
 #[derive(Debug, Clone)]
 pub struct CoregConfig {
+    /// Cell size (m) of each scan's raster terrain model.
     pub ground_cell_size: f64,
+    /// Least fraction (0-1) of the elevations from -30 to +5 degrees an azimuth
+    /// of the scan must sample for the terrain in that direction to be fitted
+    /// from it ([`refit_visible_ground`]); `None` fits the terrain from every
+    /// return. Tilted scans sample almost none along their tilt axis.
     pub ground_min_coverage: Option<f64>,
     /// Stem detection, in the detector's coregistration mode.
     pub stems: StemParams,
+    /// Settings of the global stem-map match that gives a pair its coarse transform.
     pub matching: MatchParams,
+    /// Settings of the ICP that refines each pair.
     pub icp: IcpConfig,
+    /// Voxel size (m) the ICP subsample of each scan is thinned to.
     pub icp_voxel: f64,
+    /// Planarity gate (0-1) on the ICP points of every scan; 0 keeps foliage,
+    /// which costs accuracy and can trap ICP in a local minimum.
     pub icp_min_planarity: f64,
+    /// Returns higher above ground than this (m) are left out of ICP: the upper
+    /// canopy is the least repeatable part of the scene and the most moved by wind.
     pub icp_max_height: f64,
+    /// Try reflective targets before stems where both scans saw at least
+    /// `min_reflector_matches`; far more precise, but they usually cover only
+    /// part of a survey.
     pub use_reflectors: bool,
+    /// Targets both scans must hold, and a reflector match must bring into
+    /// agreement, for it to be attempted and to succeed; never fewer than 3.
     pub min_reflector_matches: i64,
+    /// Distance (m) within which a transformed target counts as matched; also
+    /// how far ICP may move from a trusted reflector pose before the targets'
+    /// own pose is kept instead.
     pub reflector_tolerance: f64,
+    /// A reflector match with at least this many targets, agreeing within
+    /// `trusted_reflector_rmse`, is accepted even when ICP then fails its
+    /// tests; 0 always requires ICP to agree.
     pub trusted_reflector_matches: i64,
+    /// RMS target disagreement (m) a reflector match must stay under to be trusted.
     pub trusted_reflector_rmse: f64,
+    /// Stem correspondences a coarse match needs to reach ICP; permissive,
+    /// since ICP fitness decides.
     pub min_match_inliers: i64,
+    /// A coarse match whose best distinctly different rival has more than this
+    /// share (0-1) of its inliers is ambiguous: both are refined by ICP and the
+    /// pair is accepted only if one fits the above-ground points clearly better.
     pub max_match_ambiguity: f64,
+    /// Factor by which the winner's above-ground fitness must exceed its
+    /// rival's for an ambiguous match to be accepted.
     pub ambiguity_margin: f64,
+    /// Largest RMS scatter (m) of a coarse match's own stem correspondences.
     pub max_match_rmse: f64,
+    /// Cap (m) on the median horizontal disagreement of the matched stems under
+    /// the coarse transform; infinite (the default) disables it.
     pub max_coarse_stem_rmse: f64,
+    /// Take a stem match's vertical offset from the two terrain models where
+    /// both saw ground rather than from the matched stems, whose heights rest
+    /// on the terrain exactly where it is least certain.
     pub height_from_ground: bool,
+    /// Terrain cells further than this (m) from a scanner are left out of
+    /// height comparisons: there ground returns are sparse and grazing and the
+    /// model is mostly understorey.
     pub ground_radius: f64,
+    /// Shared observed terrain cells a height comparison needs.
     pub min_ground_cells: i64,
+    /// A pair whose terrain models still differ by more than this (m, median
+    /// over the shared ground) after ICP is refused; `None` disables the test.
     pub max_ground_disagreement: Option<f64>,
+    /// Pairs whose approximate scanner positions are further apart (m) are not tried.
     pub max_pair_distance: f64,
+    /// Match every pair's stems first and run ICP only on the survivors.
     pub screen_pairs: bool,
     /// 0 keeps every pair (Python's None and 0 alike).
     pub max_pairs_per_scan: i64,
+    /// Least ICP fitness (0-1, over all source points) of an accepted pair; it
+    /// falls with the distance between scans as less of each is shared.
     pub min_icp_fitness: f64,
+    /// Largest ICP inlier RMSE (m) of an accepted pair.
     pub max_icp_rmse: f64,
+    /// Least fitness (0-1) over source points higher than `fitness_min_height`:
+    /// ground is planar and fits under any horizontal shift, so stems, branches
+    /// and logs must agree too.
     pub min_icp_fitness_above_ground: f64,
+    /// Height above ground (m) from which points count in the above-ground
+    /// fitness; <= 0 skips that test.
     pub fitness_min_height: f64,
+    /// If ICP leaves the matched stems this much (m) further apart than the
+    /// coarse match did, the coarse transform is kept: ICP slid somewhere unrelated.
     pub stem_agreement_tolerance: f64,
+    /// ICP moving further than this (m) from the coarse solution has diverged,
+    /// and the pair is refused.
     pub max_coarse_to_fine_shift: f64,
+    /// Retry each scan left unregistered against the combined registered
+    /// survey: it can overlap several registered scans partly without
+    /// overlapping any one of them enough.
     pub recover_unregistered: bool,
+    /// Passes of that recovery, each able to tie in scans the previous one
+    /// registered; treated as at least 1.
     pub recovery_rounds: i64,
+    /// Nearest registered scans whose points are merged into the target a
+    /// recovery attempt is registered against.
     pub recovery_neighbours: i64,
+    /// Refine every registered pose in one joint Gauss-Newton over the
+    /// point-to-plane correspondences of every accepted pair plus the matched
+    /// stems ([`crate::coreg::refine::refine_joint`]).
     pub refine_multiview: bool,
+    /// Associations per level of that refinement; treated as at least 1.
     pub refinement_rounds: i64,
+    /// Voxel sizes (m) of its levels, coarse to fine.
     pub refinement_voxel_sizes: Vec<f64>,
+    /// Correspondence cut-off (m) at each of those levels.
     pub refinement_max_distances: Vec<f64>,
+    /// Cap on the points of each scan at each level, a seeded random subset beyond it.
     pub refinement_points_per_scan: usize,
+    /// Share (0-1) of each pair's weight carried by its matched stems.
     pub refinement_stem_weight: f64,
+    /// Horizontal radius (m) within which mutually nearest stems of a pair are
+    /// tied together.
     pub refinement_stem_radius: f64,
+    /// A voxel needs at least this many points for its centroid to take part.
     pub refinement_min_voxel_points: usize,
+    /// A refinement moving any scan further than this (m) is discarded.
     pub refinement_max_shift: f64,
+    /// Solve all poses together over the pose graph of accepted pairs; off, the
+    /// poses stay as the spanning tree over the edges placed them.
     pub optimise_globally: bool,
+    /// Index of the scan whose levelled frame is the world frame, held fixed;
+    /// clamped into range, and replaced if that scan was set aside or no
+    /// accepted pair touches it.
     pub reference_scan: i64,
+    /// Drop accepted pairs whose measured transform the rest of the graph
+    /// contradicts (solve-and-reject passes).
     pub reject_outlier_edges: bool,
+    /// ICP correspondences counted as one independent observation when
+    /// weighting pose-graph edges: neighbouring residuals share the error of
+    /// the surface they sample.
     pub information_patch_points: f64,
+    /// Floor (m) on the point-to-plane residual that weights an edge.
     pub information_min_sigma: f64,
+    /// With priors: results putting a scanner further than this (m) from its
+    /// prior position are refused.
     pub max_prior_shift: f64,
+    /// With priors: if set, results rotated more than this (degrees) from the
+    /// prior are refused too; `None` by default, since recorded headings can
+    /// be wrong by any amount.
     pub max_prior_rotation: Option<f64>,
     /// Scans prepared and pairs registered at once; 0 picks from the cores
     /// and free memory.
     pub workers: i64,
     /// 0 leaves memory out of the choice of workers.
     pub memory_per_worker_gb: f64,
+    /// RiSCAN PRO's RXP import filter applied when reading
+    /// ([`crate::riscan::riscan_like_mask`]): `"none"`, `"current"` (drops
+    /// echoes within 0.5 m of the scanner) or `"legacy"` (also the weak,
+    /// isolated echoes the older conversion discarded).
     pub riscan_filter: String,
+    /// Bounds and RiVLib options applied while reading each scan file.
     pub reading: ReadingOptions,
+    /// Scans with fewer points (after the reading filters) are set aside
+    /// rather than processed.
     pub min_points_per_scan: i64,
-    /// 0 reads every point (Python's None and 0 alike).
+    /// Most points a scan is prepared from, after the reading filters; a
+    /// larger scan is thinned by an even stride through its recording order
+    /// ([`stride_subsample`]), so the whole rotation stays covered. 0 reads
+    /// every point (Python's None and 0 alike). Only preparation is capped:
+    /// [`crate::coreg::survey::merge_clouds`] always merges every point.
     pub max_points_per_scan: usize,
 }
 
@@ -287,14 +397,20 @@ impl Default for CoregConfig {
 /// Everything later stages need from one scan (`ScanFeatures`).
 #[derive(Debug, Clone)]
 pub struct ScanFeatures {
+    /// Scan position name (the file's stem when none was given for a path).
     pub name: String,
+    /// Points the scan was prepared from, after the reading filters.
     pub n_points: usize,
+    /// Raster terrain model of the scan in its levelled frame; `None` for an
+    /// unusable scan.
     pub ground: Option<GroundModel>,
     /// Stems, best first.
     pub stems: Vec<StemRecord>,
+    /// Name the stem map is saved under (the scan's name).
     pub stem_map_name: String,
     /// Planar subsample for ICP; float32 values held as f64.
     pub icp_points: Vec<Point>,
+    /// Retro-reflective targets seen from this scan, in its levelled frame.
     pub reflectors: Vec<Reflector>,
     /// Height above ground of each ICP point.
     pub icp_heights: Vec<f32>,
@@ -302,7 +418,9 @@ pub struct ScanFeatures {
     pub levelling: Mat4,
     /// Scanner position in the levelled frame.
     pub origin: Point,
+    /// Path of the file the scan was read from; `None` for points given directly.
     pub source: Option<String>,
+    /// Wall-clock time (s) spent preparing the scan.
     pub seconds: f64,
     /// Why the scan is unusable; empty if it is fine.
     pub error: String,
@@ -350,7 +468,12 @@ pub enum ScanInput {
     /// Points in the scan's own frame.
     Points(Vec<Point>),
     /// An input that could not even be converted: set aside with this reason.
-    Failed { reason: String, source: Option<PathBuf> },
+    Failed {
+        /// Why the input could not be converted.
+        reason: String,
+        /// Path of the file it came from, if any.
+        source: Option<PathBuf>,
+    },
 }
 
 /// Why a scan could not be read or prepared.
@@ -359,6 +482,8 @@ pub enum PrepareError {
     /// A reading bound or filter needs an attribute the file does not carry
     /// (the Python package's `KeyError`).
     MissingAttribute(String),
+    /// Any other error of the core library (reading the file, fitting the
+    /// ground, ...).
     Core(Error),
 }
 
@@ -413,7 +538,8 @@ pub fn path_stem(path: &Path) -> String {
 /// Points of a scan file in its own frame, filtered for coregistration
 /// (`_read_scan`): RiSCAN's import filter on the whole stream first, then
 /// the closed intervals on range (from the scanner), deviation, reflectance
-/// and amplitude, then the cap on the number of points.
+/// and amplitude, then the cap on the number of points
+/// (`max_points_per_scan`, an even stride through the file: [`stride_subsample`]).
 pub fn read_scan(path: &Path, cfg: &CoregConfig) -> std::result::Result<Vec<Point>, PrepareError> {
     let is_rxp = path.extension().map(|e| e.to_string_lossy().to_lowercase() == "rxp").unwrap_or(false);
     let cloud = if is_rxp {
@@ -469,9 +595,24 @@ pub fn read_scan(path: &Path, cfg: &CoregConfig) -> std::result::Result<Vec<Poin
     }
     let mut out: Vec<Point> = xyz.into_iter().zip(keep).filter(|(_, k)| *k).map(|(p, _)| p).collect();
     if cfg.max_points_per_scan > 0 && out.len() > cfg.max_points_per_scan {
-        out.truncate(cfg.max_points_per_scan);
+        out = stride_subsample(&out, cfg.max_points_per_scan);
     }
     Ok(out)
+}
+
+/// `count` of `points` spread evenly through their order (point
+/// `floor(i * n / count)` for `i` in `0..count`), or all of them if there are
+/// no more than `count`.
+///
+/// A scan file is in recording order, so its first `count` points are one
+/// wedge of the rotation; an even stride keeps the whole field of view at a
+/// lower density, and is the same every run.
+pub fn stride_subsample(points: &[Point], count: usize) -> Vec<Point> {
+    let n = points.len();
+    if n <= count {
+        return points.to_vec();
+    }
+    (0..count).map(|i| points[(i as u128 * n as u128 / count as u128) as usize]).collect()
 }
 
 fn ground_params(cfg: &CoregConfig) -> GroundParams {
@@ -588,9 +729,15 @@ pub fn prepare_scan(input: &ScanInput, cfg: &CoregConfig, name: &str, reflectors
     Ok(ScanFeatures { name: name.clone(), n_points: points.len(), ground: Some(ground), stems, stem_map_name: name, icp_points, reflectors, icp_heights, levelling: level, origin: scanner, source, seconds: start.elapsed().as_secs_f64(), error: String::new() })
 }
 
+/// Fewest returns the terrain refit of [`refit_visible_ground`] is made from;
+/// with fewer left (the returns steeper than 45 degrees below the scanner and
+/// those at sighted azimuths), the first fit stands.
+const REFIT_MIN_RETURNS: usize = 100;
+
 /// The terrain refitted without the directions in which the scanner could
 /// not see it (`_refit_visible_ground`), or `None` where every azimuth, or
-/// none, is blind and the fit stands.
+/// none, is blind, or fewer than 100 returns would be left
+/// to fit, and the fit stands.
 ///
 /// An azimuth (1 degree) is blind when the scan sampled less than
 /// `ground_min_coverage` of the elevations from -30 to +5 degrees in it;
@@ -619,6 +766,12 @@ pub fn refit_visible_ground(points: &[Point], scanner: Point, cfg: &CoregConfig)
     let widen = 3i64;
     let widened: Vec<bool> = (0..360i64).map(|a| (-widen..=widen).any(|d| blind[(a + d).rem_euclid(360) as usize])).collect();
     let kept: Vec<Point> = (0..n).filter(|&k| !widened[azimuth[k]] || elevation[k] < -45.0).map(|k| points[k]).collect();
+    // Scattered blind azimuths, once widened, can cover the whole circle and
+    // leave nothing (an upright scanner sees nothing 45 degrees down): a
+    // terrain cannot be fitted to that, so the fit from every return stands.
+    if kept.len() < REFIT_MIN_RETURNS {
+        return Ok(None);
+    }
     Ok(Some(fit_ground(&kept, &ground_params(cfg))?))
 }
 
@@ -759,34 +912,62 @@ pub fn prior_ok(pose: &Mat4, prior: &Mat4, origin: Point, cfg: &CoregConfig) -> 
 /// scan `j`.
 #[derive(Debug, Clone)]
 pub struct PairResult {
+    /// Index of the source scan, whose points `transform` moves.
     pub i: i64,
+    /// Index of the target scan.
     pub j: i64,
+    /// Name of scan `i`.
     pub name_i: String,
+    /// Name of scan `j`.
     pub name_j: String,
+    /// `j_from_i`, the transform the pair reports: ICP's, or the coarse one
+    /// when `used_icp` is false; identity until something was tried.
     pub transform: Mat4,
+    /// The transform ICP started from: the reflector match's, or the stem
+    /// match's with its height set from the two terrain models.
     pub coarse_transform: Mat4,
+    /// Global stem-map match behind the coarse transform; `None` when targets
+    /// were used or stems were never matched.
     pub stem_match: Option<StemMatch>,
+    /// Alignment of the shared retro-reflective targets, where both scans had
+    /// enough and it succeeded; else `None`.
     pub reflector_match: Option<ReflectorMatch>,
+    /// ICP outcome; when `used_icp` is false it scores the coarse transform,
+    /// not the refinement that was discarded.
     pub icp: Option<IcpResult>,
+    /// Whether the pair passed every test and becomes a pose-graph edge.
     pub success: bool,
+    /// Why the pair failed, or how it was accepted; empty while undecided.
     pub reason: String,
+    /// Wall-clock time (s) spent registering the pair.
     pub seconds: f64,
     /// Positions of the matched stems in each scan's own frame.
     pub matched_source: Vec<Point>,
+    /// The same stems in the target scan's frame, row for row with `matched_source`.
     pub matched_target: Vec<Point>,
+    /// Median horizontal distance (m) between matched stems under the coarse
+    /// transform; NaN until known.
     pub coarse_stem_rmse: f64,
+    /// The same under the ICP transform; NaN if ICP did not run or fewer than
+    /// 3 stems matched.
     pub fine_stem_rmse: f64,
     /// ICP fitness over source points above ground; NaN if unknown.
     pub fitness_above: f64,
+    /// A distinctly different coarse hypothesis nearly as well supported
+    /// (`ambiguity` above `max_match_ambiguity`), resolved by ICP; else `None`.
     pub rival: Option<StemMatch>,
     /// False when the coarse transform was kept over ICP's.
     pub used_icp: bool,
+    /// Median height (m) of the target's terrain over the source's where both
+    /// saw ground, under `transform`; NaN if they share too little.
     pub ground_offset: f64,
     /// Accepted on its reflector match although ICP failed.
     pub trusted: bool,
 }
 
 impl PairResult {
+    /// An undecided pair of scans `i` and `j`: identity transforms, no match,
+    /// NaN statistics.
     pub fn new(i: i64, j: i64, name_i: &str, name_j: &str) -> Self {
         PairResult {
             i,
@@ -813,14 +994,17 @@ impl PairResult {
         }
     }
 
+    /// ICP fitness (0-1) of the reported transform; 0 when ICP did not run.
     pub fn fitness(&self) -> f64 {
         self.icp.as_ref().map_or(0.0, |r| r.fitness)
     }
 
+    /// ICP inlier RMSE (m); infinite when ICP did not run.
     pub fn rmse(&self) -> f64 {
         self.icp.as_ref().map_or(f64::INFINITY, |r| r.inlier_rmse)
     }
 
+    /// Stems the coarse stem match paired; 0 without one.
     pub fn n_stem_matches(&self) -> usize {
         self.stem_match.as_ref().map_or(0, |m| m.n_inliers)
     }
@@ -920,13 +1104,10 @@ fn score(source: &ScanFeatures, target: &ScanFeatures, pyramid: Option<&IcpTarge
     let (fitness, rmse, n) = evaluate_registration(&source.icp_points, &target.icp_points, transform, cfg.icp.fitness_threshold, 200_000, Some(0.05), 0);
     let pc = plane_config(&cfg.icp);
     let information = match pyramid {
-        Some(t) => {
-            if !t.matches(&pc) {
-                return Err(Error::invalid("the prepared ICP target was built with other pyramid settings"));
-            }
-            plane_information(&source.icp_points, t, transform, &pc)
-        }
-        None => plane_information(&source.icp_points, &IcpTarget::new(&target.icp_points, &pc), transform, &pc),
+        // A pyramid prepared for point-to-point ICP has no normals: the
+        // information is always point-to-plane, so that pyramid is built here.
+        Some(t) if t.matches(&pc) => plane_information(&source.icp_points, t, transform, &pc),
+        _ => plane_information(&source.icp_points, &IcpTarget::new(&target.icp_points, &pc), transform, &pc),
     };
     Ok(IcpResult { transform: *transform, fitness, inlier_rmse: rmse, n_correspondences: n, iterations: refined.iterations, converged: false, history: refined.history.clone(), information })
 }
@@ -1166,10 +1347,14 @@ pub struct TargetCache<'a> {
 }
 
 impl<'a> TargetCache<'a> {
+    /// A cache over `scans` for pyramids built with `config`, keeping the
+    /// `capacity` (at least 1) most recently used.
     pub fn new(scans: &'a [ScanFeatures], config: &'a IcpConfig, capacity: usize) -> Self {
         TargetCache { scans, config, capacity: capacity.max(1), built: Mutex::new(Vec::new()) }
     }
 
+    /// The pyramid of scan `k`, built on first use and marked most recently
+    /// used; `get()` on the returned cell is always `Some`.
     pub fn get(&self, k: usize) -> Arc<OnceLock<IcpTarget>> {
         let cell = {
             let mut built = self.built.lock().expect("target cache");
@@ -1263,5 +1448,66 @@ mod tests {
         assert!(!few.usable());
         let offset = height_offset(&other, &moved, &[(&scan, Matrix4::identity())], &cfg);
         assert!(offset.abs() < 0.02, "{offset}");
+    }
+
+    #[test]
+    fn a_kept_coarse_transform_is_scored_against_a_point_to_point_pyramid() {
+        // A negative tolerance makes the stem cross-check keep the coarse
+        // transform, which is then scored: with a pyramid prepared for
+        // point-to-point ICP that used to fail the pair, and the survey with it.
+        let mut cfg = CoregConfig { stem_agreement_tolerance: -1.0, ..CoregConfig::default() };
+        cfg.icp.method = "point_to_point".into();
+        let pts = stand(3);
+        let moved = crate::coreg::transforms::yaw_transform(0.4, 2.0, -1.0, 0.3);
+        let a = prepare_scan(&ScanInput::Points(pts.clone()), &cfg, "a", &[], None, None).unwrap();
+        let b = prepare_scan(&ScanInput::Points(transform_points(&invert(&moved), &pts)), &cfg, "b", &[], None, None).unwrap();
+        let prepared = IcpTarget::new(&b.icp_points, &cfg.icp);
+        let pair = register_pair(&a, &b, &cfg, None, None, 0, 1, Some(&prepared)).unwrap();
+        assert!(pair.success && !pair.used_icp, "{}", pair.reason);
+        assert!(pair.icp.unwrap().information.is_some());
+    }
+
+    #[test]
+    fn the_point_cap_strides_through_the_whole_scan() {
+        let pts: Vec<Point> = (0..10).map(|k| [k as f64, 0.0, 0.0]).collect();
+        let x = |v: Vec<Point>| v.iter().map(|p| p[0] as usize).collect::<Vec<_>>();
+        assert_eq!(x(stride_subsample(&pts, 4)), vec![0, 2, 5, 7]);
+        assert_eq!(x(stride_subsample(&pts, 10)), (0..10).collect::<Vec<_>>());
+        assert_eq!(stride_subsample(&pts, 99).len(), 10);
+        assert!(stride_subsample(&pts, 0).is_empty());
+        // Through a file: the cap reaches the far end of the recording.
+        let dir = std::env::temp_dir().join(format!("sylva-cap-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("scan.xyz");
+        let text: String = (0..1000).map(|k| format!("{k} 0 0\n")).collect();
+        std::fs::write(&path, text).unwrap();
+        let cfg = CoregConfig { max_points_per_scan: 10, ..CoregConfig::default() };
+        let read = read_scan(&path, &cfg);
+        std::fs::remove_dir_all(&dir).unwrap();
+        let read = read.unwrap();
+        assert_eq!(read.len(), 10);
+        assert_eq!(read[9][0], 900.0);
+    }
+
+    #[test]
+    fn a_refit_that_would_leave_no_ground_keeps_the_first_fit() {
+        // Flat ground seen from 1.6 m at 3-30 m (elevations -28 to -3 degrees,
+        // under 80 % of the band) and a thin pole every 6 degrees filling the
+        // band there: the blind azimuths, widened, cover the circle, and an
+        // upright scanner has nothing 45 degrees down to keep.
+        let mut rng = crate::util::nprandom::Generator::new(5);
+        let mut pts: Vec<Point> = Vec::new();
+        for _ in 0..60000 {
+            let (a, r) = (rng.random() * std::f64::consts::TAU, 3.0 + 27.0 * rng.random());
+            pts.push([r * a.cos(), r * a.sin(), 0.0]);
+        }
+        for k in 0..60 {
+            let a = (k as f64 * 6.0 + 0.5).to_radians();
+            pts.extend((0..500).map(|i| [8.0 * a.cos(), 8.0 * a.sin(), 6.0 * i as f64 / 500.0]));
+        }
+        let cfg = CoregConfig::default();
+        assert!(refit_visible_ground(&pts, [0.0, 0.0, 1.6], &cfg).unwrap().is_none());
+        let scan = prepare_scan(&ScanInput::Points(pts), &cfg, "open", &[], None, Some([0.0, 0.0, 1.6])).unwrap();
+        assert!(scan.usable(), "{}", scan.error);
     }
 }

@@ -31,8 +31,8 @@ The metrics are computed from the heights above ground `z` of the
 returns kept (see [Heights](#heights)); `n` is their number and `m` their
 mean. The definitions are those of the standard height, intensity and
 return-number metrics and of the entropy index
-([Roussel et al. 2020](../references.md)), reimplemented from the published
-definitions.
+of lidR's `stdmetrics` ([Roussel et al. 2020](../references.md)), whose
+names, formulas and binning rules are adapted from its source.
 
 | Metric | Definition |
 |---|---|
@@ -230,8 +230,9 @@ centres with columns `x`, `y` and optionally `radius` and `id`, and writes
 the table as CSV (empty cells for NaN). Both take `--dtm DTM.asc`,
 `--normalized` (z is height) or `--height-attribute height`, and
 `--dtm-resolution`, `--threshold`, `--cover-break`, `--entropy-bin`,
-`--min-height`, `--keep-noise`, `--metrics`, `--buffer` and `--workers`;
-`als-metrics` also takes `--chunk-size`. See [Command line](cli.md).
+`--clamp-negative`, `--min-height`, `--keep-noise`, `--metrics`,
+`--pattern`, `--buffer` and `--workers`; `als-metrics` also takes
+`--chunk-size`. See [Command line](cli.md).
 
 ## Checked against
 

@@ -31,7 +31,8 @@
 //!    along that pulse's beam;
 //! 4. filters: amplitude 0, the dynamic-trigger rule (amplitude below 2.5 dB
 //!    within 18 m), the range gate, the notch window on zone-1 echoes
-//!    ("notch after MTA"), MTA-uncertain unless kept on request.
+//!    ("notch after MTA"), MTA-uncertain unless kept on request (then in zone 1, on
+//!    the pulse it was recorded after; only a confident call moves an echo).
 //!
 //! With `max_zone == 1` there is nothing to resolve: steps 2 and 3 and the
 //! learned model are bypassed, every echo stays on the shot it was recorded
@@ -102,6 +103,7 @@ pub enum MtaDecision {
 /// Options of the MTA path beyond [`MtaParams`].
 #[derive(Clone, Debug)]
 pub struct MtaOptions {
+    /// Whether MTA resolution through the shim is attempted, required or skipped.
     pub mode: MtaMode,
     /// How the zone and keep/drop are decided from the evidence.
     pub decision: MtaDecision,
@@ -109,8 +111,8 @@ pub struct MtaOptions {
     pub shim: Option<PathBuf>,
     /// Zone hypotheses asked from RiVLib (1..=8); 1 bypasses the resolution.
     pub max_zone: usize,
-    /// Keep MTA-uncertain echoes (flagged `mta_uncertain_point`) instead of
-    /// dropping them; nothing to keep with `max_zone == 1`.
+    /// Keep MTA-uncertain echoes (flagged `mta_uncertain_point`) in zone 1, on the pulse they were recorded
+    /// after, instead of dropping them; nothing is uncertain with `max_zone == 1`.
     pub keep_uncertain: bool,
     /// Dynamic-trigger rule: drop echoes below this amplitude (dB) ...
     pub weak_amplitude: f32,
@@ -120,6 +122,7 @@ pub struct MtaOptions {
     pub notch: bool,
     /// Stop after this many scan lines (tests, quick looks).
     pub max_lines: Option<usize>,
+    /// Thresholds and window sizes of the three decision passes.
     pub params: MtaParams,
 }
 
@@ -143,12 +146,20 @@ impl Default for MtaOptions {
 /// What happened to the echoes of the last [`read_rxp_mta`] call (for logs and tests).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct MtaStats {
+    /// Echoes seen (count), before any filter.
     pub echoes: u64,
+    /// Echoes dropped for an amplitude of 0 dB or less (count).
     pub amplitude_zero: u64,
+    /// Echoes dropped by the dynamic-trigger rule, weak amplitude at short zone-1 range (count).
     pub weak: u64,
+    /// Echoes dropped as MTA-uncertain: no zone, no finite range in the chosen zone, no pulse to
+    /// attach to, or undecided and `keep_uncertain` off (count).
     pub uncertain: u64,
+    /// Echoes dropped for a resolved range outside `min_range..=max_range` (count).
     pub range_gate: u64,
+    /// Zone-1 echoes dropped by the RXP's notch window (count).
     pub notch: u64,
+    /// Echoes written to the point cloud (count).
     pub kept: u64,
 }
 
@@ -707,16 +718,16 @@ impl Pipeline<'_> {
                 self.n.weak += 1;
                 continue;
             }
-            let (k, stage) = match dec {
+            let (k, uncertain) = match dec {
                 Some(dec) => {
                     let d = dec[e_i];
-                    if d.zone == 0 || (d.stage == 0 && !keep_unc) {
+                    let Some(k) = emit_zone(&d, keep_unc) else {
                         self.n.uncertain += 1;
                         continue;
-                    }
-                    (d.zone as usize, d.stage)
+                    };
+                    (k, d.zone == 0 || d.stage == 0)
                 }
-                None => (1, 1),
+                None => (1, false),
             };
             let r = e.zr[k - 1] as f64;
             if !r.is_finite() {
@@ -761,7 +772,7 @@ impl Pipeline<'_> {
                     dev: e.dev.clamp(0.0, 65535.0) as u16,
                     echo_type: ((e.flags >> 6) & 3) as u8,
                     zone: k as u8,
-                    uncertain: (stage == 0) as u8,
+                    uncertain: uncertain as u8,
                 },
             ));
             self.n.kept += 1;
@@ -769,6 +780,17 @@ impl Pipeline<'_> {
         for (slot, kept) in placed {
             self.lines[i - slot].kept.push(kept);
         }
+    }
+}
+
+/// The zone an echo is emitted in, or None to drop it: a confident decision's zone; an uncertain echo (no
+/// zone, or no pass accepted it) is dropped, or with `keep_uncertain` stays on the pulse it was recorded after
+/// (zone 1), as RiSCAN keeps unresolved echoes. Only a confident decision moves an echo to a farther zone.
+fn emit_zone(d: &Decision, keep_uncertain: bool) -> Option<usize> {
+    if d.zone == 0 || d.stage == 0 {
+        keep_uncertain.then_some(1)
+    } else {
+        Some(d.zone as usize)
     }
 }
 
@@ -926,6 +948,17 @@ mod tests {
     fn struct_layouts_match_the_shim() {
         assert_eq!(std::mem::size_of::<ShimShot>(), 44);
         assert_eq!(std::mem::size_of::<ShimEcho>(), 92);
+    }
+
+    #[test]
+    fn kept_uncertain_echoes_take_zone_one() {
+        let d = |zone, stage| Decision { zone, stage, ..Default::default() };
+        assert_eq!(emit_zone(&d(2, 0), true), Some(1)); // uncertain, model's best zone 2: stays on its pulse
+        assert_eq!(emit_zone(&d(0, 0), true), Some(1));
+        assert_eq!(emit_zone(&d(2, 0), false), None);
+        assert_eq!(emit_zone(&d(2, 4), true), Some(2)); // a confident zone-2 call stands
+        assert_eq!(emit_zone(&d(2, 4), false), Some(2));
+        assert_eq!(emit_zone(&d(1, 1), true), Some(1));
     }
 
     #[test]

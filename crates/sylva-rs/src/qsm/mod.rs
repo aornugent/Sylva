@@ -12,14 +12,13 @@
 pub mod buttress;
 pub mod buttress_detect;
 pub mod cylinder;
-pub mod evidence;
 pub mod joint;
 pub mod joint_fit;
-pub mod joint_tree;
 pub mod metrics;
 pub mod model;
 pub mod ops;
 pub mod plot;
+pub mod scan_index;
 pub mod support;
 pub mod support_tree;
 pub mod weighted;

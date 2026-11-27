@@ -11,12 +11,16 @@ use crate::transform::{cross, dot, norm, normalize, scale, sub};
 use crate::Point;
 
 #[derive(Debug, Clone, PartialEq)]
+/// A cylinder fitted to points by [`fit_cylinder`]: a point on its axis,
+/// the axis direction, the radius and the fit's residual error.
 pub struct CylinderFit {
     /// A point on the axis (centroid projected onto it).
     pub point: Point,
     /// Unit axis direction (z >= 0).
     pub axis: Point,
+    /// Radius (m), always positive.
     pub radius: f64,
+    /// Root mean square of the signed radial distances of the fitted points from the surface (m).
     pub rmse: f64,
 }
 
@@ -51,7 +55,7 @@ fn axis_from_pca(xyz: &[Point]) -> Point {
 /// the axis would not change the cylinder at all, and a parameter that does
 /// nothing makes the solve ill-conditioned.
 fn perp_basis(axis: &Point) -> (Point, Point) {
-    let helper = if axis[0].abs() < 0.9 { [1.0, 0.0, 0.0] } else { [0.0, 1.0, 0.0] };
+    let helper = super::model::least_aligned(&axis);
     let u = normalize(&cross(axis, &helper));
     let v = cross(axis, &u);
     (u, v)
