@@ -90,8 +90,10 @@ def test_shots_file_roundtrip(rng, tmp_path):
     np.testing.assert_allclose(exact.echo_xyz(), shots.echo_xyz(), atol=1e-9)
 
 
-def test_pulse_attributes_follow_their_pulses(rng, tmp_path):
+def test_pulse_attributes_follow_their_pulses(tmp_path):
+    rng = np.random.default_rng(130)   # its own, so later tests keep their numbers
     shots = _random_shots(rng, 3000)
+    del shots.echo_attrs["gps_time"]   # a fact of the pulse here
     n = shots.n_shots
     shots.pulse_attrs = {"gps_time": np.arange(n) * 8e-7,
                          "target_count": rng.integers(0, 5, n).astype(np.uint8),
