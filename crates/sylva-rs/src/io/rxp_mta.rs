@@ -28,11 +28,36 @@
 //! 2. [`mta::stage1`], [`mta::stage2`] and [`mta::stage3`] pick the zone, each
 //!    pass seeing the previous one's results for the neighbouring lines;
 //! 3. the echo is placed on the pulse `zone - 1` shots earlier at that range,
-//!    along that pulse's beam, with that pulse's timestamp;
+//!    along that pulse's beam;
 //! 4. filters: amplitude 0, the dynamic-trigger rule (amplitude below 2.5 dB
 //!    within 18 m), the range gate, the notch window on zone-1 echoes
-//!    ("notch after MTA"), MTA-uncertain unless kept on request;
-//! 5. return numbers are recounted per pulse over the surviving echoes.
+//!    ("notch after MTA"), MTA-uncertain unless kept on request (then in zone 1, on
+//!    the pulse it was recorded after; only a confident call moves an echo).
+//!
+//! With `max_zone == 1` there is nothing to resolve: steps 2 and 3 and the
+//! learned model are bypassed, every echo stays on the shot it was recorded
+//! after at its zone-1 range, and there are no `mta_zone` or
+//! `mta_uncertain_point` columns. (The model was trained on a VZ-600i; at one
+//! zone it can move nothing and its uncertainty flag means nothing.)
+//!
+//! **Every shot is a pulse.** The stream records every shot in the field of
+//! view, echo or not ("on_shot() will be invoked even if no echoes are
+//! available"), so the output is [`Shots`] with one pulse per shot in the
+//! order the scanner fired them, from the scanner's origin (0, 0, 0). The
+//! filters drop echoes, never pulses: a shot whose echoes were all dropped,
+//! or that recorded none, is a pulse with `echo_count == 0`. A pulse's echoes
+//! lie at `o + r d` along its beam (origin `o`, about 0.1 m out on the mirror,
+//! and direction `d`), kept as ranges from the scanner's origin, nearest
+//! first, with the pulse's direction that of its farthest echo; a pulse
+//! without echoes takes `d`. Facts of the shot are pulse attributes:
+//! `gps_time` (s, scanner clock), `scan_line_index` (RiSCAN's convention:
+//! -1 is the first line), `shot_index_line` (0-based), `mirror_facet` and
+//! `target_count`, the targets RiVLib attached to the shot in the stream
+//! before any filter (window echo and pseudo echoes included, at its zone-1
+//! attribution). So a shot that recorded targets but kept none is told from
+//! one that recorded nothing; nothing is stored as a flag. Echo attributes:
+//! `amplitude`, `reflectance`, `deviation`, `echo_type`, and with more than
+//! one zone `mta_zone` (and `mta_uncertain_point` with `keep_uncertain`).
 
 use std::collections::VecDeque;
 use std::ffi::{c_char, c_void, CStr, CString};
@@ -46,7 +71,9 @@ use super::mta_model::{EchoInfo, MtaModel};
 use super::riegl::{search_dir, search_roots, RxpOptions};
 use crate::error::{Error, Result};
 use crate::pointcloud::Attr;
-use crate::PointCloud;
+use crate::shots::ops::packed_starts;
+use crate::transform::{norm, normalize};
+use crate::{Point, Shots};
 
 /// How [`super::riegl::read_rxp`] treats multiple-time-around ambiguity.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
@@ -82,10 +109,10 @@ pub struct MtaOptions {
     pub decision: MtaDecision,
     /// Explicit `libsylva_rivlib` file or directory.
     pub shim: Option<PathBuf>,
-    /// Zone hypotheses asked from RiVLib (1..=8).
+    /// Zone hypotheses asked from RiVLib (1..=8); 1 bypasses the resolution.
     pub max_zone: usize,
     /// Keep MTA-uncertain echoes (flagged `mta_uncertain_point`) in zone 1, on the pulse they were recorded
-    /// after, instead of dropping them.
+    /// after, instead of dropping them; nothing is uncertain with `max_zone == 1`.
     pub keep_uncertain: bool,
     /// Dynamic-trigger rule: drop echoes below this amplitude (dB) ...
     pub weak_amplitude: f32,
@@ -229,6 +256,8 @@ struct ShotRec {
     o: [f32; 3],
     d: [f32; 3],
     facet: u8,
+    /// Targets RiVLib attached to the shot, before any filter.
+    n_echo: u8,
 }
 
 #[derive(Clone, Copy)]
@@ -242,10 +271,28 @@ struct EchoRec {
     zrefl: [f32; MAXZ],
 }
 
+/// An echo that survived the filters, placed on its pulse.
+#[derive(Clone, Copy)]
+struct Kept {
+    /// The pulse's shot index in its line.
+    shot: u32,
+    xyz: Point,
+    /// From the scanner's origin.
+    range: f64,
+    amp: f32,
+    refl: f32,
+    dev: u16,
+    echo_type: u8,
+    zone: u8,
+    uncertain: u8,
+}
+
 struct Line {
     index: u32,
     shots: Vec<ShotRec>,
     echoes: Vec<EchoRec>,
+    /// Echoes placed on this line's shots (by this line or, at zone > 1, the next).
+    kept: Vec<Kept>,
     le: LineEchoes,
     grid: Option<Grid>,
     dec: Option<Vec<Decision>>,
@@ -256,7 +303,7 @@ struct Line {
 
 impl Line {
     fn new(index: u32) -> Line {
-        Line { index, shots: Vec::new(), echoes: Vec::new(), le: LineEchoes::default(), grid: None, dec: None, anchored: false, s2_done: false, emitted: false }
+        Line { index, shots: Vec::new(), echoes: Vec::new(), kept: Vec::new(), le: LineEchoes::default(), grid: None, dec: None, anchored: false, s2_done: false, emitted: false }
     }
     fn finish(&mut self, nzone: usize, p: &MtaParams) {
         self.le.n_shots = self.shots.len();
@@ -268,27 +315,101 @@ impl Line {
     }
 }
 
-/// Output columns, grown line by line.
+/// Output columns, one pulse per shot, grown line by line.
 #[derive(Default)]
 struct Out {
-    xyz: Vec<[f64; 3]>,
+    direction: Vec<Point>,
+    echo_count: Vec<u32>,
+    range: Vec<f64>,
     amplitude: Vec<f32>,
     reflectance: Vec<f32>,
     deviation: Vec<u16>,
     echo_type: Vec<u8>,
-    time: Vec<f64>,
     zone: Vec<u8>,
+    uncertain: Vec<u8>,
+    time: Vec<f64>,
     line: Vec<i32>,
     shot: Vec<i32>,
     facet: Vec<u8>,
-    uncertain: Vec<u8>,
-    range: Vec<f32>,
-    pulse: Vec<u64>,
+    targets: Vec<u8>,
+    /// Shots seen so far, for `shot_stride`.
+    fired: usize,
+}
+
+impl Out {
+    /// Append a line's shots as pulses, every `stride`-th fired shot.
+    fn push_line(&mut self, mut line: Line, stride: usize) {
+        // stable: equal ranges stay in stream order
+        line.kept.sort_by(|a, b| a.shot.cmp(&b.shot).then(a.range.total_cmp(&b.range)));
+        let mut k = 0;
+        for (s, shot) in line.shots.iter().enumerate() {
+            let first = k;
+            while k < line.kept.len() && line.kept[k].shot == s as u32 {
+                k += 1;
+            }
+            self.fired += 1;
+            if stride > 1 && (self.fired - 1) % stride != 0 {
+                continue;
+            }
+            let echoes = &line.kept[first..k];
+            self.direction.push(match echoes.last() {
+                Some(far) => normalize(&far.xyz),
+                None => normalize(&shot.d.map(|v| v as f64)),
+            });
+            self.echo_count.push(echoes.len() as u32);
+            for e in echoes {
+                self.range.push(e.range);
+                self.amplitude.push(e.amp);
+                self.reflectance.push(e.refl);
+                self.deviation.push(e.dev);
+                self.echo_type.push(e.echo_type);
+                self.zone.push(e.zone);
+                self.uncertain.push(e.uncertain);
+            }
+            self.time.push(shot.time);
+            self.line.push(-(line.index as i32) - 1); // RiSCAN's convention: negative, -1 is the first line
+            self.shot.push(s as i32);
+            self.facet.push(shot.facet);
+            self.targets.push(shot.n_echo);
+        }
+    }
+
+    fn into_shots(self, zones: bool, keep_uncertain: bool) -> Shots {
+        let n = self.direction.len();
+        let mut echo_attrs = std::collections::BTreeMap::new();
+        echo_attrs.insert("amplitude".to_string(), Attr::F32(self.amplitude));
+        echo_attrs.insert("reflectance".to_string(), Attr::F32(self.reflectance));
+        echo_attrs.insert("deviation".to_string(), Attr::U16(self.deviation));
+        echo_attrs.insert("echo_type".to_string(), Attr::U8(self.echo_type));
+        if zones {
+            echo_attrs.insert("mta_zone".to_string(), Attr::U8(self.zone));
+            if keep_uncertain {
+                echo_attrs.insert("mta_uncertain_point".to_string(), Attr::U8(self.uncertain));
+            }
+        }
+        let mut pulse_attrs = std::collections::BTreeMap::new();
+        pulse_attrs.insert("gps_time".to_string(), Attr::F64(self.time));
+        pulse_attrs.insert("scan_line_index".to_string(), Attr::I32(self.line));
+        pulse_attrs.insert("shot_index_line".to_string(), Attr::I32(self.shot));
+        pulse_attrs.insert("mirror_facet".to_string(), Attr::U8(self.facet));
+        pulse_attrs.insert("target_count".to_string(), Attr::U8(self.targets));
+        Shots {
+            origin: vec![[0.0; 3]; n],
+            direction: self.direction,
+            echo_start: packed_starts(&self.echo_count),
+            echo_count: self.echo_count,
+            echo_range: self.range,
+            echo_attrs,
+            pulse_attrs,
+        }
+    }
 }
 
 struct Pipeline<'a> {
     opts: &'a RxpOptions,
     m: &'a MtaOptions,
+    /// `max_zone == 1`: no zone resolution, every echo in zone 1.
+    bypass: bool,
     lines: VecDeque<Line>,
     out: Out,
     n: MtaStats,
@@ -427,29 +548,43 @@ impl Pipeline<'_> {
                     .collect();
                 mta::stage3(&grids, &self.lines[i].le, &mut dec, &p);
             }
-            self.emit(i, &dec);
+            self.emit(i, Some(&dec));
             self.lines[i].dec = Some(dec);
             self.lines[i].emitted = true;
         }
-        // Drop lines no longer needed: a line stays while a later line within
-        // line_nb3 is still to be emitted, plus one before it (pulse lookup).
+    }
+
+    fn advance(&mut self, force: bool) {
+        if self.bypass {
+            for i in 0..self.lines.len() {
+                if !self.lines[i].emitted {
+                    self.emit(i, None);
+                    self.lines[i].emitted = true;
+                }
+            }
+        } else {
+            self.run_stage1(force);
+            self.run_stage2(force);
+            self.run_stage3(force);
+        }
+        // Lines no longer needed go out as pulses: a line stays while a later
+        // line within line_nb3 is still to be emitted, plus one before it
+        // (an echo of the next line may still be placed on it).
+        let keep = self.m.params.line_nb3 + 1;
         loop {
             let first_open = self.lines.iter().position(|l| !l.emitted).unwrap_or(self.lines.len());
-            if first_open > p.line_nb3 + 1 && self.lines.len() > p.line_nb3 + 1 {
-                self.lines.pop_front();
+            if first_open > keep && self.lines.len() > keep {
+                let line = self.lines.pop_front().unwrap();
+                self.out.push_line(line, self.opts.shot_stride);
             } else {
                 break;
             }
         }
     }
 
-    fn advance(&mut self, force: bool) {
-        self.run_stage1(force);
-        self.run_stage2(force);
-        self.run_stage3(force);
-    }
-
-    fn emit(&mut self, i: usize, dec: &[Decision]) {
+    /// Filter line `i`'s echoes and place the survivors on their pulses; with
+    /// `dec` None (one zone) every echo is in zone 1.
+    fn emit(&mut self, i: usize, dec: Option<&[Decision]>) {
         let weak_a = self.m.weak_amplitude;
         let weak_r = self.m.weak_range as f64;
         let min_r = self.opts.min_range;
@@ -460,80 +595,81 @@ impl Pipeline<'_> {
         let prev_len = if i > 0 { self.lines[i - 1].shots.len() } else { 0 };
         // the learned rule, where one is loaded, overrides zone and keep/drop
         let dec_owned: Vec<Decision>;
-        let dec: &[Decision] = if let Some(model) = self.model.as_ref() {
-            use rayon::prelude::*;
-            let echoes = &self.lines[i].echoes;
-            // pulses = runs of equal shot index; evaluate them in parallel
-            let mut starts: Vec<usize> = vec![0];
-            for e_i in 1..echoes.len() {
-                if echoes[e_i].shot != echoes[e_i - 1].shot {
-                    starts.push(e_i);
+        let dec: Option<&[Decision]> = match (dec, self.model.as_ref()) {
+            (Some(dec), Some(model)) => {
+                use rayon::prelude::*;
+                let echoes = &self.lines[i].echoes;
+                // pulses = runs of equal shot index; evaluate them in parallel
+                let mut starts: Vec<usize> = vec![0];
+                for e_i in 1..echoes.len() {
+                    if echoes[e_i].shot != echoes[e_i - 1].shot {
+                        starts.push(e_i);
+                    }
                 }
-            }
-            if echoes.is_empty() {
-                starts.clear();
-            }
-            starts.push(echoes.len());
-            let mut v = dec.to_vec();
-            let n_shots = self.lines[i].shots.len().max(1) as f32;
-            let out: Vec<(usize, Decision)> = starts
-                .par_windows(2)
-                .flat_map_iter(|w| {
-                    let (j, e2) = (w[0], w[1]);
-                    let n_echoes = (e2 - j).min(255) as u8;
-                    (j..e2).map(move |e_i| {
-                        let e = &echoes[e_i];
-                        // closer echoes of the same pulse: strongest amplitude and the gap to the nearest
-                        let (mut prev_amp, mut prev_gap, mut next_amp, mut nearest) = (-1.0f32, -1.0f32, -1.0f32, f64::INFINITY);
-                        for o in &echoes[j..e2] {
-                            if o.r1 < e.r1 {
-                                prev_amp = prev_amp.max(o.amp);
-                                let gap = e.r1 - o.r1;
-                                if gap < nearest {
-                                    nearest = gap;
-                                    prev_gap = gap as f32;
+                if echoes.is_empty() {
+                    starts.clear();
+                }
+                starts.push(echoes.len());
+                let mut v = dec.to_vec();
+                let n_shots = self.lines[i].shots.len().max(1) as f32;
+                let out: Vec<(usize, Decision)> = starts
+                    .par_windows(2)
+                    .flat_map_iter(|w| {
+                        let (j, e2) = (w[0], w[1]);
+                        let n_echoes = (e2 - j).min(255) as u8;
+                        (j..e2).map(move |e_i| {
+                            let e = &echoes[e_i];
+                            // closer echoes of the same pulse: strongest amplitude and the gap to the nearest
+                            let (mut prev_amp, mut prev_gap, mut next_amp, mut nearest) = (-1.0f32, -1.0f32, -1.0f32, f64::INFINITY);
+                            for o in &echoes[j..e2] {
+                                if o.r1 < e.r1 {
+                                    prev_amp = prev_amp.max(o.amp);
+                                    let gap = e.r1 - o.r1;
+                                    if gap < nearest {
+                                        nearest = gap;
+                                        prev_gap = gap as f32;
+                                    }
+                                } else if o.r1 > e.r1 {
+                                    next_amp = next_amp.max(o.amp);
                                 }
-                            } else if o.r1 > e.r1 {
-                                next_amp = next_amp.max(o.amp);
                             }
-                        }
-                        let info = EchoInfo {
-                            amplitude: e.amp,
-                            deviation: e.dev,
-                            r1: e.r1 as f32,
-                            late: e.flags & 32 != 0,
-                            n_echoes,
-                            idx_in_shot: (e_i - j + 1).min(255) as u8,
-                            prev_amp,
-                            prev_gap,
-                            next_amp,
-                            shot_frac: e.shot as f32 / n_shots,
-                        };
-                        let mut d = dec[e_i];
-                        match model.decide(&e.zr, &e.zrefl, &d.evidence, info) {
-                            Some((zone, p)) => {
-                                d.zone = zone;
-                                d.stage = if p >= model.threshold() { 4 } else { 0 };
-                                d.score = p;
+                            let info = EchoInfo {
+                                amplitude: e.amp,
+                                deviation: e.dev,
+                                r1: e.r1 as f32,
+                                late: e.flags & 32 != 0,
+                                n_echoes,
+                                idx_in_shot: (e_i - j + 1).min(255) as u8,
+                                prev_amp,
+                                prev_gap,
+                                next_amp,
+                                shot_frac: e.shot as f32 / n_shots,
+                            };
+                            let mut d = dec[e_i];
+                            match model.decide(&e.zr, &e.zrefl, &d.evidence, info) {
+                                Some((zone, p)) => {
+                                    d.zone = zone;
+                                    d.stage = if p >= model.threshold() { 4 } else { 0 };
+                                    d.score = p;
+                                }
+                                None => {
+                                    d.zone = 0;
+                                    d.stage = 0;
+                                }
                             }
-                            None => {
-                                d.zone = 0;
-                                d.stage = 0;
-                            }
-                        }
-                        (e_i, d)
+                            (e_i, d)
+                        })
                     })
-                })
-                .collect();
-            for (e_i, d) in out {
-                v[e_i] = d;
+                    .collect();
+                for (e_i, d) in out {
+                    v[e_i] = d;
+                }
+                dec_owned = v;
+                Some(&dec_owned)
             }
-            dec_owned = v;
-            &dec_owned
-        } else {
-            dec
+            (dec, _) => dec,
         };
-        if let Some(w) = self.features.as_mut() {
+        if let (Some(w), Some(dec)) = (self.features.as_mut(), dec) {
             use std::io::Write;
             let mut rec = [0f32; FEATURE_LEN];
             let mut buf: Vec<u8> = Vec::with_capacity(FEATURE_LEN * 4 * self.lines[i].echoes.len());
@@ -570,6 +706,8 @@ impl Pipeline<'_> {
             }
             let _ = w.write_all(&buf);
         }
+        // (line slot: 0 this line, 1 the previous one; the echo)
+        let mut placed: Vec<(usize, Kept)> = Vec::new();
         for (e_i, e) in self.lines[i].echoes.iter().enumerate() {
             self.n.echoes += 1;
             if e.amp <= 0.0 {
@@ -580,11 +718,16 @@ impl Pipeline<'_> {
                 self.n.weak += 1;
                 continue;
             }
-            let d = dec[e_i];
-            let uncertain = d.zone == 0 || d.stage == 0;
-            let Some(k) = emit_zone(&d, keep_unc) else {
-                self.n.uncertain += 1;
-                continue;
+            let (k, uncertain) = match dec {
+                Some(dec) => {
+                    let d = dec[e_i];
+                    let Some(k) = emit_zone(&d, keep_unc) else {
+                        self.n.uncertain += 1;
+                        continue;
+                    };
+                    (k, d.zone == 0 || d.stage == 0)
+                }
+                None => (1, false),
             };
             let r = e.zr[k - 1] as f64;
             if !r.is_finite() {
@@ -605,11 +748,11 @@ impl Pipeline<'_> {
             }
             // the pulse the echo belongs to: zone-1 shots earlier, possibly in the previous line
             let s = e.shot as i64 - (k as i64 - 1);
-            let (pl, ps, shot) = if s >= 0 {
-                (line_idx, s, self.lines[i].shots[s as usize])
+            let (slot, ps, shot) = if s >= 0 {
+                (0, s, self.lines[i].shots[s as usize])
             } else if i > 0 && prev_len as i64 + s >= 0 {
                 let ps = prev_len as i64 + s;
-                (self.lines[i - 1].index, ps, self.lines[i - 1].shots[ps as usize])
+                (1, ps, self.lines[i - 1].shots[ps as usize])
             } else {
                 self.n.uncertain += 1;
                 continue;
@@ -618,21 +761,24 @@ impl Pipeline<'_> {
             let y = shot.o[1] as f64 + r * shot.d[1] as f64;
             let z = shot.o[2] as f64 + r * shot.d[2] as f64;
             let refl = if e.zrefl[k - 1].is_finite() { e.zrefl[k - 1] } else { e.zrefl[0] };
-            let o = &mut self.out;
-            o.xyz.push([x, y, z]);
-            o.amplitude.push(e.amp);
-            o.reflectance.push(refl);
-            o.deviation.push(e.dev.clamp(0.0, 65535.0) as u16);
-            o.echo_type.push(((e.flags >> 6) & 3) as u8);
-            o.time.push(shot.time);
-            o.zone.push(k as u8);
-            o.line.push(-(pl as i32) - 1); // RiSCAN's convention: negative, -1 is the first line
-            o.shot.push(ps as i32);
-            o.facet.push(shot.facet);
-            o.uncertain.push(uncertain as u8);
-            o.range.push(r as f32);
-            o.pulse.push(((pl as u64) << 24) | ps as u64);
+            placed.push((
+                slot,
+                Kept {
+                    shot: ps as u32,
+                    xyz: [x, y, z],
+                    range: norm(&[x, y, z]),
+                    amp: e.amp,
+                    refl,
+                    dev: e.dev.clamp(0.0, 65535.0) as u16,
+                    echo_type: ((e.flags >> 6) & 3) as u8,
+                    zone: k as u8,
+                    uncertain: uncertain as u8,
+                },
+            ));
             self.n.kept += 1;
+        }
+        for (slot, kept) in placed {
+            self.lines[i - slot].kept.push(kept);
         }
     }
 }
@@ -656,13 +802,15 @@ fn json_f64(meta: &str, key: &str) -> Option<f64> {
     rest[..end].trim().parse().ok()
 }
 
-/// Read an `.rxp` with MTA resolution through the shim.
-pub fn read_rxp_mta(path: &Path, opts: &RxpOptions, m: &MtaOptions) -> Result<PointCloud> {
-    read_rxp_mta_with_stats(path, opts, m).map(|(c, _)| c)
+/// Read an `.rxp` through the shim: every shot a pulse, in stream order (see
+/// the module docs). Of the [`RxpOptions`] it applies the drop of pseudo
+/// echoes, the range gate and `shot_stride` (every n-th shot fired).
+pub fn read_rxp_mta(path: &Path, opts: &RxpOptions, m: &MtaOptions) -> Result<Shots> {
+    read_rxp_mta_with_stats(path, opts, m).map(|(s, _)| s)
 }
 
 /// [`read_rxp_mta`] that also reports what happened to the echoes.
-pub fn read_rxp_mta_with_stats(path: &Path, opts: &RxpOptions, m: &MtaOptions) -> Result<(PointCloud, MtaStats)> {
+pub fn read_rxp_mta_with_stats(path: &Path, opts: &RxpOptions, m: &MtaOptions) -> Result<(Shots, MtaStats)> {
     with_shim(m.shim.as_deref(), |lib| {
         // SAFETY: symbol signatures follow sylva_rivlib.cpp.
         let (open, read, meta, last_error, close, version) = unsafe {
@@ -701,9 +849,10 @@ pub fn read_rxp_mta_with_stats(path: &Path, opts: &RxpOptions, m: &MtaOptions) -
         let zero_echo = ShimEcho { range: 0.0, amplitude: 0.0, reflectance: 0.0, deviation: 0.0, background: 0.0, flags: 0, nzone: 0, zone_range: [0.0; 8], zone_reflectance: [0.0; 8] };
         let mut shot_buf = vec![zero_shot; SHOTS];
         let mut echo_buf = vec![zero_echo; ECHOES];
-        let features = std::env::var_os("SYLVA_MTA_FEATURES").and_then(|f| std::fs::File::create(f).ok()).map(std::io::BufWriter::new);
-        let model = load_decision(&m.decision)?;
-        let mut pipe = Pipeline { opts, m, lines: VecDeque::new(), out: Out::default(), n: MtaStats::default(), notch: None, features, model };
+        let bypass = max_zone == 1;
+        let features = std::env::var_os("SYLVA_MTA_FEATURES").filter(|_| !bypass).and_then(|f| std::fs::File::create(f).ok()).map(std::io::BufWriter::new);
+        let model = if bypass { None } else { load_decision(&m.decision)? };
+        let mut pipe = Pipeline { opts, m, bypass, lines: VecDeque::new(), out: Out::default(), n: MtaStats::default(), notch: None, features, model };
         let mut cur: Option<Line> = None;
         let mut meta_read = false;
         let nzone = max_zone as usize;
@@ -739,7 +888,9 @@ pub fn read_rxp_mta_with_stats(path: &Path, opts: &RxpOptions, m: &MtaOptions) -
                 let (line_no, shot_no, n_echo) = (s.line, s.shot, s.n_echo as usize);
                 if cur.as_ref().map(|l| l.index != line_no).unwrap_or(true) {
                     if let Some(mut l) = cur.take() {
-                        l.finish(nzone, &m.params);
+                        if !bypass {
+                            l.finish(nzone, &m.params);
+                        }
                         pipe.lines.push_back(l);
                         pipe.advance(false);
                         if let Some(max) = m.max_lines {
@@ -756,7 +907,7 @@ pub fn read_rxp_mta_with_stats(path: &Path, opts: &RxpOptions, m: &MtaOptions) -
                 let l = cur.as_mut().unwrap();
                 debug_assert_eq!(shot_no as usize, l.shots.len());
                 let (time, ox, oy, oz, dx, dy, dz, facet) = (s.time, s.ox, s.oy, s.oz, s.dx, s.dy, s.dz, s.facet);
-                l.shots.push(ShotRec { time, o: [ox, oy, oz], d: [dx, dy, dz], facet });
+                l.shots.push(ShotRec { time, o: [ox, oy, oz], d: [dx, dy, dz], facet, n_echo: s.n_echo });
                 for _ in 0..n_echo {
                     let e = echo_buf[ei];
                     ei += 1;
@@ -775,80 +926,18 @@ pub fn read_rxp_mta_with_stats(path: &Path, opts: &RxpOptions, m: &MtaOptions) -
         unsafe { close(handle) };
         if !stop {
             if let Some(mut l) = cur.take() {
-                l.finish(nzone, &m.params);
+                if !bypass {
+                    l.finish(nzone, &m.params);
+                }
                 pipe.lines.push_back(l);
             }
         }
         pipe.advance(true);
-        let stats = pipe.n;
-        Ok((finish(pipe.out, opts, m), stats))
+        while let Some(line) = pipe.lines.pop_front() {
+            pipe.out.push_line(line, opts.shot_stride);
+        }
+        Ok((pipe.out.into_shots(!bypass, m.keep_uncertain), pipe.n))
     })
-}
-
-/// Return numbers, echo/stride selection and the final point cloud.
-fn finish(o: Out, opts: &RxpOptions, m: &MtaOptions) -> PointCloud {
-    let np = o.xyz.len();
-    // return_number / number_of_returns per pulse, by range
-    let mut order: Vec<u32> = (0..np as u32).collect();
-    order.sort_unstable_by(|&a, &b| {
-        o.pulse[a as usize].cmp(&o.pulse[b as usize]).then(o.range[a as usize].partial_cmp(&o.range[b as usize]).unwrap_or(std::cmp::Ordering::Equal))
-    });
-    let mut ret = vec![0u8; np];
-    let mut cnt = vec![0u8; np];
-    let mut pulse_ord = vec![0usize; np];
-    let mut i = 0;
-    let mut n_pulses = 0usize;
-    while i < np {
-        let mut j = i;
-        while j < np && o.pulse[order[j] as usize] == o.pulse[order[i] as usize] {
-            j += 1;
-        }
-        let c = (j - i).min(255) as u8;
-        for (r, &ix) in order[i..j].iter().enumerate() {
-            ret[ix as usize] = (r + 1).min(255) as u8;
-            cnt[ix as usize] = c;
-            pulse_ord[ix as usize] = n_pulses;
-        }
-        n_pulses += 1;
-        i = j;
-    }
-    // selection (echo type, strides, cap)
-    let mut keep = vec![true; np];
-    let mut total = 0usize;
-    for ix in 0..np {
-        let k = match opts.echoes.as_str() {
-            "first" => ret[ix] == 1,
-            "last" => ret[ix] == cnt[ix],
-            "single" => cnt[ix] == 1,
-            _ => true,
-        } && (opts.shot_stride <= 1 || pulse_ord[ix] % opts.shot_stride == 0)
-            && (opts.stride <= 1 || (ix + 1) % opts.stride == 0)
-            && opts.max_points.map(|mx| total < mx).unwrap_or(true);
-        keep[ix] = k;
-        if k {
-            total += 1;
-        }
-    }
-    fn sel<T: Copy>(v: &[T], keep: &[bool]) -> Vec<T> {
-        v.iter().zip(keep).filter(|(_, &k)| k).map(|(x, _)| *x).collect()
-    }
-    let mut cloud = PointCloud::new(sel(&o.xyz, &keep));
-    let a = &mut cloud.attrs;
-    a.insert("amplitude".into(), Attr::F32(sel(&o.amplitude, &keep)));
-    a.insert("reflectance".into(), Attr::F32(sel(&o.reflectance, &keep)));
-    a.insert("deviation".into(), Attr::U16(sel(&o.deviation, &keep)));
-    a.insert("echo_type".into(), Attr::U8(sel(&o.echo_type, &keep)));
-    a.insert("gps_time".into(), Attr::F64(sel(&o.time, &keep)));
-    a.insert("mta_zone".into(), Attr::U8(sel(&o.zone, &keep)));
-    a.insert("return_number".into(), Attr::U8(sel(&ret, &keep)));
-    a.insert("number_of_returns".into(), Attr::U8(sel(&cnt, &keep)));
-    a.insert("scan_line_index".into(), Attr::I32(sel(&o.line, &keep)));
-    a.insert("shot_index_line".into(), Attr::I32(sel(&o.shot, &keep)));
-    a.insert("mirror_facet".into(), Attr::U8(sel(&o.facet, &keep)));
-    if m.keep_uncertain {
-        a.insert("mta_uncertain_point".into(), Attr::U8(sel(&o.uncertain, &keep)));
-    }
-    cloud
 }
 
 #[cfg(test)]
@@ -878,6 +967,115 @@ mod tests {
         assert_eq!(json_f64(js, "range_max"), Some(0.244));
         assert_eq!(json_f64(js, "amplitude_max"), Some(3.0));
         assert_eq!(json_f64(js, "missing"), None);
+    }
+
+    // A beam along +x from a mirror 0.1 m above the scanner's origin.
+    fn shot(time: f64, n_echo: u8) -> ShotRec {
+        ShotRec { time, o: [0.0, 0.0, 0.1], d: [1.0, 0.0, 0.0], facet: (time as u8) % 3, n_echo }
+    }
+
+    // An echo at zone-1 range `r`, with a zone-2 hypothesis 120 m further.
+    fn echo(shot: u32, r: f32, amp: f32) -> EchoRec {
+        let mut zr = [f32::NAN; MAXZ];
+        zr[0] = r;
+        zr[1] = r + 120.0;
+        EchoRec { shot, r1: r as f64, amp, dev: 3.0, flags: 0, zr, zrefl: [-5.0; MAXZ] }
+    }
+
+    fn line(index: u32, shots: Vec<ShotRec>, echoes: Vec<EchoRec>) -> Line {
+        let mut l = Line::new(index);
+        l.shots = shots;
+        l.echoes = echoes;
+        l
+    }
+
+    fn pipeline<'a>(opts: &'a RxpOptions, m: &'a MtaOptions, bypass: bool) -> Pipeline<'a> {
+        Pipeline { opts, m, bypass, lines: VecDeque::new(), out: Out::default(), n: MtaStats::default(), notch: None, features: None, model: None }
+    }
+
+    /// Two lines in one zone, read as the reader streams them.
+    fn single_zone(opts: &RxpOptions) -> (Shots, MtaStats) {
+        let m = MtaOptions { max_zone: 1, keep_uncertain: true, ..Default::default() };
+        let mut p = pipeline(opts, &m, true);
+        p.lines.push_back(line(
+            0,
+            vec![shot(0.0, 1), shot(1.0, 0), shot(2.0, 2), shot(3.0, 2)],
+            vec![
+                echo(0, 10.0, 10.0),
+                echo(2, 5.0, 1.0),  // weak: under 2.5 dB within 18 m
+                echo(2, 30.0, 0.0), // amplitude 0
+                echo(3, 20.0, 5.0), // given far first
+                echo(3, 15.0, 6.0),
+            ],
+        ));
+        p.advance(false);
+        p.lines.push_back(line(1, vec![shot(4.0, 1), shot(5.0, 1)], vec![echo(0, 0.3, 10.0), echo(1, 7.0, 4.0)]));
+        p.advance(true);
+        while let Some(l) = p.lines.pop_front() {
+            p.out.push_line(l, opts.shot_stride);
+        }
+        (p.out.into_shots(false, m.keep_uncertain), p.n)
+    }
+
+    #[test]
+    fn every_shot_is_a_pulse_in_stream_order() {
+        let (s, n) = single_zone(&RxpOptions::default());
+        // shots 1 (no target), 2 (both filtered) and 4 (range gate) are pulses without echoes
+        assert_eq!(s.echo_count, vec![1, 0, 0, 2, 0, 1]);
+        assert_eq!(s.pulse_attrs["target_count"], Attr::U8(vec![1, 0, 2, 2, 1, 1]));
+        assert_eq!(s.pulse_attrs["gps_time"], Attr::F64(vec![0.0, 1.0, 2.0, 3.0, 4.0, 5.0]));
+        assert_eq!(s.pulse_attrs["scan_line_index"], Attr::I32(vec![-1, -1, -1, -1, -2, -2]));
+        assert_eq!(s.pulse_attrs["shot_index_line"], Attr::I32(vec![0, 1, 2, 3, 0, 1]));
+        assert_eq!(s.pulse_attrs["mirror_facet"], Attr::U8(vec![0, 1, 2, 0, 1, 2]));
+        assert_eq!(n, MtaStats { echoes: 7, amplitude_zero: 1, weak: 1, uncertain: 0, range_gate: 1, notch: 0, kept: 4 });
+        // ranges from the scanner's origin, nearest first; the direction points at the farthest
+        let z = 0.1f32 as f64; // the mirror's height, as the shim gives it
+        let r = |x: f64| (x * x + z * z).sqrt();
+        assert_eq!(s.echo_range, vec![r(10.0), r(15.0), r(20.0), r(7.0)]);
+        assert_eq!(s.echo_attrs["amplitude"], Attr::F32(vec![10.0, 6.0, 5.0, 4.0]));
+        assert!(s.origin.iter().all(|o| *o == [0.0; 3]));
+        let far = s.echo_xyz()[2];
+        assert!((far[0] - 20.0).abs() < 1e-12 && far[2] == z);
+        // a pulse without echoes points along its beam
+        assert_eq!(s.direction[1], [1.0, 0.0, 0.0]);
+    }
+
+    #[test]
+    fn one_zone_bypasses_the_resolution() {
+        let (s, _) = single_zone(&RxpOptions::default());
+        // zone-1 ranges though a zone-2 hypothesis exists; no zone columns, even with keep_uncertain
+        assert!(s.echo_range.iter().all(|&r| r < 21.0));
+        assert_eq!(s.echo_attrs.keys().collect::<Vec<_>>(), vec!["amplitude", "deviation", "echo_type", "reflectance"]);
+    }
+
+    #[test]
+    fn shot_stride_counts_every_shot_fired() {
+        let (s, _) = single_zone(&RxpOptions { shot_stride: 2, ..Default::default() });
+        assert_eq!(s.pulse_attrs["gps_time"], Attr::F64(vec![0.0, 2.0, 4.0]));
+        assert_eq!(s.echo_count, vec![1, 0, 0]);
+        assert_eq!(s.pulse_attrs["target_count"], Attr::U8(vec![1, 2, 1]));
+    }
+
+    #[test]
+    fn a_zone_2_echo_moves_to_the_pulse_before_across_a_line() {
+        let opts = RxpOptions::default();
+        let m = MtaOptions { max_zone: 2, keep_uncertain: true, ..Default::default() };
+        let mut p = pipeline(&opts, &m, false);
+        p.lines.push_back(line(0, vec![shot(0.0, 0), shot(1.0, 1), shot(2.0, 0)], vec![echo(1, 9.0, 8.0)]));
+        p.lines.push_back(line(1, vec![shot(3.0, 1), shot(4.0, 0)], vec![echo(0, 4.0, 8.0)]));
+        let d = |zone, stage| Decision { zone, stage, ..Default::default() };
+        p.emit(0, Some(&[d(1, 0)])); // uncertain, kept on request
+        p.emit(1, Some(&[d(2, 1)])); // recorded after shot 3: fired with shot 2, the last of line 0
+        while let Some(l) = p.lines.pop_front() {
+            p.out.push_line(l, 1);
+        }
+        let s = p.out.into_shots(true, true);
+        assert_eq!(s.echo_count, vec![0, 1, 1, 0, 0]);
+        assert_eq!(s.pulse_attrs["target_count"], Attr::U8(vec![0, 1, 0, 1, 0]));
+        let z = 0.1f32 as f64;
+        assert_eq!(s.echo_range[1], (124.0f64 * 124.0 + z * z).sqrt()); // at its zone-2 range
+        assert_eq!(s.echo_attrs["mta_zone"], Attr::U8(vec![1, 2]));
+        assert_eq!(s.echo_attrs["mta_uncertain_point"], Attr::U8(vec![1, 0]));
     }
 
     #[test]

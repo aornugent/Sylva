@@ -149,13 +149,22 @@ What happens, per scan line and in this order:
    different ranges while the right one agrees, so neighbours vote, then the
    remaining echoes are compared with the resolved ones, then with a wide range
    histogram of them;
-3. the echo is placed on its pulse at the resolved range with that pulse's beam
-   and timestamp, and its reflectance recomputed for that range;
+3. the echo is placed on its pulse at the resolved range with that pulse's beam,
+   and its reflectance recomputed for that range;
 4. echoes with amplitude 0 are dropped, so are echoes below 2.5 dB within 18 m
    (the scanner's dynamic trigger), echoes outside `min_range`/`max_range`,
    zone-1 echoes inside the window notch, and MTA-uncertain echoes unless
-   `keep_uncertain=True` (then flagged in `mta_uncertain_point`);
-5. `return_number` and `number_of_returns` are recounted over what survived.
+   `keep_uncertain=True` (then kept in zone 1, on the pulse it was recorded
+   after, and flagged in `mta_uncertain_point`);
+5. every shot is a pulse, in the order fired, with its surviving echoes
+   nearest first: the filters drop echoes, never pulses (`read_rxp_shots`).
+   `read_rxp` gives those echoes as points, with `return_number` and
+   `number_of_returns` counted over what survived.
+
+With `max_zone=1` there is nothing to resolve: steps 2 and 3 are skipped and
+every echo stays on the shot it was recorded after, at its zone-1 range. That
+is right wherever the zone depth (c/2 times the pulse interval: 109–139 m for a
+VZ-2000i at 1.2 MHz) exceeds the farthest surface.
 
 The three passes gather evidence per echo and zone (votes, anchor votes,
 heat-map density). What turns that into a decision is, by default, a learned
@@ -178,9 +187,12 @@ when its window model succeeds, which it did not on the reference scans). The
 model is specific to the scanner and scan program it was trained on; for other
 instruments train your own or use the rule.
 
-Extra attributes with MTA resolution: `mta_zone`, `return_number`,
-`number_of_returns`, `scan_line_index` (RiSCAN's convention: negative, -1 is
-the first line), `shot_index_line`, `mirror_facet`.
+Each pulse carries the facts of its shot: `gps_time`, `scan_line_index`
+(RiSCAN's convention: negative, -1 is the first line), `shot_index_line`,
+`mirror_facet` and `target_count`, the targets RiVLib recorded for the shot
+before any filter. Each echo carries `amplitude`, `reflectance`, `deviation`,
+`echo_type` and, with `max_zone` above 1, `mta_zone`. A point of `read_rxp`
+carries both, and `return_number`, `number_of_returns` and `range`.
 
 ### RDB databases
 
@@ -222,7 +234,7 @@ project = sylva.read_riscan_project("plot.RiSCAN")
 project.names                            # ['ScanPos001', ...]
 for pos in project.with_scans():         # positions with an .rxp and a SOP
     cloud = pos.read(shot_stride=4)      # project coordinates
-    shots = pos.read_shots(fill_missing=True)   # pulses, misses reconstructed
+    shots = pos.read_shots()             # pulses: every shot fired, with the shim
 ```
 
 The POP (project to global) is often a geocentric transform with offsets of

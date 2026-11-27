@@ -138,8 +138,8 @@ impl Shots {
     }
 
     /// Stack pulse sets in order. Echoes are taken in each part's order and
-    /// the offsets rebuilt; only echo attributes present in every part are
-    /// kept, promoted to a common type where the parts disagree.
+    /// the offsets rebuilt; only echo and pulse attributes present in every
+    /// part are kept, promoted to a common type where the parts disagree.
     pub fn concatenate(parts: &[&Shots]) -> Result<Shots> {
         if parts.is_empty() {
             return Err(Error::invalid("no shots to concatenate"));
@@ -152,12 +152,15 @@ impl Shots {
             out.echo_range.extend_from_slice(&p.echo_range);
         }
         out.echo_start = packed_starts(&out.echo_count);
-        out.echo_attrs = parts[0]
-            .echo_attrs
-            .keys()
-            .filter(|k| parts.iter().all(|p| p.echo_attrs.contains_key(*k)))
-            .map(|k| (k.clone(), concatenate_attrs(&parts.iter().map(|p| &p.echo_attrs[k]).collect::<Vec<_>>())))
-            .collect::<BTreeMap<_, _>>();
+        let common = |get: fn(&Shots) -> &BTreeMap<String, Attr>| -> BTreeMap<String, Attr> {
+            get(parts[0])
+                .keys()
+                .filter(|k| parts.iter().all(|p| get(p).contains_key(*k)))
+                .map(|k| (k.clone(), concatenate_attrs(&parts.iter().map(|p| &get(p)[k]).collect::<Vec<_>>())))
+                .collect()
+        };
+        out.echo_attrs = common(|p| &p.echo_attrs);
+        out.pulse_attrs = common(|p| &p.pulse_attrs);
         Ok(out)
     }
 
@@ -207,6 +210,7 @@ impl Shots {
             echo_count: vec![0; n],
             echo_range: Vec::new(),
             echo_attrs: self.echo_attrs.iter().map(|(k, v)| (k.clone(), v.take(&[]))).collect(),
+            pulse_attrs: BTreeMap::new(),
         };
         Some(Shots::concatenate(&[self, &empty]).expect("two parts"))
     }
@@ -228,6 +232,7 @@ mod tests {
             echo_count: counts.to_vec(),
             echo_range: (0..m).map(|i| i as f64 + 1.0).collect(),
             echo_attrs: attrs,
+            pulse_attrs: BTreeMap::new(),
         }
     }
 
@@ -255,6 +260,23 @@ mod tests {
         assert_eq!(promote(Kind::Float(32), Kind::Signed(32)), Kind::Float(64));
         assert_eq!(promote(Kind::Unsigned(32), Kind::Signed(32)), Kind::Signed(64));
         assert_eq!(promote(Kind::Unsigned(8), Kind::Signed(32)), Kind::Signed(32));
+    }
+
+    #[test]
+    fn pulse_attributes_follow_their_pulses() {
+        let mut a = shots(&[2, 0, 1]);
+        a.pulse_attrs.insert("t".into(), Attr::F64(vec![0.0, 1.0, 2.0]));
+        a.pulse_attrs.insert("only_a".into(), Attr::U8(vec![7; 3]));
+        let mut b = shots(&[1]);
+        b.pulse_attrs.insert("t".into(), Attr::F32(vec![3.0]));
+        let c = Shots::concatenate(&[&a, &b]).unwrap();
+        assert_eq!(c.pulse_attrs.keys().collect::<Vec<_>>(), vec!["t"]);
+        assert_eq!(c.pulse_attrs["t"], Attr::F64(vec![0.0, 1.0, 2.0, 3.0]));
+        let s = c.subset(&[false, true, true, true]);
+        assert_eq!(s.pulse_attrs["t"], Attr::F64(vec![1.0, 2.0, 3.0]));
+        // each echo of a point cloud takes its pulse's value
+        assert_eq!(c.to_pointcloud().attrs["t"], Attr::F64(vec![0.0, 0.0, 2.0, 3.0]));
+        assert_eq!(c.transformed(&crate::transform::Transform::identity()).pulse_attrs, c.pulse_attrs);
     }
 
     #[test]

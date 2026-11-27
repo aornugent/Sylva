@@ -344,10 +344,15 @@ def read_rxp(path: str | Path, **options) -> PointCloud:
 
         - ``mta`` (``"auto"``): ``"auto"`` resolves MTA when the shim is
           found, ``"on"`` requires it, ``"off"`` reads plainly.
-        - ``max_zone`` (6): MTA zones considered (1..8).
+        - ``max_zone`` (6): MTA zones considered (1..8). ``1`` bypasses the
+          resolution: every echo stays on the shot it was recorded after, at
+          its zone-1 range, and there is no ``mta_zone`` (right where the
+          zone depth exceeds the farthest surface; the learned model, trained
+          on a VZ-600i, can move nothing there).
         - ``keep_uncertain`` (False): keep MTA-uncertain echoes in zone 1,
           on the pulse they were recorded after, flagged in
-          ``mta_uncertain_point``, instead of dropping them as RiSCAN does.
+          ``mta_uncertain_point``, instead of dropping them as RiSCAN does;
+          nothing is uncertain with ``max_zone=1``.
         - ``mta_model`` (None): how the zone and keep/drop are decided from
           the evidence. ``None`` or ``"default"`` uses the learned model
           shipped with Sylva (boosted trees trained on rimta5's output of a
@@ -363,7 +368,8 @@ def read_rxp(path: str | Path, **options) -> PointCloud:
         - ``stride`` (1): keep every n-th echo. Splits multi-echo pulses, so
           do not use it for pulse data.
         - ``shot_stride`` (1): keep every n-th pulse with all its echoes;
-          the right way to thin data for gap fraction and ray tracing.
+          the right way to thin data for gap fraction and ray tracing. With
+          the shim it counts every shot fired, echo or not.
         - ``max_points`` (None): stop after this many points.
         - ``echoes`` (``"all"``): ``"all"``, ``"first"``, ``"last"`` or
           ``"single"``.
@@ -377,11 +383,14 @@ def read_rxp(path: str | Path, **options) -> PointCloud:
         coordinates. Attributes: ``amplitude`` and ``reflectance`` (dB),
         ``deviation`` (pulse-shape deviation, higher = more distorted),
         ``echo_type`` (0 single, 1 first, 2 interior, 3 last) and
-        ``gps_time`` (s, scanner clock). With MTA resolution also
-        ``mta_zone``, ``return_number`` and ``number_of_returns`` (recounted
-        over the kept echoes), ``scan_line_index`` (RiSCAN's convention:
-        negative, -1 is the first line), ``shot_index_line`` and
-        ``mirror_facet``.
+        ``gps_time`` (s, scanner clock). With the shim the points are the
+        echoes of :func:`read_rxp_shots`, pulse by pulse in the order fired
+        and nearest first, with their pulse's attributes: also
+        ``return_number`` and ``number_of_returns`` (recounted over the kept
+        echoes), ``range`` (m), ``scan_line_index`` (RiSCAN's convention:
+        negative, -1 is the first line), ``shot_index_line``,
+        ``mirror_facet``, ``target_count`` and, with ``max_zone`` above 1,
+        ``mta_zone``.
 
     Raises
     ------
@@ -397,9 +406,24 @@ def read_rxp_shots(path: str | Path, fill_missing: bool | tuple[float, float] | 
                    return_report: bool = False, **options) -> Shots | tuple[Shots, dict | None]:
     """Read a RIEGL ``.rxp`` scan as pulses.
 
-    Echoes sharing a timestamp are grouped into one pulse. RIEGL records only
-    pulses that returned something; ``fill_missing`` recovers the rest from
-    the timing and geometry of the recorded ones, which gap fraction and ray
+    With the ``libsylva_rivlib`` shim (see :func:`read_rxp`) every shot the
+    scanner fired in its field of view is a pulse, in the order fired, echo
+    or not: the stream records them all. The filters of :func:`read_rxp`
+    drop echoes, never pulses. Each pulse carries the facts of its shot as
+    pulse attributes: ``gps_time`` (s, scanner clock), ``scan_line_index``
+    (-1 is the first line), ``shot_index_line``, ``mirror_facet`` and
+    ``target_count``, the targets RiVLib recorded for the shot before any
+    filter (the window echo included). So a pulse with no echo whose
+    ``target_count`` is 0 returned nothing, and one whose ``target_count``
+    is above 0 had its echoes dropped. Thin with ``shot_stride`` (every
+    n-th shot fired); ``stride`` and ``echoes``, which would split pulses,
+    are refused, and ``max_points`` stops before the pulse that would pass
+    it.
+
+    Without the shim, through RiVLib's C interface, which delivers echoes
+    only, echoes sharing a timestamp are grouped into one pulse, and
+    ``fill_missing`` recovers the pulses that returned nothing from the
+    timing and geometry of the recorded ones, which gap fraction and ray
     tracing need.
 
     Parameters
@@ -407,42 +431,45 @@ def read_rxp_shots(path: str | Path, fill_missing: bool | tuple[float, float] | 
     path
         The ``.rxp`` file of one scan position.
     fill_missing
-        Add the pulses that returned nothing, each at the place it was fired.
-        The scanner fires at a fixed rate while the mirror sweeps the zenith
-        at constant speed, one line per azimuth step, so a time gap of *n*
-        intervals between two recorded pulses of a line holds *n* - 1 misses
-        at the interpolated angles, and the sweep is continued at the
-        measured angular step from the first recorded pulse of a line back to
-        the sky end, and from the last on to the other end. The dead time
-        between lines is left alone. A pulse whose only record is a pseudo
-        echo or an echo under ``min_range`` (the scanner's own near-range
-        echo, which a VZ-2000i writes for every pulse that returned nothing)
-        is a miss. For a scanner that keeps several pulses in flight (the
-        VZ-2000i and other VZ-i models) the echoes are first assigned to
-        their pulses by the MTA resolution of :func:`read_rxp` when it is
-        available; on the raw stream, an echo filed under the wrong pulse
-        leaves a false miss, two per cent of a Robson Creek scan. ``True`` takes the zenith limits from
-        the data (which under-fills the sky end when no pulse of the scan
-        returned from there); a ``(first, last)`` pair in degrees, from the
-        scan pattern, is better (:meth:`sylva.riscan.ScanPosition.read_shots`
-        passes it). With it, ``shot_stride`` counts fired pulses, recorded or
-        not, and a pulse whose echoes are all filtered out is dropped rather
-        than counted as a miss.
+        Without the shim, add the pulses that returned nothing, each at the
+        place it was fired (with it, they are already there, and this does
+        nothing). The scanner fires at a fixed rate while the mirror sweeps
+        the zenith at constant speed, one line per azimuth step, so a time
+        gap of *n* intervals between two recorded pulses of a line holds
+        *n* - 1 misses at the interpolated angles, and the sweep is continued
+        at the measured angular step from the first recorded pulse of a line
+        back to the sky end, and from the last on to the other end. The dead
+        time between lines is left alone. A pulse whose only record is a
+        pseudo echo or an echo under ``min_range`` (the scanner's own
+        near-range echo, which a VZ-2000i writes for every pulse that
+        returned nothing) is a miss. For a scanner that keeps several pulses
+        in flight (the VZ-2000i and other VZ-i models) an echo filed under the
+        wrong pulse leaves a false miss, two per cent of a Robson Creek scan:
+        build the shim. ``True`` takes the zenith limits from the data (which
+        under-fills the sky end when no pulse of the scan returned from
+        there); a ``(first, last)`` pair in degrees, from the scan pattern,
+        is better (:meth:`sylva.riscan.ScanPosition.read_shots` passes it).
+        With it, ``shot_stride`` counts fired pulses, recorded or not, and a
+        pulse whose echoes are all filtered out is dropped rather than
+        counted as a miss.
     return_report
         Also return what the reconstruction measured: ``n_lines``,
         ``pulse_interval`` (s), ``zenith_step`` (degrees per pulse),
         ``zenith_range``, and the misses added between recorded pulses
         (``n_gap``), before the first of a line (``n_before``) and after the
-        last (``n_after``). ``None`` without ``fill_missing``.
+        last (``n_after``). ``None`` without a reconstruction.
     **options
         As for :func:`read_rxp`. Thin with ``shot_stride``, not ``stride``.
 
     Returns
     -------
     Shots
-        Pulses in the scanner frame (origin at 0, 0, 0), with the echo
-        attributes of :func:`read_rxp`; the recovered misses follow the
-        recorded pulses. Transform with the SOP before combining scans.
+        Pulses in the scanner frame (origin at 0, 0, 0). With the shim, every
+        shot in the order fired, with the echo attributes of :func:`read_rxp`
+        other than its shot's facts, which are pulse attributes; without it,
+        the echo attributes of :func:`read_rxp`, and the recovered misses
+        follow the recorded pulses. Transform with the SOP before combining
+        scans.
 
     Raises
     ------

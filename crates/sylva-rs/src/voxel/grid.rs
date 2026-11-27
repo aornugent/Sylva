@@ -343,7 +343,7 @@ mod tests {
         let origin: Vec<Point> = (0..n).map(|i| [0.3 + 0.01 * (i % 10) as f64, 0.5, 0.0]).collect();
         let count: Vec<u32> = (0..n).map(|i| (i % 2) as u32).collect();
         let start: Vec<usize> = count.iter().scan(0usize, |s, &c| { let v = *s; *s += c as usize; Some(v) }).collect();
-        let shots = Shots { origin, direction: vec![[0.0, 0.0, 1.0]; n], echo_start: start, echo_count: count, echo_range: vec![1.5; n / 2], echo_attrs: Default::default() };
+        let shots = Shots { origin, direction: vec![[0.0, 0.0, 1.0]; n], echo_start: start, echo_count: count, echo_range: vec![1.5; n / 2], echo_attrs: Default::default(), pulse_attrs: Default::default() };
         let params = VoxelParams { voxel_size: 1.0, bounds: Some(([0.0; 3], [1.0, 1.0, 4.0])), occlusion: true, attenuation: vec![voxel::Attenuation::Transmittance], unbounded_range: 4.0, ..Default::default() };
         voxelize_labelled(&shots, &params, &EchoLabels::default(), None, None, None).unwrap()
     }

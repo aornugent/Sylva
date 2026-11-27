@@ -5,6 +5,19 @@ changes. `main` mirrors upstream; `develop` is merged up to upstream's 2.0.0. Th
 its module documentation, not here. Work since deleted, such as the per-tree fit `joint_tree`, is at the tag
 `archive/sylva-develop-2026-11-12`.
 
+- `io.read_rxp_shots`, through the shim, writes every shot of the RXP stream as a pulse in the order fired, and
+  `Shots` gains pulse attributes (`pulse_attrs`: a Parquet column each, carried by `subset`, `concatenate` and
+  `transform`, spread onto each echo by `to_pointcloud`): `gps_time`, `scan_line_index`, `shot_index_line`,
+  `mirror_facet` and `target_count`, the targets RiVLib attached to the shot before any filter. The filters drop
+  echoes, never pulses, so a shot that recorded targets but kept none is told from one that recorded nothing, and no
+  flag is stored. With `max_zone=1` the MTA resolution and its learned model are bypassed: every echo at its zone-1
+  range, no `mta_zone` or `mta_uncertain_point`. 3dtrees needs it because the stream records every shot in the field
+  of view, echo or not, while upstream keeps echoes only and rebuilds misses from timing gaps (`fill_missing`, now only
+  for the `libscanifc` fallback): on a VZ-2000i plot that lost 0.3 % of the shots (mostly sky at line tops), invented
+  some past a scan's last shot, gave misses a direction only, and couldn't tell a dropped echo or a sun-blinded receiver
+  from empty space. Changes outputs: a store's rows are every shot in stream order (misses interleaved, not appended),
+  the shot's facts are pulse columns, there are no zone columns at one zone, and `read_rxp` orders points by pulse
+  and adds `range` and `target_count`; `read_rxp_shots` refuses `stride` and `echoes`, which would split pulses.
 - `qsm.support_tree` measures one tree's wood from the rays. Each row is cut into pieces of at most 30 cm. Each
   scan's pulses near a piece measure its circle from their silhouette and front. Where no circle is determined they
   bound its radius instead (spans, passes and the ray veto), or a row's own stops give it a point circle. Pieces with

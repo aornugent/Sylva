@@ -6,10 +6,13 @@
 
 The reference reads the same file through RiVLib's C interface
 (``scanifc_point3dstream_*``) with ctypes, and applies the documented
-options with NumPy. The tests need RiVLib and a scan, which cannot be
-distributed: give the scan with ``SYLVA_TEST_RXP``, or the folder of the TERN
-RiSCAN projects with ``SYLVA_TERN_DIR`` (the smallest full scan found there is
-used). Without either they are skipped.
+options with NumPy; those tests read with ``mta="off"``, the plain reader
+over that interface. The shim's shot stream (``mta="on"``, every shot a
+pulse) is checked for its own invariants. The tests need RiVLib and a scan,
+which cannot be distributed: give the scan with ``SYLVA_TEST_RXP``, or the
+folder of the TERN RiSCAN projects with ``SYLVA_TERN_DIR`` (the smallest full
+scan found there is used). Without either they are skipped, and the shim's
+without the shim.
 """
 
 import ctypes
@@ -140,7 +143,7 @@ def _assert_same_points(cloud, ref, idx):
 def test_every_record_and_attribute_as_rivlib_reads_it(head):
     n = 1_000_000
     cloud = io.read_rxp(SCAN, library=LIBRARY, drop_pseudo_echoes=False, min_range=0.0,
-                        max_points=n)
+                        max_points=n, mta="off")
     assert len(cloud) == n
     assert cloud.attrs["amplitude"].dtype == np.float32
     assert cloud.attrs["deviation"].dtype == np.uint16
@@ -156,7 +159,7 @@ def test_every_record_and_attribute_as_rivlib_reads_it(head):
 ])
 def test_reading_options_select_the_documented_records(head, options):
     n = 100_000
-    cloud = io.read_rxp(SCAN, max_points=n, **options)
+    cloud = io.read_rxp(SCAN, max_points=n, mta="off", **options)
     rename = {"drop_pseudo_echoes": "drop_pseudo"}
     idx = _keep(head, **{rename.get(k, k): v for k, v in options.items()})[:n]
     assert len(idx) == n, "the reference read too few records"
@@ -165,7 +168,7 @@ def test_reading_options_select_the_documented_records(head, options):
 
 def test_pulses_are_runs_of_echoes_sharing_a_time(head):
     n = 200_000
-    shots = io.read_rxp_shots(SCAN, max_points=n)
+    shots = io.read_rxp_shots(SCAN, max_points=n, mta="off")
     idx = _keep(head)[:n]
     t = head["time"][idx]
     run = np.concatenate([[True], t[1:] != t[:-1]])
@@ -200,22 +203,21 @@ def _position() -> riscan.ScanPosition:
 def test_scan_position_reads_in_project_coordinates():
     pos = _position()
     n = 50_000
-    raw = io.read_rxp(SCAN, max_points=n)
-    np.testing.assert_allclose(pos.read(max_points=n).xyz,
-                               raw.xyz @ pos.sop[:3, :3].T + pos.sop[:3, 3], atol=1e-9)
-    shots = pos.read_shots(max_points=n)
+    raw = io.read_rxp(SCAN, max_points=n, mta="off")
+    points = pos.read(max_points=n, mta="off")
+    np.testing.assert_allclose(points.xyz, raw.xyz @ pos.sop[:3, :3].T + pos.sop[:3, 3], atol=1e-9)
+    shots = pos.read_shots(max_points=n, mta="off")
     np.testing.assert_allclose(shots.origin, np.tile(pos.sop[:3, 3], (shots.n_shots, 1)))
     # Echoes are placed along their pulse's one direction (to its farthest echo); RIEGL's
     # echoes of one pulse are collinear with the scanner origin to a few millimetres.
     single = np.repeat(shots.echo_count == 1, shots.echo_count)
-    np.testing.assert_allclose(shots.echo_xyz()[single], pos.read(max_points=n).xyz[single],
-                               atol=1e-6)
-    np.testing.assert_allclose(shots.echo_xyz(), pos.read(max_points=n).xyz, atol=5e-3)
+    np.testing.assert_allclose(shots.echo_xyz()[single], points.xyz[single], atol=1e-6)
+    np.testing.assert_allclose(shots.echo_xyz(), points.xyz, atol=5e-3)
     # The misses are recovered in the scanner frame, with the pattern's zenith limits, then moved.
-    filled = pos.read_shots(fill_missing=True, max_points=n, shot_stride=8)
+    filled = pos.read_shots(fill_missing=True, max_points=n, shot_stride=8, mta="off")
     p = pos.pattern
     limits = (p["theta_start"], p["theta_start"] + p["theta_delta"] * p["theta_count"])
-    own = io.read_rxp_shots(SCAN, fill_missing=limits, max_points=n, shot_stride=8)
+    own = io.read_rxp_shots(SCAN, fill_missing=limits, max_points=n, shot_stride=8, mta="off")
     assert filled.n_shots == own.n_shots > shots.n_shots // 8
     np.testing.assert_allclose(filled.direction, own.direction @ pos.sop[:3, :3].T, atol=1e-12)
     with pytest.raises(ValueError, match=f"scan position {pos.name} has no scan pattern"):
@@ -251,7 +253,7 @@ def test_misses_follow_from_the_scan_pattern(rivlib):
     per_line = int(max(pattern["phi_count"] / stride, np.quantile(observed, 0.98)))
     missing = np.maximum(per_line - observed, 0)
 
-    shots = io.read_rxp_shots(SCAN, shot_stride=stride)
+    shots = io.read_rxp_shots(SCAN, shot_stride=stride, mta="off")
     assert shots.n_shots == len(zenith)
     full = shots.fill_missing(pattern, shot_stride=stride)
     assert full.n_echoes == shots.n_echoes
@@ -265,7 +267,8 @@ def test_misses_follow_from_the_scan_pattern(rivlib):
 
 
 def test_misses_recovered_from_pulse_timing():
-    """The no-return pulses of a whole scan, each at the slot it was fired.
+    """The no-return pulses of a whole scan, each at the slot it was fired,
+    as the reader without the shim recovers them.
 
     The scanner fires at a fixed rate while the mirror sweeps the zenith at
     constant speed, one line per azimuth step. The reconstruction finds the
@@ -275,8 +278,8 @@ def test_misses_recovered_from_pulse_timing():
     pos = _position()
     p = pos.pattern
     limits = (p["theta_start"], p["theta_start"] + p["theta_delta"] * p["theta_count"])
-    shots, report = io.read_rxp_shots(SCAN, fill_missing=limits, return_report=True)
-    recorded = io.read_rxp_shots(SCAN)
+    shots, report = io.read_rxp_shots(SCAN, fill_missing=limits, return_report=True, mta="off")
+    recorded = io.read_rxp_shots(SCAN, mta="off")
     assert report["n_misses"] == shots.n_shots - recorded.n_shots > 0
     assert shots.n_echoes == recorded.n_echoes
     # One line per azimuth step, a few more than nominal as the scanner overshoots.
@@ -289,10 +292,98 @@ def test_misses_recovered_from_pulse_timing():
     zen = np.degrees(np.arccos(np.clip(shots.direction[recorded.n_shots:, 2], -1, 1)))
     assert zen.min() > limits[0] - 1 and zen.max() < limits[1] + 1
     # The stride thins the fired sequence, recorded and recovered alike.
-    thinned = io.read_rxp_shots(SCAN, fill_missing=limits, shot_stride=8)
+    thinned = io.read_rxp_shots(SCAN, fill_missing=limits, shot_stride=8, mta="off")
     assert abs(thinned.n_shots * 8 - shots.n_shots) < 0.01 * shots.n_shots
     assert abs(thinned.n_echoes * 8 - shots.n_echoes) < 0.02 * shots.n_echoes
     # Without limits the recorded extremes stand in: fewer misses at the sky end, never more.
-    inferred = io.read_rxp_shots(SCAN, fill_missing=True)
+    inferred = io.read_rxp_shots(SCAN, fill_missing=True, mta="off")
     assert recorded.n_shots < inferred.n_shots <= shots.n_shots
+
+
+# ---- the shim: every shot of the stream a pulse ---------------------------------------------
+
+LINES = 300
+
+
+def _shim():
+    try:
+        return io.find_rivlib_shim()
+    except ValueError:
+        return None
+
+
+needs_shim = pytest.mark.skipif(_shim() is None, reason="the sylva_rivlib shim is not built")
+
+
+def _stream(**options):
+    return io.read_rxp_shots(SCAN, mta="on", max_zone=1, max_lines=LINES, **options)
+
+
+@pytest.fixture(scope="module")
+def stream():
+    return _stream()
+
+
+@needs_shim
+def test_every_shot_is_a_pulse_in_the_order_fired(stream):
+    s, pa = stream, stream.pulse_attrs
+    assert set(pa) == {"gps_time", "scan_line_index", "shot_index_line", "mirror_facet",
+                       "target_count"}
+    assert all(len(v) == s.n_shots for v in pa.values())
+    # Line by line from the first, each shot in turn: nothing left out, nothing appended.
+    line = -pa["scan_line_index"] - 1
+    assert line[0] == 0 and line[-1] == LINES - 1 and set(np.diff(line)) <= {0, 1}
+    start = np.flatnonzero(np.diff(line, prepend=-1))
+    first = np.repeat(start, np.diff(np.append(start, s.n_shots)))
+    np.testing.assert_array_equal(pa["shot_index_line"], np.arange(s.n_shots) - first)
+    assert np.all(np.diff(pa["gps_time"])[np.diff(line) == 0] > 0)
+    # Shots that recorded nothing are pulses; so are shots whose every target was dropped.
+    empty = s.echo_count == 0
+    assert (empty & (pa["target_count"] == 0)).any()
+    assert (empty & (pa["target_count"] > 0)).any()
+    assert np.all(pa["target_count"] >= s.echo_count)
+    np.testing.assert_allclose(np.linalg.norm(s.direction, axis=1), 1.0)
+    # The echoes of read_rxp are these, pulse by pulse, with their pulse's attributes.
+    cloud = io.read_rxp(SCAN, mta="on", max_zone=1, max_lines=LINES)
+    np.testing.assert_array_equal(cloud.xyz, s.echo_xyz())
+    np.testing.assert_array_equal(cloud.attrs["gps_time"], np.repeat(pa["gps_time"], s.echo_count))
+
+
+@needs_shim
+def test_one_zone_bypasses_the_mta_resolution(stream):
+    # Nothing to keep or flag at one zone.
+    assert not {"mta_zone", "mta_uncertain_point"} & set(stream.echo_attrs)
+    loose = _stream(keep_uncertain=True)
+    np.testing.assert_array_equal(loose.echo_range, stream.echo_range)
+    assert set(loose.echo_attrs) == set(stream.echo_attrs)
+    # With two zones the same shots, now with zones; echoes may move between them.
+    two = io.read_rxp_shots(SCAN, mta="on", max_zone=2, max_lines=LINES, mta_model="rule")
+    assert two.n_shots == stream.n_shots and "mta_zone" in two.echo_attrs
+    for k in ("gps_time", "target_count"):
+        np.testing.assert_array_equal(two.pulse_attrs[k], stream.pulse_attrs[k])
+
+
+@needs_shim
+def test_filters_drop_echoes_not_pulses(stream):
+    near = _stream(min_range=5.0)
+    assert near.n_shots == stream.n_shots
+    np.testing.assert_array_equal(near.pulse_attrs["target_count"],
+                                  stream.pulse_attrs["target_count"])
+    lost = (near.echo_count == 0) & (stream.echo_count > 0)
+    assert lost.any() and np.all(near.pulse_attrs["target_count"][lost] > 0)
+
+
+@needs_shim
+def test_stream_thinning_and_caps(stream):
+    every4 = _stream(shot_stride=4)
+    sub = stream.subset(np.arange(stream.n_shots) % 4 == 0)
+    np.testing.assert_array_equal(every4.echo_range, sub.echo_range)
+    np.testing.assert_array_equal(every4.pulse_attrs["gps_time"], sub.pulse_attrs["gps_time"])
+    capped = _stream(max_points=10_000)
+    assert 9_990 < capped.n_echoes <= 10_000
+    np.testing.assert_array_equal(capped.pulse_attrs["gps_time"],
+                                  stream.pulse_attrs["gps_time"][:capped.n_shots])
+    for bad in ({"stride": 2}, {"echoes": "first"}):
+        with pytest.raises(ValueError, match="shot_stride"):
+            _stream(**bad)
 

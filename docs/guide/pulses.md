@@ -8,9 +8,18 @@ ray-traced canopy metrics need.
 ## From RIEGL projects and ray clouds
 
 Pulse data (from `.rxp` or a raycloudtools ray cloud) enables ray-traced
-metrics that account for free space. RiVLib's point stream holds only the
-pulses that returned an echo; `fill_missing` puts the others back, each at
-the place it was fired. A RIEGL scanner fires at a fixed rate while its
+metrics that account for free space. An `.rxp` records every shot the
+scanner fired in its field of view, echo or not, and read through the shim
+(see the IO guide) every shot is a pulse, in the order fired, with the facts
+of its shot as pulse attributes: `gps_time`, `scan_line_index`,
+`shot_index_line`, `mirror_facet` and `target_count` (the targets the scanner
+recorded for it, before Sylva's filters). A pulse without echoes whose
+`target_count` is 0 returned nothing; one whose `target_count` is above 0 had
+its echoes dropped by the filters.
+
+RiVLib's C interface, which Sylva falls back on without the shim, delivers
+echoes only; `fill_missing` then puts the missing pulses back, each at the
+place it was fired. A RIEGL scanner fires at a fixed rate while its
 mirror sweeps the zenith at constant speed, one line per azimuth step, so
 within a line the zenith is a linear function of time: a time gap of *n*
 intervals between two recorded pulses holds *n* − 1 misses at the
@@ -29,7 +38,7 @@ zen, gap = canopy.gap_fraction_pattern(shots, shots.to_pointcloud().z - pos.sop[
                                        pos.pattern, min_height=1.0)
 print("PAI", canopy.lai_from_gap_fraction(zen, gap, "hinge"))
 
-full = pos.read_shots(fill_missing=True)             # the echo-less pulses, in place
+full = pos.read_shots(fill_missing=True)             # the echo-less pulses, in place (with the shim: always)
 grid = canopy.density_grid(full, voxel_size=1.0)
 dtm = ground.make_dtm(ground.classify_ground_pmf(full.to_pointcloud()), 0.5)
 z, pad = grid.mask_ground(dtm).profile_above_ground(dtm, bin_size=2.0)   # PAD by height
@@ -40,8 +49,9 @@ z, pad = grid.mask_ground(dtm).profile_above_ground(dtm, bin_size=2.0)   # PAD b
 `Shots.save("plot.parquet")` is the native way to keep pulse data. It is a
 Parquet file with one row per pulse: `scan` (index into the scanner positions
 held in the file metadata), `zenith`, `azimuth`, `range` (a list of echo
-ranges, empty for a pulse that returned nothing) and one list column per echo
-attribute, zstd compressed in row groups of about a million pulses. A miss
+ranges, empty for a pulse that returned nothing), one list column per echo
+attribute and one column per pulse attribute, zstd compressed in row groups
+of about a million pulses. A miss
 costs two angles instead of a far "sky" point with every point attribute, an
 echo is a range instead of three coordinates, and nothing has to sit 1000 m
 outside the plot. polars, pyarrow, duckdb and R arrow read it directly.
@@ -112,19 +122,18 @@ r["height"], r["pai_hinge_profile"], r["pavd_hinge"]
   - With `shot_stride` both sides are decimated alike.
   - Shots that already hold their misses (a ray cloud,
     `read_shots(fill_missing=True)`) need no `fired_per_ring`.
-  - A pulse that returned nothing still leaves a record in the stream: a
-    pseudo echo, or the scanner's own near-range echo 0.1-0.2 m out (a
-    VZ-2000i writes one for every such pulse, 2.4 million in a rainforest
-    tilt scan). The reader counts a pulse as recorded only from an echo
-    beyond `min_range`, so these become misses where they were fired. The
-    pulses the instrument's own body and mount block leave the same record
-    and count as misses too; they point at the tripod, below the horizon
-    (for a tilted scan, behind and beneath it).
-    On a VZ-i scanner the echoes are assigned to their pulses by the MTA
-    resolution first, where the shim is built: on the raw stream, an echo
-    filed under the wrong pulse leaves a false miss, two per cent of a
-    Robson Creek scan and not one of them corroborated by the tilted scan
-    on the same tripod.
+  - Without the shim, a pulse that returned nothing still leaves a record in
+    the stream: a pseudo echo, or the scanner's own near-range echo 0.1-0.2 m
+    out (a VZ-2000i writes one for every such pulse, 2.4 million in a
+    rainforest tilt scan). The reader counts a pulse as recorded only from an
+    echo beyond `min_range`, so these become misses where they were fired.
+    The pulses the instrument's own body and mount block leave the same
+    record and count as misses too; they point at the tripod, below the
+    horizon (for a tilted scan, behind and beneath it). On a VZ-i scanner an
+    echo filed under the wrong pulse on the raw stream leaves a false miss,
+    two per cent of a Robson Creek scan: build the shim, which also keeps
+    the shots the reconstruction can't recover (on a VZ-2000i plot, 0.3 % of
+    them, mostly sky at the top of each line).
     `Shots.fill_missing_from_timing` runs the same reconstruction on shots
     already in memory that kept their `gps_time`, e.g. a RiSCAN export
     that kept every echo (one exported with a reflectance or deviation

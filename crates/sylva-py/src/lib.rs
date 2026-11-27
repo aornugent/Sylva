@@ -362,10 +362,13 @@ fn shots_from_py(d: &Bound<'_, PyDict>) -> PyResult<Shots> {
     let start = get("echo_start")?.extract::<PyReadonlyArray1<i64>>()?.as_array().to_vec();
     let count = get("echo_count")?.extract::<PyReadonlyArray1<i64>>()?.as_array().to_vec();
     let echo_range: Vec<f64> = get("echo_range")?.extract::<PyReadonlyArray1<f64>>()?.as_array().to_vec();
-    let echo_attrs = match d.get_item("echo_attrs")? {
-        Some(a) => attrs_from_py(Some(a.cast::<PyDict>()?))?,
-        None => BTreeMap::new(),
+    let attrs = |key: &str| -> PyResult<BTreeMap<String, Attr>> {
+        match d.get_item(key)? {
+            Some(a) => attrs_from_py(Some(a.cast::<PyDict>()?)),
+            None => Ok(BTreeMap::new()),
+        }
     };
+    let (echo_attrs, pulse_attrs) = (attrs("echo_attrs")?, attrs("pulse_attrs")?);
     // Everything downstream indexes echoes by these; check once here so a
     // malformed Shots is a ValueError, not a panic.
     let n = origin.len();
@@ -383,9 +386,14 @@ fn shots_from_py(d: &Bound<'_, PyDict>) -> PyResult<Shots> {
             return Err(PyValueError::new_err(format!("shots: echo attribute {name:?} has {} values for {} echoes", a.len(), echo_range.len())));
         }
     }
+    for (name, a) in &pulse_attrs {
+        if a.len() != n {
+            return Err(PyValueError::new_err(format!("shots: pulse attribute {name:?} has {} values for {n} pulses", a.len())));
+        }
+    }
     let echo_start: Vec<usize> = start.iter().map(|&v| v as usize).collect();
     let echo_count: Vec<u32> = count.iter().map(|&v| v as u32).collect();
-    Ok(Shots { origin, direction, echo_start, echo_count, echo_range, echo_attrs })
+    Ok(Shots { origin, direction, echo_start, echo_count, echo_range, echo_attrs, pulse_attrs })
 }
 
 fn shots_to_py<'py>(py: Python<'py>, s: &Shots) -> PyResult<Bound<'py, PyDict>> {
@@ -396,6 +404,7 @@ fn shots_to_py<'py>(py: Python<'py>, s: &Shots) -> PyResult<Bound<'py, PyDict>> 
     d.set_item("echo_count", s.echo_count.iter().map(|&v| v as i64).collect::<Vec<_>>().into_pyarray(py))?;
     d.set_item("echo_range", s.echo_range.clone().into_pyarray(py))?;
     d.set_item("echo_attrs", attrs_to_py(py, &s.echo_attrs)?)?;
+    d.set_item("pulse_attrs", attrs_to_py(py, &s.pulse_attrs)?)?;
     Ok(d)
 }
 
@@ -415,6 +424,11 @@ pub(crate) fn shots_into_py<'py>(py: Python<'py>, s: Shots) -> PyResult<Bound<'p
         attrs.set_item(k, attr_into_py(py, v))?;
     }
     d.set_item("echo_attrs", attrs)?;
+    let pulse = PyDict::new(py);
+    for (k, v) in s.pulse_attrs {
+        pulse.set_item(k, attr_into_py(py, v))?;
+    }
+    d.set_item("pulse_attrs", pulse)?;
     Ok(d)
 }
 
@@ -1084,6 +1098,7 @@ fn shots_info<'py>(py: Python<'py>, path: PathBuf) -> PyResult<Bound<'py, PyDict
     d.set_item("bounds", (file.bounds.0.to_vec(), file.bounds.1.to_vec()))?;
     d.set_item("scans", xyz_to_py(py, file.scans()))?;
     d.set_item("echo_attrs", file.attr_names().collect::<Vec<_>>())?;
+    d.set_item("pulse_attrs", file.pulse_attr_names().collect::<Vec<_>>())?;
     Ok(d)
 }
 

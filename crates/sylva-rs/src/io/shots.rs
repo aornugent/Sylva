@@ -12,6 +12,7 @@
 //! | `zenith`, `azimuth` | float / double | beam direction (rad; zenith from +z, azimuth `atan2(x, y)`) |
 //! | `range` | list&lt;float / double&gt; | echo ranges, nearest first; empty for a pulse without a return |
 //! | *attr* | list&lt;typed&gt; | one list column per echo attribute |
+//! | *pulse attr* | typed | one column per pulse attribute (time, scan line, ...), after the echo attributes |
 //!
 //! With more than 65 536 distinct origins (mobile or airborne platforms) the
 //! `scan` column is replaced by `origin_x`, `origin_y`, `origin_z`: int32 in
@@ -25,6 +26,7 @@
 //!
 //! File metadata keys: `sylva.shots` (format version), `sylva.precision`,
 //! `sylva.scans` (`x y z;x y z;...`), `sylva.origin_offset`, `sylva.origin_scale`, `sylva.attrs` (`name:dtype,...`),
+//! `sylva.pulse_attrs` (the same for the pulse attributes; absent from files written without them),
 //! `sylva.bounds` (echo bounding box, `x0 y0 z0 x1 y1 z1`), `sylva.n_echoes`.
 
 use std::collections::{BTreeMap, HashMap};
@@ -77,23 +79,39 @@ impl Default for ShotsWriteOptions {
     }
 }
 
-fn physical(a: &Attr) -> &'static str {
+/// A column's Parquet physical type and logical annotation.
+fn physical(a: &Attr) -> (&'static str, &'static str) {
     match a {
-        Attr::F64(_) => "double",
-        Attr::F32(_) => "float",
-        Attr::I64(_) => "int64",
-        Attr::I32(_) => "int32",
-        Attr::U32(_) => "int32 element (INTEGER(32,false))",
-        Attr::U16(_) => "int32 element (INTEGER(16,false))",
-        Attr::U8(_) => "int32 element (INTEGER(8,false))",
-        Attr::I8(_) => "int32 element (INTEGER(8,true))",
-        Attr::Bool(_) => "boolean",
+        Attr::F64(_) => ("double", ""),
+        Attr::F32(_) => ("float", ""),
+        Attr::I64(_) => ("int64", ""),
+        Attr::I32(_) => ("int32", ""),
+        Attr::U32(_) => ("int32", " (INTEGER(32,false))"),
+        Attr::U16(_) => ("int32", " (INTEGER(16,false))"),
+        Attr::U8(_) => ("int32", " (INTEGER(8,false))"),
+        Attr::I8(_) => ("int32", " (INTEGER(8,true))"),
+        Attr::Bool(_) => ("boolean", ""),
     }
 }
 
-fn list_field(name: &str, element: &str) -> String {
-    let element = if element.contains("element") { element.to_string() } else { format!("{element} element") };
-    format!("  required group {name} (LIST) {{ repeated group list {{ required {element}; }} }}\n")
+fn list_field(name: &str, (ty, ann): (&str, &str)) -> String {
+    format!("  required group {name} (LIST) {{ repeated group list {{ required {ty} element{ann}; }} }}\n")
+}
+
+/// Rows `r` of an attribute column: echoes (with list `levels`) or pulses.
+fn write_attr(rg: &mut SerializedRowGroupWriter<'_, File>, a: &Attr, r: std::ops::Range<usize>, levels: Option<(&[i16], &[i16])>) -> Result<()> {
+    let ints = |it: &mut dyn Iterator<Item = i32>| it.collect::<Vec<i32>>();
+    match a {
+        Attr::F64(v) => write_col::<DoubleType>(rg, &v[r], levels),
+        Attr::F32(v) => write_col::<FloatType>(rg, &v[r], levels),
+        Attr::I64(v) => write_col::<Int64Type>(rg, &v[r], levels),
+        Attr::I32(v) => write_col::<Int32Type>(rg, &v[r], levels),
+        Attr::U32(v) => write_col::<Int32Type>(rg, &ints(&mut v[r].iter().map(|&x| x as i32)), levels),
+        Attr::U16(v) => write_col::<Int32Type>(rg, &ints(&mut v[r].iter().map(|&x| x as i32)), levels),
+        Attr::U8(v) => write_col::<Int32Type>(rg, &ints(&mut v[r].iter().map(|&x| x as i32)), levels),
+        Attr::I8(v) => write_col::<Int32Type>(rg, &ints(&mut v[r].iter().map(|&x| x as i32)), levels),
+        Attr::Bool(v) => write_col::<BoolType>(rg, &v[r], levels),
+    }
 }
 
 /// Beam direction to `(zenith, azimuth)`.
@@ -118,10 +136,18 @@ fn write_col<T: DataType>(rg: &mut SerializedRowGroupWriter<'_, File>, values: &
 pub fn write_shots(shots: &Shots, path: impl AsRef<Path>, opts: &ShotsWriteOptions) -> Result<()> {
     let path = path.as_ref();
     let n = shots.n_shots();
-    for name in shots.echo_attrs.keys() {
+    for name in shots.echo_attrs.keys().chain(shots.pulse_attrs.keys()) {
         let ok = !name.is_empty() && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
         if !ok || matches!(name.as_str(), "scan" | "zenith" | "azimuth" | "range" | "origin_x" | "origin_y" | "origin_z" | "list" | "element") {
-            return Err(Error::invalid(format!("echo attribute {name:?} cannot be a column name")));
+            return Err(Error::invalid(format!("attribute {name:?} cannot be a column name")));
+        }
+    }
+    for (name, a) in &shots.pulse_attrs {
+        if shots.echo_attrs.contains_key(name) {
+            return Err(Error::invalid(format!("{name:?} is both an echo and a pulse attribute")));
+        }
+        if a.len() != n {
+            return Err(Error::invalid(format!("pulse attribute {name:?} has {} values for {n} pulses", a.len())));
         }
     }
 
@@ -191,9 +217,13 @@ pub fn write_shots(shots: &Shots, path: impl AsRef<Path>, opts: &ShotsWriteOptio
         schema += "  required int32 scan;\n";
     }
     schema += &format!("  required {real} zenith;\n  required {real} azimuth;\n");
-    schema += &list_field("range", real);
+    schema += &list_field("range", (real, ""));
     for (name, a) in &shots.echo_attrs {
         schema += &list_field(name, physical(a));
+    }
+    for (name, a) in &shots.pulse_attrs {
+        let (ty, ann) = physical(a);
+        schema += &format!("  required {ty} {name}{ann};\n");
     }
     schema += "}\n";
     let schema = Arc::new(parse_message_type(&schema)?);
@@ -215,6 +245,7 @@ pub fn write_shots(shots: &Shots, path: impl AsRef<Path>, opts: &ShotsWriteOptio
         KeyValue::new("sylva.precision".into(), if opts.double { "double" } else { "single" }.to_string()),
         KeyValue::new("sylva.scans".into(), if per_shot_origin { String::new() } else { scans.iter().map(join).collect::<Vec<_>>().join(";") }),
         KeyValue::new("sylva.attrs".into(), shots.echo_attrs.iter().map(|(k, a)| format!("{k}:{}", a.dtype())).collect::<Vec<_>>().join(",")),
+        KeyValue::new("sylva.pulse_attrs".into(), shots.pulse_attrs.iter().map(|(k, a)| format!("{k}:{}", a.dtype())).collect::<Vec<_>>().join(",")),
         KeyValue::new("sylva.bounds".into(), format!("{} {}", join(&xyz_bounds.0), join(&xyz_bounds.1))),
         KeyValue::new("sylva.n_echoes".into(), shots.n_echoes().to_string()),
     ];
@@ -280,18 +311,10 @@ pub fn write_shots(shots: &Shots, path: impl AsRef<Path>, opts: &ShotsWriteOptio
             write_col::<FloatType>(&mut rg, &shots.echo_range[e0..e1].iter().map(|&x| x as f32).collect::<Vec<_>>(), lv)?;
         }
         for a in shots.echo_attrs.values() {
-            let as_i32 = |it: &mut dyn Iterator<Item = i32>| it.collect::<Vec<i32>>();
-            match a {
-                Attr::F64(v) => write_col::<DoubleType>(&mut rg, &v[e0..e1], lv)?,
-                Attr::F32(v) => write_col::<FloatType>(&mut rg, &v[e0..e1], lv)?,
-                Attr::I64(v) => write_col::<Int64Type>(&mut rg, &v[e0..e1], lv)?,
-                Attr::I32(v) => write_col::<Int32Type>(&mut rg, &v[e0..e1], lv)?,
-                Attr::U32(v) => write_col::<Int32Type>(&mut rg, &as_i32(&mut v[e0..e1].iter().map(|&x| x as i32)), lv)?,
-                Attr::U16(v) => write_col::<Int32Type>(&mut rg, &as_i32(&mut v[e0..e1].iter().map(|&x| x as i32)), lv)?,
-                Attr::U8(v) => write_col::<Int32Type>(&mut rg, &as_i32(&mut v[e0..e1].iter().map(|&x| x as i32)), lv)?,
-                Attr::I8(v) => write_col::<Int32Type>(&mut rg, &as_i32(&mut v[e0..e1].iter().map(|&x| x as i32)), lv)?,
-                Attr::Bool(v) => write_col::<BoolType>(&mut rg, &v[e0..e1], lv)?,
-            }
+            write_attr(&mut rg, a, e0..e1, lv)?;
+        }
+        for a in shots.pulse_attrs.values() {
+            write_attr(&mut rg, a, s0..s1, None)?;
         }
         rg.close()?;
     }
@@ -319,6 +342,7 @@ pub struct ShotsFile {
     /// Origins are stored per pulse (`origin_x/y/z`) rather than as a `scan` index.
     per_pulse: bool,
     attrs: Vec<(String, String)>,
+    pulse_attrs: Vec<(String, String)>,
     double: bool,
     origin_offset: Point,
     origin_scale: f64,
@@ -374,7 +398,10 @@ impl ShotsFile {
             (v.len() == 3).then(|| [v[0], v[1], v[2]])
         };
         let scans: Vec<Point> = kv.get("sylva.scans").copied().unwrap_or("").split(';').filter(|s| !s.is_empty()).map(point).collect::<Option<_>>().ok_or_else(|| bad("scans"))?;
-        let attrs: Vec<(String, String)> = kv.get("sylva.attrs").copied().unwrap_or("").split(',').filter(|s| !s.is_empty()).map(|s| s.split_once(':').map(|(a, b)| (a.to_string(), b.to_string()))).collect::<Option<_>>().ok_or_else(|| bad("attrs"))?;
+        let names = |key: &str| -> Result<Vec<(String, String)>> {
+            kv.get(key).copied().unwrap_or("").split(',').filter(|s| !s.is_empty()).map(|s| s.split_once(':').map(|(a, b)| (a.to_string(), b.to_string()))).collect::<Option<_>>().ok_or_else(|| bad(key))
+        };
+        let (attrs, pulse_attrs) = (names("sylva.attrs")?, names("sylva.pulse_attrs")?);
         let b: Vec<f64> = kv.get("sylva.bounds").copied().unwrap_or("").split_whitespace().filter_map(|t| t.parse().ok()).collect();
         if b.len() != 6 {
             return Err(bad("bounds"));
@@ -387,6 +414,7 @@ impl ShotsFile {
             scans,
             per_pulse,
             attrs,
+            pulse_attrs,
             double: kv.get("sylva.precision") == Some(&"double"),
             origin_offset: kv.get("sylva.origin_offset").and_then(|s| point(s)).ok_or_else(|| bad("origin_offset"))?,
             origin_scale: kv.get("sylva.origin_scale").and_then(|s| s.parse().ok()).ok_or_else(|| bad("origin_scale"))?,
@@ -416,6 +444,10 @@ impl ShotsFile {
     /// Names of the per-echo attributes stored in the file, in column order.
     pub fn attr_names(&self) -> impl Iterator<Item = &str> {
         self.attrs.iter().map(|a| a.0.as_str())
+    }
+
+    pub fn pulse_attr_names(&self) -> impl Iterator<Item = &str> {
+        self.pulse_attrs.iter().map(|a| a.0.as_str())
     }
 
     /// Read one row group.
@@ -465,25 +497,34 @@ impl ShotsFile {
             }
             at += (l > 0) as usize;
         }
-        for (name, dtype) in &self.attrs {
-            let c = next()?;
-            let ints = |c| read_values::<Int32Type>(c, rows, true, reader_of!(Int32ColumnReader)).map(|v| v.0);
-            let attr = match dtype.as_str() {
-                "float64" => Attr::F64(read_values::<DoubleType>(c, rows, true, reader_of!(DoubleColumnReader))?.0),
-                "float32" => Attr::F32(read_values::<FloatType>(c, rows, true, reader_of!(FloatColumnReader))?.0),
-                "int64" => Attr::I64(read_values::<Int64Type>(c, rows, true, reader_of!(Int64ColumnReader))?.0),
+        let read_attr = |c: ColumnReader, dtype: &str, lists: bool| -> Result<Attr> {
+            let ints = |c| read_values::<Int32Type>(c, rows, lists, reader_of!(Int32ColumnReader)).map(|v| v.0);
+            Ok(match dtype {
+                "float64" => Attr::F64(read_values::<DoubleType>(c, rows, lists, reader_of!(DoubleColumnReader))?.0),
+                "float32" => Attr::F32(read_values::<FloatType>(c, rows, lists, reader_of!(FloatColumnReader))?.0),
+                "int64" => Attr::I64(read_values::<Int64Type>(c, rows, lists, reader_of!(Int64ColumnReader))?.0),
                 "int32" => Attr::I32(ints(c)?),
                 "uint32" => Attr::U32(ints(c)?.into_iter().map(|x| x as u32).collect()),
                 "uint16" => Attr::U16(ints(c)?.into_iter().map(|x| x as u16).collect()),
                 "uint8" => Attr::U8(ints(c)?.into_iter().map(|x| x as u8).collect()),
                 "int8" => Attr::I8(ints(c)?.into_iter().map(|x| x as i8).collect()),
-                "bool" => Attr::Bool(read_values::<BoolType>(c, rows, true, reader_of!(BoolColumnReader))?.0),
+                "bool" => Attr::Bool(read_values::<BoolType>(c, rows, lists, reader_of!(BoolColumnReader))?.0),
                 other => return Err(Error::invalid(format!("shots file: unknown dtype {other:?}"))),
-            };
+            })
+        };
+        for (name, dtype) in &self.attrs {
+            let attr = read_attr(next()?, dtype, true)?;
             if attr.len() != shots.echo_range.len() {
                 return Err(Error::invalid(format!("shots file: attribute {name:?} does not match the echoes")));
             }
             shots.echo_attrs.insert(name.clone(), attr);
+        }
+        for (name, dtype) in &self.pulse_attrs {
+            let attr = read_attr(next()?, dtype, false)?;
+            if attr.len() != rows {
+                return Err(Error::invalid(format!("shots file: pulse attribute {name:?} does not match the pulses")));
+            }
+            shots.pulse_attrs.insert(name.clone(), attr);
         }
         Ok(shots)
     }
@@ -541,9 +582,8 @@ impl ShotsFile {
 
     /// Read some row groups into one [`Shots`].
     pub fn read_groups(&self, groups: &[usize]) -> Result<Shots> {
-        let mut out = Shots::default();
-        for (name, dtype) in &self.attrs {
-            let empty = match dtype.as_str() {
+        let empty = |(name, dtype): &(String, String)| {
+            let a = match dtype.as_str() {
                 "float64" => Attr::F64(vec![]),
                 "float32" => Attr::F32(vec![]),
                 "int64" => Attr::I64(vec![]),
@@ -554,8 +594,9 @@ impl ShotsFile {
                 "int8" => Attr::I8(vec![]),
                 _ => Attr::Bool(vec![]),
             };
-            out.echo_attrs.insert(name.clone(), empty);
-        }
+            (name.clone(), a)
+        };
+        let mut out = Shots { echo_attrs: self.attrs.iter().map(empty).collect(), pulse_attrs: self.pulse_attrs.iter().map(empty).collect(), ..Default::default() };
         for &g in groups {
             if g >= self.n_groups() {
                 return Err(Error::invalid(format!("shots file has {} row groups, asked for {g}", self.n_groups())));
@@ -581,10 +622,81 @@ pub(crate) fn append(out: &mut Shots, part: Shots) -> Result<()> {
     for (k, a) in &part.echo_attrs {
         out.echo_attrs.get_mut(k).ok_or_else(|| Error::invalid(format!("shots file: attribute {k:?} is not in every row group")))?.extend(a)?;
     }
+    for (k, a) in &part.pulse_attrs {
+        out.pulse_attrs.get_mut(k).ok_or_else(|| Error::invalid(format!("shots file: pulse attribute {k:?} is not in every row group")))?.extend(a)?;
+    }
     Ok(())
 }
 
 /// Read a whole shots file.
 pub fn read_shots(path: impl AsRef<Path>) -> Result<Shots> {
     ShotsFile::open(path)?.read_all()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Five pulses, two without echoes, with echo and pulse attributes.
+    fn shots() -> Shots {
+        let counts = vec![1u32, 0, 2, 0, 1];
+        let mut s = Shots {
+            origin: vec![[1.0, 2.0, 3.0]; 5],
+            direction: vec![[0.0, 0.6, 0.8]; 5],
+            echo_start: crate::shots::ops::packed_starts(&counts),
+            echo_count: counts,
+            echo_range: vec![5.0, 2.0, 7.5, 9.0],
+            ..Default::default()
+        };
+        s.echo_attrs.insert("amplitude".into(), Attr::F32(vec![1.0, 2.0, 3.0, 4.0]));
+        s.pulse_attrs.insert("gps_time".into(), Attr::F64(vec![0.1, 0.2, 0.3, 0.4, 0.5]));
+        s.pulse_attrs.insert("target_count".into(), Attr::U8(vec![1, 0, 3, 2, 1]));
+        s.pulse_attrs.insert("scan_line_index".into(), Attr::I32(vec![-1, -1, -1, -2, -2]));
+        s
+    }
+
+    fn temp(name: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!("sylva_shots_{}_{name}.parquet", std::process::id()))
+    }
+
+    #[test]
+    fn pulse_attributes_round_trip_by_row_group() {
+        let s = shots();
+        let path = temp("pulse");
+        write_shots(&s, &path, &ShotsWriteOptions { double: true, row_group_size: 2, ..Default::default() }).unwrap();
+        let f = ShotsFile::open(&path).unwrap();
+        assert_eq!(f.pulse_attr_names().collect::<Vec<_>>(), vec!["gps_time", "scan_line_index", "target_count"]);
+        let back = f.read_all().unwrap();
+        assert_eq!(back.pulse_attrs, s.pulse_attrs);
+        assert_eq!(back.echo_attrs, s.echo_attrs);
+        assert_eq!(back.echo_count, s.echo_count);
+        let mid = f.read_groups(&[1]).unwrap();
+        assert_eq!(mid.pulse_attrs["target_count"], Attr::U8(vec![3, 2]));
+        assert_eq!(mid.echo_attrs["amplitude"], Attr::F32(vec![2.0, 3.0]));
+        // the beams alone still find the echo attributes behind the pulse columns
+        assert_eq!(f.read_rays(1, &["amplitude"]).unwrap().attrs, vec![vec![2.0, 3.0]]);
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn a_file_without_pulse_attributes_reads_none() {
+        let mut s = shots();
+        s.pulse_attrs.clear();
+        let path = temp("none");
+        write_shots(&s, &path, &ShotsWriteOptions::default()).unwrap();
+        assert!(read_shots(&path).unwrap().pulse_attrs.is_empty());
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn pulse_attributes_are_checked() {
+        let path = temp("bad");
+        let mut s = shots();
+        s.pulse_attrs.insert("amplitude".into(), Attr::F32(vec![0.0; 5]));
+        assert!(write_shots(&s, &path, &ShotsWriteOptions::default()).is_err());
+        let mut s = shots();
+        s.pulse_attrs.insert("short".into(), Attr::F32(vec![0.0; 4]));
+        assert!(write_shots(&s, &path, &ShotsWriteOptions::default()).is_err());
+        let _ = std::fs::remove_file(&path);
+    }
 }

@@ -246,6 +246,7 @@ pub fn scan(cloud: &PointCloud, origin: Point, resolution_deg: f64, max_zenith_d
         echo_count: count,
         echo_range: echo_points.iter().map(|&i| range[i]).collect(),
         echo_attrs: cloud.attrs.iter().map(|(k, v)| (k.clone(), v.take(&echo_points))).collect(),
+        pulse_attrs: Default::default(),
     }
 }
 
