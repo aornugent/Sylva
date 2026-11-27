@@ -536,7 +536,7 @@ mod tests {
             start.push(s);
             s += c as usize;
         }
-        Shots { origin, direction, echo_start: start, echo_count: counts.to_vec(), echo_range: ranges, echo_attrs: BTreeMap::new() }
+        Shots { origin, direction, echo_start: start, echo_count: counts.to_vec(), echo_range: ranges, echo_attrs: BTreeMap::new(), pulse_attrs: BTreeMap::new() }
     }
 
     #[test]

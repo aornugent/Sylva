@@ -296,6 +296,7 @@ pub fn scan_spheres(scene: &PointCloud, origins: &[Point], p: &SphereScan) -> Re
             echo_count: count,
             echo_range: echoes.iter().map(|e| e.0).collect(),
             echo_attrs: attrs,
+            pulse_attrs: Default::default(),
         });
     }
     Ok(out)

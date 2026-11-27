@@ -403,7 +403,7 @@ mod tests {
             start.push(s);
             s += c as usize;
         }
-        let shots = Shots { origin: vec![[0.0; 3]; 5], direction, echo_start: start, echo_count: counts.to_vec(), echo_range: vec![8.0, 3.0, 6.0, 12.0, 2.0], echo_attrs: BTreeMap::new() };
+        let shots = Shots { origin: vec![[0.0; 3]; 5], direction, echo_start: start, echo_count: counts.to_vec(), echo_range: vec![8.0, 3.0, 6.0, 12.0, 2.0], echo_attrs: BTreeMap::new(), pulse_attrs: BTreeMap::new() };
         let heights = [7.5, 0.2, 5.5, 8.0, 0.0];
         let img = from_shots(&shots, g, Some(&heights), 0.5, None, Some(&[1.0, 2.0, 3.0, 4.0, 5.0])).unwrap();
         let centre = 100 * 200 + 100;

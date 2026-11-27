@@ -90,6 +90,39 @@ def test_shots_file_roundtrip(rng, tmp_path):
     np.testing.assert_allclose(exact.echo_xyz(), shots.echo_xyz(), atol=1e-9)
 
 
+def test_pulse_attributes_follow_their_pulses(rng, tmp_path):
+    shots = _random_shots(rng, 3000)
+    n = shots.n_shots
+    shots.pulse_attrs = {"gps_time": np.arange(n) * 8e-7,
+                         "target_count": rng.integers(0, 5, n).astype(np.uint8),
+                         "scan_line_index": -1 - np.arange(n, dtype=np.int32) // 100}
+    path = tmp_path / "pulses.parquet"
+    shots.save(path, row_group_size=700)
+    assert set(Shots.file_info(path)["pulse_attrs"]) == set(shots.pulse_attrs)
+    back = Shots.load(path)
+    for k, v in shots.pulse_attrs.items():
+        assert back.pulse_attrs[k].dtype == v.dtype
+        np.testing.assert_array_equal(back.pulse_attrs[k], v)
+    np.testing.assert_array_equal(Shots.load(path, groups=[2]).pulse_attrs["target_count"],
+                                  shots.pulse_attrs["target_count"][1400:2100])
+    # Subsets, transforms and stacks carry them; a point takes its pulse's value.
+    keep = shots.echo_count == 0
+    np.testing.assert_array_equal(shots.subset(keep).pulse_attrs["gps_time"],
+                                  shots.pulse_attrs["gps_time"][keep])
+    np.testing.assert_array_equal(shots.transform(np.eye(4)).pulse_attrs["target_count"],
+                                  shots.pulse_attrs["target_count"])
+    both = Shots.concatenate([shots, shots])
+    assert both.pulse_attrs["gps_time"].shape == (2 * n,)
+    assert Shots.concatenate([shots, _random_shots(rng, 10)]).pulse_attrs == {}
+    pc = shots.to_pointcloud()
+    np.testing.assert_array_equal(pc.attrs["scan_line_index"],
+                                  np.repeat(shots.pulse_attrs["scan_line_index"], shots.echo_count))
+    assert shots.scan_image("target_count", grid="lines").data.shape[1] >= 1
+    with pytest.raises(ValueError, match="pulse attribute"):
+        Shots(shots.origin, shots.direction, shots.echo_start, shots.echo_count, shots.echo_range,
+              pulse_attrs={"gps_time": np.zeros(n - 1)}).save(path)
+
+
 def test_shots_file_snaps_noisy_origins_and_keeps_trajectories(rng, tmp_path):
     shots = _random_shots(rng, 3000)
     noisy = Shots(shots.origin + rng.normal(0, 2e-5, shots.origin.shape), shots.direction,
@@ -217,6 +250,11 @@ def test_scan_lines_use_time_against_stray_pulses():
     s.echo_attrs = {"gps_time": t}
     starts, _, _ = s.scan_lines()
     assert starts.tolist() == [0, 6, 12, 18, 24]
+    # A pulse time serves pulses without echoes too.
+    s.echo_count[::2] = 0
+    s.echo_attrs = {}
+    s.pulse_attrs = {"gps_time": t}
+    assert s.scan_lines()[0].tolist() == [0, 6, 12, 18, 24]
 
 
 def test_scan_image_of_an_azimuth_sweeping_scanner():

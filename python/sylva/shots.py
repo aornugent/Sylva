@@ -28,6 +28,10 @@ class Shots:
     A shot with ``echo_count == 0`` is a genuine miss and still carries
     information about free space.
 
+    Facts of a shot (its time, scan line, the targets the scanner recorded
+    for it) are pulse attributes, one value per shot whether or not an echo
+    survived; facts of an echo are echo attributes.
+
     Build one with :func:`sylva.io.read_rxp_shots`,
     :meth:`sylva.riscan.ScanPosition.read_shots`, :meth:`from_ray_cloud`,
     :meth:`from_pointcloud` or :meth:`load`.
@@ -42,6 +46,9 @@ class Shots:
         Range from the origin to each echo, ascending within a shot.
     echo_attrs
         Per-echo attributes (``amplitude``, ``reflectance``, ...).
+    pulse_attrs
+        Per-pulse attributes (``gps_time``, ``scan_line_index``, ...), each
+        of length ``n_shots``; empty when the source records none.
     """
 
     origin: np.ndarray
@@ -50,6 +57,7 @@ class Shots:
     echo_count: np.ndarray
     echo_range: np.ndarray
     echo_attrs: dict[str, np.ndarray] = field(default_factory=dict)
+    pulse_attrs: dict[str, np.ndarray] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         self.origin = np.ascontiguousarray(self.origin, dtype=np.float64).reshape(-1, 3)
@@ -58,6 +66,7 @@ class Shots:
         self.echo_count = np.ascontiguousarray(self.echo_count, dtype=np.int64)
         self.echo_range = np.ascontiguousarray(self.echo_range, dtype=np.float64)
         self.echo_attrs = {k: np.ascontiguousarray(v) for k, v in self.echo_attrs.items()}
+        self.pulse_attrs = {k: np.ascontiguousarray(v) for k, v in self.pulse_attrs.items()}
 
     @property
     def n_shots(self) -> int:
@@ -79,12 +88,13 @@ class Shots:
         }
         if attrs:
             d["echo_attrs"] = self.echo_attrs
+            d["pulse_attrs"] = self.pulse_attrs
         return d
 
     @classmethod
     def _from_core(cls, d: dict) -> Shots:
         return cls(d["origin"], d["direction"], d["echo_start"], d["echo_count"],
-                   d["echo_range"], d["echo_attrs"])
+                   d["echo_range"], d["echo_attrs"], d.get("pulse_attrs", {}))
 
     def shot_of_echo(self) -> np.ndarray:
         """Index of the owning shot for each echo.
@@ -123,7 +133,8 @@ class Shots:
         -------
         PointCloud
             One point per echo with ``return_number`` (1 = first),
-            ``number_of_returns``, ``range`` (m) and every echo attribute.
+            ``number_of_returns``, ``range`` (m), every echo attribute and
+            its pulse's attributes.
         """
         xyz, attrs = _core.shots_to_pointcloud(self._to_core())
         return PointCloud(xyz, attrs)
@@ -182,10 +193,11 @@ class Shots:
         azimuth (a head turning a full circle per elevation step), and turns
         back between lines; so a line ends where the swept angle jumps back
         against the sweep by more than ten degrees. The swept angle is the
-        one that moves more between consecutive pulses. When every shot has
-        an echo with a ``gps_time``, the jump must also span the dead time of
-        a turn, which keeps the stray out-of-sequence pulses of a fast
-        scanner from starting lines of their own.
+        one that moves more between consecutive pulses. When every shot has a
+        time (a ``gps_time`` pulse attribute, or an echo with one), the jump
+        must also span the dead time of a turn, which keeps the stray
+        out-of-sequence pulses of a fast scanner from starting lines of their
+        own.
 
         Returns
         -------
@@ -205,7 +217,9 @@ class Shots:
         zenith_sweeps = np.nanmedian(np.abs(np.diff(zen))) >= np.nanmedian(np.abs(daz))
         along = "zenith" if zenith_sweeps else "azimuth"
         time = None
-        if "gps_time" in self.echo_attrs and (self.echo_count > 0).all():
+        if "gps_time" in self.pulse_attrs:
+            time = np.ascontiguousarray(self.pulse_attrs["gps_time"], dtype=float)
+        elif "gps_time" in self.echo_attrs and (self.echo_count > 0).all():
             time = np.ascontiguousarray(self.echo_attrs["gps_time"], dtype=float)[self.echo_start]
         angle = zen if along == "zenith" else az
         starts, sweep = _core.shots_scan_lines(np.ascontiguousarray(angle, dtype=float), time)
@@ -299,7 +313,8 @@ class Shots:
             What to show: ``"range"`` (m, default), ``"n_echoes"``,
             ``"zenith"`` or ``"azimuth"`` (degrees), the name of an echo
             attribute (``"amplitude"``, ``"reflectance"``, ``"deviation"``,
-            ...), or an array with one value per echo or per shot.
+            ...) or a pulse attribute (``"target_count"``, ...), or an array
+            with one value per echo or per shot.
         echo : {"first", "last"}
             Which echo of a multi-echo pulse supplies a per-echo field.
         cmap
@@ -374,10 +389,12 @@ class Shots:
                 values = zen if field == "zenith" else az
             elif field in self.echo_attrs:
                 values = per_shot(np.asarray(self.echo_attrs[field], dtype=float))
+            elif field in self.pulse_attrs:
+                values = np.asarray(self.pulse_attrs[field], dtype=float)
             else:
-                have = ", ".join(sorted(self.echo_attrs)) or "none"
+                have = ", ".join(sorted({*self.echo_attrs, *self.pulse_attrs})) or "none"
                 raise ValueError(f"unknown field {field!r}; use range, n_echoes, zenith, azimuth "
-                                 f"or an echo attribute ({have})")
+                                 f"or an attribute ({have})")
         else:
             arr = np.asarray(field, dtype=float).ravel()
             name = "value"
@@ -443,8 +460,8 @@ class Shots:
         Returns
         -------
         Shots
-            All pulses in order; only echo attributes present in every part
-            are kept.
+            All pulses in order; only echo and pulse attributes present in
+            every part are kept.
 
         Raises
         ------
@@ -511,10 +528,12 @@ class Shots:
     def fill_missing_from_timing(self, zenith_range: tuple[float, float] | None = None,
                                  shot_stride: int = 1, return_report: bool = False):
         """Add the pulses that returned nothing, each where it was fired, from
-        the pulse timing: the reconstruction of
-        :func:`sylva.io.read_rxp_shots` for shots already in memory, e.g.
-        built by :meth:`from_pointcloud` from points that kept their
-        ``gps_time``. Every shot needs an echo with a ``gps_time``, and the
+        the pulse timing, for a source that recorded echoes only: the
+        reconstruction :func:`sylva.io.read_rxp_shots` does without the
+        RiVLib shim, for shots already in memory, e.g. built by
+        :meth:`from_pointcloud` from an export's points that kept their
+        ``gps_time``. (Read through the shim, an ``.rxp`` already holds every
+        shot fired.) Every shot needs an echo with a ``gps_time``, and the
         shots must be in acquisition order in the scanner's frame.
 
         Parameters
@@ -560,9 +579,9 @@ class Shots:
                      seed: int = 0, shot_stride: int = 1) -> Shots:
         """Add the pulses that returned nothing, by count per zenith line.
 
-        Prefer ``read_rxp_shots(..., fill_missing=...)`` or
-        ``ScanPosition.read_shots(fill_missing=True)``, which recover each
-        miss at the place it was fired from the pulse timing. This method
+        Prefer :func:`sylva.io.read_rxp_shots`, which with the RiVLib shim
+        holds every shot fired, or :meth:`fill_missing_from_timing`, which
+        recovers each miss at the place it was fired. This method
         only knows the shots, not their timing: given the angular scan
         ``pattern`` it compares, per zenith line, the pulses fired against the
         shots observed and adds the difference as shots with
@@ -614,8 +633,9 @@ class Shots:
 
         Columns are ``scan`` (index into the scanner positions kept in the
         file metadata), ``zenith`` and ``azimuth`` (rad), ``range`` (a list of
-        echo ranges, empty for a pulse without a return) and one list column
-        per echo attribute, zstd compressed in row groups of
+        echo ranges, empty for a pulse without a return), one list column
+        per echo attribute and one column per pulse attribute, zstd
+        compressed in row groups of
         ``row_group_size`` pulses that can be read or voxelised one at a time
         (:func:`sylva.voxels.ray_voxelize` accepts the path). Any Parquet
         reader (polars, pyarrow, duckdb, R arrow) opens it.
@@ -682,7 +702,7 @@ class Shots:
         dict
             ``n_shots``, ``n_echoes``, ``n_groups``, echo ``bounds``,
             ``scans`` (scanner positions; empty when origins are stored per
-            pulse) and ``echo_attrs`` (names).
+            pulse), ``echo_attrs`` and ``pulse_attrs`` (names).
         """
         return _core.shots_info(str(path))
 

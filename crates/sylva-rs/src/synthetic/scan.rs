@@ -597,7 +597,7 @@ pub fn scan_beam(cloud: &PointCloud, p: &BeamScan) -> Result<Shots> {
     echo_attrs.insert("reflectance".into(), Attr::F32(flat.iter().map(|e| (10.0 * e.0.energy.log10()) as f32).collect()));
     echo_attrs.insert("footprint_fraction".into(), Attr::F32(flat.iter().map(|e| e.0.fraction as f32).collect()));
     echo_attrs.insert("range_spread".into(), Attr::F32(flat.iter().map(|e| e.0.spread as f32).collect()));
-    Ok(Shots { origin: vec![o; n_pulses], direction, echo_start, echo_count: count, echo_range: flat.iter().map(|e| e.1).collect(), echo_attrs })
+    Ok(Shots { origin: vec![o; n_pulses], direction, echo_start, echo_count: count, echo_range: flat.iter().map(|e| e.1).collect(), echo_attrs, pulse_attrs: Default::default() })
 }
 
 #[cfg(test)]

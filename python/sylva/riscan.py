@@ -158,10 +158,11 @@ class ScanPosition:
         pop
             Also apply this project-to-global matrix.
         fill_missing
-            Recover the pulses that returned nothing, each where it was fired
-            (see :func:`sylva.io.read_rxp_shots`), with the sweep's zenith
-            limits from the project's scan pattern. Needed for gap fraction
-            and ray tracing.
+            Without the RiVLib shim, recover the pulses that returned nothing,
+            each where it was fired (see :func:`sylva.io.read_rxp_shots`),
+            with the sweep's zenith limits from the project's scan pattern.
+            Needed for gap fraction and ray tracing. With the shim every shot
+            fired is already a pulse.
         **options
             Passed to :func:`sylva.io.read_rxp_shots`.
 

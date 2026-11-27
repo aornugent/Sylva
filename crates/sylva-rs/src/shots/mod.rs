@@ -7,6 +7,11 @@
 //! This is the representation ray-based canopy metrics need: a shot with
 //! `echo_count == 0` is a genuine miss and still carries information about
 //! free space. Modelled on canopygrid's `Shots` and raycloudtools' ray clouds.
+//!
+//! Facts of a shot (its time, scan line, place in the line, mirror facet, the
+//! targets the scanner recorded for it) are pulse attributes, one value per
+//! shot, held whether or not an echo survived; facts of an echo (amplitude,
+//! reflectance, ...) are echo attributes. Either map may be empty.
 
 pub mod ops;
 pub mod reconstruct;
@@ -32,6 +37,9 @@ pub struct Shots {
     pub echo_range: Vec<f64>,
     /// Extra per-echo attributes (amplitude, reflectance, deviation, ...).
     pub echo_attrs: BTreeMap<String, Attr>,
+    /// Per-pulse attributes (gps_time, scan_line_index, ...), one value per
+    /// shot; empty when the source records none.
+    pub pulse_attrs: BTreeMap<String, Attr>,
 }
 
 impl Shots {
@@ -75,16 +83,19 @@ impl Shots {
     }
 
     /// Convert echoes to a point cloud with `return_number`, `number_of_returns`,
-    /// `range` and the echo attributes.
+    /// `range`, the echo attributes and each echo's pulse attributes.
     pub fn to_pointcloud(&self) -> PointCloud {
         let xyz = self.echo_xyz();
         let mut cloud = PointCloud::new(xyz);
+        let shot = self.shot_of_echo();
         let ranks: Vec<u8> = self.echo_rank().iter().map(|r| (r + 1).min(255) as u8).collect();
-        let nret: Vec<u8> =
-            self.shot_of_echo().iter().map(|&s| self.echo_count[s].min(255) as u8).collect();
+        let nret: Vec<u8> = shot.iter().map(|&s| self.echo_count[s].min(255) as u8).collect();
         cloud.attrs.insert("return_number".into(), Attr::U8(ranks));
         cloud.attrs.insert("number_of_returns".into(), Attr::U8(nret));
         cloud.attrs.insert("range".into(), Attr::F32(self.echo_range.iter().map(|&r| r as f32).collect()));
+        for (k, v) in &self.pulse_attrs {
+            cloud.attrs.insert(k.clone(), v.take(&shot));
+        }
         for (k, v) in &self.echo_attrs {
             cloud.attrs.insert(k.clone(), v.clone());
         }
@@ -107,10 +118,12 @@ impl Shots {
     pub fn subset(&self, keep: &[bool]) -> Shots {
         let mut out = Shots::default();
         let mut echo_idx = Vec::new();
+        let mut shot_idx = Vec::new();
         for s in 0..self.n_shots() {
             if !keep[s] {
                 continue;
             }
+            shot_idx.push(s);
             out.origin.push(self.origin[s]);
             out.direction.push(self.direction[s]);
             out.echo_start.push(out.echo_range.len());
@@ -122,6 +135,7 @@ impl Shots {
             }
         }
         out.echo_attrs = self.echo_attrs.iter().map(|(k, v)| (k.clone(), v.take(&echo_idx))).collect();
+        out.pulse_attrs = self.pulse_attrs.iter().map(|(k, v)| (k.clone(), v.take(&shot_idx))).collect();
         out
     }
 

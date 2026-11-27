@@ -9,8 +9,11 @@
 //! locations (`~/.local/lib`, `~/opt`, `/opt`, `/usr/local/lib`, ...).
 //!
 //! Points come back in the scanner's own coordinate system (SOCS) with the
-//! scanner at the origin. Runs of echoes sharing a timestamp form one pulse,
-//! which is how [`Shots`] are recovered.
+//! scanner at the origin. With the `sylva_rivlib` shim ([`super::rxp_mta`])
+//! every shot is a pulse straight from RiVLib's shot stream. Without it,
+//! through `libscanifc`, which delivers echoes only, runs of echoes sharing a
+//! timestamp form one pulse, and the pulses that returned nothing can only be
+//! inferred from the gaps they leave in the timing ([`crate::shots::reconstruct`]).
 
 use std::ffi::{c_char, c_void, CString};
 use std::path::{Path, PathBuf};
@@ -189,10 +192,11 @@ pub struct RxpOptions {
     /// [`super::rxp_mta`]. The default tries the shim and falls back to plain
     /// `libscanifc` reading when it is not built.
     pub mta: super::rxp_mta::MtaOptions,
-    /// Recover the pulses that returned nothing from the timing and geometry
-    /// of those that did ([`crate::shots::reconstruct`]); `shot_stride` then
-    /// counts fired pulses, recorded or not. Only `read_rxp_shots` carries them,
-    /// with MTA resolution first where the shim is built.
+    /// Without the shim, recover the pulses that returned nothing from the
+    /// timing and geometry of those that did ([`crate::shots::reconstruct`]);
+    /// `shot_stride` then counts fired pulses, recorded or not. Only
+    /// `read_rxp_shots` carries them. With the shim every shot is already a
+    /// pulse, so this does nothing there.
     pub fill_missing: bool,
     /// First and last zenith of the mirror sweep (degrees) for `fill_missing`,
     /// from the scan pattern; `None` takes the extremes recorded.
@@ -388,14 +392,46 @@ fn read_raw(path: &Path, opts: &RxpOptions) -> Result<RawRxp> {
 /// `reflectance`, `deviation`, `echo_type` and `gps_time` (seconds) attributes.
 ///
 /// With MTA resolution available ([`RxpOptions::mta`]) the cloud is converted
-/// the way RiSCAN PRO does it and additionally carries `mta_zone`,
-/// `return_number`, `number_of_returns`, `scan_line_index`, `shot_index_line`
-/// and `mirror_facet`.
+/// the way RiSCAN PRO does it, ordered by pulse in stream order and by range
+/// within a pulse: the echoes of [`read_rxp_shots`] with their pulse's
+/// attributes ([`Shots::to_pointcloud`]), so it additionally carries
+/// `return_number`, `number_of_returns`, `range`, `scan_line_index`,
+/// `shot_index_line`, `mirror_facet`, `target_count` and, with more than one
+/// zone, `mta_zone`.
 pub fn read_rxp(path: impl AsRef<Path>, opts: &RxpOptions) -> Result<PointCloud> {
     if mta_active(opts) {
-        return super::rxp_mta::read_rxp_mta(path.as_ref(), opts, &opts.mta);
+        let shots = super::rxp_mta::read_rxp_mta(path.as_ref(), opts, &opts.mta)?;
+        return Ok(select_points(shots.to_pointcloud(), opts));
     }
     Ok(cloud_from_raw(read_raw(path.as_ref(), opts)?))
+}
+
+/// The echo selection, point stride and cap of `opts` on a converted cloud.
+fn select_points(cloud: PointCloud, opts: &RxpOptions) -> PointCloud {
+    let (ret, cnt) = match (cloud.attrs.get("return_number"), cloud.attrs.get("number_of_returns")) {
+        (Some(Attr::U8(r)), Some(Attr::U8(c))) => (r, c),
+        _ => unreachable!("Shots::to_pointcloud numbers the returns"),
+    };
+    let mut keep = Vec::new();
+    for i in 0..cloud.len() {
+        if opts.max_points.map(|m| keep.len() >= m).unwrap_or(false) {
+            break;
+        }
+        let echo = match opts.echoes.as_str() {
+            "first" => ret[i] == 1,
+            "last" => ret[i] == cnt[i],
+            "single" => cnt[i] == 1,
+            _ => true,
+        };
+        if echo && (opts.stride <= 1 || (i + 1) % opts.stride == 0) {
+            keep.push(i);
+        }
+    }
+    if keep.len() == cloud.len() {
+        cloud
+    } else {
+        cloud.take(&keep)
+    }
 }
 
 /// Whether these options resolve MTA: asked for, or left automatic with the
@@ -419,32 +455,34 @@ fn cloud_from_raw(raw: RawRxp) -> PointCloud {
     cloud
 }
 
-/// Read an `.rxp` file as pulses. Echoes sharing a timestamp form one shot.
-/// With `fill_missing` the pulses that returned nothing follow the recorded
-/// ones as echo-less shots, and the report says what was recovered.
+/// Read an `.rxp` file as pulses.
+///
+/// With the shim, every shot of the stream is a pulse, in the order fired,
+/// with its pulse attributes ([`super::rxp_mta`]); `max_points` stops before
+/// the pulse that would take the echoes past it, and `fill_missing` does
+/// nothing. A pulse is never split, so `stride` and `echoes` are refused:
+/// thin with `shot_stride`.
+///
+/// Through `libscanifc`, echoes sharing a timestamp form one shot; with
+/// `fill_missing` the pulses that returned nothing follow the recorded ones as
+/// echo-less shots, and the report says what was recovered.
 pub fn read_rxp_shots_with_report(path: impl AsRef<Path>, opts: &RxpOptions) -> Result<(Shots, Option<MissReport>)> {
     if mta_active(opts) {
-        if !opts.fill_missing {
-            let cloud = read_rxp(path, opts)?;
-            return Ok((Shots::from_pointcloud(&cloud, [0.0, 0.0, 0.0]), None));
+        if opts.stride > 1 || opts.echoes != "all" {
+            return Err(Error::invalid("read_rxp_shots keeps every echo of a pulse: thin with shot_stride, not stride or echoes"));
         }
-        // The echoes assigned to their pulses by the MTA resolution first:
-        // on the raw stream an echo filed under the wrong pulse leaves a
-        // false miss (two per cent of a VZ-2000i rainforest scan). Every
-        // pulse and echo is read so that the gaps between pulses are real;
-        // the stride is applied to the fired sequence afterwards.
-        let mut all = opts.clone();
-        all.shot_stride = 1;
-        all.stride = 1;
-        all.max_points = None;
-        all.echoes = "all".into();
-        let cloud = super::rxp_mta::read_rxp_mta(path.as_ref(), &all, &all.mta)?;
-        let shots = Shots::from_pointcloud(&cloud, [0.0, 0.0, 0.0]);
-        let times = shots.echo_attrs.get("gps_time").map(|a| a.to_f64()).ok_or_else(|| Error::invalid("the MTA stream carries no gps_time"))?;
-        let time_ns: Vec<u64> = shots.echo_start.iter().map(|&s| (times[s] * 1e9).round().max(0.0) as u64).collect();
-        let rec = reconstruct_misses(&time_ns, &shots.direction, opts.zenith_range, opts.shot_stride);
-        let kept = if opts.shot_stride > 1 { shots.subset(&rec.keep) } else { shots };
-        return with_misses(kept, rec.misses).map(|s| (s, Some(rec.report)));
+        let shots = super::rxp_mta::read_rxp_mta(path.as_ref(), opts, &opts.mta)?;
+        let Some(cap) = opts.max_points else { return Ok((shots, None)) };
+        let mut total = 0usize;
+        let keep: Vec<bool> = shots
+            .echo_count
+            .iter()
+            .map(|&c| {
+                total += c as usize;
+                total <= cap
+            })
+            .collect();
+        return Ok((shots.subset(&keep), None));
     }
     let mut raw = read_raw(path.as_ref(), opts)?;
     let misses = std::mem::take(&mut raw.misses);
@@ -454,7 +492,8 @@ pub fn read_rxp_shots_with_report(path: impl AsRef<Path>, opts: &RxpOptions) -> 
     with_misses(shots, misses).map(|s| (s, report))
 }
 
-/// The recovered misses appended to the recorded pulses as echo-less shots.
+/// The misses recovered without the shim appended to the recorded pulses as
+/// echo-less shots.
 fn with_misses(shots: Shots, misses: Vec<Point>) -> Result<Shots> {
     if misses.is_empty() {
         return Ok(shots);
@@ -467,6 +506,7 @@ fn with_misses(shots: Shots, misses: Vec<Point>) -> Result<Shots> {
         echo_count: vec![0; n],
         echo_range: Vec::new(),
         echo_attrs: shots.echo_attrs.iter().map(|(k, v)| (k.clone(), v.take(&[]))).collect(),
+        pulse_attrs: Default::default(),
     };
     Shots::concatenate(&[&shots, &empty])
 }
